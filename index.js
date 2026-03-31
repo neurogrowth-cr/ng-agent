@@ -912,10 +912,12 @@ async function callClaude(messages, retries = 3, userId = null) {
             { role: 'user', content: toolResults }
           ]
         });
-        return followUp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        const followUpText = followUp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        return followUpText || null;
       }
 
-      return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const responseText = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+      return responseText || null;
 
     } catch (err) {
       lastErr = err;
@@ -1037,11 +1039,16 @@ slack.message(async ({ message, say }) => {
   history.push({ role: 'user', content: message.text });
 
   try {
-    const reply = await callClaude(history, 3, userId);
+    let reply = await callClaude(history, 3, userId);
+    if (!reply || !reply.trim()) {
+      console.error('Empty reply, retrying for user:', userId);
+      reply = await callClaude(history, 2, userId);
+    }
+    if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
-    if (reply && reply.trim()) await say(reply);
+    await say(reply);
   } catch (err) {
     console.error('Claude API error (DM):', err);
     await say('Got turned around for a second — go ahead and ask again.');
@@ -1058,11 +1065,16 @@ slack.event('app_mention', async ({ event, say }) => {
   history.push({ role: 'user', content: cleanText });
 
   try {
-    const reply = await callClaude(history, 3, userId);
+    let reply = await callClaude(history, 3, userId);
+    if (!reply || !reply.trim()) {
+      console.error('Empty reply on mention, retrying for user:', userId);
+      reply = await callClaude(history, 2, userId);
+    }
+    if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
-    if (reply && reply.trim()) await say({ text: reply, thread_ts: event.thread_ts || event.ts });
+    await say({ text: reply, thread_ts: event.thread_ts || event.ts });
   } catch (err) {
     console.error('Claude API error (mention):', err);
     await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts });
@@ -1119,11 +1131,16 @@ slack.message(async ({ message, say }) => {
   history.push({ role: 'user', content: message.text });
 
   try {
-    const reply = await callClaude(history, 3, userId);
+    let reply = await callClaude(history, 3, userId);
+    if (!reply || !reply.trim()) {
+      console.error('Empty reply on channel, retrying for user:', userId);
+      reply = await callClaude(history, 2, userId);
+    }
+    if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
-    if (reply && reply.trim()) await say({ text: reply, thread_ts: message.thread_ts || message.ts });
+    await say({ text: reply, thread_ts: message.thread_ts || message.ts });
   } catch (err) {
     console.error('Claude API error (channel):', err);
   }
