@@ -26,6 +26,181 @@ const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || '#ng-internal
 
 const pendingApprovals = {};
 
+// ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
+const TEAM_MEMBERS = {
+  'U05HXGX18H3': {
+    name: 'Ron',
+    role: 'ceo',
+    displayName: 'Ron Duarte'
+  },
+  'U07SMMDMSLQ': {
+    name: 'Tania',
+    role: 'client_success',
+    displayName: 'Tania'
+  },
+  'U08ABBFNGUW': {
+    name: 'Josue',
+    role: 'tech_ops',
+    displayName: 'Josue'
+  },
+  'U08ACUHUUP6': {
+    name: 'David',
+    role: 'tech_lead',
+    displayName: 'David'
+  },
+  'U09Q3BXJ18B': {
+    name: 'Valeria',
+    role: 'fulfillment',
+    displayName: 'Valeria'
+  },
+  'U09TNMVML3F': {
+    name: 'Felipe',
+    role: 'campaigns',
+    displayName: 'Felipe'
+  },
+  'U0A9J00EMGD': {
+    name: 'Joseph',
+    role: 'setter',
+    displayName: 'Joseph'
+  },
+  'U0AMTEKDCPN': {
+    name: 'Jose',
+    role: 'closer',
+    displayName: 'Jose'
+  }
+};
+
+const ROLE_PERMISSIONS = {
+  ceo: {
+    canReadChannels: ['ng-fullfillment-ops', 'ng-sales-goats', 'ng-ops-management', 'ng-new-client-alerts', 'ng-app-and-systems-improvents', 'ng-internal-announcements'],
+    canPostChannels: ['ng-fullfillment-ops', 'ng-sales-goats', 'ng-ops-management', 'ng-new-client-alerts', 'ng-app-and-systems-improvents', 'ng-internal-announcements'],
+    canUseEmail: true,
+    canUseCalendar: true,
+    canUseGHL: true,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: true,
+    fullAccess: true
+  },
+  client_success: {
+    canReadChannels: ['ng-fullfillment-ops', 'ng-new-client-alerts', 'ng-ops-management'],
+    canPostChannels: ['ng-fullfillment-ops', 'ng-new-client-alerts'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: false,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: true,
+    fullAccess: false
+  },
+  tech_ops: {
+    canReadChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
+    canPostChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: false,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: true,
+    fullAccess: false
+  },
+  tech_lead: {
+    canReadChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents', 'ng-ops-management'],
+    canPostChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: false,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: true,
+    fullAccess: false
+  },
+  fulfillment: {
+    canReadChannels: ['ng-fullfillment-ops'],
+    canPostChannels: ['ng-fullfillment-ops'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: false,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: false,
+    fullAccess: false
+  },
+  campaigns: {
+    canReadChannels: ['ng-fullfillment-ops'],
+    canPostChannels: ['ng-fullfillment-ops'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: false,
+    canUseDrive: true,
+    canUseNotion: true,
+    canSaveKnowledge: false,
+    fullAccess: false
+  },
+  setter: {
+    canReadChannels: ['ng-sales-goats'],
+    canPostChannels: ['ng-sales-goats'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: true,
+    canUseDrive: false,
+    canUseNotion: false,
+    canSaveKnowledge: false,
+    fullAccess: false
+  },
+  closer: {
+    canReadChannels: ['ng-sales-goats'],
+    canPostChannels: ['ng-sales-goats'],
+    canUseEmail: false,
+    canUseCalendar: false,
+    canUseGHL: true,
+    canUseDrive: false,
+    canUseNotion: false,
+    canSaveKnowledge: false,
+    fullAccess: false
+  }
+};
+
+function getMemberContext(userId) {
+  return TEAM_MEMBERS[userId] || { name: 'Team Member', role: 'fulfillment', displayName: 'Team Member' };
+}
+
+function getMemberPermissions(userId) {
+  const member = getMemberContext(userId);
+  return ROLE_PERMISSIONS[member.role] || ROLE_PERMISSIONS.fulfillment;
+}
+
+function buildRoleSystemPrompt(userId) {
+  const member = getMemberContext(userId);
+  const perms = getMemberPermissions(userId);
+
+  if (perms.fullAccess) return SYSTEM_PROMPT;
+
+  const roleContext = {
+    client_success: `You are speaking with Tania, the Client Success Operations Manager at NeuroGrowth. She manages active client relationships, account health, AR, contract processing, and case study collection. Help her with client status queries, drafting client communications, checking fulfillment channel activity, and searching client knowledge. She cannot access Ron's email, calendar, or GHL.`,
+    tech_ops: `You are speaking with Josue, the Technical Operations Manager at NeuroGrowth. He handles activation calls, campaign operations, and client launch sequencing. Help him with fulfillment channel activity, client launch status, technical blockers, and Notion SOPs. He cannot access Ron's email, calendar, or GHL.`,
+    tech_lead: `You are speaking with David, the Lead Technology and Automation specialist at NeuroGrowth. He builds and maintains Make.com scenarios, Supabase infrastructure, and the Neurogrowth Portal. Help him with technical questions, systems channel activity, and process documentation. He cannot access Ron's email, calendar, or GHL.`,
+    fulfillment: `You are speaking with a fulfillment team member at NeuroGrowth. Help them with campaign questions, client delivery status, and fulfillment channel activity. Keep responses focused on delivery operations.`,
+    campaigns: `You are speaking with Felipe, the Campaign Operations specialist at NeuroGrowth. He implements campaigns, manages Prosp, and handles technical escalations. Help him with campaign status, client delivery questions, and fulfillment channel activity.`,
+    setter: `You are speaking with Joseph, the Appointment Setter at NeuroGrowth. He books discovery calls with qualified prospects. Help him with prospect information from GHL, sales channel activity, and call scheduling context.`,
+    closer: `You are speaking with Jose, the High-Ticket Closer at NeuroGrowth. He closes prospects after the appointment-setting stage. Help him with GHL conversation data, prospect status, and sales channel activity.`
+  };
+
+  const baseContext = roleContext[member.role] || roleContext.fulfillment;
+  const channelList = perms.canReadChannels.join(', ');
+
+  return `${SYSTEM_PROMPT}
+
+---
+CURRENT USER CONTEXT:
+${baseContext}
+
+This user can access these channels: ${channelList}
+This user cannot access Ron's Gmail, personal calendar, or tools not listed in their permissions.
+Always address this person by name: ${member.displayName}.
+Keep responses focused on their operational scope. Do not share sensitive business financials, compensation details, or information outside their role.`;
+}
+
 function getConversationKey(channelId, threadTs, userId) {
   return threadTs ? `${channelId}:${threadTs}` : `${channelId}:${userId}`;
 }
@@ -538,7 +713,7 @@ function getFileMimeType(filename, mimeType) {
 }
 
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
-async function callClaude(messages, retries = 3) {
+async function callClaude(messages, retries = 3, userId = null) {
   let lastErr;
 
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -546,7 +721,7 @@ async function callClaude(messages, retries = 3) {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 1024,
-        system: SYSTEM_PROMPT,
+        system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
         messages,
         tools: [
           {
@@ -730,7 +905,7 @@ async function callClaude(messages, retries = 3) {
         const followUp = await anthropic.messages.create({
           model: 'claude-sonnet-4-6',
           max_tokens: 1024,
-          system: SYSTEM_PROMPT,
+          system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
           messages: [
             ...messages,
             { role: 'assistant', content: response.content },
@@ -851,11 +1026,12 @@ slack.message(async ({ message, say }) => {
 
   if (message.subtype) return;
 
+  const member = getMemberContext(userId);
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
 
   try {
-    const reply = await callClaude(history);
+    const reply = await callClaude(history, 3, userId);
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
@@ -876,7 +1052,7 @@ slack.event('app_mention', async ({ event, say }) => {
   history.push({ role: 'user', content: cleanText });
 
   try {
-    const reply = await callClaude(history);
+    const reply = await callClaude(history, 3, userId);
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
@@ -937,7 +1113,7 @@ slack.message(async ({ message, say }) => {
   history.push({ role: 'user', content: message.text });
 
   try {
-    const reply = await callClaude(history);
+    const reply = await callClaude(history, 3, userId);
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
