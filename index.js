@@ -933,7 +933,13 @@ async function callClaude(messages, retries = 3, userId = null) {
 }
 
 async function postToSlack(channel, text, threadTs = null) {
-  const payload = { channel, text };
+  if (!text || !text.trim()) {
+    console.error('postToSlack called with empty text, skipping.');
+    return;
+  }
+  // Strip # prefix — Slack API uses channel names without #
+  const channelName = channel.startsWith('#') ? channel.slice(1) : channel;
+  const payload = { channel: channelName, text };
   if (threadTs) payload.thread_ts = threadTs;
   await slack.client.chat.postMessage(payload);
 }
@@ -1035,7 +1041,7 @@ slack.message(async ({ message, say }) => {
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
-    await say(reply);
+    if (reply && reply.trim()) await say(reply);
   } catch (err) {
     console.error('Claude API error (DM):', err);
     await say('Got turned around for a second — go ahead and ask again.');
@@ -1056,7 +1062,7 @@ slack.event('app_mention', async ({ event, say }) => {
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
-    await say({ text: reply, thread_ts: event.thread_ts || event.ts });
+    if (reply && reply.trim()) await say({ text: reply, thread_ts: event.thread_ts || event.ts });
   } catch (err) {
     console.error('Claude API error (mention):', err);
     await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts });
@@ -1117,7 +1123,7 @@ slack.message(async ({ message, say }) => {
     if (handleDraftReply(reply, userId, say)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
-    await say({ text: reply, thread_ts: message.thread_ts || message.ts });
+    if (reply && reply.trim()) await say({ text: reply, thread_ts: message.thread_ts || message.ts });
   } catch (err) {
     console.error('Claude API error (channel):', err);
   }
