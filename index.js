@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const cron = require('node-cron');
 const { google } = require('googleapis');
+const sharp = require('sharp');
 
 const slack = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -446,20 +447,61 @@ async function downloadSlackFile(fileUrl) {
   return Buffer.from(buffer);
 }
 
-async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt) {
-  const base64 = fileBuffer.toString('base64');
+async function resizeImageIfNeeded(fileBuffer, mimeType) {
+  // Skip resize for GIF and PDF
+  if (mimeType === 'application/pdf' || mimeType === 'image/gif') return { buffer: fileBuffer, mimeType };
 
-  // Determine content type for Claude API
+  try {
+    const image = sharp(fileBuffer);
+    const metadata = await image.metadata();
+
+    // Only resize if image is large (over 1200px on longest side)
+    const maxDimension = 1200;
+    if (metadata.width <= maxDimension && metadata.height <= maxDimension) {
+      return { buffer: fileBuffer, mimeType };
+    }
+
+    const isLandscape = metadata.width > metadata.height;
+    const resized = await image
+      .resize(
+        isLandscape ? maxDimension : null,
+        isLandscape ? null : maxDimension,
+        { fit: 'inside', withoutEnlargement: true }
+      )
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    console.log(`Image resized from ${metadata.width}x${metadata.height} to fit ${maxDimension}px`);
+    return { buffer: resized, mimeType: 'image/jpeg' };
+  } catch (err) {
+    console.error('Image resize error:', err.message);
+    return { buffer: fileBuffer, mimeType };
+  }
+}
+
+async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt) {
+  let finalBuffer = fileBuffer;
+  let finalMimeType = mimeType;
+
+  // Resize images to reduce token usage
+  if (mimeType.startsWith('image/')) {
+    const resized = await resizeImageIfNeeded(fileBuffer, mimeType);
+    finalBuffer = resized.buffer;
+    finalMimeType = resized.mimeType;
+  }
+
+  const base64 = finalBuffer.toString('base64');
+
   let contentBlock;
-  if (mimeType === 'application/pdf') {
+  if (finalMimeType === 'application/pdf') {
     contentBlock = {
       type: 'document',
       source: { type: 'base64', media_type: 'application/pdf', data: base64 }
     };
-  } else if (mimeType.startsWith('image/')) {
+  } else if (finalMimeType.startsWith('image/')) {
     contentBlock = {
       type: 'image',
-      source: { type: 'base64', media_type: mimeType, data: base64 }
+      source: { type: 'base64', media_type: finalMimeType, data: base64 }
     };
   } else {
     return 'Unsupported file type. I can process images (PNG, JPG, GIF, WEBP) and PDFs.';
