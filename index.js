@@ -435,6 +435,66 @@ Write a brief, direct message to Ron (2-4 sentences) summarizing what is still u
   }
 }
 
+
+// ─── FILE PROCESSING ──────────────────────────────────────────────────────────
+async function downloadSlackFile(fileUrl) {
+  const res = await fetch(fileUrl, {
+    headers: { 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` }
+  });
+  if (!res.ok) throw new Error(`Failed to download file: ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  return Buffer.from(buffer);
+}
+
+async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt) {
+  const base64 = fileBuffer.toString('base64');
+
+  // Determine content type for Claude API
+  let contentBlock;
+  if (mimeType === 'application/pdf') {
+    contentBlock = {
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: base64 }
+    };
+  } else if (mimeType.startsWith('image/')) {
+    contentBlock = {
+      type: 'image',
+      source: { type: 'base64', media_type: mimeType, data: base64 }
+    };
+  } else {
+    return 'Unsupported file type. I can process images (PNG, JPG, GIF, WEBP) and PDFs.';
+  }
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1024,
+    system: systemPrompt,
+    messages: [{
+      role: 'user',
+      content: [
+        contentBlock,
+        { type: 'text', text: userInstruction || 'Analyze this file and provide a useful summary. Extract any action items, key information, or insights relevant to NeuroGrowth operations.' }
+      ]
+    }]
+  });
+
+  return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+}
+
+function getFileMimeType(filename, mimeType) {
+  if (mimeType && mimeType !== 'application/octet-stream') return mimeType;
+  const ext = filename?.split('.').pop()?.toLowerCase();
+  const map = {
+    'pdf': 'application/pdf',
+    'png': 'image/png',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'gif': 'image/gif',
+    'webp': 'image/webp'
+  };
+  return map[ext] || mimeType;
+}
+
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
 async function callClaude(messages, retries = 3) {
   let lastErr;
@@ -712,13 +772,43 @@ function handleDraftReply(reply, userId, say) {
 
 // ─── SLACK HANDLERS ───────────────────────────────────────────────────────────
 slack.message(async ({ message, say }) => {
-  if (message.subtype || message.bot_id) return;
+  if (message.bot_id) return;
   if (message.channel_type !== 'im') return;
 
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
 
   const userId = message.user;
+
+  // Handle file uploads
+  if (message.subtype === 'file_share' && message.files?.length > 0) {
+    const file = message.files[0];
+    const instruction = message.text || null;
+    const mimeType = getFileMimeType(file.name, file.mimetype);
+
+    const supported = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    if (!supported.includes(mimeType)) {
+      await say(`I can process images (PNG, JPG, GIF, WEBP) and PDFs. This file type (${mimeType}) is not supported yet.`);
+      return;
+    }
+
+    await say(`Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Give me a moment to analyze it...`);
+
+    try {
+      const fileBuffer = await downloadSlackFile(file.url_private);
+      const result = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
+      await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
+      await saveMessage(userId, 'assistant', result);
+      await say(result);
+    } catch (err) {
+      console.error('File processing error:', err);
+      await say(`Had trouble processing that file — ${err.message}`);
+    }
+    return;
+  }
+
+  if (message.subtype) return;
+
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
 
@@ -771,6 +861,36 @@ slack.message(async ({ message, say }) => {
   if (isApproval) return;
 
   const userId = message.user;
+
+  // Handle file uploads in channel
+  if (message.subtype === 'file_share' && message.files?.length > 0) {
+    const file = message.files[0];
+    const instruction = message.text || null;
+    const mimeType = getFileMimeType(file.name, file.mimetype);
+
+    const supported = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    if (!supported.includes(mimeType)) {
+      await say({ text: `I can process images and PDFs. This file type (${mimeType}) is not supported yet.`, thread_ts: message.thread_ts || message.ts });
+      return;
+    }
+
+    await say({ text: `Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Analyzing...`, thread_ts: message.thread_ts || message.ts });
+
+    try {
+      const fileBuffer = await downloadSlackFile(file.url_private);
+      const result = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
+      await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
+      await saveMessage(userId, 'assistant', result);
+      await say({ text: result, thread_ts: message.thread_ts || message.ts });
+    } catch (err) {
+      console.error('File processing error:', err);
+      await say({ text: `Had trouble processing that file — ${err.message}`, thread_ts: message.thread_ts || message.ts });
+    }
+    return;
+  }
+
+  if (message.subtype) return;
+
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
 
