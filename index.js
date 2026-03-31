@@ -6,6 +6,8 @@ const fs = require('fs');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 const sharp = require('sharp');
+const OpenAI = require('openai');
+const { Readable } = require('stream');
 
 const slack = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -14,6 +16,7 @@ const slack = new App({
 });
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const SYSTEM_PROMPT = fs.readFileSync('./system_prompt.txt', 'utf8');
 
@@ -28,136 +31,60 @@ const pendingApprovals = {};
 
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
-  'U05HXGX18H3': {
-    name: 'Ron',
-    role: 'ceo',
-    displayName: 'Ron Duarte'
-  },
-  'U07SMMDMSLQ': {
-    name: 'Tania',
-    role: 'client_success',
-    displayName: 'Tania'
-  },
-  'U08ABBFNGUW': {
-    name: 'Josue',
-    role: 'tech_ops',
-    displayName: 'Josue'
-  },
-  'U08ACUHUUP6': {
-    name: 'David',
-    role: 'tech_lead',
-    displayName: 'David'
-  },
-  'U09Q3BXJ18B': {
-    name: 'Valeria',
-    role: 'fulfillment',
-    displayName: 'Valeria'
-  },
-  'U09TNMVML3F': {
-    name: 'Felipe',
-    role: 'campaigns',
-    displayName: 'Felipe'
-  },
-  'U0A9J00EMGD': {
-    name: 'Joseph',
-    role: 'setter',
-    displayName: 'Joseph'
-  },
-  'U0AMTEKDCPN': {
-    name: 'Jose',
-    role: 'closer',
-    displayName: 'Jose'
-  }
+  'U05HXGX18H3': { name: 'Ron',     role: 'ceo',            displayName: 'Ron Duarte' },
+  'U07SMMDMSLQ': { name: 'Tania',   role: 'client_success', displayName: 'Tania'      },
+  'U08ABBFNGUW': { name: 'Josue',   role: 'tech_ops',       displayName: 'Josue'      },
+  'U08ACUHUUP6': { name: 'David',   role: 'tech_lead',      displayName: 'David'      },
+  'U09Q3BXJ18B': { name: 'Valeria', role: 'fulfillment',    displayName: 'Valeria'    },
+  'U09TNMVML3F': { name: 'Felipe',  role: 'campaigns',      displayName: 'Felipe'     },
+  'U0A9J00EMGD': { name: 'Joseph',  role: 'setter',         displayName: 'Joseph'     },
+  'U0AMTEKDCPN': { name: 'Jose',    role: 'closer',         displayName: 'Jose'       }
 };
 
 const ROLE_PERMISSIONS = {
   ceo: {
     canReadChannels: ['ng-fullfillment-ops', 'ng-sales-goats', 'ng-ops-management', 'ng-new-client-alerts', 'ng-app-and-systems-improvents', 'ng-internal-announcements'],
     canPostChannels: ['ng-fullfillment-ops', 'ng-sales-goats', 'ng-ops-management', 'ng-new-client-alerts', 'ng-app-and-systems-improvents', 'ng-internal-announcements'],
-    canUseEmail: true,
-    canUseCalendar: true,
-    canUseGHL: true,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: true,
-    fullAccess: true
+    canUseEmail: true, canUseCalendar: true, canUseGHL: true,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: true
   },
   client_success: {
     canReadChannels: ['ng-fullfillment-ops', 'ng-new-client-alerts', 'ng-ops-management'],
     canPostChannels: ['ng-fullfillment-ops', 'ng-new-client-alerts'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: false,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: true,
-    fullAccess: false
+    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false
   },
   tech_ops: {
     canReadChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
     canPostChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: false,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: true,
-    fullAccess: false
+    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false
   },
   tech_lead: {
     canReadChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents', 'ng-ops-management'],
     canPostChannels: ['ng-fullfillment-ops', 'ng-app-and-systems-improvents'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: false,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: true,
-    fullAccess: false
+    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false
   },
   fulfillment: {
-    canReadChannels: ['ng-fullfillment-ops'],
-    canPostChannels: ['ng-fullfillment-ops'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: false,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: false,
-    fullAccess: false
+    canReadChannels: ['ng-fullfillment-ops'], canPostChannels: ['ng-fullfillment-ops'],
+    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: false, fullAccess: false
   },
   campaigns: {
-    canReadChannels: ['ng-fullfillment-ops'],
-    canPostChannels: ['ng-fullfillment-ops'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: false,
-    canUseDrive: true,
-    canUseNotion: true,
-    canSaveKnowledge: false,
-    fullAccess: false
+    canReadChannels: ['ng-fullfillment-ops'], canPostChannels: ['ng-fullfillment-ops'],
+    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: false, fullAccess: false
   },
   setter: {
-    canReadChannels: ['ng-sales-goats'],
-    canPostChannels: ['ng-sales-goats'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: true,
-    canUseDrive: false,
-    canUseNotion: false,
-    canSaveKnowledge: false,
-    fullAccess: false
+    canReadChannels: ['ng-sales-goats'], canPostChannels: ['ng-sales-goats'],
+    canUseEmail: false, canUseCalendar: false, canUseGHL: true,
+    canUseDrive: false, canUseNotion: false, canSaveKnowledge: false, fullAccess: false
   },
   closer: {
-    canReadChannels: ['ng-sales-goats'],
-    canPostChannels: ['ng-sales-goats'],
-    canUseEmail: false,
-    canUseCalendar: false,
-    canUseGHL: true,
-    canUseDrive: false,
-    canUseNotion: false,
-    canSaveKnowledge: false,
-    fullAccess: false
+    canReadChannels: ['ng-sales-goats'], canPostChannels: ['ng-sales-goats'],
+    canUseEmail: false, canUseCalendar: false, canUseGHL: true,
+    canUseDrive: false, canUseNotion: false, canSaveKnowledge: false, fullAccess: false
   }
 };
 
@@ -173,7 +100,6 @@ function getMemberPermissions(userId) {
 function buildRoleSystemPrompt(userId) {
   const member = getMemberContext(userId);
   const perms = getMemberPermissions(userId);
-
   if (perms.fullAccess) return SYSTEM_PROMPT;
 
   const roleContext = {
@@ -288,21 +214,15 @@ async function getAllKnowledgeByCategory(category) {
 // ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
 function getGoogleAuth() {
   let credentials, token;
-
-  // Railway: read from environment variables
   if (process.env.GOOGLE_CREDENTIALS) {
     credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
     token = JSON.parse(process.env.GOOGLE_TOKEN);
   } else {
-    // Local: read from files
     credentials = JSON.parse(fs.readFileSync('./credentials.json'));
     token = JSON.parse(fs.readFileSync('./token.json'));
   }
-
   const { client_id, client_secret } = credentials.installed;
-  const oauth2Client = new google.auth.OAuth2(
-    client_id, client_secret, 'http://localhost:3000/callback'
-  );
+  const oauth2Client = new google.auth.OAuth2(client_id, client_secret, 'http://localhost:3000/callback');
   oauth2Client.setCredentials(token);
   return oauth2Client;
 }
@@ -318,10 +238,8 @@ async function getRecentEmails() {
     const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
     const headers = msg.data.payload.headers;
     const subject = headers.find(h => h.name === 'Subject')?.value || 'No subject';
-    const from = headers.find(h => h.name === 'From')?.value || 'Unknown';
-    const date = headers.find(h => h.name === 'Date')?.value || '';
-
-    // Extract full email body
+    const from    = headers.find(h => h.name === 'From')?.value    || 'Unknown';
+    const date    = headers.find(h => h.name === 'Date')?.value    || '';
     let body = '';
     const payload = msg.data.payload;
     if (payload.parts) {
@@ -333,7 +251,6 @@ async function getRecentEmails() {
       body = Buffer.from(payload.body.data, 'base64').toString('utf8').substring(0, 1000);
     }
     if (!body) body = msg.data.snippet?.substring(0, 500) || '';
-
     return `From: ${from}\nDate: ${date}\nSubject: ${subject}\nBody:\n${body}`;
   }));
   return details.join('\n\n---\n\n');
@@ -352,15 +269,12 @@ async function sendEmail(to, subject, body) {
 async function getCalendarEvents(daysFromNow = 0, daysRange = 1) {
   const auth = getGoogleAuth();
   const calendar = google.calendar({ version: 'v3', auth });
-
   const startDate = new Date();
   startDate.setDate(startDate.getDate() + daysFromNow);
   startDate.setHours(6, 0, 0, 0);
-
   const endDate = new Date(startDate);
   endDate.setDate(endDate.getDate() + daysRange);
   endDate.setHours(29, 59, 59, 0);
-
   const res = await calendar.events.list({
     calendarId: 'primary',
     timeMin: startDate.toISOString(),
@@ -420,11 +334,9 @@ async function getNotionPage(pageId) {
 async function getGHLConversations(limit = 20, unreadOnly = false) {
   try {
     const locationId = process.env.GHL_LOCATION_ID;
-    const apiKey = process.env.GHL_API_KEY;
-
+    const apiKey     = process.env.GHL_API_KEY;
     let url = `https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=${limit}`;
     if (unreadOnly) url += `&status=unread`;
-
     const res = await fetch(url, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -432,32 +344,25 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
         'Content-Type': 'application/json'
       }
     });
-
     const data = await res.json();
     const convos = data.conversations || [];
     if (!convos.length) return 'No conversations found.';
-
     const now = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
-
     const lines = convos.map(c => {
       const lastDate = new Date(c.lastMessageDate).toLocaleString('en-US', {
-        timeZone: 'America/Costa_Rica',
-        month: 'short', day: 'numeric',
+        timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
-      const age = Math.floor((now - c.lastMessageDate) / oneDayMs);
-      const unread = c.unreadCount > 0 ? ` [UNREAD: ${c.unreadCount}]` : '';
+      const age       = Math.floor((now - c.lastMessageDate) / oneDayMs);
+      const unread    = c.unreadCount > 0 ? ` [UNREAD: ${c.unreadCount}]` : '';
       const direction = c.lastMessageDirection === 'inbound' ? '<-- inbound' : '--> outbound';
-      const channel = c.lastMessageType?.replace('TYPE_', '') || 'unknown';
-      const stale = age >= 3 ? ` [${age}d ago - needs follow-up]` : '';
-
+      const channel   = c.lastMessageType?.replace('TYPE_', '') || 'unknown';
+      const stale     = age >= 3 ? ` [${age}d ago - needs follow-up]` : '';
       return `${c.contactName || c.fullName || 'Unknown'} | ${channel} | ${direction}${unread}${stale}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
     });
-
     const unreadCount = convos.filter(c => c.unreadCount > 0).length;
-    const staleCount = convos.filter(c => (now - c.lastMessageDate) / oneDayMs >= 3).length;
-
+    const staleCount  = convos.filter(c => (now - c.lastMessageDate) / oneDayMs >= 3).length;
     let summary = `GHL Conversations — ${convos.length} total | ${unreadCount} unread | ${staleCount} need follow-up\n\n`;
     summary += lines.join('\n\n');
     return summary;
@@ -470,34 +375,25 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
 async function readSlackChannel(channelName, messageCount = 20) {
   const linkMatch = channelName.match(/<#[A-Z0-9]+\|([^>]+)>/);
   const cleanName = linkMatch ? linkMatch[1] : channelName.replace('#', '');
-
   const result = await slack.client.conversations.list({
     limit: 200,
     types: 'public_channel,private_channel,mpim,im'
   });
-
   const channel = result.channels.find(c => c.name === cleanName);
   if (!channel) return `Channel ${channelName} not found or agent not invited.`;
-
   try {
     const history = await slack.client.conversations.history({
       channel: channel.id,
       limit: Math.min(messageCount, 20)
     });
-
     if (!history.messages.length) return 'No recent messages found.';
-
-    const messages = history.messages
-      .reverse()
-      .map(m => {
-        const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', {
-          timeZone: 'America/Costa_Rica',
-          month: 'short', day: 'numeric',
-          hour: '2-digit', minute: '2-digit'
-        });
-        return `[${time}] ${(m.text || '').substring(0, 300)}`;
+    const messages = history.messages.reverse().map(m => {
+      const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', {
+        timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit'
       });
-
+      return `[${time}] ${(m.text || '').substring(0, 300)}`;
+    });
     return messages.join('\n');
   } catch (err) {
     return `Error reading channel: ${err.message}`;
@@ -510,16 +406,11 @@ async function runNightlyLearning() {
   try {
     const channels = ['ng-fullfillment-ops', 'ng-sales-goats', 'ng-new-client-alerts', 'ng-app-and-systems-improvents'];
     let digest = '';
-
     for (const ch of channels) {
       const messages = await readSlackChannel(ch, 20);
-      if (!messages.includes('not found')) {
-        digest += `\n\n=== ${ch} ===\n${messages}`;
-      }
+      if (!messages.includes('not found')) digest += `\n\n=== ${ch} ===\n${messages}`;
     }
-
     if (!digest) return;
-
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${today}.
 
@@ -535,16 +426,13 @@ Categories: client, team, process, decision, alert
 Keep each value under 150 words. Only extract meaningful operational intelligence.
 
 ${digest}`;
-
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
       messages: [{ role: 'user', content: learningPrompt }]
     });
-
-    const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
-
     let saved = 0;
     for (const line of lines) {
       const parts = line.split('|').map(p => p.trim());
@@ -557,7 +445,6 @@ ${digest}`;
         }
       }
     }
-
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
   } catch (err) {
     console.error('Nightly learning error:', err.message);
@@ -573,22 +460,12 @@ async function runProactiveAlerts() {
       .select('key, value, updated_at')
       .eq('category', 'alert')
       .order('updated_at', { ascending: true });
-
     if (error || !data || !data.length) return;
-
     const now = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
-    const staleAlerts = data.filter(a => {
-      const age = now - new Date(a.updated_at).getTime();
-      return age > oneDayMs;
-    });
-
+    const staleAlerts = data.filter(a => (now - new Date(a.updated_at).getTime()) > oneDayMs);
     if (!staleAlerts.length) return;
-
-    const alertText = staleAlerts.map(a =>
-      `${a.key}: ${a.value}`
-    ).join('\n\n');
-
+    const alertText = staleAlerts.map(a => `${a.key}: ${a.value}`).join('\n\n');
     const prompt = `You are the NeuroGrowth PM agent checking on unresolved alerts.
 
 These items have been flagged as alerts and have not been updated in over 24 hours:
@@ -596,13 +473,11 @@ These items have been flagged as alerts and have not been updated in over 24 hou
 ${alertText}
 
 Write a brief, direct message to Ron (2-4 sentences) summarizing what is still unresolved and what needs his attention today. No markdown formatting. Sound like a colleague, not a report.`;
-
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 256,
       messages: [{ role: 'user', content: prompt }]
     });
-
     const message = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     await postToSlack(AGENT_CHANNEL, message);
     console.log(`Proactive alert posted. ${staleAlerts.length} unresolved items flagged.`);
@@ -610,7 +485,6 @@ Write a brief, direct message to Ron (2-4 sentences) summarizing what is still u
     console.error('Proactive alert error:', err.message);
   }
 }
-
 
 // ─── FILE PROCESSING ──────────────────────────────────────────────────────────
 async function downloadSlackFile(fileUrl) {
@@ -623,29 +497,17 @@ async function downloadSlackFile(fileUrl) {
 }
 
 async function resizeImageIfNeeded(fileBuffer, mimeType) {
-  // Skip resize for GIF and PDF
   if (mimeType === 'application/pdf' || mimeType === 'image/gif') return { buffer: fileBuffer, mimeType };
-
   try {
-    const image = sharp(fileBuffer);
+    const image    = sharp(fileBuffer);
     const metadata = await image.metadata();
-
-    // Only resize if image is large (over 1200px on longest side)
     const maxDimension = 1200;
-    if (metadata.width <= maxDimension && metadata.height <= maxDimension) {
-      return { buffer: fileBuffer, mimeType };
-    }
-
+    if (metadata.width <= maxDimension && metadata.height <= maxDimension) return { buffer: fileBuffer, mimeType };
     const isLandscape = metadata.width > metadata.height;
     const resized = await image
-      .resize(
-        isLandscape ? maxDimension : null,
-        isLandscape ? null : maxDimension,
-        { fit: 'inside', withoutEnlargement: true }
-      )
+      .resize(isLandscape ? maxDimension : null, isLandscape ? null : maxDimension, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 85 })
       .toBuffer();
-
     console.log(`Image resized from ${metadata.width}x${metadata.height} to fit ${maxDimension}px`);
     return { buffer: resized, mimeType: 'image/jpeg' };
   } catch (err) {
@@ -655,33 +517,22 @@ async function resizeImageIfNeeded(fileBuffer, mimeType) {
 }
 
 async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt) {
-  let finalBuffer = fileBuffer;
+  let finalBuffer   = fileBuffer;
   let finalMimeType = mimeType;
-
-  // Resize images to reduce token usage
   if (mimeType.startsWith('image/')) {
     const resized = await resizeImageIfNeeded(fileBuffer, mimeType);
-    finalBuffer = resized.buffer;
+    finalBuffer   = resized.buffer;
     finalMimeType = resized.mimeType;
   }
-
   const base64 = finalBuffer.toString('base64');
-
   let contentBlock;
   if (finalMimeType === 'application/pdf') {
-    contentBlock = {
-      type: 'document',
-      source: { type: 'base64', media_type: 'application/pdf', data: base64 }
-    };
+    contentBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } };
   } else if (finalMimeType.startsWith('image/')) {
-    contentBlock = {
-      type: 'image',
-      source: { type: 'base64', media_type: finalMimeType, data: base64 }
-    };
+    contentBlock = { type: 'image', source: { type: 'base64', media_type: finalMimeType, data: base64 } };
   } else {
     return 'Unsupported file type. I can process images (PNG, JPG, GIF, WEBP) and PDFs.';
   }
-
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 1024,
@@ -694,7 +545,6 @@ async function processFileWithClaude(fileBuffer, mimeType, userInstruction, syst
       ]
     }]
   });
-
   return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
 }
 
@@ -702,20 +552,43 @@ function getFileMimeType(filename, mimeType) {
   if (mimeType && mimeType !== 'application/octet-stream') return mimeType;
   const ext = filename?.split('.').pop()?.toLowerCase();
   const map = {
-    'pdf': 'application/pdf',
-    'png': 'image/png',
-    'jpg': 'image/jpeg',
-    'jpeg': 'image/jpeg',
-    'gif': 'image/gif',
-    'webp': 'image/webp'
+    'pdf': 'application/pdf', 'png': 'image/png', 'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp'
   };
   return map[ext] || mimeType;
+}
+
+// ─── AUDIO TRANSCRIPTION (WHISPER) ───────────────────────────────────────────
+const AUDIO_MIME_TYPES = ['audio/webm', 'audio/mp4', 'audio/mpeg', 'audio/mp3', 'audio/ogg', 'audio/wav', 'audio/m4a'];
+const AUDIO_EXTENSIONS = ['webm', 'mp4', 'mp3', 'm4a', 'ogg', 'wav'];
+
+function isAudioFile(mimeType, filename) {
+  if (mimeType && AUDIO_MIME_TYPES.some(t => mimeType.startsWith(t))) return true;
+  const ext = filename?.split('.').pop()?.toLowerCase();
+  return AUDIO_EXTENSIONS.includes(ext);
+}
+
+async function transcribeAudio(fileBuffer, filename) {
+  // Whisper requires a File-like object. We write to a temp file and pass it.
+  const tmpPath = `/tmp/audio_${Date.now()}_${filename || 'audio.webm'}`;
+  fs.writeFileSync(tmpPath, fileBuffer);
+
+  try {
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(tmpPath),
+      model: 'whisper-1',
+      response_format: 'text'
+    });
+    return transcription; // plain string when response_format is 'text'
+  } finally {
+    // Clean up temp file
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
 }
 
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
 async function callClaude(messages, retries = 3, userId = null) {
   let lastErr;
-
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await anthropic.messages.create({
@@ -727,20 +600,12 @@ async function callClaude(messages, retries = 3, userId = null) {
           {
             name: "search_notion",
             description: "Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs",
-            input_schema: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"]
-            }
+            input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
           },
           {
             name: "get_notion_page",
             description: "Get the content of a specific Notion page by its ID",
-            input_schema: {
-              type: "object",
-              properties: { page_id: { type: "string" } },
-              required: ["page_id"]
-            }
+            input_schema: { type: "object", properties: { page_id: { type: "string" } }, required: ["page_id"] }
           },
           {
             name: "get_recent_emails",
@@ -752,11 +617,7 @@ async function callClaude(messages, retries = 3, userId = null) {
             description: "Send an email on Ron's behalf. Always confirm before sending.",
             input_schema: {
               type: "object",
-              properties: {
-                to: { type: "string" },
-                subject: { type: "string" },
-                body: { type: "string" }
-              },
+              properties: { to: { type: "string" }, subject: { type: "string" }, body: { type: "string" } },
               required: ["to", "subject", "body"]
             }
           },
@@ -765,20 +626,13 @@ async function callClaude(messages, retries = 3, userId = null) {
             description: "Get calendar events. daysFromNow: 0=today, 1=tomorrow, -1=yesterday. daysRange: 1=day, 7=week, 14=two weeks.",
             input_schema: {
               type: "object",
-              properties: {
-                daysFromNow: { type: "number" },
-                daysRange: { type: "number" }
-              }
+              properties: { daysFromNow: { type: "number" }, daysRange: { type: "number" } }
             }
           },
           {
             name: "search_drive",
             description: "Search Ron's Google Drive for files and documents",
-            input_schema: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"]
-            }
+            input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
           },
           {
             name: "read_slack_channel",
@@ -797,10 +651,7 @@ async function callClaude(messages, retries = 3, userId = null) {
             description: "Prepare a Slack channel post for Ron's approval before sending.",
             input_schema: {
               type: "object",
-              properties: {
-                channelName: { type: "string" },
-                message: { type: "string" }
-              },
+              properties: { channelName: { type: "string" }, message: { type: "string" } },
               required: ["channelName", "message"]
             }
           },
@@ -845,9 +696,7 @@ async function callClaude(messages, retries = 3, userId = null) {
             description: "Get all knowledge entries for a specific category.",
             input_schema: {
               type: "object",
-              properties: {
-                category: { type: "string", description: "client, team, process, decision, alert, or intel" }
-              },
+              properties: { category: { type: "string", description: "client, team, process, decision, alert, or intel" } },
               required: ["category"]
             }
           }
@@ -855,43 +704,26 @@ async function callClaude(messages, retries = 3, userId = null) {
       });
 
       if (response.stop_reason === 'tool_use') {
-        const toolUses = response.content.filter(b => b.type === 'tool_use');
+        const toolUses   = response.content.filter(b => b.type === 'tool_use');
         const toolResults = await Promise.all(toolUses.map(async (toolUse) => {
           let result;
           try {
-            if (toolUse.name === 'search_notion') {
-              result = await searchNotion(toolUse.input.query);
-            } else if (toolUse.name === 'get_notion_page') {
-              result = await getNotionPage(toolUse.input.page_id);
-            } else if (toolUse.name === 'get_recent_emails') {
-              result = await getRecentEmails();
-            } else if (toolUse.name === 'send_email') {
-              result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
-            } else if (toolUse.name === 'get_calendar_events') {
-              result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
-            } else if (toolUse.name === 'search_drive') {
-              result = await searchDrive(toolUse.input.query);
-            } else if (toolUse.name === 'read_slack_channel') {
-              result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
-            } else if (toolUse.name === 'draft_channel_post') {
-              result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
-            } else if (toolUse.name === 'get_ghl_conversations') {
-              result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
-            } else if (toolUse.name === 'search_knowledge') {
-              result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
-            } else if (toolUse.name === 'save_knowledge') {
-              result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
-            } else if (toolUse.name === 'get_knowledge_category') {
-              result = await getAllKnowledgeByCategory(toolUse.input.category);
-            }
+            if      (toolUse.name === 'search_notion')        result = await searchNotion(toolUse.input.query);
+            else if (toolUse.name === 'get_notion_page')      result = await getNotionPage(toolUse.input.page_id);
+            else if (toolUse.name === 'get_recent_emails')    result = await getRecentEmails();
+            else if (toolUse.name === 'send_email')           result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
+            else if (toolUse.name === 'get_calendar_events')  result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
+            else if (toolUse.name === 'search_drive')         result = await searchDrive(toolUse.input.query);
+            else if (toolUse.name === 'read_slack_channel')   result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
+            else if (toolUse.name === 'draft_channel_post')   result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
+            else if (toolUse.name === 'get_ghl_conversations') result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
+            else if (toolUse.name === 'search_knowledge')     result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
+            else if (toolUse.name === 'save_knowledge')       result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
+            else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
           } catch (err) {
             result = `Error running tool ${toolUse.name}: ${err.message}`;
           }
-          return {
-            type: 'tool_result',
-            tool_use_id: toolUse.id,
-            content: JSON.stringify(result)
-          };
+          return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
         }));
 
         const draftResult = toolResults.find(r => {
@@ -922,7 +754,7 @@ async function callClaude(messages, retries = 3, userId = null) {
     } catch (err) {
       lastErr = err;
       if (err.status === 529 || err.status === 503 || err.status === 500) {
-        const wait = (attempt + 1) * 4000;
+        const wait = err.status === 529 ? (attempt + 1) * 10000 : (attempt + 1) * 4000;
         console.log(`API overloaded (attempt ${attempt + 1}/${retries}), retrying in ${wait / 1000}s...`);
         await new Promise(r => setTimeout(r, wait));
       } else {
@@ -930,16 +762,11 @@ async function callClaude(messages, retries = 3, userId = null) {
       }
     }
   }
-
   throw lastErr;
 }
 
 async function postToSlack(channel, text, threadTs = null) {
-  if (!text || !text.trim()) {
-    console.error('postToSlack called with empty text, skipping.');
-    return;
-  }
-  // Strip # prefix — Slack API uses channel names without #
+  if (!text || !text.trim()) { console.error('postToSlack called with empty text, skipping.'); return; }
   const channelName = channel.startsWith('#') ? channel.slice(1) : channel;
   const payload = { channel: channelName, text };
   if (threadTs) payload.thread_ts = threadTs;
@@ -948,10 +775,7 @@ async function postToSlack(channel, text, threadTs = null) {
 
 async function executeChannelPost(channelName, message, say) {
   try {
-    const result = await slack.client.conversations.list({
-      limit: 200,
-      types: 'public_channel,private_channel,mpim,im'
-    });
+    const result  = await slack.client.conversations.list({ limit: 200, types: 'public_channel,private_channel,mpim,im' });
     const channel = result.channels.find(c => c.name === channelName.replace('#', ''));
     if (!channel) {
       await say(`Could not find channel ${channelName}.`);
@@ -967,35 +791,107 @@ async function executeChannelPost(channelName, message, say) {
 async function checkApproval(message, say, userId) {
   const pending = pendingApprovals[userId];
   if (!pending) return false;
-
   const text = (typeof message === 'string' ? message : message.text || '').toLowerCase().trim();
-
   if (['yes', 'send it', 'approved', 'go ahead', '👍'].includes(text)) {
     await executeChannelPost(pending.channelName, pending.message, say);
     delete pendingApprovals[userId];
     return true;
   }
-
   if (['no', 'cancel', 'stop'].includes(text)) {
     await say('Cancelled. Nothing was posted.');
     delete pendingApprovals[userId];
     return true;
   }
-
   return false;
 }
 
 function handleDraftReply(reply, userId, say) {
   if (!reply.startsWith('APPROVAL_NEEDED|')) return false;
-  const parts = reply.split('|');
-  const channelName = parts[1];
+  const parts        = reply.split('|');
+  const channelName  = parts[1];
   const draftMessage = parts.slice(2).join('|');
   pendingApprovals[userId] = { channelName, message: draftMessage };
   say(`Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`);
   return true;
 }
 
+// ─── SHARED FILE HANDLER (DM + CHANNEL) ──────────────────────────────────────
+async function handleFileMessage(message, say, userId, threadReply = false) {
+  const file        = message.files[0];
+  const instruction = message.text || null;
+  const mimeType    = getFileMimeType(file.name, file.mimetype);
+
+  // ── Audio ──
+  if (isAudioFile(mimeType, file.name)) {
+    const replyOpts = threadReply
+      ? { text: '🎙️ Got the voice note. Transcribing...', thread_ts: message.thread_ts || message.ts }
+      : '🎙️ Got the voice note. Transcribing...';
+    await say(replyOpts);
+
+    try {
+      const fileBuffer = await downloadSlackFile(file.url_private);
+      const transcript = await transcribeAudio(fileBuffer, file.name);
+
+      if (!transcript || !transcript.trim()) {
+        const errMsg = "Couldn't make out anything in that audio. Try again?";
+        await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+        return;
+      }
+
+      console.log(`Audio transcribed (${file.name}): ${transcript.substring(0, 100)}...`);
+
+      // Show transcript briefly, then act on it
+      const transcriptNotice = `_Transcript:_ "${transcript.substring(0, 200)}${transcript.length > 200 ? '...' : ''}"`;
+      await say(threadReply ? { text: transcriptNotice, thread_ts: message.thread_ts || message.ts } : transcriptNotice);
+
+      // Feed transcript into Claude as a normal message
+      const history = await loadHistory(userId);
+      history.push({ role: 'user', content: `[Voice note transcript]: ${transcript}` });
+
+      let reply = await callClaude(history, 3, userId);
+      if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId);
+      if (!reply || !reply.trim()) return;
+
+      if (handleDraftReply(reply, userId, say)) return;
+      await saveMessage(userId, 'user', `[Voice note]: ${transcript}`);
+      await saveMessage(userId, 'assistant', reply);
+      await say(threadReply ? { text: reply, thread_ts: message.thread_ts || message.ts } : reply);
+
+    } catch (err) {
+      console.error('Audio processing error:', err);
+      const errMsg = `Had trouble with that audio — ${err.message}`;
+      await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+    }
+    return;
+  }
+
+  // ── Images / PDFs ──
+  const supported = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  if (!supported.includes(mimeType)) {
+    const errMsg = `I can process images (PNG, JPG, GIF, WEBP), PDFs, and audio files. This file type (${mimeType}) isn't supported yet.`;
+    await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+    return;
+  }
+
+  const ackMsg = `Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Give me a moment to analyze it...`;
+  await say(threadReply ? { text: ackMsg, thread_ts: message.thread_ts || message.ts } : ackMsg);
+
+  try {
+    const fileBuffer = await downloadSlackFile(file.url_private);
+    const result     = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
+    await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
+    await saveMessage(userId, 'assistant', result);
+    await say(threadReply ? { text: result, thread_ts: message.thread_ts || message.ts } : result);
+  } catch (err) {
+    console.error('File processing error:', err);
+    const errMsg = `Had trouble processing that file — ${err.message}`;
+    await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+  }
+}
+
 // ─── SLACK HANDLERS ───────────────────────────────────────────────────────────
+
+// DM handler
 slack.message(async ({ message, say }) => {
   if (message.bot_id) return;
   if (message.channel_type !== 'im') return;
@@ -1005,36 +901,14 @@ slack.message(async ({ message, say }) => {
 
   const userId = message.user;
 
-  // Handle file uploads
+  // File uploads (images, PDFs, audio)
   if (message.subtype === 'file_share' && message.files?.length > 0) {
-    const file = message.files[0];
-    const instruction = message.text || null;
-    const mimeType = getFileMimeType(file.name, file.mimetype);
-
-    const supported = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-    if (!supported.includes(mimeType)) {
-      await say(`I can process images (PNG, JPG, GIF, WEBP) and PDFs. This file type (${mimeType}) is not supported yet.`);
-      return;
-    }
-
-    await say(`Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Give me a moment to analyze it...`);
-
-    try {
-      const fileBuffer = await downloadSlackFile(file.url_private);
-      const result = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
-      await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
-      await saveMessage(userId, 'assistant', result);
-      await say(result);
-    } catch (err) {
-      console.error('File processing error:', err);
-      await say(`Had trouble processing that file — ${err.message}`);
-    }
+    await handleFileMessage(message, say, userId, false);
     return;
   }
 
   if (message.subtype) return;
 
-  const member = getMemberContext(userId);
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
 
@@ -1055,12 +929,13 @@ slack.message(async ({ message, say }) => {
   }
 });
 
+// @mention handler
 slack.event('app_mention', async ({ event, say }) => {
   if (event.bot_id) return;
   const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!cleanText) return;
 
-  const userId = event.user;
+  const userId  = event.user;
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: cleanText });
 
@@ -1081,6 +956,7 @@ slack.event('app_mention', async ({ event, say }) => {
   }
 });
 
+// #ng-pm-agent channel handler
 slack.message(async ({ message, say }) => {
   if (message.subtype || message.bot_id) return;
   if (message.channel_type === 'im') return;
@@ -1098,30 +974,9 @@ slack.message(async ({ message, say }) => {
 
   const userId = message.user;
 
-  // Handle file uploads in channel
+  // File uploads (images, PDFs, audio)
   if (message.subtype === 'file_share' && message.files?.length > 0) {
-    const file = message.files[0];
-    const instruction = message.text || null;
-    const mimeType = getFileMimeType(file.name, file.mimetype);
-
-    const supported = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-    if (!supported.includes(mimeType)) {
-      await say({ text: `I can process images and PDFs. This file type (${mimeType}) is not supported yet.`, thread_ts: message.thread_ts || message.ts });
-      return;
-    }
-
-    await say({ text: `Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Analyzing...`, thread_ts: message.thread_ts || message.ts });
-
-    try {
-      const fileBuffer = await downloadSlackFile(file.url_private);
-      const result = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
-      await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
-      await saveMessage(userId, 'assistant', result);
-      await say({ text: result, thread_ts: message.thread_ts || message.ts });
-    } catch (err) {
-      console.error('File processing error:', err);
-      await say({ text: `Had trouble processing that file — ${err.message}`, thread_ts: message.thread_ts || message.ts });
-    }
+    await handleFileMessage(message, say, userId, true);
     return;
   }
 
@@ -1147,7 +1002,6 @@ slack.message(async ({ message, say }) => {
 });
 
 // ─── CRON JOBS ────────────────────────────────────────────────────────────────
-
 // Daily standup — 9:00 AM CST
 cron.schedule('0 15 * * 1-5', async () => {
   const prompt = `Generate a daily standup message for the NeuroGrowth team.
@@ -1199,18 +1053,11 @@ Keep it to 2 lines.`;
 }, { timezone: 'America/Costa_Rica' });
 
 // Proactive alerts — 9:00 AM and 2:00 PM CST
-cron.schedule('0 15 * * *', async () => {
-  await runProactiveAlerts();
-}, { timezone: 'America/Costa_Rica' });
-
-cron.schedule('0 20 * * *', async () => {
-  await runProactiveAlerts();
-}, { timezone: 'America/Costa_Rica' });
+cron.schedule('0 15 * * *', async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
+cron.schedule('0 20 * * *', async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
 
 // Nightly learning — 11:30 PM CST
-cron.schedule('30 5 * * *', async () => {
-  await runNightlyLearning();
-}, { timezone: 'America/Costa_Rica' });
+cron.schedule('30 5 * * *', async () => { await runNightlyLearning(); }, { timezone: 'America/Costa_Rica' });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
