@@ -9,8 +9,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
-    "@slack/bolt": "^3.17.1",
+    "@slack/bolt": "^4.6.0",
+    "@slack/socket-mode": "^2.0.6",
+    "@supabase/supabase-js": "^2.99.3",
     "dotenv": "^16.4.5",
+    "googleapis": "^171.4.0",
     "node-cron": "^3.0.3"
   },
   "devDependencies": {
