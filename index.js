@@ -569,11 +569,16 @@ function isAudioFile(mimeType, filename) {
 }
 
 async function transcribeAudio(fileBuffer, filename) {
-  // Whisper requires a File-like object. We write to a temp file and pass it.
   const tmpPath = `/tmp/audio_${Date.now()}_${filename || 'audio.webm'}`;
   fs.writeFileSync(tmpPath, fileBuffer);
 
   try {
+    // Polyfill File global — required for Node 18 (Node 20 has it natively)
+    if (typeof globalThis.File === 'undefined') {
+      const { File } = await import('node:buffer');
+      globalThis.File = File;
+    }
+
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(tmpPath),
       model: 'whisper-1',
@@ -581,7 +586,6 @@ async function transcribeAudio(fileBuffer, filename) {
     });
     return transcription; // plain string when response_format is 'text'
   } finally {
-    // Clean up temp file
     try { fs.unlinkSync(tmpPath); } catch {}
   }
 }
