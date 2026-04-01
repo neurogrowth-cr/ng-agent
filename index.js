@@ -856,6 +856,7 @@ async function runWeeklyPortalTrends() {
     }
 
     console.log('Weekly trend analysis complete.');
+    await postToSlack(AGENT_CHANNEL, `📊 *Weekly trend analysis saved* — check knowledge base for latest intel and process insights.`);
   } catch (err) {
     console.error('Weekly trend error:', err.message);
   }
@@ -934,6 +935,7 @@ async function runMondayGapDetection() {
 
     await postToSlack(OPS_CHANNEL, message);
     console.log(`Gap detection: ${gaps.length} gaps posted to ops channel.`);
+    await postToSlack(AGENT_CHANNEL, `🔍 *Monday gap detection complete* — ${gaps.length} issue(s) posted to #ng-fullfillment-ops.`);
   } catch (err) {
     console.error('Gap detection error:', err.message);
   }
@@ -1027,6 +1029,13 @@ ${digest}`;
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
+
+    // Post confirmation to agent channel so Ron knows it ran
+    const summary = [
+      `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}`,
+      `Slack channels scanned: 4 | Knowledge entries saved: ${saved}`,
+    ].join('\n');
+    await postToSlack(AGENT_CHANNEL, summary);
   } catch (err) {
     console.error('Nightly learning error:', err.message);
   }
