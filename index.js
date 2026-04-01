@@ -30,6 +30,17 @@ const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || '#ng-internal
 
 const pendingApprovals = {};
 
+// Clean up stale pending approvals every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const userId of Object.keys(pendingApprovals)) {
+    if (now - pendingApprovals[userId].createdAt > 30 * 60 * 1000) {
+      console.log(`Cleared stale pending approval for user ${userId}`);
+      delete pendingApprovals[userId];
+    }
+  }
+}, 30 * 60 * 1000);
+
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',     role: 'ceo',            displayName: 'Ron Duarte' },
@@ -238,10 +249,12 @@ async function saveMessage(userId, role, content) {
 // ─── SUPABASE: KNOWLEDGE STORE ────────────────────────────────────────────────
 async function searchKnowledge(query, category = null) {
   try {
+    // Sanitize query to prevent special char issues in ilike
+    const safeQuery = (query || '').replace(/[%_\\]/g, '\\$&').substring(0, 200);
     let q = supabase
       .from('agent_knowledge')
       .select('category, key, value, updated_at')
-      .ilike('value', `%${query}%`)
+      .ilike('value', `%${safeQuery}%`)
       .order('updated_at', { ascending: false })
       .limit(8);
     if (category) q = q.eq('category', category);
@@ -1346,18 +1359,36 @@ async function callClaude(messages, retries = 3, userId = null) {
           return `APPROVAL_NEEDED|${parts[1]}|${parts.slice(2).join('|')}`;
         }
 
-        const followUp = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1024,
-          system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
-          messages: [
-            ...messages,
-            { role: 'assistant', content: response.content },
-            { role: 'user', content: toolResults }
-          ]
-        });
-        const followUpText = followUp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-        return followUpText || null;
+        // followUp also gets retry logic for 529s
+        let followUpText = null;
+        for (let fuAttempt = 0; fuAttempt < 3; fuAttempt++) {
+          try {
+            const followUp = await anthropic.messages.create({
+              model: 'claude-sonnet-4-6',
+              max_tokens: 1024,
+              system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
+              messages: [
+                ...messages,
+                { role: 'assistant', content: response.content },
+                { role: 'user', content: toolResults }
+              ]
+            });
+            followUpText = followUp.content.filter(b => b.type === 'text').map(b => b.text).join('\n') || null;
+            // Empty reply guard on followUp
+            if (!followUpText && fuAttempt < 2) {
+              console.error('Empty followUp reply, retrying...');
+              continue;
+            }
+            break;
+          } catch (fuErr) {
+            if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
+              const wait = (fuAttempt + 1) * 10000;
+              console.log(`followUp overloaded, retrying in ${wait/1000}s...`);
+              await new Promise(r => setTimeout(r, wait));
+            } else { throw fuErr; }
+          }
+        }
+        return followUpText;
       }
 
       const responseText = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -1422,7 +1453,7 @@ function handleDraftReply(reply, userId, say) {
   const parts        = reply.split('|');
   const channelName  = parts[1];
   const draftMessage = parts.slice(2).join('|');
-  pendingApprovals[userId] = { channelName, message: draftMessage };
+  pendingApprovals[userId] = { channelName, message: draftMessage, createdAt: Date.now() };
   say(`Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`);
   return true;
 }
@@ -1673,7 +1704,8 @@ cron.schedule('30 14 * * 1-5', async () => {
     const fulfillmentActivity = await readSlackChannel('ng-fullfillment-ops', 20);
     const alerts = await getAllKnowledgeByCategory('alert');
     const clientKnowledge = await searchKnowledge('blocked', 'client');
-    const portalAlerts = await getPortalAlerts();
+    let portalAlerts = 'Portal data unavailable.';
+    try { portalAlerts = await getPortalAlerts(); } catch (e) { console.error('Portal alerts failed in Josue briefing:', e.message); }
 
     const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long' });
     const isMonday = dayOfWeek === 'Monday';
