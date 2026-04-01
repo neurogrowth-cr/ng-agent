@@ -409,6 +409,179 @@ async function getNotionPage(pageId) {
 // ─── GHL CONVERSATIONS ───────────────────────────────────────────────────────
 
 // ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
+// Schema notes:
+// customer_activities.status values: 'phase_1', 'phase_2', 'phase_3', 'live', 'blocked'
+// client_dashboards.customer_status: 'phase_1', 'phase_2', 'phase_3', 'live', 'blocked'
+// client_dashboards.customer_type: 'flywheel-ai' or 'full-service'
+// template_phase_assignments.phase: 'phase_1', 'phase_2', 'phase_3'
+// Activities are linked via template_id — need to join with customer_activity_templates
+
+async function getClientStatus(clientName = null) {
+  try {
+    // First get client dashboards which have the current phase status
+    let dashQuery = portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler')
+      .eq('is_active', true)
+      .order('created_at', { ascending: false })
+      .limit(60);
+
+    if (clientName) {
+      dashQuery = dashQuery.or(`client_name.ilike.%${clientName}%,email.ilike.%${clientName}%`);
+    }
+
+    const { data: dashboards, error: dashErr } = await dashQuery;
+    if (dashErr) throw dashErr;
+    if (!dashboards || !dashboards.length) return clientName ? `No client found matching: ${clientName}` : 'No active clients found in portal.';
+
+    // Get activity templates for title lookup
+    const { data: templates } = await portalSupabase
+      .from('customer_activity_templates')
+      .select('id, title, order_index')
+      .eq('is_active', true);
+
+    const templateMap = {};
+    (templates || []).forEach(t => { templateMap[t.id] = t; });
+
+    const results = await Promise.all(dashboards.slice(0, 20).map(async (dash) => {
+      // Match to onboarding record by email for intel
+      const { data: onboarding } = await portalSupabase
+        .from('customer_onboarding')
+        .select('id, first_name, last_name, company, services_products, ideal_customer, service_tier, payment_status')
+        .eq('email', dash.email)
+        .limit(1);
+
+      const ob = onboarding?.[0];
+      const customerId = ob?.id;
+
+      // Get activities for this customer
+      let activities = [];
+      if (customerId) {
+        const { data: acts } = await portalSupabase
+          .from('customer_activities')
+          .select('id, template_id, status, assigned_to, completed_at, notes')
+          .eq('customer_id', customerId);
+        activities = acts || [];
+      }
+
+      const total     = activities.length;
+      const live      = activities.filter(a => a.status === 'live').length;
+      const blocked   = activities.filter(a => a.status === 'blocked').length;
+      const phase1    = activities.filter(a => a.status === 'phase_1').length;
+      const phase2    = activities.filter(a => a.status === 'phase_2').length;
+
+      const blockedActs = activities
+        .filter(a => a.status === 'blocked')
+        .map(a => templateMap[a.template_id]?.title || 'Unknown activity')
+        .join(', ');
+
+      const pendingActs = activities
+        .filter(a => a.status === 'phase_1' || a.status === 'phase_2')
+        .sort((a,b) => (templateMap[a.template_id]?.order_index||99) - (templateMap[b.template_id]?.order_index||99))
+        .slice(0, 3)
+        .map(a => templateMap[a.template_id]?.title || 'Unknown')
+        .join(', ');
+
+      const statusEmoji = {
+        'live': '🟢', 'phase_1': '🟡', 'phase_2': '🔵', 'phase_3': '🟣', 'blocked': '🔴'
+      }[dash.customer_status] || '⚪';
+
+      const startDate = dash.created_at ? new Date(dash.created_at) : null;
+      const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+
+      const lines = [
+        `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
+        `Status: ${dash.customer_status || 'unknown'} | Day ${daysSince || '?'} since created`,
+        total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
+        blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
+        pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
+        ob?.services_products && clientName ? `Service: ${ob.services_products.substring(0,120)}` : '',
+        ob?.ideal_customer && clientName ? `ICP: ${ob.ideal_customer.substring(0,100)}` : '',
+      ].filter(Boolean);
+
+      return lines.join('\n');
+    }));
+
+    const statusCounts = dashboards.reduce((acc, d) => {
+      acc[d.customer_status] = (acc[d.customer_status] || 0) + 1;
+      return acc;
+    }, {});
+
+    const header = clientName
+      ? `Portal status for "${clientName}":\n\n`
+      : `Portal — ${dashboards.length} active clients | 🟢 ${statusCounts.live||0} live | 🟡 ${statusCounts.phase_1||0} phase 1 | 🔵 ${statusCounts.phase_2||0} phase 2 | 🟣 ${statusCounts.phase_3||0} phase 3 | 🔴 ${statusCounts.blocked||0} blocked\n\n`;
+
+    return header + results.join('\n\n');
+  } catch (err) {
+    return `Portal client status error: ${err.message}`;
+  }
+}
+
+async function getPortalAlerts() {
+  try {
+    // Get all blocked clients and phase 1/2 clients who may be at risk
+    const { data: dashboards, error } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, email, customer_status, customer_type, created_at')
+      .eq('is_active', true)
+      .in('customer_status', ['blocked', 'phase_1', 'phase_2'])
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    if (!dashboards || !dashboards.length) return '✅ No blocked or at-risk clients. All clients on track.';
+
+    const now = Date.now();
+    const alerts = [];
+
+    for (const dash of dashboards) {
+      const startDate = dash.created_at ? new Date(dash.created_at) : null;
+      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+
+      // Get blocked activities
+      const { data: onboarding } = await portalSupabase
+        .from('customer_onboarding')
+        .select('id')
+        .eq('email', dash.email)
+        .limit(1);
+
+      let blockedDetails = '';
+      if (onboarding?.[0]) {
+        const { data: acts } = await portalSupabase
+          .from('customer_activities')
+          .select('template_id, status, notes')
+          .eq('customer_id', onboarding[0].id)
+          .eq('status', 'blocked');
+
+        if (acts?.length) {
+          const { data: templates } = await portalSupabase
+            .from('customer_activity_templates')
+            .select('id, title')
+            .in('id', acts.map(a => a.template_id));
+          const titleMap = {};
+          (templates || []).forEach(t => { titleMap[t.id] = t.title; });
+          blockedDetails = acts.map(a => titleMap[a.template_id] || 'Unknown').join(', ');
+        }
+      }
+
+      if (dash.customer_status === 'blocked') {
+        alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
+      } else if (daysSince >= 14) {
+        alerts.push(`🔴 OVERDUE — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince} (past 14-day window)`);
+      } else if (daysSince >= 7) {
+        alerts.push(`🟡 AT RISK — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}`);
+      }
+    }
+
+    if (!alerts.length) return '✅ No critical alerts. Some clients still in onboarding phases but within timeline.';
+    return `Launch & block alerts (${alerts.length} clients):\n\n` + alerts.join('\n');
+  } catch (err) {
+    return `Portal alerts error: ${err.message}`;
+  }
+}
+
+// ─── GHL CONVERSATIONS ───────────────────────────────────────────────────────
+
+// ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
 async function getClientStatus(clientName = null) {
   try {
     let onboardingQuery = portalSupabase
