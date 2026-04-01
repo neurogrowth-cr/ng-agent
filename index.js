@@ -18,6 +18,7 @@ const slack = new App({
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
 const SYSTEM_PROMPT = fs.readFileSync('./system_prompt.txt', 'utf8');
 
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
@@ -406,6 +407,112 @@ async function getNotionPage(pageId) {
 }
 
 // ─── GHL CONVERSATIONS ───────────────────────────────────────────────────────
+
+// ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
+async function getClientStatus(clientName = null) {
+  try {
+    // Query customer_onboarding for client list and phase info
+    let onboardingQuery = portalSupabase
+      .from('customer_onboarding')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (clientName) {
+      onboardingQuery = onboardingQuery.ilike('full_name', `%${clientName}%`);
+    }
+
+    const { data: clients, error: clientErr } = await onboardingQuery;
+    if (clientErr) throw clientErr;
+    if (!clients || !clients.length) return clientName ? `No client found matching: ${clientName}` : 'No clients found in portal.';
+
+    // For each client, get their activity completion status
+    const results = await Promise.all(clients.slice(0, 10).map(async (client) => {
+      const customerId = client.id || client.customer_id;
+
+      const { data: activities } = await portalSupabase
+        .from('customer_activities')
+        .select('title, status, phase_assignments, category')
+        .eq('customer_id', customerId)
+        .order('order', { ascending: true });
+
+      const completed  = (activities || []).filter(a => a.status === 'completed' || a.status === 'done').length;
+      const total      = (activities || []).length;
+      const pending    = (activities || []).filter(a => !a.status || a.status === 'pending' || a.status === 'not_started');
+      const phase1Done = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 1') && (a.status === 'completed' || a.status === 'done')).length;
+      const phase2Done = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 2') && (a.status === 'completed' || a.status === 'done')).length;
+      const phase1Total = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 1')).length;
+      const phase2Total = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 2')).length;
+
+      const nextPending = pending.slice(0, 3).map(a => a.title).join(', ');
+
+      const startDate  = client.created_at ? new Date(client.created_at) : null;
+      const daysSince  = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      const launchRisk = daysSince > 10 && completed < total ? ' ⚠️ LAUNCH RISK' : '';
+
+      return [
+        `Client: ${client.full_name || client.name || client.email || customerId}`,
+        `Progress: ${completed}/${total} activities complete${launchRisk}`,
+        `Phase 1: ${phase1Done}/${phase1Total} | Phase 2: ${phase2Done}/${phase2Total}`,
+        daysSince !== null ? `Days since onboarding: ${daysSince}` : '',
+        nextPending ? `Next pending: ${nextPending}` : 'All activities complete'
+      ].filter(Boolean).join(' | ');
+    }));
+
+    const header = clientName
+      ? `Portal status for "${clientName}":\n\n`
+      : `Portal — ${clients.length} clients (showing ${Math.min(clients.length, 10)}):\n\n`;
+
+    return header + results.join('\n\n');
+  } catch (err) {
+    return `Portal client status error: ${err.message}`;
+  }
+}
+
+async function getPortalAlerts() {
+  try {
+    // Find clients overdue on their 14-day launch window
+    const { data: clients, error } = await portalSupabase
+      .from('customer_onboarding')
+      .select('*')
+      .order('created_at', { ascending: true })
+      .limit(50);
+
+    if (error) throw error;
+    if (!clients || !clients.length) return 'No clients in portal.';
+
+    const now = Date.now();
+    const alerts = [];
+
+    for (const client of clients) {
+      const customerId = client.id || client.customer_id;
+      const startDate  = client.created_at ? new Date(client.created_at) : null;
+      const daysSince  = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+
+      if (!daysSince || daysSince < 7) continue; // Only flag clients 7+ days in
+
+      const { data: activities } = await portalSupabase
+        .from('customer_activities')
+        .select('title, status')
+        .eq('customer_id', customerId);
+
+      const total     = (activities || []).length;
+      const completed = (activities || []).filter(a => a.status === 'completed' || a.status === 'done').length;
+
+      if (total > 0 && completed < total) {
+        const pct = Math.round((completed / total) * 100);
+        const risk = daysSince >= 14 ? '🔴 OVERDUE' : '🟡 AT RISK';
+        alerts.push(`${risk} ${client.full_name || client.email} — Day ${daysSince}, ${pct}% complete (${completed}/${total})`);
+      }
+    }
+
+    if (!alerts.length) return 'No launch risk clients detected. All clients on track.';
+    return `Launch risk alerts (${alerts.length} clients):\n\n` + alerts.join('\n');
+  } catch (err) {
+    return `Portal alerts error: ${err.message}`;
+  }
+}
+
 async function getGHLConversations(limit = 20, unreadOnly = false) {
   try {
     const locationId = process.env.GHL_LOCATION_ID;
@@ -779,6 +886,22 @@ async function callClaude(messages, retries = 3, userId = null) {
               required: ["category"]
             }
           }
+,
+          {
+            name: "get_client_status",
+            description: "ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. This queries the live NeuroGrowth Supabase portal database directly. Do not use Notion for this — Notion does not have this data.",
+            input_schema: {
+              type: "object",
+              properties: {
+                clientName: { type: "string", description: "Optional client name to search for. Leave empty to get all clients." }
+              }
+            }
+          },
+          {
+            name: "get_portal_alerts",
+            description: "ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.",
+            input_schema: { type: "object", properties: {} }
+          }
         ]
       });
 
@@ -799,6 +922,8 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'search_knowledge')     result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
             else if (toolUse.name === 'save_knowledge')       result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
             else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
+            else if (toolUse.name === 'get_client_status')     result = await getClientStatus(toolUse.input.clientName || null);
+            else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
           } catch (err) {
             result = `Error running tool ${toolUse.name}: ${err.message}`;
           }
@@ -1140,6 +1265,7 @@ cron.schedule('30 14 * * 1-5', async () => {
     const fulfillmentActivity = await readSlackChannel('ng-fullfillment-ops', 20);
     const alerts = await getAllKnowledgeByCategory('alert');
     const clientKnowledge = await searchKnowledge('blocked', 'client');
+    const portalAlerts = await getPortalAlerts();
 
     const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long' });
     const isMonday = dayOfWeek === 'Monday';
@@ -1163,6 +1289,9 @@ ${alerts}
 
 Blocked or at-risk clients:
 ${clientKnowledge}
+
+Portal launch risk:
+${portalAlerts}
 
 Write Josue a direct, useful morning briefing:
 - What carried over from yesterday that needs his attention
