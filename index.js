@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
+const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
@@ -29,6 +30,33 @@ const SYSTEMS_CHANNEL       = process.env.SYSTEMS_CHANNEL       || '#ng-app-and-
 const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || '#ng-internal-announcements';
 
 const pendingApprovals = {};
+
+// Rate limiter — max 10 requests per user per minute
+const userRateLimits = {};
+function isRateLimited(userId) {
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute
+  const maxRequests = 10;
+
+  if (!userRateLimits[userId]) userRateLimits[userId] = [];
+
+  // Clear old entries outside window
+  userRateLimits[userId] = userRateLimits[userId].filter(t => now - t < windowMs);
+
+  if (userRateLimits[userId].length >= maxRequests) return true;
+
+  userRateLimits[userId].push(now);
+  return false;
+}
+
+// Clean up rate limit map every 5 minutes to prevent memory bloat
+setInterval(() => {
+  const now = Date.now();
+  for (const userId of Object.keys(userRateLimits)) {
+    userRateLimits[userId] = (userRateLimits[userId] || []).filter(t => now - t < 60000);
+    if (!userRateLimits[userId].length) delete userRateLimits[userId];
+  }
+}, 5 * 60 * 1000);
 
 // Clean up stale pending approvals every 30 minutes
 setInterval(() => {
@@ -241,8 +269,38 @@ async function saveMessage(userId, role, content) {
       .from('conversations')
       .insert({ user_id: userId, role, content: content.substring(0, 8000) });
     if (error) throw error;
+    // Prune after every 5 saves — keep max 40 rows per user
+    await pruneConversationHistory(userId);
   } catch (err) {
     console.error('Supabase save error:', err.message);
+  }
+}
+
+async function pruneConversationHistory(userId, maxRows = 40) {
+  try {
+    // Get count for this user
+    const { count } = await supabase
+      .from('conversations')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+
+    if (!count || count <= maxRows) return;
+
+    // Delete oldest rows beyond the limit
+    const { data: oldest } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true })
+      .limit(count - maxRows);
+
+    if (oldest?.length) {
+      const ids = oldest.map(r => r.id);
+      await supabase.from('conversations').delete().in('id', ids);
+      console.log(`Pruned ${ids.length} old messages for user ${userId}`);
+    }
+  } catch (err) {
+    console.error('Conversation prune error:', err.message);
   }
 }
 
@@ -1552,6 +1610,12 @@ slack.message(async ({ message, say }) => {
 
   if (message.subtype) return;
 
+  // Rate limit check
+  if (isRateLimited(userId)) {
+    await say('Slow down a bit — you are sending messages too fast. Give me a moment.');
+    return;
+  }
+
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
 
@@ -1624,6 +1688,12 @@ slack.message(async ({ message, say }) => {
   }
 
   if (message.subtype) return;
+
+  // Rate limit check
+  if (isRateLimited(userId)) {
+    await say({ text: 'Slow down a bit — too many messages at once. Give me a moment.', thread_ts: message.thread_ts || message.ts });
+    return;
+  }
 
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
@@ -1765,6 +1835,25 @@ cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); }, { t
 
 // Monday gap detection — 8:00 AM CST (runs before Josue's 8:30 briefing)
 cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { timezone: 'America/Costa_Rica' });
+
+// ─── HEALTH CHECK SERVER ─────────────────────────────────────────────────────
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/health' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      agent: 'NeuroGrowth PM Agent (Max)',
+      uptime: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+healthServer.listen(process.env.PORT || 3000, () => {
+  console.log(`Health check server listening on port ${process.env.PORT || 3000}`);
+});
 
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
