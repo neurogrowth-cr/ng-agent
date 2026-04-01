@@ -1196,3 +1196,51 @@ cron.schedule('30 5 * * *', async () => { await runNightlyLearning(); }, { timez
   await slack.start();
   console.log('NeuroGrowth PM Agent is running.');
 })();
+
+// ─── MEMBER JOINED CHANNEL ────────────────────────────────────────────────────
+slack.event('member_joined_channel', async ({ event }) => {
+  // Only trigger for #ng-pm-agent channel
+  try {
+    const channelInfo = await slack.client.conversations.info({ channel: event.channel });
+    const channelName = channelInfo.channel?.name || '';
+    if (!channelName.includes('ng-pm-agent')) return;
+
+    // Don't greet the bot itself
+    if (event.user === process.env.SLACK_BOT_USER_ID) return;
+
+    const member   = getMemberContext(event.user);
+    const perms    = getMemberPermissions(event.user);
+
+    const roleIntros = {
+      ceo: `You are greeting Ron, the CEO and Founder of NeuroGrowth. This is your home base. Give him a sharp 2-line welcome that shows you're ready to work — mention you can pull emails, calendar, GHL, Slack channels, Drive, and Notion on demand.`,
+      client_success: `You are greeting Tania, the Client Success Operations Manager. Welcome her and let her know you can help with: client health checks, drafting client comms, checking fulfillment channel activity, contract reminders, and searching the knowledge base. Keep it to 3-4 lines max.`,
+      tech_ops: `You are greeting Josue, the Technical Operations Manager. Welcome him and let him know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and his daily briefing every morning at 8:30 AM. Keep it to 3-4 lines max.`,
+      tech_lead: `You are greeting David, the Lead Technology and Automation specialist. Welcome him and let him know you can help with: systems channel activity, Make.com issue tracking, process documentation, and Notion. Keep it to 3-4 lines max.`,
+      fulfillment: `You are greeting Valeria, the Fulfillment Operations specialist. Welcome her and let her know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
+      campaigns: `You are greeting Felipe, the Technical Campaign Specialist. Welcome him and let him know you can help with: campaign status per client, Prosp config questions, fulfillment channel updates, and content pipeline tracking. Keep it to 3-4 lines max.`,
+      setter: `You are greeting Joseph, the Appointment Setter. Welcome him and let him know you can help with: GHL prospect lookups, drafting follow-up messages in Spanish, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`,
+      closer: `You are greeting Jose, the High-Ticket Closer. Welcome him and let him know you can help with: GHL pipeline status, prospect follow-up drafts, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`
+    };
+
+    const roleIntro = roleIntros[member.role] || `You are greeting a new NeuroGrowth team member named ${member.displayName}. Welcome them warmly and briefly explain what you can help with.`;
+
+    const prompt = `You are Max, the NeuroGrowth PM Agent. A new team member just joined the #ng-pm-agent channel.
+
+${roleIntro}
+
+Address them by name: ${member.displayName}.
+Sound like a sharp, friendly colleague — not a corporate bot. No markdown formatting. No bullet points. Conversational tone.`;
+
+    const greeting = await callClaude([{ role: 'user', content: prompt }]);
+    if (!greeting || !greeting.trim()) return;
+
+    await slack.client.chat.postMessage({
+      channel: event.channel,
+      text: greeting
+    });
+
+    console.log(`Greeted ${member.displayName} (${member.role}) in #ng-pm-agent`);
+  } catch (err) {
+    console.error('member_joined_channel error:', err.message);
+  }
+});
