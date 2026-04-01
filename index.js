@@ -358,6 +358,239 @@ async function getAllKnowledgeByCategory(category) {
   }
 }
 
+
+// ─── DYNAMIC CRON SCHEDULER ───────────────────────────────────────────────────
+// Tasks stored in Supabase scheduled_tasks table:
+// id, name, cron_expression, prompt, channel, active, created_by, created_at
+
+const activeDynamicCrons = {}; // track node-cron instances by task id
+
+async function loadAndRegisterDynamicCrons() {
+  try {
+    const { data: tasks, error } = await supabase
+      .from('scheduled_tasks')
+      .select('*')
+      .eq('active', true);
+
+    if (error) throw error;
+    if (!tasks || !tasks.length) {
+      console.log('No dynamic cron tasks found.');
+      return;
+    }
+
+    for (const task of tasks) {
+      registerDynamicCron(task);
+    }
+    console.log(`Loaded ${tasks.length} dynamic cron task(s).`);
+  } catch (err) {
+    console.error('Dynamic cron load error:', err.message);
+  }
+}
+
+function registerDynamicCron(task) {
+  try {
+    // Cancel existing instance if re-registering
+    if (activeDynamicCrons[task.id]) {
+      activeDynamicCrons[task.id].stop();
+    }
+
+    const job = cron.schedule(task.cron_expression, async () => {
+      console.log(`Running dynamic cron: ${task.name}`);
+      try {
+        const reply = await callClaude([{ role: 'user', content: task.prompt }]);
+        if (reply && reply.trim()) {
+          await postToSlack(task.channel || AGENT_CHANNEL, reply);
+        }
+      } catch (err) {
+        console.error(`Dynamic cron error (${task.name}):`, err.message);
+      }
+    }, { timezone: 'America/Costa_Rica' });
+
+    activeDynamicCrons[task.id] = job;
+    console.log(`Registered dynamic cron: "${task.name}" (${task.cron_expression})`);
+  } catch (err) {
+    console.error(`Failed to register cron "${task.name}":`, err.message);
+  }
+}
+
+async function createScheduledTask(name, naturalLanguageSchedule, prompt, channel, createdBy) {
+  try {
+    // Convert natural language to cron expression via Claude
+    const cronPrompt = `Convert this schedule description to a cron expression (5-field format).
+Schedule: "${naturalLanguageSchedule}"
+Timezone: America/Costa_Rica
+
+Reply with ONLY the cron expression, nothing else. Examples:
+- "every weekday at 9am" → 0 9 * * 1-5
+- "every Monday at 8:30am" → 30 8 * * 1
+- "every day at 6pm" → 0 18 * * *
+- "every Friday at 4pm" → 0 16 * * 5`;
+
+    const cronResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: cronPrompt }]
+    });
+
+    const cronExpression = cronResponse.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim()
+      .replace(/[^0-9*,/\- ]/g, '')
+      .trim();
+
+    if (!cronExpression || cronExpression.split(' ').length !== 5) {
+      return `Could not parse schedule "${naturalLanguageSchedule}" into a valid cron expression. Try something like "every weekday at 9am" or "every Monday at 8:30am".`;
+    }
+
+    // Save to Supabase
+    const { data, error } = await supabase
+      .from('scheduled_tasks')
+      .insert({
+        name,
+        cron_expression: cronExpression,
+        prompt,
+        channel: channel || AGENT_CHANNEL,
+        active: true,
+        created_by: createdBy,
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Register immediately without restart
+    registerDynamicCron(data);
+
+    return `Scheduled task created: "${name}" — runs ${naturalLanguageSchedule} (${cronExpression}). It is now active.`;
+  } catch (err) {
+    return `Failed to create scheduled task: ${err.message}`;
+  }
+}
+
+async function listScheduledTasks() {
+  try {
+    const { data, error } = await supabase
+      .from('scheduled_tasks')
+      .select('id, name, cron_expression, channel, active, created_at')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || !data.length) return 'No scheduled tasks found.';
+
+    return data.map(t =>
+      `${t.active ? '✅' : '⏸️'} ${t.name} | ${t.cron_expression} | ${t.channel} | ID: ${t.id.substring(0,8)}`
+    ).join('\n');
+  } catch (err) {
+    return `Error listing tasks: ${err.message}`;
+  }
+}
+
+async function deleteScheduledTask(taskId) {
+  try {
+    // Deactivate in Supabase
+    const { error } = await supabase
+      .from('scheduled_tasks')
+      .update({ active: false })
+      .eq('id', taskId);
+
+    if (error) throw error;
+
+    // Stop the live cron if running
+    if (activeDynamicCrons[taskId]) {
+      activeDynamicCrons[taskId].stop();
+      delete activeDynamicCrons[taskId];
+    }
+
+    return `Scheduled task ${taskId.substring(0,8)} has been deactivated.`;
+  } catch (err) {
+    return `Error deleting task: ${err.message}`;
+  }
+}
+
+
+// ─── NOTION WRITE-BACK ────────────────────────────────────────────────────────
+// Two databases:
+// OPERATIONAL task → Operations Tracking (collection://20ecddb6-8d9f-8126-a408-000bbbc3c088)
+//   Schema: Name (title), Status, Priority, Deadline Date, Responsible, Customer, Type, Tags, Frequency
+//   Status values: "Not started", "In progress", "Done", "Blocked / No Action Needed"
+//   Priority values: "P0 - Critical Customer Impact", "P1 - High Business Impact", "P2 - Growth & Scalability", "P3 - Strategic Initiatives"
+//
+// PROJECT task → Neuro Project Sprint Tracking (collection://8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c)
+//   Schema: Name (title), Status, Priority, Deadline Date, Stakeholders, Customer, Type, Tags, Comments/Milestones/Insights
+//   Status values: "Not started", "Sprint Backlog", "In progress", "Done", "Blocked / No Action Needed"
+
+const NOTION_OPS_DB    = '20ecddb68d9f8126a408000bbbc3c088';
+const NOTION_PROJECT_DB = '8d0645e6eabb4f0d9c8a4d8641ad4e8c';
+
+async function createNotionTask(title, taskType = 'operational', priority = 'P2 - Growth & Scalability', dueDate = null, notes = null, customer = null) {
+  try {
+    const isProject = taskType === 'project';
+    const dbId = isProject ? NOTION_PROJECT_DB : NOTION_OPS_DB;
+
+    const properties = {
+      'Name': {
+        title: [{ text: { content: title } }]
+      },
+      'Status': {
+        status: { name: 'Not started' }
+      },
+      'Priority ': {
+        select: { name: priority }
+      },
+      'Type': {
+        select: { name: 'One-time' }
+      }
+    };
+
+    if (dueDate) {
+      properties['Deadline Date'] = {
+        date: { start: dueDate }
+      };
+    }
+
+    if (notes) {
+      if (isProject) {
+        properties['Comments/Milestones/Insights'] = {
+          rich_text: [{ text: { content: `Max: ${notes.substring(0, 500)}` } }]
+        };
+      } else {
+        properties['Main Milestone'] = {
+          rich_text: [{ text: { content: notes.substring(0, 500) } }]
+        };
+      }
+    }
+
+    if (customer) {
+      properties['Customer'] = {
+        multi_select: [{ name: customer }]
+      };
+    }
+
+    const body = { parent: { database_id: dbId }, properties };
+
+    const res = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.NOTION_TOKEN}`,
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || JSON.stringify(data));
+
+    const dbName = isProject ? 'Project Sprint Tracking' : 'Operations Tracking';
+    return `Task created in Notion (${dbName}): "${title}"${dueDate ? ` — due ${dueDate}` : ''}${priority ? ` — ${priority}` : ''}. Link: ${data.url}`;
+  } catch (err) {
+    return `Notion task creation error: ${err.message}`;
+  }
+}
+
 // ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
 function getGoogleAuth() {
   let credentials, token;
@@ -1381,6 +1614,53 @@ async function callClaude(messages, retries = 3, userId = null) {
             description: "ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.",
             input_schema: { type: "object", properties: {} }
           }
+,
+          {
+            name: "create_notion_task",
+            description: "Create a task in NeuroGrowth Notion. Operational/recurring tasks (client delivery, campaigns, team ops, SOPs, account management) go to Operations Tracking. Project/strategic tasks (new features, sprint work, integrations, R&D) go to Project Sprint Tracking. Ask the user which type if unclear.",
+            input_schema: {
+              type: "object",
+              properties: {
+                title: { type: "string", description: "Task title" },
+                taskType: { type: "string", description: "operational (default) or project" },
+                priority: { type: "string", description: "P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives" },
+                dueDate: { type: "string", description: "Due date in YYYY-MM-DD format (optional)" },
+                notes: { type: "string", description: "Additional context, milestone, or notes (optional)" },
+                customer: { type: "string", description: "Customer name if task is client-related e.g. Neurogrowth, Build & Release, Full Service (optional)" }
+              },
+              required: ["title"]
+            }
+          },
+          {
+            name: "create_scheduled_task",
+            description: "Create a new recurring scheduled task that Max will run automatically. Use when Ron asks Max to do something on a recurring schedule like every Monday, every weekday at 9am, etc.",
+            input_schema: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Short name for the task e.g. Weekly client health check" },
+                schedule: { type: "string", description: "Natural language schedule e.g. every Monday at 9am, every weekday at 5pm" },
+                prompt: { type: "string", description: "The instruction Max will execute at each scheduled run" },
+                channel: { type: "string", description: "Slack channel to post results to e.g. #ng-pm-agent, #ng-fullfillment-ops" }
+              },
+              required: ["name", "schedule", "prompt"]
+            }
+          },
+          {
+            name: "list_scheduled_tasks",
+            description: "List all scheduled tasks Max is currently running. Use when asked what recurring tasks Max has, what automations are active, or what scheduled jobs exist.",
+            input_schema: { type: "object", properties: {} }
+          },
+          {
+            name: "delete_scheduled_task",
+            description: "Deactivate and stop a scheduled task by its ID. Use when asked to cancel, stop, or remove a recurring task.",
+            input_schema: {
+              type: "object",
+              properties: {
+                taskId: { type: "string", description: "The task ID from list_scheduled_tasks" }
+              },
+              required: ["taskId"]
+            }
+          }
         ]
       });
 
@@ -1403,6 +1683,10 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
             else if (toolUse.name === 'get_client_status')     result = await getClientStatus(toolUse.input.clientName || null);
             else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
+            else if (toolUse.name === 'create_notion_task')      result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
+            else if (toolUse.name === 'create_scheduled_task')   result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
+            else if (toolUse.name === 'list_scheduled_tasks')    result = await listScheduledTasks();
+            else if (toolUse.name === 'delete_scheduled_task')   result = await deleteScheduledTask(toolUse.input.taskId);
           } catch (err) {
             result = `Error running tool ${toolUse.name}: ${err.message}`;
           }
@@ -1859,6 +2143,8 @@ healthServer.listen(process.env.PORT || 3000, () => {
 (async () => {
   await slack.start();
   console.log('NeuroGrowth PM Agent is running.');
+  // Load and register any dynamic cron tasks saved in Supabase
+  await loadAndRegisterDynamicCrons();
 })();
 
 // ─── MEMBER JOINED CHANNEL ────────────────────────────────────────────────────
