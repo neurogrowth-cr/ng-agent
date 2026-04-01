@@ -411,57 +411,65 @@ async function getNotionPage(pageId) {
 // ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
 async function getClientStatus(clientName = null) {
   try {
-    // Query customer_onboarding for client list and phase info
     let onboardingQuery = portalSupabase
       .from('customer_onboarding')
-      .select('*')
+      .select('id, first_name, last_name, email, company, status, service_tier, payment_status, created_at, onboarding_completed_at, dashboard_created, services_products, ideal_customer, client_pain_points, main_competitors, current_tools')
       .order('created_at', { ascending: false })
       .limit(50);
 
     if (clientName) {
-      onboardingQuery = onboardingQuery.ilike('full_name', `%${clientName}%`);
+      onboardingQuery = onboardingQuery.or(`first_name.ilike.%${clientName}%,last_name.ilike.%${clientName}%,email.ilike.%${clientName}%,company.ilike.%${clientName}%`);
     }
 
     const { data: clients, error: clientErr } = await onboardingQuery;
     if (clientErr) throw clientErr;
     if (!clients || !clients.length) return clientName ? `No client found matching: ${clientName}` : 'No clients found in portal.';
 
-    // For each client, get their activity completion status
-    const results = await Promise.all(clients.slice(0, 10).map(async (client) => {
-      const customerId = client.id || client.customer_id;
+    // For each client get their activity completion from customer_activities
+    const results = await Promise.all(clients.slice(0, 15).map(async (client) => {
+      const fullName = `${client.first_name || ''} ${client.last_name || ''}`.trim() || client.email;
 
       const { data: activities } = await portalSupabase
         .from('customer_activities')
         .select('title, status, phase_assignments, category')
-        .eq('customer_id', customerId)
-        .order('order', { ascending: true });
+        .eq('customer_id', client.id);
 
-      const completed  = (activities || []).filter(a => a.status === 'completed' || a.status === 'done').length;
-      const total      = (activities || []).length;
-      const pending    = (activities || []).filter(a => !a.status || a.status === 'pending' || a.status === 'not_started');
-      const phase1Done = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 1') && (a.status === 'completed' || a.status === 'done')).length;
-      const phase2Done = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 2') && (a.status === 'completed' || a.status === 'done')).length;
+      const total     = (activities || []).length;
+      const completed = (activities || []).filter(a => a.status === 'completed' || a.status === 'done').length;
+      const pending   = (activities || []).filter(a => !a.status || a.status === 'pending' || a.status === 'not_started' || a.status === 'in_progress');
+
+      const phase1Done  = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 1') && (a.status === 'completed' || a.status === 'done')).length;
+      const phase2Done  = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 2') && (a.status === 'completed' || a.status === 'done')).length;
       const phase1Total = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 1')).length;
       const phase2Total = (activities || []).filter(a => (a.phase_assignments || '').includes('Phase 2')).length;
 
       const nextPending = pending.slice(0, 3).map(a => a.title).join(', ');
 
-      const startDate  = client.created_at ? new Date(client.created_at) : null;
-      const daysSince  = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      const startDate = client.created_at ? new Date(client.created_at) : null;
+      const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
       const launchRisk = daysSince > 10 && completed < total ? ' ⚠️ LAUNCH RISK' : '';
 
+      const intelLines = clientName ? [
+        client.services_products ? `Service: ${client.services_products.substring(0, 150)}` : '',
+        client.ideal_customer    ? `ICP: ${client.ideal_customer.substring(0, 100)}` : '',
+        client.client_pain_points ? `Pain points: ${client.client_pain_points.substring(0, 100)}` : '',
+        client.main_competitors  ? `Competitors: ${client.main_competitors.substring(0, 100)}` : '',
+        client.current_tools     ? `Tools: ${client.current_tools.substring(0, 100)}` : ''
+      ].filter(Boolean) : [];
+
       return [
-        `Client: ${client.full_name || client.name || client.email || customerId}`,
-        `Progress: ${completed}/${total} activities complete${launchRisk}`,
-        `Phase 1: ${phase1Done}/${phase1Total} | Phase 2: ${phase2Done}/${phase2Total}`,
-        daysSince !== null ? `Days since onboarding: ${daysSince}` : '',
-        nextPending ? `Next pending: ${nextPending}` : 'All activities complete'
-      ].filter(Boolean).join(' | ');
+        `${fullName} (${client.company || client.email})`,
+        `Tier: ${client.service_tier || 'unknown'} | Payment: ${client.payment_status || 'unknown'} | Status: ${client.status || 'unknown'}`,
+        total > 0 ? `Activities: ${completed}/${total} complete${launchRisk} | Phase 1: ${phase1Done}/${phase1Total} | Phase 2: ${phase2Done}/${phase2Total}` : 'No activities found',
+        daysSince !== null ? `Day ${daysSince} since onboarding` : '',
+        nextPending ? `Pending: ${nextPending}` : 'All activities complete',
+        ...intelLines
+      ].filter(Boolean).join('\n');
     }));
 
     const header = clientName
       ? `Portal status for "${clientName}":\n\n`
-      : `Portal — ${clients.length} clients (showing ${Math.min(clients.length, 10)}):\n\n`;
+      : `Portal — ${clients.length} active clients:\n\n`;
 
     return header + results.join('\n\n');
   } catch (err) {
@@ -471,10 +479,9 @@ async function getClientStatus(clientName = null) {
 
 async function getPortalAlerts() {
   try {
-    // Find clients overdue on their 14-day launch window
     const { data: clients, error } = await portalSupabase
       .from('customer_onboarding')
-      .select('*')
+      .select('id, first_name, last_name, email, company, service_tier, payment_status, created_at, onboarding_completed_at')
       .order('created_at', { ascending: true })
       .limit(50);
 
@@ -485,24 +492,23 @@ async function getPortalAlerts() {
     const alerts = [];
 
     for (const client of clients) {
-      const customerId = client.id || client.customer_id;
-      const startDate  = client.created_at ? new Date(client.created_at) : null;
-      const daysSince  = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
-
-      if (!daysSince || daysSince < 7) continue; // Only flag clients 7+ days in
+      const startDate = client.created_at ? new Date(client.created_at) : null;
+      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      if (!daysSince || daysSince < 7) continue;
 
       const { data: activities } = await portalSupabase
         .from('customer_activities')
         .select('title, status')
-        .eq('customer_id', customerId);
+        .eq('customer_id', client.id);
 
       const total     = (activities || []).length;
       const completed = (activities || []).filter(a => a.status === 'completed' || a.status === 'done').length;
 
       if (total > 0 && completed < total) {
-        const pct = Math.round((completed / total) * 100);
+        const pct  = Math.round((completed / total) * 100);
         const risk = daysSince >= 14 ? '🔴 OVERDUE' : '🟡 AT RISK';
-        alerts.push(`${risk} ${client.full_name || client.email} — Day ${daysSince}, ${pct}% complete (${completed}/${total})`);
+        const fullName = `${client.first_name || ''} ${client.last_name || ''}`.trim() || client.email;
+        alerts.push(`${risk} ${fullName} (${client.company || client.email}) — Day ${daysSince}, ${pct}% complete (${completed}/${total})`);
       }
     }
 
