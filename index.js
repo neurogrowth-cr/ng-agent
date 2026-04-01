@@ -423,12 +423,14 @@ async function getClientStatus(clientName = null) {
       .from('client_dashboards')
       .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler')
       .eq('is_active', true)
-      .order('created_at', { ascending: false })
+      .order('customer_status', { ascending: true })
       .limit(60);
 
     if (clientName) {
       dashQuery = dashQuery.or(`client_name.ilike.%${clientName}%,email.ilike.%${clientName}%`);
     }
+    // Default: show flywheel-ai (Build & Release) clients — the active offer
+    // Full-service clients are legacy and less relevant for daily ops
 
     const { data: dashboards, error: dashErr } = await dashQuery;
     if (dashErr) throw dashErr;
@@ -482,16 +484,22 @@ async function getClientStatus(clientName = null) {
         .map(a => templateMap[a.template_id]?.title || 'Unknown')
         .join(', ');
 
-      const statusEmoji = {
-        'live': '🟢', 'phase_1': '🟡', 'phase_2': '🔵', 'phase_3': '🟣', 'blocked': '🔴'
-      }[dash.customer_status] || '⚪';
+      const statusLabel = {
+        'live': '🟢 Live',
+        'phase_1': '🟡 Phase 1 – Optimization',
+        'phase_2': '🔵 Phase 2 – Campaign Launch',
+        'phase_3': '🟣 Phase 3 – Stabilization',
+        'blocked': '🔴 Blocked',
+        'phase_0': '🟠 Phase 0 – Onboarding'
+      }[dash.customer_status] || `⚪ ${dash.customer_status}`;
+      const statusEmoji = statusLabel.split(' ')[0];
 
       const startDate = dash.created_at ? new Date(dash.created_at) : null;
       const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
 
       const lines = [
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
-        `Status: ${dash.customer_status || 'unknown'} | Day ${daysSince || '?'} since created`,
+        `${statusLabel} | Day ${daysSince || '?'} since created`,
         total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
         blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
         pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
@@ -509,7 +517,7 @@ async function getClientStatus(clientName = null) {
 
     const header = clientName
       ? `Portal status for "${clientName}":\n\n`
-      : `Portal — ${dashboards.length} active clients | 🟢 ${statusCounts.live||0} live | 🟡 ${statusCounts.phase_1||0} phase 1 | 🔵 ${statusCounts.phase_2||0} phase 2 | 🟣 ${statusCounts.phase_3||0} phase 3 | 🔴 ${statusCounts.blocked||0} blocked\n\n`;
+      : `Portal — ${dashboards.length} active clients | 🟢 ${statusCounts.live||0} Live | 🟠 ${statusCounts.phase_0||0} Onboarding | 🟡 ${statusCounts.phase_1||0} Optimization | 🔵 ${statusCounts.phase_2||0} Campaign Launch | 🟣 ${statusCounts.phase_3||0} Stabilization | 🔴 ${statusCounts.blocked||0} Blocked\n\n`;
 
     return header + results.join('\n\n');
   } catch (err) {
