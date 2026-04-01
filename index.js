@@ -769,6 +769,176 @@ async function readSlackChannel(channelName, messageCount = 20) {
   }
 }
 
+
+// ─── PORTAL: WEEKLY TREND ANALYSIS ───────────────────────────────────────────
+async function runWeeklyPortalTrends() {
+  console.log('Running weekly portal trend analysis...');
+  try {
+    // Lean query — only the columns we need
+    const { data: dashboards } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, customer_status, customer_type, created_at')
+      .eq('is_active', true);
+
+    const { data: templates } = await portalSupabase
+      .from('customer_activity_templates')
+      .select('id, title, order_index');
+    const tMap = {};
+    (templates || []).forEach(t => { tMap[t.id] = t.title; });
+
+    const { data: allActs } = await portalSupabase
+      .from('customer_activities')
+      .select('customer_id, template_id, status, assigned_to, completed_at');
+
+    if (!dashboards || !allActs) return;
+
+    const clientMap = {};
+    dashboards.forEach(d => { clientMap[d.id] = d; });
+
+    // Trend 1: Phase distribution
+    const phaseCounts = dashboards.reduce((acc, d) => {
+      acc[d.customer_status] = (acc[d.customer_status]||0) + 1;
+      return acc;
+    }, {});
+
+    // Trend 2: Most blocked activities
+    const blockedByActivity = {};
+    allActs.filter(a => a.status === 'blocked').forEach(a => {
+      const title = tMap[a.template_id] || 'Unknown';
+      blockedByActivity[title] = (blockedByActivity[title]||0) + 1;
+    });
+    const topBlocked = Object.entries(blockedByActivity)
+      .sort((a,b) => b[1]-a[1]).slice(0,5)
+      .map(([t,c]) => `${t} (${c}x)`).join(', ');
+
+    // Trend 3: Team workload — pending activities per assignee
+    const pendingByAssignee = {};
+    allActs.filter(a => a.status === 'phase_1' || a.status === 'phase_2').forEach(a => {
+      const email = (a.assigned_to || 'unassigned').split('@')[0];
+      pendingByAssignee[email] = (pendingByAssignee[email]||0) + 1;
+    });
+    const workload = Object.entries(pendingByAssignee)
+      .sort((a,b) => b[1]-a[1])
+      .map(([e,c]) => `${e}: ${c} pending`).join(' | ');
+
+    // Trend 4: Avg days to reach live from created_at
+    const liveClients = dashboards.filter(d => d.customer_status === 'live' && d.created_at);
+    const avgDaysToLive = liveClients.length > 0
+      ? Math.round(liveClients.reduce((sum, d) => sum + Math.floor((Date.now() - new Date(d.created_at).getTime()) / (1000*60*60*24)), 0) / liveClients.length)
+      : null;
+
+    // Trend 5: Flywheel vs full-service split
+    const fwCount = dashboards.filter(d => d.customer_type === 'flywheel-ai').length;
+    const fsCount = dashboards.filter(d => d.customer_type === 'full-service').length;
+
+    const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
+
+    const trendReport = [
+      `Week ending ${today}:`,
+      `Phase distribution: ${Object.entries(phaseCounts).map(([k,v])=>`${k}:${v}`).join(', ')}`,
+      `Client mix: ${fwCount} Flywheel AI, ${fsCount} Full Service`,
+      topBlocked ? `Top blocked activities: ${topBlocked}` : 'No blocked activities this week.',
+      workload ? `Team workload: ${workload}` : '',
+      avgDaysToLive ? `Avg days since onboarding for live clients: ${avgDaysToLive} days` : ''
+    ].filter(Boolean).join(' | ');
+
+    // Save trends to knowledge base
+    await upsertKnowledge('intel', `weekly-trends-${new Date().toISOString().slice(0,10)}`, trendReport, 'weekly-cron');
+
+    // Also save top blocked as a process insight
+    if (topBlocked) {
+      await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Josue and Felipe.`, 'weekly-cron');
+    }
+
+    // Save workload insight
+    if (workload) {
+      await upsertKnowledge('team', 'current-workload', `As of ${today}: ${workload}`, 'weekly-cron');
+    }
+
+    console.log('Weekly trend analysis complete.');
+  } catch (err) {
+    console.error('Weekly trend error:', err.message);
+  }
+}
+
+// ─── PORTAL: MONDAY GAP DETECTION ────────────────────────────────────────────
+async function runMondayGapDetection() {
+  console.log('Running Monday gap detection...');
+  try {
+    const { data: dashboards } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, email, customer_status, customer_type, created_at')
+      .eq('is_active', true)
+      .in('customer_status', ['phase_1', 'phase_2', 'blocked']);
+
+    if (!dashboards || !dashboards.length) {
+      console.log('No at-risk clients detected.');
+      return;
+    }
+
+    const { data: templates } = await portalSupabase
+      .from('customer_activity_templates')
+      .select('id, title, order_index');
+    const tMap = {};
+    (templates || []).forEach(t => { tMap[t.id] = t.title; });
+
+    const now = Date.now();
+    const gaps = [];
+
+    for (const dash of dashboards) {
+      const daysSince = dash.created_at
+        ? Math.floor((now - new Date(dash.created_at).getTime()) / (1000*60*60*24))
+        : 0;
+
+      // Get their pending/blocked activities
+      const { data: onboarding } = await portalSupabase
+        .from('customer_onboarding')
+        .select('id')
+        .eq('email', dash.email)
+        .limit(1);
+
+      if (!onboarding?.[0]) continue;
+
+      const { data: acts } = await portalSupabase
+        .from('customer_activities')
+        .select('template_id, status, assigned_to, updated_at')
+        .eq('customer_id', onboarding[0].id)
+        .in('status', ['blocked', 'phase_1', 'phase_2']);
+
+      if (!acts?.length) continue;
+
+      // Flag if any activity hasn't been updated in 72hrs
+      const staleActs = acts.filter(a => {
+        const updatedAt = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        return (now - updatedAt) > (72 * 60 * 60 * 1000);
+      });
+
+      if (dash.customer_status === 'blocked') {
+        const blockedTitles = acts.filter(a=>a.status==='blocked').map(a=>tMap[a.template_id]||'Unknown').join(', ');
+        gaps.push(`🔴 BLOCKED — ${dash.client_name} (Day ${daysSince}): ${blockedTitles}`);
+      } else if (daysSince >= 14) {
+        gaps.push(`🔴 OVERDUE — ${dash.client_name} still in ${dash.customer_status} at Day ${daysSince} (past 14-day window)`);
+      } else if (daysSince >= 7 && staleActs.length > 0) {
+        const assignees = [...new Set(staleActs.map(a=>(a.assigned_to||'').split('@')[0]))].join(', ');
+        gaps.push(`🟡 STALE — ${dash.client_name} (Day ${daysSince}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`);
+      }
+    }
+
+    if (!gaps.length) {
+      console.log('Gap detection: no critical gaps found.');
+      return;
+    }
+
+    const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
+    const message = `Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
+
+    await postToSlack(OPS_CHANNEL, message);
+    console.log(`Gap detection: ${gaps.length} gaps posted to ops channel.`);
+  } catch (err) {
+    console.error('Gap detection error:', err.message);
+  }
+}
+
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
 async function runNightlyLearning() {
   console.log('Running nightly learning cycle...');
@@ -779,6 +949,48 @@ async function runNightlyLearning() {
       const messages = await readSlackChannel(ch, 20);
       if (!messages.includes('not found')) digest += `\n\n=== ${ch} ===\n${messages}`;
     }
+
+    // ── Lean portal snapshot — only blocked + recently changed activities ──
+    try {
+      const { data: dashboards } = await portalSupabase
+        .from('client_dashboards')
+        .select('id, client_name, email, customer_status, customer_type')
+        .eq('is_active', true);
+
+      const { data: templates } = await portalSupabase
+        .from('customer_activity_templates')
+        .select('id, title, order_index');
+      const tMap = {};
+      (templates || []).forEach(t => { tMap[t.id] = t.title; });
+
+      // Only pull blocked and activities completed/changed today
+      const today = new Date();
+      today.setHours(0,0,0,0);
+      const { data: recentActs } = await portalSupabase
+        .from('customer_activities')
+        .select('customer_id, template_id, status, assigned_to, completed_at, notes')
+        .or(`status.eq.blocked,completed_at.gte.${today.toISOString()}`);
+
+      if (dashboards && recentActs) {
+        const clientMap = {};
+        dashboards.forEach(d => { clientMap[d.id] = d; });
+
+        const blocked = recentActs.filter(a => a.status === 'blocked');
+        const completedToday = recentActs.filter(a => a.completed_at && a.completed_at >= today.toISOString());
+
+        const portalSummary = [
+          `PORTAL SNAPSHOT (${new Date().toLocaleDateString('en-US', {timeZone:'America/Costa_Rica'})}):`,
+          `Total active: ${dashboards.length} | Live: ${dashboards.filter(d=>d.customer_status==='live').length} | Phase 1: ${dashboards.filter(d=>d.customer_status==='phase_1').length} | Phase 2: ${dashboards.filter(d=>d.customer_status==='phase_2').length} | Phase 3: ${dashboards.filter(d=>d.customer_status==='phase_3').length} | Blocked: ${dashboards.filter(d=>d.customer_status==='blocked').length}`,
+          blocked.length > 0 ? `Blocked activities (${blocked.length}): ${blocked.map(a => `${clientMap[a.customer_id]?.client_name||'Unknown'} → ${tMap[a.template_id]||'Unknown'}${a.notes ? ` (note: ${a.notes.substring(0,80)})` : ''}`).join(' | ')}` : 'No blocked activities.',
+          completedToday.length > 0 ? `Completed today (${completedToday.length}): ${completedToday.map(a => `${clientMap[a.customer_id]?.client_name||'Unknown'} → ${tMap[a.template_id]||'Unknown'}`).join(' | ')}` : 'No completions today.'
+        ].join('\n');
+
+        digest += `\n\n=== PORTAL ===\n${portalSummary}`;
+      }
+    } catch (portalErr) {
+      console.error('Portal snapshot error in nightly learning:', portalErr.message);
+    }
+
     if (!digest) return;
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${today}.
@@ -1504,8 +1716,14 @@ Keep it under 150 words. Sound like a sharp colleague, not a report. No markdown
 cron.schedule('0 15 * * *', async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
 cron.schedule('0 20 * * *', async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
 
-// Nightly learning — 11:30 PM CST
+// Nightly learning — 11:30 PM CST (extended with portal digest)
 cron.schedule('30 5 * * *', async () => { await runNightlyLearning(); }, { timezone: 'America/Costa_Rica' });
+
+// Weekly trend analysis — Friday 4:30 PM CST (runs before weekly digest)
+cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); }, { timezone: 'America/Costa_Rica' });
+
+// Monday gap detection — 8:00 AM CST (runs before Josue's 8:30 briefing)
+cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { timezone: 'America/Costa_Rica' });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
