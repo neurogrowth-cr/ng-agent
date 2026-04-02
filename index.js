@@ -522,9 +522,9 @@ async function deleteScheduledTask(taskId) {
 //   Schema: Name (title), Status, Priority, Deadline Date, Stakeholders, Customer, Type, Tags, Comments/Milestones/Insights
 //   Status values: "Not started", "Sprint Backlog", "In progress", "Done", "Blocked / No Action Needed"
 
-// Use the collection/data_source IDs (not the database page IDs)
-const NOTION_OPS_DB    = '20ecddb6-8d9f-8126-a408-000bbbc3c088';  // Operations Tracking collection
-const NOTION_PROJECT_DB = '8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c'; // Project Sprint Tracking collection
+// Use the DATABASE PAGE IDs from the URLs (not collection IDs) for REST API
+const NOTION_OPS_DB    = '20ecddb6-8d9f-809b-a904-d248ed95fce9';  // Operations Tracking
+const NOTION_PROJECT_DB = 'dc12b8a9-30f1-4872-9e42-c11391271bd1'; // Project Sprint Tracking
 
 async function createNotionTask(title, taskType = 'operational', priority = 'P2 - Growth & Scalability', dueDate = null, notes = null, customer = null) {
   try {
