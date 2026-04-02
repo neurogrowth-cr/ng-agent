@@ -512,65 +512,49 @@ async function deleteScheduledTask(taskId) {
 
 
 // ─── NOTION WRITE-BACK ────────────────────────────────────────────────────────
-// Two databases:
-// OPERATIONAL task → Operations Tracking (collection://20ecddb6-8d9f-8126-a408-000bbbc3c088)
-//   Schema: Name (title), Status, Priority, Deadline Date, Responsible, Customer, Type, Tags, Frequency
-//   Status values: "Not started", "In progress", "Done", "Blocked / No Action Needed"
-//   Priority values: "P0 - Critical Customer Impact", "P1 - High Business Impact", "P2 - Growth & Scalability", "P3 - Strategic Initiatives"
-//
-// PROJECT task → Neuro Project Sprint Tracking (collection://8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c)
-//   Schema: Name (title), Status, Priority, Deadline Date, Stakeholders, Customer, Type, Tags, Comments/Milestones/Insights
-//   Status values: "Not started", "Sprint Backlog", "In progress", "Done", "Blocked / No Action Needed"
-
-// Use the DATABASE PAGE IDs from the URLs (not collection IDs) for REST API
-const NOTION_OPS_DB    = '20ecddb6-8d9f-809b-a904-d248ed95fce9';  // Operations Tracking
-const NOTION_PROJECT_DB = 'dc12b8a9-30f1-4872-9e42-c11391271bd1'; // Project Sprint Tracking
+// Operations Tracking:    collection 20ecddb6-8d9f-8126-a408-000bbbc3c088
+// Project Sprint Tracking: collection 8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c
 
 async function createNotionTask(title, taskType = 'operational', priority = 'P2 - Growth & Scalability', dueDate = null, notes = null, customer = null) {
   try {
     const isProject = taskType === 'project';
-    const dbId = isProject ? NOTION_PROJECT_DB : NOTION_OPS_DB;
+
+    // These are the collection (data source) IDs — confirmed working via MCP
+    const collectionId = isProject
+      ? '8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c'
+      : '20ecddb6-8d9f-8126-a408-000bbbc3c088';
+
+    // Notion REST API requires the database page ID (not collection ID)
+    // Operations Tracking page: 20ecddb6-8d9f-809b-a904-d248ed95fce9
+    // Project Sprint Tracking page: dc12b8a9-30f1-4872-9e42-c11391271bd1
+    const databaseId = isProject
+      ? 'dc12b8a930f148729e42c11391271bd1'
+      : '20ecddb68d9f809ba904d248ed95fce9';
 
     const properties = {
-      'Name': {
-        title: [{ text: { content: title } }]
-      },
-      'Status': {
-        status: { name: 'Not started' }
-      },
-      'Priority ': {
-        select: { name: priority }
-      },
-      'Type': {
-        select: { name: 'One-time' }
-      }
+      'Name': { title: [{ text: { content: title } }] },
+      'Status': { status: { name: 'Not started' } },
+      'Priority ': { select: { name: priority } },
+      'Type': { select: { name: 'One-time' } }
     };
 
     if (dueDate) {
-      properties['Deadline Date'] = {
-        date: { start: dueDate }
-      };
+      properties['Deadline Date'] = { date: { start: dueDate } };
     }
 
     if (notes) {
-      if (isProject) {
-        properties['Comments/Milestones/Insights'] = {
-          rich_text: [{ text: { content: `Max: ${notes.substring(0, 500)}` } }]
-        };
-      } else {
-        properties['Main Milestone'] = {
-          rich_text: [{ text: { content: notes.substring(0, 500) } }]
-        };
-      }
+      const notesKey = isProject ? 'Comments/Milestones/Insights' : 'Main Milestone';
+      properties[notesKey] = { rich_text: [{ text: { content: `Max: ${notes.substring(0, 500)}` } }] };
     }
 
     if (customer) {
-      properties['Customer'] = {
-        multi_select: [{ name: customer }]
-      };
+      properties['Customer'] = { multi_select: [{ name: customer }] };
     }
 
-    const body = { parent: { database_id: dbId.replace(/-/g, '') }, properties };
+    const body = {
+      parent: { database_id: databaseId },
+      properties
+    };
 
     const res = await fetch('https://api.notion.com/v1/pages', {
       method: 'POST',
@@ -583,16 +567,38 @@ async function createNotionTask(title, taskType = 'operational', priority = 'P2 
     });
 
     const data = await res.json();
-    if (!res.ok) throw new Error(data.message || JSON.stringify(data));
+
+    if (!res.ok) {
+      // Log full error to Railway for debugging
+      console.error('Notion create task failed:', res.status, JSON.stringify(data));
+      // Try with collection ID as fallback
+      const body2 = { ...body, parent: { database_id: collectionId.replace(/-/g,'') } };
+      const res2 = await fetch('https://api.notion.com/v1/pages', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.NOTION_TOKEN}`,
+          'Notion-Version': '2022-06-28',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body2)
+      });
+      const data2 = await res2.json();
+      if (!res2.ok) {
+        console.error('Notion fallback also failed:', res2.status, JSON.stringify(data2));
+        throw new Error(`${data.message || data.code} | fallback: ${data2.message || data2.code}`);
+      }
+      const dbName = isProject ? 'Project Sprint Tracking' : 'Operations Tracking';
+      return `Task created in Notion (${dbName}): "${title}"${dueDate ? ` — due ${dueDate}` : ''} — ${priority}. Link: ${data2.url}`;
+    }
 
     const dbName = isProject ? 'Project Sprint Tracking' : 'Operations Tracking';
-    return `Task created in Notion (${dbName}): "${title}"${dueDate ? ` — due ${dueDate}` : ''}${priority ? ` — ${priority}` : ''}. Link: ${data.url}`;
+    return `Task created in Notion (${dbName}): "${title}"${dueDate ? ` — due ${dueDate}` : ''} — ${priority}. Link: ${data.url}`;
   } catch (err) {
     return `Notion task creation error: ${err.message}`;
   }
 }
 
-// ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
+// ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────// ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
 function getGoogleAuth() {
   let credentials, token;
   if (process.env.GOOGLE_CREDENTIALS) {
@@ -709,6 +715,141 @@ async function getNotionPage(pageId) {
     }
   });
   return await res.json();
+}
+
+
+// ─── META ADS ─────────────────────────────────────────────────────────────────
+// Requires: META_ACCESS_TOKEN, META_AD_ACCOUNT_ID env vars
+// Read-only access to NeuroGrowth ad campaigns
+
+async function getMetaAdsSummary(datePreset = 'last_7d') {
+  try {
+    const accountId = process.env.META_AD_ACCOUNT_ID;
+    const token     = process.env.META_ACCESS_TOKEN;
+    if (!accountId || !token) return 'Meta Ads not configured. Add META_ACCESS_TOKEN and META_AD_ACCOUNT_ID to env vars.';
+
+    // Account-level insights
+    const fields = 'spend,impressions,clicks,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type';
+    const insightUrl = `https://graph.facebook.com/v19.0/${accountId}/insights?fields=${fields}&date_preset=${datePreset}&access_token=${token}`;
+    const insightRes = await fetch(insightUrl);
+    const insightData = await insightRes.json();
+
+    if (insightData.error) throw new Error(insightData.error.message);
+
+    const d = insightData.data?.[0] || {};
+
+    // Extract leads if available
+    const leads = (d.actions || []).find(a => a.action_type === 'lead')?.value || '0';
+    const clicks = d.clicks || '0';
+    const spend  = parseFloat(d.spend || 0).toFixed(2);
+    const ctr    = parseFloat(d.ctr  || 0).toFixed(2);
+    const cpc    = parseFloat(d.cpc  || 0).toFixed(2);
+    const cpm    = parseFloat(d.cpm  || 0).toFixed(2);
+    const cpl    = leads > 0 ? (parseFloat(spend) / parseInt(leads)).toFixed(2) : 'N/A';
+
+    return [
+      `Meta Ads — ${datePreset.replace(/_/g,' ')}:`,
+      `Spend: $${spend} | Impressions: ${parseInt(d.impressions||0).toLocaleString()} | Reach: ${parseInt(d.reach||0).toLocaleString()}`,
+      `Clicks: ${parseInt(clicks).toLocaleString()} | CTR: ${ctr}% | CPC: $${cpc} | CPM: $${cpm}`,
+      leads !== '0' ? `Leads: ${leads} | CPL: $${cpl}` : 'No lead conversions tracked in this period.'
+    ].join('\n');
+  } catch (err) {
+    return `Meta Ads summary error: ${err.message}`;
+  }
+}
+
+async function getMetaCampaigns(datePreset = 'last_7d', limit = 10) {
+  try {
+    const accountId = process.env.META_AD_ACCOUNT_ID;
+    const token     = process.env.META_ACCESS_TOKEN;
+    if (!accountId || !token) return 'Meta Ads not configured.';
+
+    const fields = 'name,status,objective,spend,impressions,clicks,ctr,cpc,actions,cost_per_action_type';
+    const url = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=id,name,status,objective,insights.date_preset(${datePreset}){${fields}}&limit=${limit}&access_token=${token}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+
+    if (data.error) throw new Error(data.error.message);
+
+    const campaigns = data.data || [];
+    if (!campaigns.length) return 'No campaigns found.';
+
+    const lines = campaigns.map(c => {
+      const ins    = c.insights?.data?.[0] || {};
+      const spend  = parseFloat(ins.spend || 0).toFixed(2);
+      const leads  = (ins.actions || []).find(a => a.action_type === 'lead')?.value || '0';
+      const status = c.status === 'ACTIVE' ? '🟢' : c.status === 'PAUSED' ? '⏸️' : '🔴';
+      return `${status} ${c.name}\n   Spend: $${spend} | Clicks: ${ins.clicks||0} | CTR: ${parseFloat(ins.ctr||0).toFixed(2)}%${leads!=='0' ? ` | Leads: ${leads}` : ''}`;
+    });
+
+    return `Campaigns (${datePreset.replace(/_/g,' ')}) — ${campaigns.length} found:\n\n${lines.join('\n\n')}`;
+  } catch (err) {
+    return `Meta campaigns error: ${err.message}`;
+  }
+}
+
+async function getMetaAdSets(campaignId = null, datePreset = 'last_7d') {
+  try {
+    const accountId = process.env.META_AD_ACCOUNT_ID;
+    const token     = process.env.META_ACCESS_TOKEN;
+    if (!accountId || !token) return 'Meta Ads not configured.';
+
+    const fields = 'name,status,daily_budget,lifetime_budget,spend,impressions,clicks,ctr,cpc,actions';
+    const baseId  = campaignId || accountId;
+    const endpoint = campaignId ? `${campaignId}/adsets` : `${accountId}/adsets`;
+    const url = `https://graph.facebook.com/v19.0/${endpoint}?fields=id,name,status,daily_budget,insights.date_preset(${datePreset}){${fields}}&limit=20&access_token=${token}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+
+    if (data.error) throw new Error(data.error.message);
+
+    const adsets = data.data || [];
+    if (!adsets.length) return 'No ad sets found.';
+
+    const lines = adsets.map(a => {
+      const ins    = a.insights?.data?.[0] || {};
+      const spend  = parseFloat(ins.spend || 0).toFixed(2);
+      const budget = a.daily_budget ? `$${(parseInt(a.daily_budget)/100).toFixed(0)}/day` : 'No daily budget';
+      const leads  = (ins.actions || []).find(x => x.action_type === 'lead')?.value || '0';
+      const status = a.status === 'ACTIVE' ? '🟢' : a.status === 'PAUSED' ? '⏸️' : '🔴';
+      return `${status} ${a.name} | Budget: ${budget}\n   Spend: $${spend} | Clicks: ${ins.clicks||0} | CTR: ${parseFloat(ins.ctr||0).toFixed(2)}%${leads!=='0' ? ` | Leads: ${leads}` : ''}`;
+    });
+
+    return `Ad Sets (${datePreset.replace(/_/g,' ')}):\n\n${lines.join('\n\n')}`;
+  } catch (err) {
+    return `Meta ad sets error: ${err.message}`;
+  }
+}
+
+async function getMetaAds(adSetId = null, datePreset = 'last_7d') {
+  try {
+    const accountId = process.env.META_AD_ACCOUNT_ID;
+    const token     = process.env.META_ACCESS_TOKEN;
+    if (!accountId || !token) return 'Meta Ads not configured.';
+
+    const endpoint = adSetId ? `${adSetId}/ads` : `${accountId}/ads`;
+    const fields   = 'name,status,spend,impressions,clicks,ctr,cpc,actions';
+    const url = `https://graph.facebook.com/v19.0/${endpoint}?fields=id,name,status,insights.date_preset(${datePreset}){${fields}}&limit=20&access_token=${token}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+
+    if (data.error) throw new Error(data.error.message);
+
+    const ads = data.data || [];
+    if (!ads.length) return 'No ads found.';
+
+    const lines = ads.map(a => {
+      const ins   = a.insights?.data?.[0] || {};
+      const spend = parseFloat(ins.spend || 0).toFixed(2);
+      const leads = (ins.actions || []).find(x => x.action_type === 'lead')?.value || '0';
+      const status = a.status === 'ACTIVE' ? '🟢' : a.status === 'PAUSED' ? '⏸️' : '🔴';
+      return `${status} ${a.name}\n   Spend: $${spend} | Impressions: ${parseInt(ins.impressions||0).toLocaleString()} | Clicks: ${ins.clicks||0} | CTR: ${parseFloat(ins.ctr||0).toFixed(2)}%${leads!=='0' ? ` | Leads: ${leads}` : ''}`;
+    });
+
+    return `Ads (${datePreset.replace(/_/g,' ')}):\n\n${lines.join('\n\n')}`;
+  } catch (err) {
+    return `Meta ads error: ${err.message}`;
+  }
 }
 
 // ─── GHL CONVERSATIONS ───────────────────────────────────────────────────────
@@ -1662,6 +1803,50 @@ async function callClaude(messages, retries = 3, userId = null) {
               required: ["taskId"]
             }
           }
+,
+          {
+            name: "get_meta_ads_summary",
+            description: "Get NeuroGrowth Meta Ads account-level performance summary — spend, impressions, reach, clicks, CTR, CPC, CPM, leads, and CPL. Use when asked about ad performance, how ads are doing, spend, or results.",
+            input_schema: {
+              type: "object",
+              properties: {
+                datePreset: { type: "string", description: "Date range: today, yesterday, last_7d (default), last_14d, last_30d, last_month, this_month, this_quarter" }
+              }
+            }
+          },
+          {
+            name: "get_meta_campaigns",
+            description: "Get Meta Ads campaign-level breakdown — name, status, spend, clicks, CTR, leads per campaign. Use when asked about specific campaigns or campaign performance.",
+            input_schema: {
+              type: "object",
+              properties: {
+                datePreset: { type: "string", description: "Date range: last_7d (default), last_14d, last_30d, this_month" },
+                limit: { type: "number", description: "Number of campaigns to return, default 10" }
+              }
+            }
+          },
+          {
+            name: "get_meta_adsets",
+            description: "Get Meta Ads ad set level breakdown — budget, spend, clicks, CTR per ad set. Use when asked about ad sets, targeting, or budget allocation.",
+            input_schema: {
+              type: "object",
+              properties: {
+                campaignId: { type: "string", description: "Optional campaign ID to filter ad sets by campaign" },
+                datePreset: { type: "string", description: "Date range: last_7d (default), last_14d, last_30d, this_month" }
+              }
+            }
+          },
+          {
+            name: "get_meta_ads",
+            description: "Get individual ad-level performance — spend, impressions, clicks, CTR, leads per ad creative. Use when asked about specific ads or creative performance.",
+            input_schema: {
+              type: "object",
+              properties: {
+                adSetId: { type: "string", description: "Optional ad set ID to filter ads" },
+                datePreset: { type: "string", description: "Date range: last_7d (default), last_14d, last_30d, this_month" }
+              }
+            }
+          }
         ]
       });
 
@@ -1688,6 +1873,10 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'create_scheduled_task')   result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
             else if (toolUse.name === 'list_scheduled_tasks')    result = await listScheduledTasks();
             else if (toolUse.name === 'delete_scheduled_task')   result = await deleteScheduledTask(toolUse.input.taskId);
+            else if (toolUse.name === 'get_meta_ads_summary')      result = await getMetaAdsSummary(toolUse.input.datePreset || 'last_7d');
+            else if (toolUse.name === 'get_meta_campaigns')        result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
+            else if (toolUse.name === 'get_meta_adsets')           result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
+            else if (toolUse.name === 'get_meta_ads')              result = await getMetaAds(toolUse.input.adSetId || null, toolUse.input.datePreset || 'last_7d');
           } catch (err) {
             result = `Error running tool ${toolUse.name}: ${err.message}`;
           }
