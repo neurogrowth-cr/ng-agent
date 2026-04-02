@@ -1860,7 +1860,10 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'get_recent_emails')    result = await getRecentEmails();
             else if (toolUse.name === 'send_email')           result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
             else if (toolUse.name === 'get_calendar_events')  result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
-            else if (toolUse.name === 'search_drive')         result = await searchDrive(toolUse.input.query);
+            else if (toolUse.name === 'search_drive') {
+              const driveResult = await searchDrive(toolUse.input.query);
+              result = driveResult.length > 4000 ? driveResult.substring(0, 4000) + '...[trimmed]' : driveResult;
+            }
             else if (toolUse.name === 'read_slack_channel')   result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
             else if (toolUse.name === 'draft_channel_post')   result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
             else if (toolUse.name === 'get_ghl_conversations') result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
