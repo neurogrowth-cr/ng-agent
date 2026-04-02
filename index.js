@@ -1633,7 +1633,7 @@ async function callClaude(messages, retries = 3, userId = null) {
     try {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
-        max_tokens: 1024,
+        max_tokens: 2048,
         system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
         messages,
         tools: [
