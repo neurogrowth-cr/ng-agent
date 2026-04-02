@@ -522,8 +522,9 @@ async function deleteScheduledTask(taskId) {
 //   Schema: Name (title), Status, Priority, Deadline Date, Stakeholders, Customer, Type, Tags, Comments/Milestones/Insights
 //   Status values: "Not started", "Sprint Backlog", "In progress", "Done", "Blocked / No Action Needed"
 
-const NOTION_OPS_DB    = '20ecddb68d9f8126a408000bbbc3c088';
-const NOTION_PROJECT_DB = '8d0645e6eabb4f0d9c8a4d8641ad4e8c';
+// Use the collection/data_source IDs (not the database page IDs)
+const NOTION_OPS_DB    = '20ecddb6-8d9f-8126-a408-000bbbc3c088';  // Operations Tracking collection
+const NOTION_PROJECT_DB = '8d0645e6-eabb-4f0d-9c8a-4d8641ad4e8c'; // Project Sprint Tracking collection
 
 async function createNotionTask(title, taskType = 'operational', priority = 'P2 - Growth & Scalability', dueDate = null, notes = null, customer = null) {
   try {
@@ -569,7 +570,7 @@ async function createNotionTask(title, taskType = 'operational', priority = 'P2 
       };
     }
 
-    const body = { parent: { database_id: dbId }, properties };
+    const body = { parent: { database_id: dbId.replace(/-/g, '') }, properties };
 
     const res = await fetch('https://api.notion.com/v1/pages', {
       method: 'POST',
