@@ -2400,10 +2400,13 @@ async function handleGHLWebhook(req, res) {
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
         const source     = cd.source
                         || payload.source
-                        || payload.contact_source    // GHL standard field
+                        || payload.contact_source
+                        || payload.contact?.source
+                        || payload.triggerData?.source
+                        || payload.attributionSource?.url
                         || ct.source
                         || payload.type
-                        || 'Unknown channel';
+                        || '';
         const assignedTo = cd.assignedTo                    // custom data field
                         || cd['opportunity.assignedTo']       // GHL opportunity field
                         || payload.assignedTo
@@ -2433,19 +2436,27 @@ async function handleGHLWebhook(req, res) {
             const contactData = await contactRes.json();
             const assignedUser = contactData.contact?.assignedTo || contactData.assignedTo || '';
             if (assignedUser) {
-              // GHL returns user ID — look up user name
-              const userRes = await fetch(
-                `https://services.leadconnectorhq.com/users/${assignedUser}`,
-                {
-                  headers: {
-                    'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
-                    'Version': '2021-07-28'
+              // Try to resolve user name from GHL location users endpoint
+              try {
+                const usersRes = await fetch(
+                  `https://services.leadconnectorhq.com/users/?locationId=${process.env.GHL_LOCATION_ID}`,
+                  {
+                    headers: {
+                      'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+                      'Version': '2021-07-28'
+                    }
                   }
-                }
-              );
-              const userData = await userRes.json();
-              resolvedAssignedTo = userData.name || userData.firstName || assignedUser;
-              console.log(`GHL API resolved assignedTo: ${resolvedAssignedTo}`);
+                );
+                const usersData = await usersRes.json();
+                const users = usersData.users || usersData || [];
+                const matchedUser = users.find(u => u.id === assignedUser);
+                resolvedAssignedTo = matchedUser
+                  ? (matchedUser.name || matchedUser.firstName || matchedUser.email)
+                  : assignedUser; // fallback to ID if not found
+              } catch (userErr) {
+                resolvedAssignedTo = assignedUser; // fallback to ID
+              }
+              console.log(`GHL resolved assignedTo: ${resolvedAssignedTo}`);
             }
           } catch (apiErr) {
             console.error('GHL contact lookup error:', apiErr.message);
