@@ -2409,6 +2409,9 @@ async function handleGHLWebhook(req, res) {
 
         // Log full raw payload for debugging
         console.log('GHL raw payload keys:', Object.keys(payload).join(', '));
+        if (payload.contact) console.log('GHL contact object:', JSON.stringify(payload.contact).substring(0, 300));
+        if (payload.customData) console.log('GHL customData:', JSON.stringify(payload.customData).substring(0, 300));
+        if (payload.attributionSource) console.log('GHL attributionSource:', JSON.stringify(payload.attributionSource).substring(0, 200));
 
         // GHL can send data in multiple formats:
         // 1. Flat: { fullName: '...', email: '...', assignedTo: '...' }
