@@ -2384,17 +2384,17 @@ async function handleGHLWebhook(req, res) {
         console.log('GHL webhook received:', JSON.stringify(payload).substring(0, 300));
 
         // Extract lead data from GHL payload
-        // GHL sends different formats depending on trigger type
-        const contact = payload.contact || payload;
-        const firstName   = contact.firstName || contact.first_name || '';
-        const lastName    = contact.lastName  || contact.last_name  || '';
-        const fullName    = `${firstName} ${lastName}`.trim() || contact.name || 'Unknown';
-        const email       = contact.email || '';
-        const phone       = contact.phone || contact.phoneRaw || '';
-        const source      = contact.source || payload.source || payload.type || 'Unknown channel';
-        const assignedTo  = contact.assignedTo || payload.assignedTo || payload.assigned_user || '';
-        const contactId   = contact.id || payload.contactId || '';
-        const locationId  = payload.locationId || process.env.GHL_LOCATION_ID || '';
+        // GHL sends Custom Data fields as top-level keys in the payload
+        // Field names match exactly what was configured in the GHL webhook step
+        const fullName   = payload.fullName   || payload.contact?.name  || payload.name  || 'Unknown';
+        const email      = payload.email      || payload.contact?.email || '';
+        const phone      = payload.phone      || payload.contact?.phone || '';
+        const source     = payload.source     || payload.contact?.source || payload.type || 'Unknown channel';
+        const assignedTo = payload.assignedTo || payload.responsible    || payload.contact?.assignedTo || '';
+        const contactId  = payload.contactId  || payload.contact?.id    || payload.id    || '';
+        const locationId = payload.locationId || process.env.GHL_LOCATION_ID || '';
+
+        console.log('GHL parsed:', { fullName, email, phone, source, assignedTo, contactId });
 
         // GHL contact URL
         const ghlLink = contactId
