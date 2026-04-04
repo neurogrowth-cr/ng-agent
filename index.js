@@ -2355,7 +2355,8 @@ cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { ti
 // Names must match exactly how GHL sends them in the assignedTo field
 const GHL_TO_SLACK = {
   'joseph':       'U0A9J00EMGD',  // Joseph — appointment setter
-  'debanny':      'U0AMTEKDCPN',  // Debanny — appointment setter (using Jose's ID as placeholder — update when Debanny has Slack)
+  'debanny':      'U0AR16QVDB3',  // Debbanny Romero — appointment setter
+  'debbanny':     'U0AR16QVDB3',  // alternate spelling
   'jose':         'U0AMTEKDCPN',  // Jose — closer
   'jonathan':     'U0AMTEKDCPN',  // Jose also goes by Jonathan
 };
