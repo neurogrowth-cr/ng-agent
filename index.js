@@ -2313,6 +2313,116 @@ cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); }, { t
 // Monday gap detection — 8:00 AM CST (runs before Josue's 8:30 briefing)
 cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { timezone: 'America/Costa_Rica' });
 
+
+// ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
+// GHL fires this when a contact is created or assigned
+// Endpoint: POST /webhook/ghl-lead
+// Set this URL in GHL: https://your-railway-url.railway.app/webhook/ghl-lead
+
+// Map GHL user emails/names to Slack user IDs
+const GHL_TO_SLACK = {
+  // Add your setter emails here as they appear in GHL
+  'joseph':       'U0A9J00EMGD',  // Joseph — setter
+  'jose':         'U0AMTEKDCPN',  // Jose — closer
+  'jonathan':     'U0AMTEKDCPN',  // Jose also goes by Jonathan
+  // Add emails if GHL sends them
+  // 'joseph@neurogrowth.io': 'U0A9J00EMGD',
+};
+
+function resolveSetterSlackId(assignedUser) {
+  if (!assignedUser) return null;
+  const lower = assignedUser.toLowerCase();
+  // Try direct match first
+  for (const [key, slackId] of Object.entries(GHL_TO_SLACK)) {
+    if (lower.includes(key)) return slackId;
+  }
+  return null;
+}
+
+async function handleGHLWebhook(req, res) {
+  try {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ received: true }));
+
+      try {
+        const payload = JSON.parse(body);
+        console.log('GHL webhook received:', JSON.stringify(payload).substring(0, 300));
+
+        // Extract lead data from GHL payload
+        // GHL sends different formats depending on trigger type
+        const contact = payload.contact || payload;
+        const firstName   = contact.firstName || contact.first_name || '';
+        const lastName    = contact.lastName  || contact.last_name  || '';
+        const fullName    = `${firstName} ${lastName}`.trim() || contact.name || 'Unknown';
+        const email       = contact.email || '';
+        const phone       = contact.phone || contact.phoneRaw || '';
+        const source      = contact.source || payload.source || payload.type || 'Unknown channel';
+        const assignedTo  = contact.assignedTo || payload.assignedTo || payload.assigned_user || '';
+        const contactId   = contact.id || payload.contactId || '';
+        const locationId  = payload.locationId || process.env.GHL_LOCATION_ID || '';
+
+        // GHL contact URL
+        const ghlLink = contactId
+          ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}`
+          : 'https://app.gohighlevel.com';
+
+        // Resolve which setter to notify
+        const setterSlackId = resolveSetterSlackId(assignedTo);
+
+        // Build the briefing message
+        const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.
+
+Lead details:
+- Name: ${fullName}
+- Email: ${email || 'not provided'}
+- Phone: ${phone || 'not provided'}
+- Source: ${source}
+- Assigned to: ${assignedTo || 'unassigned'}
+- GHL link: ${ghlLink}
+
+Write a short, direct Slack DM to the setter (2-3 sentences max) telling them:
+1. A new lead came in and was assigned to them
+2. Key lead details
+3. Their first action (reach out now, check GHL)
+
+Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
+
+        const briefing = await callClaude([{ role: 'user', content: prompt }]);
+
+        if (!briefing || !briefing.trim()) {
+          console.error('GHL webhook: empty briefing from Claude');
+          return;
+        }
+
+        // DM the assigned setter
+        if (setterSlackId) {
+          await slack.client.chat.postMessage({
+            channel: setterSlackId,
+            text: briefing
+          });
+          console.log(`GHL lead briefing sent to setter ${assignedTo} (${setterSlackId})`);
+        }
+
+        // Always post to sales channel as well
+        await slack.client.chat.postMessage({
+          channel: 'C0AJANQBYUE', // #ng-sales-goats
+          text: `🆕 *New lead assigned* — ${fullName} | ${source}\n${briefing}`
+        });
+
+      } catch (parseErr) {
+        console.error('GHL webhook parse error:', parseErr.message);
+      }
+    });
+  } catch (err) {
+    console.error('GHL webhook handler error:', err.message);
+    res.writeHead(500);
+    res.end('error');
+  }
+}
+
 // ─── HEALTH CHECK SERVER ─────────────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
@@ -2323,6 +2433,8 @@ const healthServer = http.createServer((req, res) => {
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString()
     }));
+  } else if (req.url === '/webhook/ghl-lead' && req.method === 'POST') {
+    handleGHLWebhook(req, res);
   } else {
     res.writeHead(404);
     res.end('Not found');
