@@ -2398,9 +2398,12 @@ async function handleGHLWebhook(req, res) {
                         || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
-        const source     = cd.source     || payload.source     || ct.source   || payload.type || 'Unknown channel';
-        const assignedTo = cd.assignedTo || payload.assignedTo || ct.assignedTo
-                        || payload.assigned_user || payload.responsible || '';
+        const source     = cd.source     || payload.source     || payload.contact_source
+                        || ct.source   || payload.type || 'Unknown channel';
+        const assignedTo = cd.assignedTo      || payload.assignedTo
+                        || payload.assigned_user  || payload.contact_owner
+                        || ct.assignedTo          || ct.assigned_user
+                        || payload.responsible    || '';
         const contactId  = cd.contactId  || payload.contactId  || payload.contact_id
                         || ct.id || payload.id || '';
         const locationId = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
@@ -2440,19 +2443,31 @@ Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
           return;
         }
 
-        // DM the assigned setter
+        // DM the assigned setter only if we can resolve their Slack ID
         if (setterSlackId) {
           await slack.client.chat.postMessage({
             channel: setterSlackId,
             text: briefing
           });
           console.log(`GHL lead briefing sent to setter ${assignedTo} (${setterSlackId})`);
+        } else {
+          // Log silently — don't post confusion to team channels
+          console.log(`GHL lead received but setter not resolved. assignedTo: "${assignedTo}". Add to GHL_TO_SLACK map if needed.`);
         }
 
-        // Always post to sales channel as well
+        // Post clean notification to #ng-sales-goats — factual only, no meta commentary
+        const channelNote = [
+          `🆕 *New Lead* — ${fullName}`,
+          email ? `📧 ${email}` : null,
+          phone ? `📱 ${phone}` : null,
+          source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
+          assignedTo ? `👤 Assigned to: ${assignedTo}` : null,
+          contactId ? `🔗 https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : null
+        ].filter(Boolean).join('\n');
+
         await slack.client.chat.postMessage({
-          channel: 'C0AJANQBYUE', // #ng-sales-goats
-          text: `🆕 *New lead assigned* — ${fullName} | ${source}\n${briefing}`
+          channel: 'C0AJANQBYUE',
+          text: channelNote
         });
 
       } catch (parseErr) {
