@@ -265,9 +265,19 @@ async function loadHistory(userId, limit = 10) {
 
 async function saveMessage(userId, role, content) {
   try {
+    // Redact sensitive patterns before storing in conversation history
+    let safeContent = content;
+    if (containsSensitiveData(content)) {
+      safeContent = content
+        .replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED-API-KEY]')
+        .replace(/xox[bpoas]-[A-Za-z0-9-]{10,}/g, '[REDACTED-SLACK-TOKEN]')
+        .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[REDACTED-JWT]')
+        .replace(/-----BEGIN[^-]+-----[\s\S]+?-----END[^-]+-----/g, '[REDACTED-KEY]');
+      console.warn(`Sensitive data redacted in conversation message for user ${userId}`);
+    }
     const { error } = await supabase
       .from('conversations')
-      .insert({ user_id: userId, role, content: content.substring(0, 8000) });
+      .insert({ user_id: userId, role, content: safeContent.substring(0, 8000) });
     if (error) throw error;
     // Prune after every 5 saves — keep max 40 rows per user
     await pruneConversationHistory(userId);
@@ -327,8 +337,30 @@ async function searchKnowledge(query, category = null) {
   }
 }
 
+// Patterns that indicate sensitive data — never save these to knowledge base
+const SENSITIVE_PATTERNS = [
+  /password/i, /passwd/i, /secret/i, /api.?key/i, /access.?token/i,
+  /private.?key/i, /credentials/i, /auth.?token/i, /bearer/i,
+  /eyJ[A-Za-z0-9_-]{10,}/,  // JWT tokens
+  /sk-[A-Za-z0-9]{20,}/,     // OpenAI keys
+  /xox[bpoas]-[A-Za-z0-9-]{10,}/, // Slack tokens
+  /-----BEGIN/,               // PEM keys
+  /[0-9]{16}/,               // Credit card numbers
+  /\d{3}-\d{2}-\d{4}/,  // SSN format
+];
+
+function containsSensitiveData(text) {
+  if (!text) return false;
+  return SENSITIVE_PATTERNS.some(pattern => pattern.test(text));
+}
+
 async function upsertKnowledge(category, key, value, source = 'agent') {
   try {
+    // Never save sensitive data to knowledge base
+    if (containsSensitiveData(value) || containsSensitiveData(key)) {
+      console.warn(`Knowledge save blocked — sensitive data detected in [${category}] ${key}`);
+      return `Knowledge save skipped — sensitive data detected. This information was not stored.`;
+    }
     const { error } = await supabase
       .from('agent_knowledge')
       .upsert(
