@@ -2400,10 +2400,15 @@ async function handleGHLWebhook(req, res) {
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
         const source     = cd.source     || payload.source     || payload.contact_source
                         || ct.source   || payload.type || 'Unknown channel';
-        const assignedTo = cd.assignedTo      || payload.assignedTo
-                        || payload.assigned_user  || payload.contact_owner
-                        || ct.assignedTo          || ct.assigned_user
-                        || payload.responsible    || '';
+        const assignedTo = cd.assignedTo                    // custom data field
+                        || cd['opportunity.assignedTo']       // GHL opportunity field
+                        || payload.assignedTo
+                        || payload['opportunity.assignedTo']
+                        || payload.assigned_user
+                        || payload.contact_owner
+                        || ct.assignedTo
+                        || ct.assigned_user
+                        || '';
         const contactId  = cd.contactId  || payload.contactId  || payload.contact_id
                         || ct.id || payload.id || '';
         const locationId = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
@@ -2455,14 +2460,18 @@ Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
           console.log(`GHL lead received but setter not resolved. assignedTo: "${assignedTo}". Add to GHL_TO_SLACK map if needed.`);
         }
 
-        // Post clean notification to #ng-sales-goats — factual only, no meta commentary
+        // Post clean notification to #ng-sales-goats
+        const ghlContactUrl = contactId
+          ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}`
+          : null;
+
         const channelNote = [
           `🆕 *New Lead* — ${fullName}`,
-          email ? `📧 ${email}` : null,
-          phone ? `📱 ${phone}` : null,
-          source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
+          email      ? `📧 ${email}`              : null,
+          phone      ? `📱 ${phone}`              : null,
+          source && source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
           assignedTo ? `👤 Assigned to: ${assignedTo}` : null,
-          contactId ? `🔗 https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : null
+          ghlContactUrl ? `🔗 ${ghlContactUrl}`   : null
         ].filter(Boolean).join('\n');
 
         await slack.client.chat.postMessage({
