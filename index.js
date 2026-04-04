@@ -2351,22 +2351,34 @@ cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { ti
 // Endpoint: POST /webhook/ghl-lead
 // Set this URL in GHL: https://your-railway-url.railway.app/webhook/ghl-lead
 
-// Map GHL user emails/names to Slack user IDs
-// Names must match exactly how GHL sends them in the assignedTo field
+// Map GHL user names/IDs to Slack user IDs
 const GHL_TO_SLACK = {
-  'joseph':       'U0A9J00EMGD',  // Joseph — appointment setter
-  'debanny':      'U0AR16QVDB3',  // Debbanny Romero — appointment setter
-  'debbanny':     'U0AR16QVDB3',  // alternate spelling
-  'jose':         'U0AMTEKDCPN',  // Jose — closer
-  'jonathan':     'U0AMTEKDCPN',  // Jose also goes by Jonathan
+  // By name (lowercase match)
+  'joseph':              'U0A9J00EMGD',  // Joseph Salazar — setter
+  'joseph salazar':      'U0A9J00EMGD',
+  'debbanny':            'U0AR16QVDB3',  // Debbanny Romero — setter
+  'debanny':             'U0AR16QVDB3',
+  'debbanny neurogrowth':'U0AR16QVDB3',
+  'debbanny romero':     'U0AR16QVDB3',
+  'jonnathan':           'U0AMTEKDCPN',  // Jonnathan Navarrete — closer
+  'jonathan':            'U0AMTEKDCPN',
+  'jose':                'U0AMTEKDCPN',  // Jose Carranza — closer
+  'jose carranza':       'U0AMTEKDCPN',
+  // By GHL user ID (from My Staff page)
+  'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD',  // Joseph Salazar
+  '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',  // Debbanny Neurogrowth
+  'gqymykpddltdxvbkfl2c': 'U0AMTEKDCPN',  // Jonnathan Navarrete
+  'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',  // Jose Carranza
 };
 
 function resolveSetterSlackId(assignedUser) {
   if (!assignedUser) return null;
-  const lower = assignedUser.toLowerCase();
-  // Try direct match first
+  const lower = assignedUser.toLowerCase().trim();
+  // Try exact match first (for IDs)
+  if (GHL_TO_SLACK[lower]) return GHL_TO_SLACK[lower];
+  // Try partial match (for names)
   for (const [key, slackId] of Object.entries(GHL_TO_SLACK)) {
-    if (lower.includes(key)) return slackId;
+    if (lower.includes(key) || key.includes(lower)) return slackId;
   }
   return null;
 }
@@ -2491,7 +2503,13 @@ Write a short, direct Slack DM to the setter (2-3 sentences max) telling them:
 
 Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
 
-        const briefing = await callClaude([{ role: 'user', content: prompt }]);
+        // Use direct API call for webhook briefing — lighter than callClaude
+        const briefingResponse = await anthropic.messages.create({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 300,
+          messages: [{ role: 'user', content: prompt }]
+        });
+        const briefing = briefingResponse.content.filter(b => b.type === 'text').map(b => b.text).join('');
 
         if (!briefing || !briefing.trim()) {
           console.error('GHL webhook: empty briefing from Claude');
