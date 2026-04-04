@@ -2384,7 +2384,7 @@ async function handleGHLWebhook(req, res) {
         console.log('GHL webhook received:', JSON.stringify(payload).substring(0, 300));
 
         // Log full raw payload for debugging
-        console.log('GHL raw payload:', JSON.stringify(payload).substring(0, 500));
+        console.log('GHL raw payload keys:', Object.keys(payload).join(', '));
 
         // GHL can send data in multiple formats:
         // 1. Flat: { fullName: '...', email: '...', assignedTo: '...' }
@@ -2398,8 +2398,12 @@ async function handleGHLWebhook(req, res) {
                         || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
-        const source     = cd.source     || payload.source     || payload.contact_source
-                        || ct.source   || payload.type || 'Unknown channel';
+        const source     = cd.source
+                        || payload.source
+                        || payload.contact_source    // GHL standard field
+                        || ct.source
+                        || payload.type
+                        || 'Unknown channel';
         const assignedTo = cd.assignedTo                    // custom data field
                         || cd['opportunity.assignedTo']       // GHL opportunity field
                         || payload.assignedTo
@@ -2413,7 +2417,42 @@ async function handleGHLWebhook(req, res) {
                         || ct.id || payload.id || '';
         const locationId = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
 
-        console.log('GHL parsed:', { fullName, email, phone, source, assignedTo, contactId });
+        // If assignedTo is still empty, fetch from GHL API using contactId
+        let resolvedAssignedTo = assignedTo;
+        if (!resolvedAssignedTo && contactId) {
+          try {
+            const contactRes = await fetch(
+              `https://services.leadconnectorhq.com/contacts/${contactId}`,
+              {
+                headers: {
+                  'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+                  'Version': '2021-07-28'
+                }
+              }
+            );
+            const contactData = await contactRes.json();
+            const assignedUser = contactData.contact?.assignedTo || contactData.assignedTo || '';
+            if (assignedUser) {
+              // GHL returns user ID — look up user name
+              const userRes = await fetch(
+                `https://services.leadconnectorhq.com/users/${assignedUser}`,
+                {
+                  headers: {
+                    'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+                    'Version': '2021-07-28'
+                  }
+                }
+              );
+              const userData = await userRes.json();
+              resolvedAssignedTo = userData.name || userData.firstName || assignedUser;
+              console.log(`GHL API resolved assignedTo: ${resolvedAssignedTo}`);
+            }
+          } catch (apiErr) {
+            console.error('GHL contact lookup error:', apiErr.message);
+          }
+        }
+
+        console.log('GHL parsed:', { fullName, email, phone, source, assignedTo: resolvedAssignedTo, contactId });
 
         // GHL contact URL
         const ghlLink = contactId
@@ -2421,7 +2460,7 @@ async function handleGHLWebhook(req, res) {
           : 'https://app.gohighlevel.com';
 
         // Resolve which setter to notify
-        const setterSlackId = resolveSetterSlackId(assignedTo);
+        const setterSlackId = resolveSetterSlackId(resolvedAssignedTo);
 
         // Build the briefing message
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.
@@ -2431,7 +2470,7 @@ Lead details:
 - Email: ${email || 'not provided'}
 - Phone: ${phone || 'not provided'}
 - Source: ${source}
-- Assigned to: ${assignedTo || 'unassigned'}
+- Assigned to: ${resolvedAssignedTo || 'unassigned'}
 - GHL link: ${ghlLink}
 
 Write a short, direct Slack DM to the setter (2-3 sentences max) telling them:
@@ -2470,7 +2509,7 @@ Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
           email      ? `📧 ${email}`              : null,
           phone      ? `📱 ${phone}`              : null,
           source && source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
-          assignedTo ? `👤 Assigned to: ${assignedTo}` : null,
+          resolvedAssignedTo ? `👤 Assigned to: ${resolvedAssignedTo}` : null,
           ghlContactUrl ? `🔗 ${ghlContactUrl}`   : null
         ].filter(Boolean).join('\n');
 
