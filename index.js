@@ -2351,6 +2351,18 @@ cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { ti
 // Endpoint: POST /webhook/ghl-lead
 // Set this URL in GHL: https://your-railway-url.railway.app/webhook/ghl-lead
 
+// Map GHL user IDs to display names (for channel notifications)
+const GHL_USER_NAMES = {
+  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',
+  'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+  '5orsahkh2joujb5fczrp': 'Debbanny',
+  '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
+  'gqymykpddltdxvbkfl2c': 'Jonnathan Navarrete',
+  'gqYMYkpDDlTdxvBkfl2C': 'Jonnathan Navarrete',
+  'izlta0jy5orkymsyltjv': 'Jose Carranza',
+  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+};
+
 // Map GHL user names/IDs to Slack user IDs
 const GHL_TO_SLACK = {
   // By name (lowercase match)
@@ -2410,14 +2422,16 @@ async function handleGHLWebhook(req, res) {
                         || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
+        const attrSource = payload.attributionSource || {};
         const source     = cd.source
                         || payload.source
                         || payload.contact_source
-                        || payload.contact?.source
-                        || payload.triggerData?.source
-                        || payload.attributionSource?.url
                         || ct.source
-                        || payload.type
+                        || ct.source_name
+                        || attrSource.medium
+                        || attrSource.campaign
+                        || attrSource.referrer
+                        || payload.triggerData?.source
                         || '';
         const assignedTo = cd.assignedTo                    // custom data field
                         || cd['opportunity.assignedTo']       // GHL opportunity field
@@ -2468,6 +2482,9 @@ async function handleGHLWebhook(req, res) {
               } catch (userErr) {
                 resolvedAssignedTo = assignedUser; // fallback to ID
               }
+              // Resolve display name from our local map
+              const displayName = GHL_USER_NAMES[resolvedAssignedTo] || GHL_USER_NAMES[resolvedAssignedTo.toLowerCase()];
+              if (displayName) resolvedAssignedTo = displayName;
               console.log(`GHL resolved assignedTo: ${resolvedAssignedTo}`);
             }
           } catch (apiErr) {
