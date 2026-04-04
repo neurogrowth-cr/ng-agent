@@ -2425,17 +2425,35 @@ async function handleGHLWebhook(req, res) {
                         || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
-        const attrSource = payload.attributionSource || {};
-        const source     = cd.source
+        // Source lives in payload.contact.attributionSource (confirmed from logs)
+        const contactAttr = (payload.contact && payload.contact.attributionSource) || {};
+        const attrSource  = payload.attributionSource || {};
+
+        // Friendly source name mapping
+        const sourceRaw = cd.source
                         || payload.source
                         || payload.contact_source
                         || ct.source
-                        || ct.source_name
+                        || contactAttr.sessionSource
+                        || contactAttr.medium
                         || attrSource.medium
-                        || attrSource.campaign
-                        || attrSource.referrer
                         || payload.triggerData?.source
                         || '';
+
+        // Map GHL medium codes to readable names
+        const sourceMap = {
+          'whatsapp_coex': 'WhatsApp',
+          'whatsapp':      'WhatsApp',
+          'fb':            'Facebook',
+          'facebook':      'Facebook',
+          'instagram':     'Instagram',
+          'organic':       'Organic',
+          'paid':          'Paid Ads',
+          'email':         'Email',
+          'sms':           'SMS',
+          'referral':      'Referral',
+        };
+        const source = sourceMap[sourceRaw.toLowerCase()] || sourceRaw;
         const assignedTo = cd.assignedTo                    // custom data field
                         || cd['opportunity.assignedTo']       // GHL opportunity field
                         || payload.assignedTo
