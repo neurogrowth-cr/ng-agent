@@ -2352,13 +2352,12 @@ cron.schedule('0 14 * * 1', async () => { await runMondayGapDetection(); }, { ti
 // Set this URL in GHL: https://your-railway-url.railway.app/webhook/ghl-lead
 
 // Map GHL user emails/names to Slack user IDs
+// Names must match exactly how GHL sends them in the assignedTo field
 const GHL_TO_SLACK = {
-  // Add your setter emails here as they appear in GHL
-  'joseph':       'U0A9J00EMGD',  // Joseph — setter
+  'joseph':       'U0A9J00EMGD',  // Joseph — appointment setter
+  'debanny':      'U0AMTEKDCPN',  // Debanny — appointment setter (using Jose's ID as placeholder — update when Debanny has Slack)
   'jose':         'U0AMTEKDCPN',  // Jose — closer
   'jonathan':     'U0AMTEKDCPN',  // Jose also goes by Jonathan
-  // Add emails if GHL sends them
-  // 'joseph@neurogrowth.io': 'U0A9J00EMGD',
 };
 
 function resolveSetterSlackId(assignedUser) {
