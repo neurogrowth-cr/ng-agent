@@ -410,10 +410,23 @@ async function loadAndRegisterDynamicCrons() {
       return;
     }
 
+    // Deduplicate by name — keep only the most recent task per name
+    const seen = {};
+    const dedupedTasks = [];
     for (const task of tasks) {
+      const key = task.name.toLowerCase().trim();
+      if (!seen[key]) {
+        seen[key] = true;
+        dedupedTasks.push(task);
+      } else {
+        console.log(`Skipping duplicate cron task: "${task.name}" (${task.id})`);
+      }
+    }
+
+    for (const task of dedupedTasks) {
       registerDynamicCron(task);
     }
-    console.log(`Loaded ${tasks.length} dynamic cron task(s).`);
+    console.log(`Loaded ${dedupedTasks.length} dynamic cron task(s).`);
   } catch (err) {
     console.error('Dynamic cron load error:', err.message);
   }
@@ -447,6 +460,18 @@ function registerDynamicCron(task) {
 
 async function createScheduledTask(name, naturalLanguageSchedule, prompt, channel, createdBy) {
   try {
+    // Check for existing task with same name — prevent duplicates
+    const { data: existing } = await supabase
+      .from('scheduled_tasks')
+      .select('id, name')
+      .ilike('name', name.trim())
+      .eq('active', true)
+      .limit(1);
+
+    if (existing && existing.length > 0) {
+      return `A scheduled task named "${name}" already exists. Use list_scheduled_tasks to see all active tasks, or delete the existing one first.`;
+    }
+
     // Convert natural language to cron expression via Claude
     const cronPrompt = `Convert this schedule description to a cron expression (5-field format).
 Schedule: "${naturalLanguageSchedule}"
