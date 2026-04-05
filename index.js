@@ -884,6 +884,102 @@ async function getMetaAds(adSetId = null, datePreset = 'last_7d') {
   }
 }
 
+
+// ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
+async function readGoogleSheet(spreadsheetId, range = null) {
+  try {
+    const auth   = getGoogleAuth();
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // If no range specified, get sheet metadata first to find sheet names
+    if (!range) {
+      const meta = await sheets.spreadsheets.get({ spreadsheetId });
+      const firstSheet = meta.data.sheets?.[0]?.properties?.title || 'Sheet1';
+      range = `${firstSheet}!A1:Z100`;
+    }
+
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+
+    const rows = res.data.values || [];
+    if (!rows.length) return 'Sheet is empty or no data in range.';
+
+    // Format as readable table
+    const headers = rows[0] || [];
+    const dataRows = rows.slice(1);
+
+    let output = `Sheet data (${rows.length} rows, ${headers.length} columns):\n\n`;
+    output += headers.join(' | ') + '\n';
+    output += headers.map(() => '---').join(' | ') + '\n';
+    output += dataRows.slice(0, 50).map(row =>
+      headers.map((_, i) => row[i] || '').join(' | ')
+    ).join('\n');
+
+    if (dataRows.length > 50) {
+      output += `\n\n... and ${dataRows.length - 50} more rows.`;
+    }
+
+    return output.substring(0, 6000);
+  } catch (err) {
+    return `Google Sheets read error: ${err.message}`;
+  }
+}
+
+// ─── GOOGLE DOCS ──────────────────────────────────────────────────────────────
+async function readGoogleDoc(documentId) {
+  try {
+    const auth = getGoogleAuth();
+    const docs  = google.docs({ version: 'v1', auth });
+
+    const res = await docs.documents.get({ documentId });
+    const doc = res.data;
+
+    // Extract plain text from the doc body
+    let text = '';
+    const body = doc.body?.content || [];
+    for (const element of body) {
+      if (element.paragraph) {
+        for (const pe of element.paragraph.elements || []) {
+          if (pe.textRun?.content) {
+            text += pe.textRun.content;
+          }
+        }
+      } else if (element.table) {
+        for (const row of element.table.tableRows || []) {
+          for (const cell of row.tableCells || []) {
+            for (const cp of cell.content || []) {
+              for (const pe of cp.paragraph?.elements || []) {
+                if (pe.textRun?.content) {
+                  text += pe.textRun.content + ' | ';
+                }
+              }
+            }
+          }
+          text += '\n';
+        }
+      }
+    }
+
+    if (!text.trim()) return 'Document is empty or has no readable text content.';
+
+    return `Document: ${doc.title}\n\n${text.substring(0, 6000)}${text.length > 6000 ? '\n\n... [trimmed]' : ''}`;
+  } catch (err) {
+    return `Google Docs read error: ${err.message}`;
+  }
+}
+
+// Helper to extract file ID from a Google Drive/Sheets/Docs URL
+function extractGoogleFileId(urlOrId) {
+  // Match /d/{id}/ pattern in Drive, Sheets, Docs URLs
+  const match = urlOrId.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (match) return match[1];
+  // If it looks like a raw ID already (no slashes, spaces)
+  if (/^[a-zA-Z0-9_-]+$/.test(urlOrId)) return urlOrId;
+  return urlOrId;
+}
+
 // ─── GHL CONVERSATIONS ───────────────────────────────────────────────────────
 
 // ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
@@ -1707,6 +1803,29 @@ async function callClaude(messages, retries = 3, userId = null) {
             input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
           },
           {
+            name: "read_google_sheet",
+            description: "Read the actual cell data from a Google Sheet. Use when asked to read, analyze, or summarize a spreadsheet. Accepts a Google Sheets URL or file ID. Optionally specify a range like 'Sheet1!A1:Z50'.",
+            input_schema: {
+              type: "object",
+              properties: {
+                spreadsheetId: { type: "string", description: "Google Sheets URL or spreadsheet ID" },
+                range: { type: "string", description: "Optional range e.g. Sheet1!A1:Z100. Defaults to first 100 rows." }
+              },
+              required: ["spreadsheetId"]
+            }
+          },
+          {
+            name: "read_google_doc",
+            description: "Read the text content of a Google Doc. Use when asked to read, summarize, or analyze a Google Document. Accepts a Google Docs URL or document ID.",
+            input_schema: {
+              type: "object",
+              properties: {
+                documentId: { type: "string", description: "Google Docs URL or document ID" }
+              },
+              required: ["documentId"]
+            }
+          },
+          {
             name: "read_slack_channel",
             description: "Read recent messages from a NeuroGrowth Slack channel. Always use this tool when asked about channel activity — never answer from memory.",
             input_schema: {
@@ -1895,6 +2014,14 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'search_drive') {
               const driveResult = await searchDrive(toolUse.input.query);
               result = driveResult.length > 4000 ? driveResult.substring(0, 4000) + '...[trimmed]' : driveResult;
+            }
+            else if (toolUse.name === 'read_google_sheet') {
+              const sheetId = extractGoogleFileId(toolUse.input.spreadsheetId);
+              result = await readGoogleSheet(sheetId, toolUse.input.range || null);
+            }
+            else if (toolUse.name === 'read_google_doc') {
+              const docId = extractGoogleFileId(toolUse.input.documentId);
+              result = await readGoogleDoc(docId);
             }
             else if (toolUse.name === 'read_slack_channel')   result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
             else if (toolUse.name === 'draft_channel_post')   result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
