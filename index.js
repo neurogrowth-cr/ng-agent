@@ -1731,54 +1731,23 @@ slack.message(async ({ message, say }) => {
 });
 
 // ─── CRON JOBS ────────────────────────────────────────────────────────────────
-cron.schedule('0 15 * * 1-5', async () => {
-  const prompt = `Generate a daily standup message for the NeuroGrowth team. Tag @Tania, @Josue, @David, @Valeria, and @Felipe. Ask: (1) what they are working on today, (2) any blockers. Direct and brief. Today is ${new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' })}.`;
-  try { const msg = await callClaude([{ role:'user', content:prompt }]); await postToSlack(OPS_CHANNEL, msg); console.log('Daily standup posted.'); }
-  catch (err) { console.error('Standup cron error:', err); }
-}, { timezone: 'America/Costa_Rica' });
+// All scheduled jobs run as dynamic tasks loaded from Supabase scheduled_tasks table.
+// Internal system functions (nightly learning, portal trends, gap detection, proactive alerts)
+// are still wired to their schedules below — these are infrastructure-level and not
+// configurable via Slack, so they stay hardcoded.
 
-cron.schedule('0 23 * * 1-5', async () => {
-  const prompt = `EOD check for NeuroGrowth. Generate a brief accountability message. Remind team to log completions. Flag unresolved standup items. 3-4 lines, direct tone.`;
-  try { const msg = await callClaude([{ role:'user', content:prompt }]); await postToSlack(OPS_CHANNEL, msg); console.log('EOD check posted.'); }
-  catch (err) { console.error('EOD cron error:', err); }
-}, { timezone: 'America/Costa_Rica' });
+// Nightly learning — 11:30 PM CR (infrastructure — reads all channels, saves knowledge)
+cron.schedule('30 5 * * *',  async () => { await runNightlyLearning(); },     { timezone: 'America/Costa_Rica' });
 
-cron.schedule('0 22 * * 5', async () => {
-  const prompt = `Friday EOD at NeuroGrowth. Weekly digest for Ron: (1) What should have been completed this week — sales, delivery, ops. (2) Key open items for Monday. (3) One question for Ron over the weekend. Executive summary, no fluff.`;
-  try { const msg = await callClaude([{ role:'user', content:prompt }]); await postToSlack(OPS_CHANNEL, msg); console.log('Weekly digest posted.'); }
-  catch (err) { console.error('Weekly digest cron error:', err); }
-}, { timezone: 'America/Costa_Rica' });
+// Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
+cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); },  { timezone: 'America/Costa_Rica' });
 
-cron.schedule('0 1 * * 1-5', async () => {
-  const prompt = `Check Ron's calendar for sales calls scheduled for tomorrow. If there are calls, post a reminder asking Tania to confirm prospect research briefs are ready. Keep it to 2 lines.`;
-  try { const msg = await callClaude([{ role:'user', content:prompt }]); await postToSlack(AGENT_CHANNEL, msg); console.log('Sales prep reminder posted.'); }
-  catch (err) { console.error('Sales prep cron error:', err); }
-}, { timezone: 'America/Costa_Rica' });
+// Monday gap detection — 8:00 AM CR (infrastructure — posts to ops channel)
+cron.schedule('0 14 * * 1',  async () => { await runMondayGapDetection(); },  { timezone: 'America/Costa_Rica' });
 
-cron.schedule('30 14 * * 1-5', async () => {
-  console.log('Running Josue daily briefing...');
-  try {
-    const today               = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const fulfillmentActivity = await readSlackChannel('ng-fullfillment-ops', 20);
-    const alerts              = await getAllKnowledgeByCategory('alert');
-    const clientKnowledge     = await searchKnowledge('blocked', 'client');
-    let portalAlerts = 'Portal data unavailable.';
-    try { portalAlerts = await getPortalAlerts(); } catch (e) { console.error('Portal alerts failed in Josue briefing:', e.message); }
-    const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday:'long' });
-    const roleReminder = dayOfWeek === 'Monday' ? `Today is Monday — Josue has his 60-minute Campaign Fix session at 9AM. Flag any RED or YELLOW campaigns that need attention.` : dayOfWeek === 'Friday' ? `Today is Friday — Josue does his weekly portfolio performance deep dive. Remind him to update GREEN/YELLOW/RED status for each active DFY client.` : `It's ${dayOfWeek} — standard ops day.`;
-    const prompt = `You are Max, the NeuroGrowth PM Agent. Today is ${today}.\n\nYou are preparing a morning briefing for Josue, the Technical Operations Manager. He owns the 14-day client launch cycle and ongoing DFY campaign performance. ${roleReminder}\n\nRecent activity from ng-fullfillment-ops:\n${fulfillmentActivity}\n\nActive alerts:\n${alerts}\n\nBlocked or at-risk clients:\n${clientKnowledge}\n\nPortal launch risk:\n${portalAlerts}\n\nWrite Josue a direct, useful morning briefing:\n- What carried over from yesterday that needs his attention\n- Any clients at risk of missing their 14-day launch window or SLA breach\n- One clear first action to take this morning\n\nKeep it under 150 words. Sound like a sharp colleague, not a report. No markdown formatting.`;
-    const message = await callClaude([{ role:'user', content:prompt }]);
-    if (!message || !message.trim()) return;
-    await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: `Good morning Josue!\n\n${message}` });
-    console.log('Josue daily briefing sent.');
-  } catch (err) { console.error('Josue briefing cron error:', err.message); }
-}, { timezone: 'America/Costa_Rica' });
-
-cron.schedule('0 15 * * *',  async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
-cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); }, { timezone: 'America/Costa_Rica' });
-cron.schedule('30 5 * * *',  async () => { await runNightlyLearning(); }, { timezone: 'America/Costa_Rica' });
-cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); }, { timezone: 'America/Costa_Rica' });
-cron.schedule('0 14 * * 1',  async () => { await runMondayGapDetection(); }, { timezone: 'America/Costa_Rica' });
+// Proactive alerts — 9:00 AM and 2:00 PM CR (infrastructure — posts stale alerts to agent channel)
+cron.schedule('0 15 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
+cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
