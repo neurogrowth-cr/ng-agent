@@ -726,16 +726,30 @@ async function cleanDuplicateTasks() {
 
     if (!toDelete.length) return 'No duplicate tasks found — all clean.';
 
-    // Delete the duplicates
+    // Delete duplicates — use service role client if available for RLS bypass
     const ids = toDelete.map(t => t.id);
-    const { error: delError } = await supabase
+    const deleteClient = process.env.SUPABASE_SERVICE_KEY
+      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+      : supabase;
+
+    const { error: delError } = await deleteClient
       .from('scheduled_tasks')
       .delete()
       .in('id', ids);
 
-    if (delError) throw delError;
+    if (delError) {
+      console.error('cleanDuplicateTasks delete error:', delError.message);
+      throw new Error(`Delete failed: ${delError.message}`);
+    }
 
-    return `Cleaned up ${toDelete.length} duplicate task(s): ${toDelete.map(t => t.name).join(', ')}. ${Object.keys(seen).length} unique tasks remain.`;
+    // Verify deletion
+    const { data: remaining } = await supabase.from('scheduled_tasks').select('id').in('id', ids);
+    if (remaining && remaining.length > 0) {
+      throw new Error(`Delete appeared to succeed but ${remaining.length} rows still exist. RLS may be blocking — check Supabase permissions.`);
+    }
+
+    const names = toDelete.map(t => t.name).join(', ');
+    return `Done. Removed ${toDelete.length} duplicate task(s): ${names}. ${Object.keys(seen).length} unique tasks remain active.`;
   } catch (err) {
     return `Clean duplicate tasks error: ${err.message}`;
   }
@@ -743,23 +757,41 @@ async function cleanDuplicateTasks() {
 
 async function deleteScheduledTask(taskId) {
   try {
-    // Deactivate in Supabase
-    const { error } = await supabase
+    // Use service role if available to bypass RLS
+    const deleteClient = process.env.SUPABASE_SERVICE_KEY
+      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+      : supabase;
+
+    const { error } = await deleteClient
       .from('scheduled_tasks')
       .update({ active: false })
       .eq('id', taskId);
 
-    if (error) throw error;
+    if (error) throw new Error(`Supabase update failed: ${error.message}`);
+
+    // Verify the update took effect
+    const { data: check } = await supabase
+      .from('scheduled_tasks')
+      .select('id, name, active')
+      .eq('id', taskId)
+      .single();
+
+    if (check && check.active !== false) {
+      throw new Error(`Update did not persist — task is still active. RLS may be blocking writes on the anon key.`);
+    }
 
     // Stop the live cron if running
     if (activeDynamicCrons[taskId]) {
       activeDynamicCrons[taskId].stop();
       delete activeDynamicCrons[taskId];
+      console.log(`Dynamic cron stopped: ${taskId}`);
     }
 
-    return `Scheduled task ${taskId.substring(0,8)} has been deactivated.`;
+    const taskName = check?.name || taskId.substring(0,8);
+    return `Done. Task "${taskName}" has been deactivated and will no longer run.`;
   } catch (err) {
-    return `Error deleting task: ${err.message}`;
+    console.error('deleteScheduledTask error:', err.message);
+    return `Delete task failed: ${err.message}`;
   }
 }
 
