@@ -705,7 +705,7 @@ async function cleanDuplicateTasks() {
     const { data: tasks, error } = await supabase
       .from('scheduled_tasks')
       .select('id, name, cron_expression, active, created_at')
-      .order('name,asc')
+      .order('name', { ascending: true })
       .order('created_at', { ascending: true });
 
     if (error) throw error;
