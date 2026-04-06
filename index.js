@@ -715,10 +715,30 @@ async function cleanDuplicateTasks() {
     const seen = {};
     const toDelete = [];
 
+    // Normalize name for dedup — strip # prefix and channel names like #ng-*
+    function normalizeName(name) {
+      return name
+        .toLowerCase()
+        .trim()
+        .replace(/^#[a-z0-9-]+\s+/i, '') // strip leading #channel-name
+        .replace(/\s+#[a-z0-9-]+$/i, '') // strip trailing #channel-name
+        .trim();
+    }
+
     for (const task of tasks) {
-      const key = task.name.toLowerCase().trim();
+      const key = normalizeName(task.name);
       if (seen[key]) {
-        toDelete.push(task);
+        // Keep the one WITHOUT the # prefix (cleaner name)
+        const hasHash = task.name.startsWith('#');
+        const existingHasHash = seen[key].name.startsWith('#');
+        if (hasHash) {
+          toDelete.push(task); // current has #, delete it
+        } else if (existingHasHash) {
+          toDelete.push(seen[key]); // existing has #, swap
+          seen[key] = task;
+        } else {
+          toDelete.push(task); // both clean, delete newer
+        }
       } else {
         seen[key] = task;
       }
@@ -726,13 +746,11 @@ async function cleanDuplicateTasks() {
 
     if (!toDelete.length) return 'No duplicate tasks found — all clean.';
 
-    // Delete duplicates — use service role client if available for RLS bypass
+    // Delete duplicates
     const ids = toDelete.map(t => t.id);
-    const deleteClient = process.env.SUPABASE_SERVICE_KEY
-      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
-      : supabase;
+    console.log(`cleanDuplicateTasks: deleting IDs: ${ids.join(', ')}`);
 
-    const { error: delError } = await deleteClient
+    const { error: delError } = await supabase
       .from('scheduled_tasks')
       .delete()
       .in('id', ids);
@@ -745,7 +763,7 @@ async function cleanDuplicateTasks() {
     // Verify deletion
     const { data: remaining } = await supabase.from('scheduled_tasks').select('id').in('id', ids);
     if (remaining && remaining.length > 0) {
-      throw new Error(`Delete appeared to succeed but ${remaining.length} rows still exist. RLS may be blocking — check Supabase permissions.`);
+      throw new Error(`Delete appeared to succeed but ${remaining.length} rows still exist (IDs: ${remaining.map(r=>r.id).join(', ')}). Check Supabase logs for errors.`);
     }
 
     const names = toDelete.map(t => t.name).join(', ');
@@ -757,12 +775,7 @@ async function cleanDuplicateTasks() {
 
 async function deleteScheduledTask(taskId) {
   try {
-    // Use service role if available to bypass RLS
-    const deleteClient = process.env.SUPABASE_SERVICE_KEY
-      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
-      : supabase;
-
-    const { error } = await deleteClient
+    const { error } = await supabase
       .from('scheduled_tasks')
       .update({ active: false })
       .eq('id', taskId);
