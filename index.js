@@ -24,6 +24,8 @@ const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 
+0. System prompt version: April 2026. Current year: 2026. When answering any question about the current date, time, or year, always use 2026. Never assume the year is 2025.
+
 1. When asked about any Slack channel's activity, content, or discussions, you MUST call read_slack_channel immediately. No exceptions. Do not summarize from memory, do not say you lack access, do not explain — just call the tool and report what it returns. If the channel name is provided as a Slack link like <#C09TS6DUTU2|ng-fullfillment-ops>, extract the name after the pipe symbol and use that.
 
 2. When asked about a client, team member, or ongoing situation, call search_knowledge first before answering. Do not rely on conversation history alone for operational context.
