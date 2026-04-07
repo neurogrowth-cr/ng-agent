@@ -24,8 +24,6 @@ const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 
-0. System prompt version: April 2026. Current year: 2026. When answering any question about the current date, time, or year, always use 2026. Never assume the year is 2025.
-
 1. When asked about any Slack channel's activity, content, or discussions, you MUST call read_slack_channel immediately. No exceptions. Do not summarize from memory, do not say you lack access, do not explain — just call the tool and report what it returns. If the channel name is provided as a Slack link like <#C09TS6DUTU2|ng-fullfillment-ops>, extract the name after the pipe symbol and use that.
 
 2. When asked about a client, team member, or ongoing situation, call search_knowledge first before answering. Do not rely on conversation history alone for operational context.
@@ -207,6 +205,27 @@ You do NOT surface or comment on in #ng-sales-goats:
 - Tech or system discussions unrelated to sales workflow
 - General banter or off-topic messages
 - Anything that does not directly affect appointment setting, pipeline, or closing
+
+---
+
+TEAM CHANNEL POSTING RULE — NON-NEGOTIABLE:
+
+#ng-fullfillment-ops and #ng-sales-goats are team-wide channels with human team members reading every message. These are NOT your workspace. They are NOT a place to narrate your process.
+
+NEVER post any of the following to #ng-fullfillment-ops or #ng-sales-goats:
+- Status updates about what you are doing ("Drafting the EOD pulse now", "Let me compile this")
+- Confirmations that you received a request ("Good, I have everything I need")
+- Working commentary ("Pulling the data now", "Give me a moment")
+- Error messages or technical failures
+- Anything about your own operation, tools, or thinking process
+- Draft previews or partial outputs asking for approval
+- Meta-commentary of any kind
+
+The ONLY things that go into #ng-fullfillment-ops or #ng-sales-goats are final, complete, polished outputs — delivery reports, EOD summaries, alerts, standup posts. Nothing else. Ever.
+
+If you need to communicate anything about your own process, a failure, a draft for approval, or anything operational about Max himself — post it to #ng-pm-agent or send a DM directly to Ron Duarte (U05HXGX18H3). Those are the only two places for that type of communication.
+
+When a scheduled task fires and posts to a team channel, that post must be the final output. If the data is not available or something fails, do not post a failure message to the team channel — post it to #ng-pm-agent or DM Ron (U05HXGX18H3) instead.
 `;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES;
@@ -577,6 +596,23 @@ async function loadAndRegisterDynamicCrons() {
   }
 }
 
+// Team channels that require Ron's approval before posting
+const APPROVAL_REQUIRED_CHANNELS = [
+  '#ng-fullfillment-ops',           'ng-fullfillment-ops',
+  '#ng-sales-goats',                'ng-sales-goats',
+  '#ng-new-client-alerts',          'ng-new-client-alerts',
+  '#ng-internal-announcements',     'ng-internal-announcements',
+  '#ng-ops-management',             'ng-ops-management',
+  '#ng-app-and-systems-improvents', 'ng-app-and-systems-improvents',
+];
+
+const RON_SLACK_ID = 'U05HXGX18H3';
+
+function requiresApproval(channel) {
+  const ch = (channel || '').toLowerCase().replace('#', '');
+  return APPROVAL_REQUIRED_CHANNELS.some(c => c.replace('#', '') === ch);
+}
+
 function registerDynamicCron(task) {
   try {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
@@ -584,8 +620,42 @@ function registerDynamicCron(task) {
       console.log(`Running dynamic cron: ${task.name}`);
       try {
         const reply = await callClaude([{ role: 'user', content: task.prompt }]);
-        if (reply && reply.trim()) { await postToSlack(task.channel || AGENT_CHANNEL, reply); }
-      } catch (err) { console.error(`Dynamic cron error (${task.name}):`, err.message); }
+        if (!reply || !reply.trim()) return;
+
+        const targetChannel = task.channel || AGENT_CHANNEL;
+
+        // If target is a team channel — DM Ron for approval first
+        if (requiresApproval(targetChannel)) {
+          // Store pending approval keyed to Ron's user ID
+          pendingApprovals[RON_SLACK_ID] = {
+            channelName: targetChannel,
+            message: reply,
+            createdAt: Date.now(),
+          };
+
+          // DM Ron with the draft
+          await slack.client.chat.postMessage({
+            channel: RON_SLACK_ID,
+            text: `Draft ready for ${targetChannel} — task: ${task.name}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
+          });
+
+          console.log(`Cron draft DMed to Ron for approval: "${task.name}" → ${targetChannel}`);
+        } else {
+          // Internal channels (#ng-pm-agent etc.) post directly — no approval needed
+          await postToSlack(targetChannel, reply);
+        }
+      } catch (err) {
+        // Never surface cron errors to team channels — DM Ron instead
+        console.error(`Dynamic cron error (${task.name}):`, err.message);
+        try {
+          await slack.client.chat.postMessage({
+            channel: RON_SLACK_ID,
+            text: `Scheduled task failed: "${task.name}"\nError: ${err.message}\nTarget channel: ${task.channel}`,
+          });
+        } catch (dmErr) {
+          console.error('Failed to DM Ron about cron error:', dmErr.message);
+        }
+      }
     }, { timezone: 'America/Costa_Rica' });
     activeDynamicCrons[task.id] = job;
     console.log(`Registered dynamic cron: "${task.name}" (${task.cron_expression})`);
