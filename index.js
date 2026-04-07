@@ -1361,9 +1361,17 @@ async function runMondayGapDetection() {
     if (!gaps.length) { console.log('Gap detection: no critical gaps found.'); return; }
     const today   = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     const message = `Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
-    await postToSlack(OPS_CHANNEL, message);
-    console.log(`Gap detection: ${gaps.length} gaps posted to ops channel.`);
-    await postToSlack(AGENT_CHANNEL, `🔍 *Monday gap detection complete* — ${gaps.length} issue(s) posted to #ng-fullfillment-ops.`);
+    // Route through Ron for approval before posting to team channel
+    pendingApprovals[RON_SLACK_ID] = {
+      channelName: OPS_CHANNEL,
+      message,
+      createdAt: Date.now(),
+    };
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `Draft ready for ${OPS_CHANNEL} — Monday Gap Detection\n\n${message}\n\nReply "send it" to post or "cancel" to discard.`,
+    });
+    console.log(`Gap detection: ${gaps.length} gap(s) DMed to Ron for approval.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
 }
 
@@ -1371,7 +1379,7 @@ async function runMondayGapDetection() {
 async function runNightlyLearning() {
   console.log('Running nightly learning cycle...');
   try {
-    const channels = ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents'];
+    const channels = ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-ops-management'];
     let digest = '';
     for (const ch of channels) {
       const messages = await readSlackChannel(ch, 20);
@@ -1414,7 +1422,7 @@ async function runNightlyLearning() {
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSlack channels scanned: 4 | Knowledge entries saved: ${saved}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSlack channels scanned: 5 | Knowledge entries saved: ${saved}`);
   } catch (err) { console.error('Nightly learning error:', err.message); }
 }
 
