@@ -618,44 +618,64 @@ function registerDynamicCron(task) {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
     const job = cron.schedule(task.cron_expression, async () => {
       console.log(`Running dynamic cron: ${task.name}`);
-      try {
-        const reply = await callClaude([{ role: 'user', content: task.prompt }]);
-        if (!reply || !reply.trim()) return;
 
-        const targetChannel = task.channel || AGENT_CHANNEL;
+      // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
+      let reply = null;
+      let lastErr = null;
+      const maxAttempts = 3;
+      const retryDelays = [15000, 30000, 60000]; // 15s, 30s, 60s
 
-        // If target is a team channel — DM Ron for approval first
-        if (requiresApproval(targetChannel)) {
-          // Store pending approval keyed to Ron's user ID
-          pendingApprovals[RON_SLACK_ID] = {
-            channelName: targetChannel,
-            message: reply,
-            createdAt: Date.now(),
-          };
-
-          // DM Ron with the draft
-          await slack.client.chat.postMessage({
-            channel: RON_SLACK_ID,
-            text: `Draft ready for ${targetChannel} — task: ${task.name}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
-          });
-
-          console.log(`Cron draft DMed to Ron for approval: "${task.name}" → ${targetChannel}`);
-        } else {
-          // Internal channels (#ng-pm-agent etc.) post directly — no approval needed
-          await postToSlack(targetChannel, reply);
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          reply = await callClaude([{ role: 'user', content: task.prompt }]);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const isOverload = err.status === 529 || err.status === 503 || err.status === 500;
+          if (isOverload && attempt < maxAttempts - 1) {
+            const wait = retryDelays[attempt];
+            console.log(`Cron "${task.name}" overloaded (attempt ${attempt + 1}/${maxAttempts}), retrying in ${wait / 1000}s...`);
+            await new Promise(r => setTimeout(r, wait));
+          } else {
+            break;
+          }
         }
-      } catch (err) {
-        // Never surface cron errors to team channels — DM Ron instead
-        console.error(`Dynamic cron error (${task.name}):`, err.message);
+      }
+
+      // If all retries failed — DM Ron, never post to team channel
+      if (lastErr) {
+        console.error(`Dynamic cron error (${task.name}):`, lastErr.message);
         try {
           await slack.client.chat.postMessage({
             channel: RON_SLACK_ID,
-            text: `Scheduled task failed: "${task.name}"\nError: ${err.message}\nTarget channel: ${task.channel}`,
+            text: `Scheduled task failed after ${maxAttempts} attempts: "${task.name}"\nError: ${lastErr.message}\nTarget channel: ${task.channel}\nThis will retry automatically at the next scheduled run.`,
           });
         } catch (dmErr) {
           console.error('Failed to DM Ron about cron error:', dmErr.message);
         }
+        return;
       }
+
+      if (!reply || !reply.trim()) return;
+
+      const targetChannel = task.channel || AGENT_CHANNEL;
+
+      if (requiresApproval(targetChannel)) {
+        pendingApprovals[RON_SLACK_ID] = {
+          channelName: targetChannel,
+          message: reply,
+          createdAt: Date.now(),
+        };
+        await slack.client.chat.postMessage({
+          channel: RON_SLACK_ID,
+          text: `Draft ready for ${targetChannel} — task: ${task.name}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
+        });
+        console.log(`Cron draft DMed to Ron for approval: "${task.name}" → ${targetChannel}`);
+      } else {
+        await postToSlack(targetChannel, reply);
+      }
+
     }, { timezone: 'America/Costa_Rica' });
     activeDynamicCrons[task.id] = job;
     console.log(`Registered dynamic cron: "${task.name}" (${task.cron_expression})`);
