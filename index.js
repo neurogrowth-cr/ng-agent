@@ -1428,7 +1428,7 @@ async function runNightlyLearning() {
     } catch (portalErr) { console.error('Portal snapshot error in nightly learning:', portalErr.message); }
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}.\n\nBelow is today's activity from key Slack channels. Extract and summarize:\n1. Client status updates (who is blocked, who launched, who needs attention)\n2. Team decisions made today\n3. Open action items that were not resolved\n4. Any patterns or recurring issues worth noting\n\nFormat each insight as: CATEGORY | KEY | VALUE\nCategories: client, team, process, decision, alert\n\nKeep each value under 150 words. Only extract meaningful operational intelligence.\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n\n${digest}`;
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
@@ -1436,9 +1436,12 @@ async function runNightlyLearning() {
     for (const line of lines) {
       const parts = line.split('|').map(p => p.trim());
       if (parts.length >= 3) {
-        const [category, key, ...valueParts] = parts;
+        const [rawCategory, key, ...valueParts] = parts;
+        // Strip any markdown characters and normalize to valid category
+        const category = rawCategory.toLowerCase().replace(/[^a-z]/g, '').trim();
+        const VALID_CATEGORIES = new Set(['client','team','process','decision','alert','intel']);
         const value = valueParts.join('|').trim();
-        if (category && key && value) { await upsertKnowledge(category.toLowerCase(), key, value, 'nightly-learning'); saved++; }
+        if (category && VALID_CATEGORIES.has(category) && key && value) { await upsertKnowledge(category, key, value, 'nightly-learning'); saved++; }
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
