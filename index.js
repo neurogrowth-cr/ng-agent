@@ -1468,6 +1468,91 @@ async function runProactiveAlerts() {
   } catch (err) { console.error('Proactive alert error:', err.message); }
 }
 
+// ─── PROACTIVE TEAM DMs ───────────────────────────────────────────────────────
+// Runs nightly. Checks portal for clients hitting critical milestones tomorrow
+// and DMs the responsible team member before they even have to ask.
+async function runProactiveDMs() {
+  console.log('Running proactive team DMs...');
+  try {
+    const { data: dashboards } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, email, customer_status, customer_type, created_at')
+      .eq('is_active', true)
+      .in('customer_status', ['phase_1', 'phase_2', 'phase_3', 'blocked']);
+
+    if (!dashboards || !dashboards.length) {
+      console.log('Proactive DMs: no at-risk clients found.');
+      return;
+    }
+
+    const now = Date.now();
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStr = tomorrow.toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
+
+    const hitting14Tomorrow   = []; // Day 13 today → Day 14 tomorrow (launch deadline)
+    const hitting7Tomorrow    = []; // Day 6 today → Day 7 tomorrow (at-risk threshold)
+    const blocked             = []; // Currently blocked
+    const stalledPhase1       = []; // Stuck in phase_1 for 4+ days
+    const stalledPhase2       = []; // Stuck in phase_2 for 4+ days
+
+    for (const dash of dashboards) {
+      if (!dash.created_at) continue;
+      const daysSince = Math.floor((now - new Date(dash.created_at).getTime()) / (1000 * 60 * 60 * 24));
+
+      if (daysSince === 13) hitting14Tomorrow.push(dash);
+      else if (daysSince === 6) hitting7Tomorrow.push(dash);
+      if (dash.customer_status === 'blocked') blocked.push(dash);
+      if (dash.customer_status === 'phase_1' && daysSince >= 4) stalledPhase1.push(dash);
+      if (dash.customer_status === 'phase_2' && daysSince >= 4) stalledPhase2.push(dash);
+    }
+
+    // ── DM Josue: clients hitting Day 14 tomorrow ──
+    if (hitting14Tomorrow.length > 0) {
+      const names = hitting14Tomorrow.map(d => `${d.client_name} (Day 13)`).join(', ');
+      const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} their 14-day launch deadline tomorrow: ${names}. If campaigns are not live by end of day tomorrow, we miss the SLA. What needs to happen tonight or first thing tomorrow to make sure they launch on time?`;
+      await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
+      console.log(`Proactive DM sent to Josue: ${hitting14Tomorrow.length} client(s) hitting Day 14 tomorrow`);
+    }
+
+    // ── DM Josue: clients hitting at-risk threshold tomorrow ──
+    if (hitting7Tomorrow.length > 0) {
+      const names = hitting7Tomorrow.map(d => `${d.client_name} (Day 6)`).join(', ');
+      const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} Day 7 tomorrow, which is the at-risk threshold: ${names}. Worth checking their progress today so we're not scrambling next week.`;
+      await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
+      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) hitting Day 7 tomorrow`);
+    }
+
+    // ── DM Valeria: clients stalled in phase_1 ──
+    if (stalledPhase1.length > 0) {
+      const names = stalledPhase1.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
+      const msg = `These clients are still in Phase 1 and have been for a while: ${names}. If any delivery documents are pending on your end, this is the priority. Let Josue know if you're blocked on anything.`;
+      await slack.client.chat.postMessage({ channel: 'U09Q3BXJ18B', text: msg });
+      console.log(`Proactive DM sent to Valeria: ${stalledPhase1.length} client(s) stalled in Phase 1`);
+    }
+
+    // ── DM Felipe: clients stalled in phase_2 ──
+    if (stalledPhase2.length > 0) {
+      const names = stalledPhase2.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
+      const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag Josue if anything is blocked.`;
+      await slack.client.chat.postMessage({ channel: 'U09TNMVML3F', text: msg });
+      console.log(`Proactive DM sent to Felipe: ${stalledPhase2.length} client(s) stalled in Phase 2`);
+    }
+
+    // ── DM Tania: blocked clients ──
+    if (blocked.length > 0) {
+      const names = blocked.map(d => `${d.client_name}`).join(', ');
+      const msg = `These clients are currently blocked: ${names}. If the block is on the client side — missing onboarding form, unresponsive, contract issue — this needs a proactive outreach before it becomes a bigger problem. Can you check what's needed and follow up?`;
+      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
+    }
+
+    console.log('Proactive team DMs complete.');
+  } catch (err) {
+    console.error('Proactive DM error:', err.message);
+  }
+}
+
 // ─── FILE PROCESSING ──────────────────────────────────────────────────────────
 async function downloadSlackFile(fileUrl) {
   const res = await fetch(fileUrl, { headers: { 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` } });
@@ -1851,6 +1936,9 @@ cron.schedule('0 14 * * 1',  async () => { await runMondayGapDetection(); },  { 
 // Proactive alerts — 9:00 AM and 2:00 PM CR (infrastructure — posts stale alerts to agent channel)
 cron.schedule('0 15 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
 cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
+
+// Proactive team DMs — 8:00 PM CR weekdays (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
+cron.schedule('0 2 * * 2-6', async () => { await runProactiveDMs(); },        { timezone: 'America/Costa_Rica' });
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
