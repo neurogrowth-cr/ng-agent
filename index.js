@@ -659,6 +659,40 @@ function registerDynamicCron(task) {
 
       if (!reply || !reply.trim()) return;
 
+      // Guard: reject intermediate/process commentary, force final compiled output.
+      // Triggers on working phrases OR reply too short to be a real report (< 300 chars).
+      const processPhrases = [
+        'let me get the full picture', 'let me compile', 'now i have everything',
+        'give me a moment', 'pulling the data', "i'll pull", 'let me pull',
+        'before writing anything', 'one moment', 'gathering the data',
+        'let me check', 'let me look', 'i need to', 'i will now',
+        "i'll now", 'stand by', 'working on it', 'drafting the', 'compiling the',
+        'let me first', "i'm going to", 'here is what i have so far',
+        'i have all the data', 'i now have',
+      ];
+      const replyLower = reply.toLowerCase();
+      const isTooShort = reply.trim().length < 300;
+      const isProcessCommentary = isTooShort || processPhrases.some(p => replyLower.includes(p));
+
+      if (isProcessCommentary) {
+        console.log(`Cron "${task.name}": incomplete reply detected (${reply.trim().length} chars), re-prompting...`);
+        try {
+          const finalReply = await callClaude([
+            { role: 'user', content: task.prompt },
+            { role: 'assistant', content: reply },
+            { role: 'user', content: 'Stop. Do not narrate your process. You have all the data. Write the complete final report now — every section, all data, final formatting, ready to post. Nothing else.' }
+          ]);
+          if (finalReply && finalReply.trim().length > 300) {
+            reply = finalReply;
+            console.log(`Cron "${task.name}": re-prompt successful (${reply.trim().length} chars)`);
+          } else {
+            console.error(`Cron "${task.name}": re-prompt also returned short reply, using best available.`);
+          }
+        } catch (rePromptErr) {
+          console.error(`Re-prompt failed for "${task.name}":`, rePromptErr.message);
+        }
+      }
+
       const targetChannel = task.channel || AGENT_CHANNEL;
 
       if (requiresApproval(targetChannel)) {
