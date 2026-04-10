@@ -1211,16 +1211,29 @@ async function getMetaAds(adSetId = null, datePreset = 'last_7d') {
 // The old customer_onboarding-based duplicate has been removed entirely.
 async function getClientStatus(clientName = null) {
   try {
-    let dashQuery = portalSupabase
-      .from('client_dashboards')
-      .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler')
-      .eq('is_active', true)
-      .order('customer_status', { ascending: true })
-      .limit(60);
-    if (clientName) {
-      dashQuery = dashQuery.or(`client_name.ilike.%${clientName}%,email.ilike.%${clientName}%`);
+    // Paginate through ALL active clients — no hard limit.
+    // Supabase default page size is 1000. We paginate to handle any future scale.
+    let dashboards = [];
+    let dashFrom = 0;
+    const PAGE_SIZE = 200;
+    while (true) {
+      let dashQuery = portalSupabase
+        .from('client_dashboards')
+        .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler')
+        .eq('is_active', true)
+        .order('customer_status', { ascending: true })
+        .range(dashFrom, dashFrom + PAGE_SIZE - 1);
+      if (clientName) {
+        dashQuery = dashQuery.or(`client_name.ilike.%${clientName}%,email.ilike.%${clientName}%`);
+      }
+      const { data: page, error: dashErr } = await dashQuery;
+      if (dashErr) throw dashErr;
+      if (!page || !page.length) break;
+      dashboards = dashboards.concat(page);
+      if (page.length < PAGE_SIZE) break; // last page — no more rows
+      dashFrom += PAGE_SIZE;
     }
-    const { data: dashboards, error: dashErr } = await dashQuery;
+    const dashErr = null; // kept for downstream compatibility
     if (dashErr) throw dashErr;
     if (!dashboards || !dashboards.length) return clientName ? `No client found matching: ${clientName}` : 'No active clients found in portal.';
 
@@ -1231,7 +1244,7 @@ async function getClientStatus(clientName = null) {
     const templateMap = {};
     (templates || []).forEach(t => { templateMap[t.id] = t; });
 
-    const results = await Promise.all(dashboards.slice(0, 20).map(async (dash) => {
+    const results = await Promise.all(dashboards.map(async (dash) => {
       const { data: onboarding } = await portalSupabase
         .from('customer_onboarding')
         .select('id, first_name, last_name, company, services_products, ideal_customer, service_tier, payment_status')
