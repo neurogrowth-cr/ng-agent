@@ -1240,12 +1240,27 @@ async function getClientStatus(clientName = null) {
       const ob = onboarding?.[0];
       const customerId = ob?.id;
       let activities = [];
-      if (customerId) {
-        const { data: acts } = await portalSupabase
+
+      // customer_activities.customer_id links to client_dashboards.id directly (confirmed via schema query).
+      // The old path via customer_onboarding.id returns empty results for most clients.
+      // Query by client_dashboards.id first (primary), then merge any results from customer_onboarding.id.
+      const { data: actsByDashId } = await portalSupabase
+        .from('customer_activities')
+        .select('id, template_id, status, assigned_to, completed_at, notes')
+        .eq('customer_id', dash.id);
+      activities = actsByDashId || [];
+
+      // Also query by onboarding ID if different, merge without duplicates
+      if (customerId && customerId !== dash.id) {
+        const { data: actsByObId } = await portalSupabase
           .from('customer_activities')
           .select('id, template_id, status, assigned_to, completed_at, notes')
           .eq('customer_id', customerId);
-        activities = acts || [];
+        if (actsByObId && actsByObId.length > 0) {
+          const existingIds = new Set(activities.map(a => a.id));
+          const merged = actsByObId.filter(a => !existingIds.has(a.id));
+          activities = [...activities, ...merged];
+        }
       }
       const total   = activities.length;
       const live    = activities.filter(a => a.status === 'live').length;
