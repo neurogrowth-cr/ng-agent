@@ -659,37 +659,63 @@ function registerDynamicCron(task) {
 
       if (!reply || !reply.trim()) return;
 
-      // Guard: reject intermediate/process commentary, force final compiled output.
-      // Triggers on working phrases OR reply too short to be a real report (< 300 chars).
-      const processPhrases = [
-        'let me get the full picture', 'let me compile', 'now i have everything',
-        'give me a moment', 'pulling the data', "i'll pull", 'let me pull',
-        'before writing anything', 'one moment', 'gathering the data',
-        'let me check', 'let me look', 'i need to', 'i will now',
-        "i'll now", 'stand by', 'working on it', 'drafting the', 'compiling the',
-        'let me first', "i'm going to", 'here is what i have so far',
-        'i have all the data', 'i now have',
-      ];
-      const replyLower = reply.toLowerCase();
-      const isTooShort = reply.trim().length < 300;
-      const isProcessCommentary = isTooShort || processPhrases.some(p => replyLower.includes(p));
+      // ── STRUCTURAL WHITELIST GUARD ───────────────────────────────────────────
+      // Rejects any reply that doesn't contain the expected section headers.
+      // This is a WHITELIST check — the reply must prove it is a final report
+      // by containing at least one known section header. If it doesn't, it gets
+      // rejected and re-prompted regardless of what it says. This is stronger
+      // than a phrase blacklist which always has gaps.
+      //
+      // Each task defines its required headers. If the task name matches a known
+      // task, we check for its headers. Unknown tasks fall back to length check.
+      const TASK_HEADERS = {
+        'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
+        'Fulfillment EOD Pulse':      ['WINS TODAY', 'DELIVERY STATUS', 'BLOCKERS', 'SLA WATCH'],
+        'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS', 'MONDAY PRIORITIES'],
+        'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'MONDAY PRIORITY'],
+        'Sales Call Prep Reminder':   [], // short task, skip header check
+      };
 
-      if (isProcessCommentary) {
-        console.log(`Cron "${task.name}": incomplete reply detected (${reply.trim().length} chars), re-prompting...`);
+      function isValidFinalReport(text, taskName) {
+        const upper = text.toUpperCase();
+        const headers = TASK_HEADERS[taskName];
+        if (headers === undefined) {
+          // Unknown task — fall back to length check only
+          return text.trim().length >= 300;
+        }
+        if (headers.length === 0) {
+          // Short tasks like Sales Call Prep — just check it's not empty
+          return text.trim().length > 20;
+        }
+        // Must contain at least half the expected headers to pass
+        const found = headers.filter(h => upper.includes(h)).length;
+        const threshold = Math.ceil(headers.length / 2);
+        return found >= threshold && text.trim().length >= 300;
+      }
+
+      const isValidReport = isValidFinalReport(reply, task.name);
+
+      if (!isValidReport) {
+        console.log(`Cron "${task.name}": output failed structural validation (${reply.trim().length} chars, missing required headers). Re-prompting...`);
         try {
           const finalReply = await callClaude([
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
-            { role: 'user', content: 'Stop. Do not narrate your process. You have all the data. Write the complete final report now — every section, all data, final formatting, ready to post. Nothing else.' }
+            { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
           ]);
-          if (finalReply && finalReply.trim().length > 300) {
+          if (finalReply && isValidFinalReport(finalReply, task.name)) {
             reply = finalReply;
-            console.log(`Cron "${task.name}": re-prompt successful (${reply.trim().length} chars)`);
+            console.log(`Cron "${task.name}": re-prompt passed validation (${reply.trim().length} chars)`);
           } else {
-            console.error(`Cron "${task.name}": re-prompt also returned short reply, using best available.`);
+            // Re-prompt also failed — DM Ron with an error instead of sending garbage
+            const errMsg = `Scheduled task "${task.name}" failed to produce a valid structured report after 2 attempts. The output did not contain the required section headers. Please trigger this report manually or check Railway logs for details.`;
+            await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: errMsg });
+            console.error(`Cron "${task.name}": re-prompt also failed validation. Notified Ron.`);
+            return;
           }
         } catch (rePromptErr) {
           console.error(`Re-prompt failed for "${task.name}":`, rePromptErr.message);
+          return;
         }
       }
 
