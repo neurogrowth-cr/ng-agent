@@ -1263,11 +1263,22 @@ async function getClientStatus(clientName = null) {
         'blocked': '🔴 Blocked', 'phase_0': '🟠 Phase 0 – Onboarding',
       }[dash.customer_status] || `⚪ ${dash.customer_status}`;
       const statusEmoji = statusLabel.split(' ')[0];
-      const startDate = dash.created_at ? new Date(dash.created_at) : null;
+
+      // Use Activation Call completed_at as Day 1 — this is the correct 14-day SLA anchor.
+      // The activation call checkbox timestamp is set by the operator when the call is done.
+      // Fall back to client_dashboards.created_at only if the activation call hasn't been completed yet.
+      const activationCallAct = activities.find(a => {
+        const title = (templateMap[a.template_id]?.title || '').toLowerCase();
+        return title.includes('activation call') && a.completed_at;
+      });
+      const startDate = activationCallAct
+        ? new Date(activationCallAct.completed_at)
+        : (dash.created_at ? new Date(dash.created_at) : null);
       const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      const dayAnchor = activationCallAct ? 'since activation call' : 'since portal creation';
       const lines = [
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
-        `${statusLabel} | Day ${daysSince || '?'} since created`,
+        `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}`,
         total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
         blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
         pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
