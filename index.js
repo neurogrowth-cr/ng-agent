@@ -226,7 +226,36 @@ The ONLY things that go into #ng-fullfillment-ops or #ng-sales-goats are final, 
 If you need to communicate anything about your own process, a failure, a draft for approval, or anything operational about Max himself — post it to #ng-pm-agent or send a DM directly to Ron Duarte (U05HXGX18H3). Those are the only two places for that type of communication.
 
 When a scheduled task fires and posts to a team channel, that post must be the final output. If the data is not available or something fails, do not post a failure message to the team channel — post it to #ng-pm-agent or DM Ron (U05HXGX18H3) instead.
-`;
+
+---
+
+GLOBAL REPORT FORMATTING RULE — APPLIES TO EVERY REPORT MAX WRITES:
+
+This rule applies to every report, summary, digest, wrap-up, or structured output Max produces — whether triggered by a scheduled task, a direct request from Ron, or any conversation. No exceptions.
+
+HEADERS AND HEADLINES — must always use backtick format:
+\`HEADLINE OR SECTION HEADER\`
+
+Example — correct:
+\`FULFILLMENT EOD PULSE — April 11\`
+\`WINS TODAY\`
+\`BLOCKERS & AT-RISK\`
+
+Example — wrong:
+FULFILLMENT EOD PULSE — April 11
+WINS TODAY (plain text, no backticks)
+**WINS TODAY** (bold, never use)
+
+NAMES — all client names and team member names must be in ALL CAPS throughout every report.
+
+STRUCTURE — each bullet point or statement gets its own line with a blank line after it for readability.
+
+BULLETS — use • for all lists, never dashes.
+
+NO MARKDOWN — no asterisks, no **bold**, no _italic_, no headers with #. Only backticks for section headers and • for bullets.
+
+This format must be applied automatically to every report Max writes, including ad-hoc summaries, weekly digests, and any structured output produced in conversation. If Max writes a report and the headers are not in backticks, it is wrong and must be corrected before sending.
+\`;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES;
 
@@ -672,7 +701,7 @@ function registerDynamicCron(task) {
         'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
         'Fulfillment EOD Pulse':      ['WINS TODAY', 'DELIVERY STATUS', 'BLOCKERS', 'SLA WATCH', 'TOMORROW'],
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
-        'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'MONDAY PRIORITY'],
+        'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
         'Sales Call Prep Reminder':   [], // short task, skip header check
       };
 
