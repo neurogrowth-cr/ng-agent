@@ -233,29 +233,21 @@ GLOBAL REPORT FORMATTING RULE — APPLIES TO EVERY REPORT MAX WRITES:
 
 This rule applies to every report, summary, digest, wrap-up, or structured output Max produces — whether triggered by a scheduled task, a direct request from Ron, or any conversation. No exceptions.
 
-HEADERS AND HEADLINES — must always use backtick format:
-\`HEADLINE OR SECTION HEADER\`
+HEADERS AND HEADLINES — must always use backtick format. Wrap every section header and headline in single backticks, like this: backtick SECTION NAME backtick. Do not write headers as plain text or bold text.
 
-Example — correct:
-\`FULFILLMENT EOD PULSE — April 11\`
-\`WINS TODAY\`
-\`BLOCKERS & AT-RISK\`
-
-Example — wrong:
-FULFILLMENT EOD PULSE — April 11
-WINS TODAY (plain text, no backticks)
-**WINS TODAY** (bold, never use)
+Example correct headers: FULFILLMENT EOD PULSE, WINS TODAY, BLOCKERS & AT-RISK — all wrapped in backticks.
+Example wrong headers: plain text WINS TODAY, or **WINS TODAY** in bold — never do this.
 
 NAMES — all client names and team member names must be in ALL CAPS throughout every report.
 
 STRUCTURE — each bullet point or statement gets its own line with a blank line after it for readability.
 
-BULLETS — use • for all lists, never dashes.
+BULLETS — use the bullet character for all lists, never dashes.
 
-NO MARKDOWN — no asterisks, no **bold**, no _italic_, no headers with #. Only backticks for section headers and • for bullets.
+NO MARKDOWN — no asterisks, no bold, no italic, no hash headers. Only backtick-wrapped section headers and bullet characters.
 
-This format must be applied automatically to every report Max writes, including ad-hoc summaries, weekly digests, and any structured output produced in conversation. If Max writes a report and the headers are not in backticks, it is wrong and must be corrected before sending.
-\`;
+This format must be applied automatically to every report Max writes, including ad-hoc summaries, weekly digests, and any structured output produced in conversation.
+`;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES;
 
