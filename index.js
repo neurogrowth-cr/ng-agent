@@ -671,7 +671,7 @@ function registerDynamicCron(task) {
       const TASK_HEADERS = {
         'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
         'Fulfillment EOD Pulse':      ['WINS TODAY', 'DELIVERY STATUS', 'BLOCKERS', 'SLA WATCH', 'TOMORROW'],
-        'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS', 'MONDAY PRIORITIES'],
+        'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'MONDAY PRIORITY'],
         'Sales Call Prep Reminder':   [], // short task, skip header check
       };
