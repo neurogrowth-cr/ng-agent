@@ -69,7 +69,7 @@ Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Pro
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Joseph Salazar (U0A9J00EMGD) — Appointment Setter. Books discovery calls.
 Debbanny Romero (U0AR16QVDB3) — Appointment Setter. Books discovery calls.
-Jose/Jonathan Navarrete (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting.
+Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999) — High-Ticket Closers. They close deals after setting.
 
 ---
 
@@ -300,7 +300,8 @@ const TEAM_MEMBERS = {
   'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe'     },
   'U0A9J00EMGD': { name: 'Joseph',   role: 'setter',         displayName: 'Joseph'     },
   'U0AR16QVDB3': { name: 'Debbanny', role: 'setter',         displayName: 'Debbanny'   },
-  'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose'       },
+  'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza' },
+  'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
 
 const ROLE_PERMISSIONS = {
@@ -434,7 +435,7 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with Jose (also known as Jonathan), the High-Ticket Closer at NeuroGrowth. He takes booked calls from Joseph and closes them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Joseph and Debbanny and close them into paying clients.
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
@@ -1393,6 +1394,168 @@ async function getPortalAlerts() {
   }
 }
 
+// ─── SALES INTELLIGENCE (iClosed + RevOps) ───────────────────────────────────
+// Queries revops_* tables in the portal Supabase project.
+// Tables are populated by the iClosed webhook pipeline.
+// setter_id / closer_id mapping — update when David confirms the ID format.
+const SALES_TEAM_MAP = {
+  // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
+  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+  '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
+
+  // ── CLOSERS — iClosed identifies hosts by email address ─────────────────
+  'ronny.duarte@neurogrowth.io':  'Ron Duarte',
+  'jose.neurogrowth@gmail.com':   'Jose Carranza',
+  'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
+
+  // ── FALLBACK — GHL user IDs for closers if iClosed uses those instead ───
+  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+  'izlta0jy5orkymsyltjv': 'Jose Carranza',       'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+};
+function resolveSalesMember(id) {
+  if (!id) return 'Unknown';
+  return SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()] || id;
+}
+
+async function getSalesIntelligence(query) {
+  try {
+    const q = (query || '').toLowerCase();
+    const now = new Date();
+    const todayStart = new Date(now); todayStart.setHours(0,0,0,0);
+    const todayEnd   = new Date(now); todayEnd.setHours(23,59,59,999);
+    const weekStart  = new Date(now); weekStart.setDate(now.getDate() - now.getDay());  weekStart.setHours(0,0,0,0);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    // ── Query 1: appointments with prospect names ──────────────────────────
+    const { data: appointments } = await portalSupabase
+      .from('revops_appointments')
+      .select(`
+        id, setter_id, closer_id, booked_at, scheduled_start,
+        attended, no_show_reason, reschedule_count, meeting_type, iclosed_call_id,
+        prospect:prospect_id ( full_name, company, email, lead_source, setter_owner_id, closer_owner_id, status )
+      `)
+      .order('scheduled_start', { ascending: false })
+      .limit(200);
+
+    // ── Query 2: outcomes joined to appointments ───────────────────────────
+    const { data: outcomes } = await portalSupabase
+      .from('revops_sales_outcomes')
+      .select('appointment_id, outcome, offer_pitched, proposed_value, closed_revenue, close_date, lost_reason, objection_category, notes')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    const outcomeMap = {};
+    (outcomes || []).forEach(o => { outcomeMap[o.appointment_id] = o; });
+
+    const appts = appointments || [];
+
+    if (!appts.length) {
+      return 'No sales data found yet. The iClosed webhook pipeline is being set up — once the first bookings flow in, I can answer questions about setters, call outcomes, close rates, and pipeline health.';
+    }
+
+    // ── TODAY'S CALLS ──────────────────────────────────────────────────────
+    if (q.includes('today') || q.includes('hoy')) {
+      const todayCalls = appts.filter(a => {
+        const d = new Date(a.scheduled_start);
+        return d >= todayStart && d <= todayEnd;
+      });
+      if (!todayCalls.length) return 'No calls scheduled for today.';
+      const lines = todayCalls.map(a => {
+        const name    = a.prospect?.full_name || 'Unknown prospect';
+        const setter  = resolveSalesMember(a.setter_id || a.prospect?.setter_owner_id);
+        const closer  = resolveSalesMember(a.closer_id);
+        const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+        const outcome = outcomeMap[a.id];
+        const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
+        return `${name} — ${time} CR — setter: ${setter} — closer: ${closer} — ${status}`;
+      });
+      return `${todayCalls.length} call(s) today:\n\n${lines.join('\n')}`;
+    }
+
+    // ── PROSPECT LOOKUP ────────────────────────────────────────────────────
+    const prospectKeywords = appts.map(a => a.prospect?.full_name?.toLowerCase()).filter(Boolean);
+    const matchedProspect = appts.find(a => a.prospect?.full_name && q.includes(a.prospect.full_name.toLowerCase().split(' ')[0]));
+    if (matchedProspect || q.includes('prospect') || q.includes('call with') || q.includes('quien atendio') || q.includes('who booked') || q.includes('setter') && q.length < 60) {
+      const target = matchedProspect;
+      if (target) {
+        const setter  = resolveSalesMember(target.setter_id || target.prospect?.setter_owner_id);
+        const closer  = resolveSalesMember(target.closer_id);
+        const time    = target.scheduled_start ? new Date(target.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unknown time';
+        const outcome = outcomeMap[target.id];
+        const lines   = [
+          `Prospect: ${target.prospect?.full_name || 'Unknown'}`,
+          `Company: ${target.prospect?.company || 'N/A'}`,
+          `Booked by setter: ${setter}`,
+          `Assigned closer: ${closer}`,
+          `Scheduled: ${time} CR`,
+          `Attended: ${target.attended === true ? 'Yes' : target.attended === false ? 'No — ' + (target.no_show_reason || 'no reason given') : 'Not recorded'}`,
+          target.reschedule_count > 0 ? `Rescheduled: ${target.reschedule_count}x` : '',
+          outcome ? `Outcome: ${outcome.outcome}` : 'Outcome: not recorded yet',
+          outcome?.offer_pitched ? `Offer pitched: ${outcome.offer_pitched}` : '',
+          outcome?.closed_revenue ? `Revenue closed: $${outcome.closed_revenue}` : '',
+          outcome?.lost_reason    ? `Lost reason: ${outcome.lost_reason}` : '',
+          outcome?.objection_category ? `Objection: ${outcome.objection_category}` : '',
+        ].filter(Boolean);
+        return lines.join('\n');
+      }
+    }
+
+    // ── SETTER PERFORMANCE ─────────────────────────────────────────────────
+    if (q.includes('setter') || q.includes('joseph') || q.includes('debbanny') || q.includes('booked')) {
+      const byDate = q.includes('week') ? weekStart : q.includes('month') ? monthStart : null;
+      const filtered = byDate ? appts.filter(a => new Date(a.booked_at) >= byDate) : appts;
+      const counts = {};
+      filtered.forEach(a => {
+        const name = resolveSalesMember(a.setter_id || a.prospect?.setter_owner_id);
+        counts[name] = (counts[name] || 0) + 1;
+      });
+      const period = q.includes('week') ? 'this week' : q.includes('month') ? 'this month' : 'all time';
+      const lines = Object.entries(counts).sort((a,b) => b[1]-a[1]).map(([name, count]) => `${name}: ${count} bookings`);
+      return `Setter bookings ${period}:\n\n${lines.join('\n')}`;
+    }
+
+    // ── CLOSE RATE / OUTCOMES ─────────────────────────────────────────────
+    if (q.includes('close rate') || q.includes('outcome') || q.includes('closed') || q.includes('won') || q.includes('lost')) {
+      const byDate = q.includes('week') ? weekStart : q.includes('month') ? monthStart : null;
+      const relevantOutcomes = byDate
+        ? outcomes?.filter(o => new Date(o.close_date || o.created_at) >= byDate) || []
+        : outcomes || [];
+      if (!relevantOutcomes.length) return 'No outcome data recorded yet.';
+      const total  = relevantOutcomes.length;
+      const won    = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('won') || o.outcome?.toLowerCase().includes('closed')).length;
+      const lost   = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('lost')).length;
+      const noShow = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('no_show') || o.outcome?.toLowerCase().includes('no show')).length;
+      const revenue = relevantOutcomes.reduce((sum, o) => sum + (parseFloat(o.closed_revenue) || 0), 0);
+      const period  = q.includes('week') ? 'this week' : q.includes('month') ? 'this month' : 'all time';
+      return [
+        `Sales outcomes ${period}:`,
+        `Total calls with outcomes: ${total}`,
+        `Won/Closed: ${won} (${total > 0 ? Math.round(won/total*100) : 0}%)`,
+        `Lost: ${lost}`,
+        `No-shows: ${noShow}`,
+        revenue > 0 ? `Revenue closed: $${revenue.toLocaleString()}` : '',
+      ].filter(Boolean).join('\n');
+    }
+
+    // ── DEFAULT: PIPELINE SUMMARY ─────────────────────────────────────────
+    const scheduled = appts.filter(a => new Date(a.scheduled_start) >= now).length;
+    const thisWeek  = appts.filter(a => new Date(a.scheduled_start) >= weekStart).length;
+    const withOutcome = Object.keys(outcomeMap).length;
+    const won = outcomes?.filter(o => o.outcome?.toLowerCase().includes('won') || o.outcome?.toLowerCase().includes('closed')).length || 0;
+    return [
+      `Sales pipeline summary:`,
+      `Total appointments on record: ${appts.length}`,
+      `Upcoming (not yet held): ${scheduled}`,
+      `This week: ${thisWeek}`,
+      `Outcomes recorded: ${withOutcome}`,
+      won > 0 ? `Deals closed: ${won}` : 'No closed deals recorded yet',
+    ].join('\n');
+
+  } catch (err) {
+    return `Sales intelligence error: ${err.message}`;
+  }
+}
+
 // ─── GHL CONVERSATIONS ────────────────────────────────────────────────────────
 async function getGHLConversations(limit = 20, unreadOnly = false) {
   try {
@@ -1783,6 +1946,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
+          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: which setter booked a call, call outcomes, close rates, how many calls today/this week, prospect lookup by name, setter performance stats, pipeline summary. Covers revops_appointments, revops_sales_outcomes, and revops_prospects tables.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
@@ -1816,6 +1980,7 @@ async function callClaude(messages, retries = 3, userId = null) {
             else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
             else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
             else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
+            else if (toolUse.name === 'get_sales_intelligence')  result = await getSalesIntelligence(toolUse.input.query);
             else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
             else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
             else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
@@ -2072,7 +2237,7 @@ cron.schedule('0 2 * * 2-6', async () => { await runProactiveDMs(); },        { 
 const GHL_USER_NAMES = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
   '5orsahkh2joujb5fczrp': 'Debbanny',       '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
-  'gqymykpddltdxvbkfl2c': 'Jonnathan Navarrete', 'gqYMYkpDDlTdxvBkfl2C': 'Jonnathan Navarrete',
+  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
 };
 
