@@ -1753,10 +1753,18 @@ async function callClaude(messages, retries = 3, userId = null) {
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
+      // Inject current Costa Rica date/time into every Claude call so Max always knows when he is
+      const nowCR = new Date().toLocaleString('en-US', {
+        timeZone: 'America/Costa_Rica',
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: true
+      });
+      const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
+      const basePrompt = userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT;
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 2048,
-        system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
+        system: basePrompt + timeContext,
         messages,
         tools: [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
