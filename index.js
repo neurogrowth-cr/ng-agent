@@ -1582,6 +1582,13 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
     if (!convos.length) return 'No conversations found.';
     const now      = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
+    // GHL user ID to name map for setter resolution
+    const GHL_USERS = {
+      'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+      '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
+      'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+      'izlta0jy5orkymsyltjv': 'Jose Carranza', 'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+    };
     const lines = convos.map(c => {
       const lastDate  = new Date(c.lastMessageDate).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const age       = Math.floor((now - c.lastMessageDate) / oneDayMs);
@@ -1589,7 +1596,10 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       const direction = c.lastMessageDirection === 'inbound' ? '<-- inbound' : '--> outbound';
       const channel   = c.lastMessageType?.replace('TYPE_', '') || 'unknown';
       const stale     = age >= 3 ? ` [${age}d ago - needs follow-up]` : '';
-      return `${c.contactName || c.fullName || 'Unknown'} | ${channel} | ${direction}${unread}${stale}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+      // Resolve assigned setter from GHL user ID
+      const assignedId   = c.assignedTo || c.userId || '';
+      const assignedName = GHL_USERS[assignedId] || GHL_USERS[assignedId.toLowerCase()] || (assignedId ? `user:${assignedId}` : 'unassigned');
+      return `${c.contactName || c.fullName || 'Unknown'} | setter: ${assignedName} | ${channel} | ${direction}${unread}${stale}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
     });
     const unreadCount = convos.filter(c => c.unreadCount > 0).length;
     const staleCount  = convos.filter(c => (now - c.lastMessageDate) / oneDayMs >= 3).length;
