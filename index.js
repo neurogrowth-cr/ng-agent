@@ -1853,6 +1853,40 @@ async function runProactiveDMs() {
       console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
     }
 
+    // ── DM Tania: clients hitting Day 20 in Phase 3 (stabilization) ──
+    // Uses stabilization_started_at as the Day 1 anchor.
+    // Day 20 = time to reach out, schedule the 1:1 progress check, coordinate with client.
+    const { data: phase3Clients } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, stabilization_started_at')
+      .eq('is_active', true)
+      .eq('customer_status', 'phase_3')
+      .not('stabilization_started_at', 'is', null);
+
+    const hitting20InStabilization = (phase3Clients || []).filter(d => {
+      const daysInStabilization = Math.floor((now - new Date(d.stabilization_started_at).getTime()) / (1000 * 60 * 60 * 24));
+      return daysInStabilization === 20;
+    });
+
+    const approaching20InStabilization = (phase3Clients || []).filter(d => {
+      const daysInStabilization = Math.floor((now - new Date(d.stabilization_started_at).getTime()) / (1000 * 60 * 60 * 24));
+      return daysInStabilization === 18; // 2-day heads up before Day 20
+    });
+
+    if (hitting20InStabilization.length > 0) {
+      const names = hitting20InStabilization.map(d => d.client_name).join(', ');
+      const msg = `Day 20 in stabilization today for: ${names}. This is the checkpoint — time to reach out to the client, schedule the 1:1 progress check, and confirm how the campaign is performing. Can you get that call on the calendar and flag anything that needs Ron's attention?`;
+      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      console.log(`Proactive DM sent to Tania: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
+    }
+
+    if (approaching20InStabilization.length > 0) {
+      const names = approaching20InStabilization.map(d => d.client_name).join(', ');
+      const msg = `Heads up — these clients hit Day 20 in stabilization in 2 days: ${names}. Start preparing the 1:1 progress check outreach so it's ready to go on Day 20.`;
+      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      console.log(`Proactive DM sent to Tania: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
+    }
+
     console.log('Proactive team DMs complete.');
   } catch (err) {
     console.error('Proactive DM error:', err.message);
@@ -1963,7 +1997,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'read_google_doc',      description: 'Read the text content of a Google Doc. Accepts a Google Docs URL or document ID.',      input_schema: { type: 'object', properties: { documentId: { type: 'string', description: 'Google Docs URL or document ID' } }, required: ['documentId'] } },
           { name: 'read_slack_channel',   description: 'Read recent messages from a NeuroGrowth Slack channel. Always use this tool when asked about channel activity — never answer from memory.', input_schema: { type: 'object', properties: { channelName: { type: 'string', description: 'Channel name e.g. ng-fullfillment-ops, ng-sales-goats, ng-ops-management, ng-new-client-alerts, ng-app-and-systems-improvents' }, messageCount: { type: 'number', description: 'Messages to pull, max 20' } }, required: ['channelName'] } },
           { name: 'draft_channel_post',   description: "Prepare a Slack channel post for Ron's approval before sending.",                        input_schema: { type: 'object', properties: { channelName: { type: 'string' }, message: { type: 'string' } }, required: ['channelName','message'] } },
-          { name: 'get_ghl_conversations',description: 'Get recent GHL conversations — prospects and contacts across all channels. Shows unread messages and contacts that need follow-up.',                                                                                                                        input_schema: { type: 'object', properties: { limit: { type: 'number', description: 'Number of conversations to pull, default 20' }, unreadOnly: { type: 'boolean', description: 'Set true to only show unread conversations' } } } },
+          { name: 'get_ghl_conversations',description: 'Get recent GHL conversations — prospects and contacts across all channels. Each conversation includes the assigned setter name (or "unassigned" if no owner is set — that is a valid complete answer, not an error). Use this to answer questions about which setter is working a prospect, or whether a prospect is unassigned.',                                                                                                                        input_schema: { type: 'object', properties: { limit: { type: 'number', description: 'Number of conversations to pull, default 20' }, unreadOnly: { type: 'boolean', description: 'Set true to only show unread conversations' } } } },
           { name: 'search_knowledge',     description: "Search the agent's long-term knowledge base for accumulated intelligence about clients, team, processes, and decisions.", input_schema: { type: 'object', properties: { query: { type: 'string' }, category: { type: 'string', description: 'Optional: client, team, process, decision, alert, intel' } }, required: ['query'] } },
           { name: 'save_knowledge',       description: 'Save an important insight to long-term memory. Use when Ron shares important context or when a pattern emerges.',  input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' }, key: { type: 'string', description: 'Short identifier e.g. Max Valverde or onboarding bottleneck' }, value: { type: 'string', description: 'The knowledge to store' } }, required: ['category','key','value'] } },
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
@@ -2193,9 +2227,43 @@ slack.event('app_mention', async ({ event, say }) => {
   if (event.bot_id) return;
   const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!cleanText) return;
-  const userId  = event.user;
+  const userId = event.user;
+
+  // If this mention is inside a thread, fetch the full thread context first
+  let threadContext = '';
+  if (event.thread_ts && event.thread_ts !== event.ts) {
+    try {
+      const threadResult = await slack.client.conversations.replies({
+        channel: event.channel,
+        ts: event.thread_ts,
+        limit: 50,
+      });
+      const threadMessages = (threadResult.messages || []).filter(m => m.ts !== event.ts);
+      if (threadMessages.length > 0) {
+        const channelInfo = await slack.client.conversations.info({ channel: event.channel }).catch(() => null);
+        const channelName = channelInfo?.channel?.name || 'unknown channel';
+        threadContext = `\n\nTHREAD CONTEXT from #${channelName} (read this before responding — this is what was discussed before you were tagged):\n` +
+          threadMessages.map(m => {
+            const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const sender = m.bot_id ? 'Max' : (m.user === event.user ? 'Ron' : `user:${m.user}`);
+            return `[${time}] ${sender}: ${(m.text || '').substring(0, 300)}`;
+          }).join('\n');
+
+        // Save this thread to knowledge base so Max remembers it
+        const threadSummaryKey = `thread:${event.channel}:${event.thread_ts}`;
+        await upsertKnowledge('process', threadSummaryKey,
+          `Thread tagged for Max on ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica' })} in #${channelInfo?.channel?.name || 'unknown'}. Last action: "${cleanText.substring(0, 200)}"`,
+          'thread-mention'
+        );
+      }
+    } catch (threadErr) {
+      console.error('Thread context fetch error:', threadErr.message);
+    }
+  }
+
   const history = await loadHistory(userId);
-  history.push({ role: 'user', content: cleanText });
+  const fullMessage = threadContext ? `${threadContext}\n\nMY TASK (what I was just tagged to do): ${cleanText}` : cleanText;
+  history.push({ role: 'user', content: fullMessage });
   try {
     let reply = await callClaude(history, 3, userId);
     if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId); }
