@@ -273,6 +273,23 @@ const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || '#ng-internal
 
 const pendingApprovals = {};
 
+// ─── SLACK CHANNEL LIST CACHE ─────────────────────────────────────────────────
+// conversations.list is rate-limited — cache for 10 minutes instead of calling per-request
+let channelListCache = null;
+let channelListCachedAt = 0;
+const CHANNEL_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function getCachedChannelList() {
+  const now = Date.now();
+  if (channelListCache && (now - channelListCachedAt) < CHANNEL_CACHE_TTL_MS) {
+    return channelListCache;
+  }
+  const result = await slack.client.conversations.list({ limit: 200, types: 'public_channel,private_channel,mpim,im' });
+  channelListCache = result.channels;
+  channelListCachedAt = now;
+  return channelListCache;
+}
+
 const userRateLimits = {};
 function isRateLimited(userId) {
   const now = Date.now();
@@ -1370,7 +1387,6 @@ async function getClientStatus(clientName = null) {
 }
 
 // ─── PORTAL: ALERTS ───────────────────────────────────────────────────────────
-// FIX 2: Single definition only. Queries client_dashboards (correct schema).
 async function getPortalAlerts() {
   try {
     const { data: dashboards, error } = await portalSupabase
@@ -1382,24 +1398,49 @@ async function getPortalAlerts() {
     if (error) throw error;
     if (!dashboards || !dashboards.length) return '✅ No blocked or at-risk clients. All clients on track.';
 
+    // Fetch templates upfront so we can resolve activity titles and find activation call
+    const { data: templates } = await portalSupabase
+      .from('customer_activity_templates')
+      .select('id, title');
+    const templateMap = {};
+    (templates || []).forEach(t => { templateMap[t.id] = t.title; });
+
     const now    = Date.now();
     const alerts = [];
     for (const dash of dashboards) {
-      const startDate = dash.created_at ? new Date(dash.created_at) : null;
-      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+      // ── Dual-path activity query: dash.id first, merge onboarding.id if different ──
+      const { data: actsByDashId } = await portalSupabase
+        .from('customer_activities')
+        .select('template_id, status, notes, completed_at')
+        .eq('customer_id', dash.id);
+      let allActs = actsByDashId || [];
+
       const { data: onboarding } = await portalSupabase.from('customer_onboarding').select('id').eq('email', dash.email).limit(1);
-      let blockedDetails = '';
-      if (onboarding?.[0]) {
-        const { data: acts } = await portalSupabase
-          .from('customer_activities').select('template_id, status, notes')
-          .eq('customer_id', onboarding[0].id).eq('status', 'blocked');
-        if (acts?.length) {
-          const { data: tmpl } = await portalSupabase.from('customer_activity_templates').select('id, title').in('id', acts.map(a => a.template_id));
-          const titleMap = {};
-          (tmpl || []).forEach(t => { titleMap[t.id] = t.title; });
-          blockedDetails = acts.map(a => titleMap[a.template_id] || 'Unknown').join(', ');
+      if (onboarding?.[0] && onboarding[0].id !== dash.id) {
+        const { data: actsByObId } = await portalSupabase
+          .from('customer_activities')
+          .select('template_id, status, notes, completed_at')
+          .eq('customer_id', onboarding[0].id);
+        if (actsByObId?.length) {
+          const existingIds = new Set(allActs.map(a => a.template_id + a.status));
+          allActs = [...allActs, ...actsByObId.filter(a => !existingIds.has(a.template_id + a.status))];
         }
       }
+
+      // ── Day anchor: activation call completed_at → fallback to created_at ──
+      const activationAct = allActs.find(a => {
+        const title = (templateMap[a.template_id] || '').toLowerCase();
+        return title.includes('activation call') && a.completed_at;
+      });
+      const startDate = activationAct
+        ? new Date(activationAct.completed_at)
+        : (dash.created_at ? new Date(dash.created_at) : null);
+      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+
+      // ── Blocked activity details ──
+      const blockedActs = allActs.filter(a => a.status === 'blocked');
+      const blockedDetails = blockedActs.map(a => templateMap[a.template_id] || 'Unknown').join(', ');
+
       if (dash.customer_status === 'blocked') {
         alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
       } else if (daysSince >= 14) {
@@ -1619,8 +1660,8 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
 async function readSlackChannel(channelName, messageCount = 20) {
   const linkMatch = channelName.match(/<#[A-Z0-9]+\|([^>]+)>/);
   const cleanName = linkMatch ? linkMatch[1] : channelName.replace('#', '');
-  const result    = await slack.client.conversations.list({ limit: 200, types: 'public_channel,private_channel,mpim,im' });
-  const channel   = result.channels.find(c => c.name === cleanName);
+  const channels  = await getCachedChannelList();
+  const channel   = channels.find(c => c.name === cleanName);
   if (!channel) return `Channel ${channelName} not found or agent not invited.`;
   try {
     const history  = await slack.client.conversations.history({ channel: channel.id, limit: Math.min(messageCount, 20) });
@@ -1676,11 +1717,31 @@ async function runMondayGapDetection() {
     const now  = Date.now();
     const gaps = [];
     for (const dash of dashboards) {
-      const daysSince = dash.created_at ? Math.floor((now - new Date(dash.created_at).getTime()) / (1000*60*60*24)) : 0;
+      // ── Dual-path activity query: dash.id first, merge onboarding.id if different ──
+      const { data: actsByDashId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at').eq('customer_id', dash.id).in('status', ['blocked','phase_1','phase_2']);
+      let acts = actsByDashId || [];
+
       const { data: onboarding } = await portalSupabase.from('customer_onboarding').select('id').eq('email', dash.email).limit(1);
-      if (!onboarding?.[0]) continue;
-      const { data: acts } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at').eq('customer_id', onboarding[0].id).in('status', ['blocked','phase_1','phase_2']);
-      if (!acts?.length) continue;
+      if (onboarding?.[0] && onboarding[0].id !== dash.id) {
+        const { data: actsByObId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at').eq('customer_id', onboarding[0].id).in('status', ['blocked','phase_1','phase_2']);
+        if (actsByObId?.length) {
+          const existingIds = new Set(acts.map(a => a.template_id + a.status));
+          acts = [...acts, ...actsByObId.filter(a => !existingIds.has(a.template_id + a.status))];
+        }
+      }
+
+      if (!acts.length) continue;
+
+      // ── Day anchor: activation call completed_at → fallback to created_at ──
+      // Fetch all activities (not just in-progress) to find completed activation call
+      const { data: allActsForAnchor } = await portalSupabase.from('customer_activities').select('template_id, status, completed_at').eq('customer_id', dash.id);
+      const activationAct = (allActsForAnchor || []).find(a => {
+        const title = (tMap[a.template_id] || '').toLowerCase();
+        return title.includes('activation call') && a.completed_at;
+      });
+      const startDate = activationAct ? new Date(activationAct.completed_at) : (dash.created_at ? new Date(dash.created_at) : null);
+      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000*60*60*24)) : 0;
+
       const staleActs = acts.filter(a => { const u = a.updated_at ? new Date(a.updated_at).getTime() : 0; return (now - u) > (72*60*60*1000); });
       if (dash.customer_status === 'blocked') {
         const blockedTitles = acts.filter(a=>a.status==='blocked').map(a=>tMap[a.template_id]||'Unknown').join(', ');
@@ -1760,7 +1821,17 @@ async function runNightlyLearning() {
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
     await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSlack channels scanned: 5 | Knowledge entries saved: ${saved}`);
-  } catch (err) { console.error('Nightly learning error:', err.message); }
+  } catch (err) {
+    console.error('Nightly learning error:', err.message);
+    try {
+      await slack.client.chat.postMessage({
+        channel: RON_SLACK_ID,
+        text: `Nightly learning failed: ${err.message}. Knowledge base was not updated tonight. Check Railway logs for details.`,
+      });
+    } catch (dmErr) {
+      console.error('Failed to DM Ron about nightly learning error:', dmErr.message);
+    }
+  }
 }
 
 // ─── PROACTIVE ALERTS ─────────────────────────────────────────────────────────
@@ -1981,20 +2052,16 @@ async function callClaude(messages, retries = 3, userId = null) {
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      // Inject current Costa Rica date/time into every Claude call so Max always knows when he is
+      // Inject current Costa Rica date/time — built once, reused in ALL calls (initial + follow-ups)
       const nowCR = new Date().toLocaleString('en-US', {
         timeZone: 'America/Costa_Rica',
         weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
         hour: '2-digit', minute: '2-digit', hour12: true
       });
       const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
-      const basePrompt = userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT;
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 2048,
-        system: basePrompt + timeContext,
-        messages,
-        tools: [
+      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext;
+
+      const TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
           { name: 'get_notion_page',      description: 'Get the content of a specific Notion page by its ID',                                   input_schema: { type: 'object', properties: { page_id: { type: 'string' } }, required: ['page_id'] } },
           { name: 'get_recent_emails',    description: "Get recent unread emails from Ron's Gmail inbox including full email body content",      input_schema: { type: 'object', properties: {} } },
@@ -2021,70 +2088,94 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_meta_campaigns',   description: 'Get Meta Ads campaign-level breakdown.',                                                  input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' }, limit: { type: 'number', description: 'Number of campaigns, default 10' } } } },
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
-        ],
+      ];
+
+      // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
+      async function dispatchTool(toolUse) {
+        let result;
+        if      (toolUse.name === 'search_notion')          result = await searchNotion(toolUse.input.query);
+        else if (toolUse.name === 'get_notion_page')        result = await getNotionPage(toolUse.input.page_id);
+        else if (toolUse.name === 'get_recent_emails')      result = await getRecentEmails();
+        else if (toolUse.name === 'send_email')             result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
+        else if (toolUse.name === 'get_calendar_events')    result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
+        else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? r.substring(0, 4000) + '...[trimmed]' : r; }
+        else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
+        else if (toolUse.name === 'read_google_doc')        result = await readGoogleDoc(extractGoogleFileId(toolUse.input.documentId));
+        else if (toolUse.name === 'read_slack_channel')     result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
+        else if (toolUse.name === 'draft_channel_post')     result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
+        else if (toolUse.name === 'get_ghl_conversations')  result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
+        else if (toolUse.name === 'search_knowledge')       result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
+        else if (toolUse.name === 'save_knowledge')         result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
+        else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
+        else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
+        else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
+        else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
+        else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
+        else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
+        else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
+        else if (toolUse.name === 'clean_duplicate_tasks')  result = await cleanDuplicateTasks();
+        else if (toolUse.name === 'delete_scheduled_task')  result = await deleteScheduledTask(toolUse.input.taskId);
+        else if (toolUse.name === 'get_meta_ads_summary')   result = await getMetaAdsSummary(toolUse.input.datePreset || 'last_7d');
+        else if (toolUse.name === 'get_meta_campaigns')     result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
+        else if (toolUse.name === 'get_meta_adsets')        result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
+        else if (toolUse.name === 'get_meta_ads')           result = await getMetaAds(toolUse.input.adSetId || null, toolUse.input.datePreset || 'last_7d');
+        return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
+      }
+
+      // ── Initial call ─────────────────────────────────────────────────────────
+      let response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2048,
+        system: fullSystemPrompt,
+        messages,
+        tools: TOOLS,
       });
 
-      if (response.stop_reason === 'tool_use') {
-        const toolUses    = response.content.filter(b => b.type === 'tool_use');
+      // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
+      const MAX_TOOL_ROUNDS = 5;
+      let currentMessages = [...messages];
+
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        if (response.stop_reason !== 'tool_use') break;
+
+        const toolUses = response.content.filter(b => b.type === 'tool_use');
         const toolResults = await Promise.all(toolUses.map(async (toolUse) => {
-          let result;
-          try {
-            if      (toolUse.name === 'search_notion')          result = await searchNotion(toolUse.input.query);
-            else if (toolUse.name === 'get_notion_page')        result = await getNotionPage(toolUse.input.page_id);
-            else if (toolUse.name === 'get_recent_emails')      result = await getRecentEmails();
-            else if (toolUse.name === 'send_email')             result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
-            else if (toolUse.name === 'get_calendar_events')    result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
-            else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? r.substring(0, 4000) + '...[trimmed]' : r; }
-            else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
-            else if (toolUse.name === 'read_google_doc')        result = await readGoogleDoc(extractGoogleFileId(toolUse.input.documentId));
-            else if (toolUse.name === 'read_slack_channel')     result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
-            else if (toolUse.name === 'draft_channel_post')     result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
-            else if (toolUse.name === 'get_ghl_conversations')  result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
-            else if (toolUse.name === 'search_knowledge')       result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
-            else if (toolUse.name === 'save_knowledge')         result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
-            else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
-            else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
-            else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
-            else if (toolUse.name === 'get_sales_intelligence')  result = await getSalesIntelligence(toolUse.input.query);
-            else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
-            else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
-            else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
-            else if (toolUse.name === 'clean_duplicate_tasks')  result = await cleanDuplicateTasks();
-            else if (toolUse.name === 'delete_scheduled_task')  result = await deleteScheduledTask(toolUse.input.taskId);
-            else if (toolUse.name === 'get_meta_ads_summary')   result = await getMetaAdsSummary(toolUse.input.datePreset || 'last_7d');
-            else if (toolUse.name === 'get_meta_campaigns')     result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
-            else if (toolUse.name === 'get_meta_adsets')        result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
-            else if (toolUse.name === 'get_meta_ads')           result = await getMetaAds(toolUse.input.adSetId || null, toolUse.input.datePreset || 'last_7d');
-          } catch (err) { result = `Error running tool ${toolUse.name}: ${err.message}`; }
-          return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
+          try { return await dispatchTool(toolUse); }
+          catch (err) { return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(`Error running tool ${toolUse.name}: ${err.message}`) }; }
         }));
 
+        // Check for approval draft before continuing
         const draftResult = toolResults.find(r => { try { return JSON.parse(r.content).startsWith('APPROVAL_NEEDED|'); } catch { return false; } });
         if (draftResult) {
           const parts = JSON.parse(draftResult.content).split('|');
           return `APPROVAL_NEEDED|${parts[1]}|${parts.slice(2).join('|')}`;
         }
 
-        let followUpText = null;
+        // Advance message chain and call Claude again with same fullSystemPrompt (preserves time context)
+        currentMessages = [...currentMessages, { role: 'assistant', content: response.content }, { role: 'user', content: toolResults }];
+
+        let nextResponse = null;
         for (let fuAttempt = 0; fuAttempt < 3; fuAttempt++) {
           try {
-            const followUp = await anthropic.messages.create({
-              model: 'claude-sonnet-4-6', max_tokens: 1024,
-              system: userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT,
-              messages: [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: toolResults }],
+            nextResponse = await anthropic.messages.create({
+              model: 'claude-sonnet-4-6',
+              max_tokens: 1024,
+              system: fullSystemPrompt,
+              messages: currentMessages,
+              tools: TOOLS,
             });
-            followUpText = followUp.content.filter(b => b.type === 'text').map(b => b.text).join('\n') || null;
-            if (!followUpText && fuAttempt < 2) { console.error('Empty followUp reply, retrying...'); continue; }
             break;
           } catch (fuErr) {
             if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
               const wait = (fuAttempt + 1) * 10000;
-              console.log(`followUp overloaded, retrying in ${wait/1000}s...`);
+              console.log(`followUp overloaded (round ${round + 1}), retrying in ${wait/1000}s...`);
               await new Promise(r => setTimeout(r, wait));
             } else { throw fuErr; }
           }
         }
-        return followUpText;
+
+        if (!nextResponse) break;
+        response = nextResponse;
       }
 
       const responseText = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -2113,8 +2204,8 @@ async function postToSlack(channel, text, threadTs = null) {
 
 async function executeChannelPost(channelName, message, say) {
   try {
-    const result  = await slack.client.conversations.list({ limit: 200, types: 'public_channel,private_channel,mpim,im' });
-    const channel = result.channels.find(c => c.name === channelName.replace('#', ''));
+    const channels = await getCachedChannelList();
+    const channel  = channels.find(c => c.name === channelName.replace('#', ''));
     if (!channel) { await say(`Could not find channel ${channelName}.`); }
     else { await slack.client.chat.postMessage({ channel: channel.id, text: message }); await say(`Posted to ${channelName}.`); }
   } catch (err) { await say(`Something went wrong posting: ${err.message}`); }
@@ -2194,7 +2285,7 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
   await say(threadReply ? { text: ackMsg, thread_ts: message.thread_ts || message.ts } : ackMsg);
   try {
     const fileBuffer = await downloadSlackFile(file.url_private);
-    const result     = await processFileWithClaude(fileBuffer, mimeType, instruction, SYSTEM_PROMPT);
+    const result     = await processFileWithClaude(fileBuffer, mimeType, instruction, buildRoleSystemPrompt(userId));
     await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
     await saveMessage(userId, 'assistant', result);
     await say(threadReply ? { text: result, thread_ts: message.thread_ts || message.ts } : result);
@@ -2343,9 +2434,10 @@ const GHL_USER_NAMES = {
 const GHL_TO_SLACK = {
   'joseph': 'U0A9J00EMGD', 'joseph salazar': 'U0A9J00EMGD',
   'debbanny': 'U0AR16QVDB3', 'debanny': 'U0AR16QVDB3', 'debbanny neurogrowth': 'U0AR16QVDB3', 'debbanny romero': 'U0AR16QVDB3',
-  'jonnathan': 'U0AMTEKDCPN', 'jonathan': 'U0AMTEKDCPN', 'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
+  'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
+  'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
   'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD', '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',
-  'gqymykpddltdxvbkfl2c': 'U0AMTEKDCPN', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
+  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
 };
 
 function resolveSetterSlackId(assignedUser) {
@@ -2359,6 +2451,18 @@ function resolveSetterSlackId(assignedUser) {
 }
 
 async function handleGHLWebhook(req, res) {
+  // Auth check — reject requests that don't include the correct secret header
+  // Set GHL_WEBHOOK_SECRET in env vars and configure GHL to send it as x-ghl-secret
+  const secret = process.env.GHL_WEBHOOK_SECRET;
+  if (secret) {
+    const provided = req.headers['x-ghl-secret'] || req.headers['x-webhook-secret'];
+    if (provided !== secret) {
+      console.warn('GHL webhook rejected — invalid or missing secret header');
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+  }
   try {
     let body = '';
     req.on('data', chunk => { body += chunk.toString(); });
