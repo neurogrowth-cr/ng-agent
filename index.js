@@ -1327,18 +1327,26 @@ async function getClientStatus(clientName = null) {
       }[dash.customer_status] || `⚪ ${dash.customer_status}`;
       const statusEmoji = statusLabel.split(' ')[0];
 
-      // Use Activation Call completed_at as Day 1 — this is the correct 14-day SLA anchor.
-      // The activation call checkbox timestamp is set by the operator when the call is done.
-      // Fall back to client_dashboards.created_at only if the activation call hasn't been completed yet.
+      // Day 1 anchor logic — depends on phase:
+      // Phase 3: use stabilization_started_at (the correct stabilization Day 1)
+      // All others: use Activation Call completed_at (14-day SLA anchor)
+      // Fall back to portal created_at if neither is available
       const activationCallAct = activities.find(a => {
         const title = (templateMap[a.template_id]?.title || '').toLowerCase();
         return title.includes('activation call') && a.completed_at;
       });
-      const startDate = activationCallAct
-        ? new Date(activationCallAct.completed_at)
-        : (dash.created_at ? new Date(dash.created_at) : null);
+      let startDate, dayAnchor;
+      if (dash.customer_status === 'phase_3' && dash.stabilization_started_at) {
+        startDate  = new Date(dash.stabilization_started_at);
+        dayAnchor  = 'since stabilization start';
+      } else if (activationCallAct) {
+        startDate  = new Date(activationCallAct.completed_at);
+        dayAnchor  = 'since activation call';
+      } else {
+        startDate  = dash.created_at ? new Date(dash.created_at) : null;
+        dayAnchor  = 'since portal creation';
+      }
       const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
-      const dayAnchor = activationCallAct ? 'since activation call' : 'since portal creation';
       const lines = [
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
         `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}`,
