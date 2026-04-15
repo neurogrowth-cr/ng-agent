@@ -1491,6 +1491,11 @@ const SALES_TEAM_MAP = {
   'jose.neurogrowth@gmail.com':   'Jose Carranza',
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
 
+  // ── SETTERS — iClosed EOD email IDs ─────────────────────────────────────
+  'debbanny.neurogrowth@gmail.com': 'Debbanny Romero',
+  'joseph.neurogrowth@gmail.com':   'Joseph Salazar',
+  'Salazcamjos@gmail.com':          'Joseph Salazar',
+
   // ── FALLBACK — GHL user IDs for closers if iClosed uses those instead ───
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',       'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
@@ -1506,10 +1511,28 @@ async function getSalesIntelligence(query) {
     const now = new Date();
     const todayStart = new Date(now); todayStart.setHours(0,0,0,0);
     const todayEnd   = new Date(now); todayEnd.setHours(23,59,59,999);
-    const weekStart  = new Date(now); weekStart.setDate(now.getDate() - now.getDay());  weekStart.setHours(0,0,0,0);
+    const weekStart  = new Date(now); weekStart.setDate(now.getDate() - now.getDay()); weekStart.setHours(0,0,0,0);
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
-    // ── Query 1: appointments with prospect names ──────────────────────────
+    const toDateStr = (d) => d.toISOString().split('T')[0];
+    const todayStr      = toDateStr(now);
+    const weekStartStr  = toDateStr(weekStart);
+    const monthStartStr = toDateStr(monthStart);
+
+    // ── Query EOD tables ───────────────────────────────────────────────────
+    const { data: setterEOD } = await portalSupabase
+      .from('revops_setter_eod_daily')
+      .select('report_date, setter_id, new_conversations, follow_ups, qualified_leads, not_qualified_leads, scheduled_calls, calls_show, calls_no_show, notes')
+      .order('report_date', { ascending: false })
+      .limit(100);
+
+    const { data: closerEOD } = await portalSupabase
+      .from('revops_closer_eod_daily')
+      .select('report_date, closer_id, scheduled_calls, canceled_calls, no_shows, qualified_calls, bookings, installment_closes, full_closes, notes')
+      .order('report_date', { ascending: false })
+      .limit(100);
+
+    // ── Query appointments for individual call lookups ─────────────────────
     const { data: appointments } = await portalSupabase
       .from('revops_appointments')
       .select(`
@@ -1520,7 +1543,7 @@ async function getSalesIntelligence(query) {
       .order('scheduled_start', { ascending: false })
       .limit(200);
 
-    // ── Query 2: outcomes joined to appointments ───────────────────────────
+    // ── Query outcomes ─────────────────────────────────────────────────────
     const { data: outcomes } = await portalSupabase
       .from('revops_sales_outcomes')
       .select('appointment_id, outcome, offer_pitched, proposed_value, closed_revenue, close_date, lost_reason, objection_category, notes')
@@ -1529,109 +1552,159 @@ async function getSalesIntelligence(query) {
 
     const outcomeMap = {};
     (outcomes || []).forEach(o => { outcomeMap[o.appointment_id] = o; });
+    const appts      = appointments || [];
+    const setterRows = setterEOD || [];
+    const closerRows = closerEOD || [];
 
-    const appts = appointments || [];
-
-    if (!appts.length) {
-      return 'No sales data found yet. The iClosed webhook pipeline is being set up — once the first bookings flow in, I can answer questions about setters, call outcomes, close rates, and pipeline health.';
+    if (!appts.length && !setterRows.length && !closerRows.length) {
+      return 'No sales data found yet. iClosed API integration is being set up — data will appear here once it starts syncing.';
     }
+
+    const filterByDate = (rows, dateField, fromStr) =>
+      rows.filter(r => r[dateField] && r[dateField] >= fromStr);
 
     // ── TODAY'S CALLS ──────────────────────────────────────────────────────
     if (q.includes('today') || q.includes('hoy')) {
       const todayCalls = appts.filter(a => {
+        if (!a.scheduled_start) return false;
         const d = new Date(a.scheduled_start);
         return d >= todayStart && d <= todayEnd;
       });
-      if (!todayCalls.length) return 'No calls scheduled for today.';
-      const lines = todayCalls.map(a => {
-        const name    = a.prospect?.full_name || 'Unknown prospect';
-        const setter  = resolveSalesMember(a.setter_id || a.prospect?.setter_owner_id);
-        const closer  = resolveSalesMember(a.closer_id);
-        const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
-        const outcome = outcomeMap[a.id];
-        const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
-        return `${name} — ${time} CR — setter: ${setter} — closer: ${closer} — ${status}`;
-      });
-      return `${todayCalls.length} call(s) today:\n\n${lines.join('\n')}`;
-    }
+      const todayCloserRows = closerRows.filter(r => r.report_date === todayStr);
+      const todaySetterRows = setterRows.filter(r => r.report_date === todayStr);
 
-    // ── PROSPECT LOOKUP ────────────────────────────────────────────────────
-    const prospectKeywords = appts.map(a => a.prospect?.full_name?.toLowerCase()).filter(Boolean);
-    const matchedProspect = appts.find(a => a.prospect?.full_name && q.includes(a.prospect.full_name.toLowerCase().split(' ')[0]));
-    if (matchedProspect || q.includes('prospect') || q.includes('call with') || q.includes('quien atendio') || q.includes('who booked') || q.includes('setter') && q.length < 60) {
-      const target = matchedProspect;
-      if (target) {
-        const setter  = resolveSalesMember(target.setter_id || target.prospect?.setter_owner_id);
-        const closer  = resolveSalesMember(target.closer_id);
-        const time    = target.scheduled_start ? new Date(target.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unknown time';
-        const outcome = outcomeMap[target.id];
-        const lines   = [
-          `Prospect: ${target.prospect?.full_name || 'Unknown'}`,
-          `Company: ${target.prospect?.company || 'N/A'}`,
-          `Booked by setter: ${setter}`,
-          `Assigned closer: ${closer}`,
-          `Scheduled: ${time} CR`,
-          `Attended: ${target.attended === true ? 'Yes' : target.attended === false ? 'No — ' + (target.no_show_reason || 'no reason given') : 'Not recorded'}`,
-          target.reschedule_count > 0 ? `Rescheduled: ${target.reschedule_count}x` : '',
-          outcome ? `Outcome: ${outcome.outcome}` : 'Outcome: not recorded yet',
-          outcome?.offer_pitched ? `Offer pitched: ${outcome.offer_pitched}` : '',
-          outcome?.closed_revenue ? `Revenue closed: $${outcome.closed_revenue}` : '',
-          outcome?.lost_reason    ? `Lost reason: ${outcome.lost_reason}` : '',
-          outcome?.objection_category ? `Objection: ${outcome.objection_category}` : '',
-        ].filter(Boolean);
-        return lines.join('\n');
+      const lines = [];
+
+      if (todayCalls.length) {
+        lines.push(`Scheduled calls today (${todayCalls.length}):`);
+        todayCalls.forEach(a => {
+          const name    = a.prospect?.full_name || 'Unknown prospect';
+          const closer  = resolveSalesMember(a.closer_id);
+          const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+          const outcome = outcomeMap[a.id];
+          const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
+          lines.push(`  ${name} — ${time} CR — closer: ${closer} — ${status}`);
+        });
       }
+
+      if (todayCloserRows.length) {
+        lines.push(`\nCloser activity today:`);
+        todayCloserRows.forEach(r => {
+          const name = resolveSalesMember(r.closer_id);
+          lines.push(`  ${name}: ${r.scheduled_calls} scheduled, ${r.canceled_calls} canceled, ${r.no_shows} no-shows, ${r.qualified_calls} qualified, ${r.full_closes} closes`);
+        });
+      }
+
+      if (todaySetterRows.length) {
+        lines.push(`\nSetter activity today:`);
+        todaySetterRows.forEach(r => {
+          const name = resolveSalesMember(r.setter_id);
+          lines.push(`  ${name}: ${r.new_conversations} new convos, ${r.qualified_leads} qualified, ${r.scheduled_calls} calls booked`);
+        });
+      }
+
+      if (!lines.length) return 'No call or EOD data found for today.';
+      return lines.join('\n');
     }
 
     // ── SETTER PERFORMANCE ─────────────────────────────────────────────────
-    if (q.includes('setter') || q.includes('joseph') || q.includes('debbanny') || q.includes('booked')) {
-      const byDate = q.includes('week') ? weekStart : q.includes('month') ? monthStart : null;
-      const filtered = byDate ? appts.filter(a => new Date(a.booked_at) >= byDate) : appts;
-      const counts = {};
-      filtered.forEach(a => {
-        const name = resolveSalesMember(a.setter_id || a.prospect?.setter_owner_id);
-        counts[name] = (counts[name] || 0) + 1;
+    if (q.includes('setter') || q.includes('joseph') || q.includes('debbanny') || q.includes('booked') || q.includes('conversations') || q.includes('qualified leads')) {
+      const fromStr = q.includes('month') ? monthStartStr : weekStartStr;
+      const period  = q.includes('month') ? 'this month' : 'this week';
+      const rows    = filterByDate(setterRows, 'report_date', fromStr);
+
+      if (!rows.length) return `No setter EOD data found for ${period}. Note: setter data comes from GHL EOD reports submitted daily.`;
+
+      const byPerson = {};
+      rows.forEach(r => {
+        const name = resolveSalesMember(r.setter_id);
+        if (!byPerson[name]) byPerson[name] = { new_conversations: 0, qualified_leads: 0, not_qualified: 0, scheduled_calls: 0, calls_show: 0, calls_no_show: 0, days: 0 };
+        byPerson[name].new_conversations += r.new_conversations || 0;
+        byPerson[name].qualified_leads   += r.qualified_leads   || 0;
+        byPerson[name].not_qualified     += r.not_qualified_leads || 0;
+        byPerson[name].scheduled_calls   += r.scheduled_calls   || 0;
+        byPerson[name].calls_show        += r.calls_show        || 0;
+        byPerson[name].calls_no_show     += r.calls_no_show     || 0;
+        byPerson[name].days++;
       });
-      const period = q.includes('week') ? 'this week' : q.includes('month') ? 'this month' : 'all time';
-      const lines = Object.entries(counts).sort((a,b) => b[1]-a[1]).map(([name, count]) => `${name}: ${count} bookings`);
-      return `Setter bookings ${period}:\n\n${lines.join('\n')}`;
+
+      const lines = [`Setter performance ${period}:`];
+      Object.entries(byPerson).forEach(([name, s]) => {
+        lines.push(`\n${name} (${s.days} day(s) with EOD):`);
+        lines.push(`  New conversations: ${s.new_conversations}`);
+        lines.push(`  Qualified: ${s.qualified_leads} | Not qualified: ${s.not_qualified}`);
+        lines.push(`  Calls booked: ${s.scheduled_calls} | Show: ${s.calls_show} | No-show: ${s.calls_no_show}`);
+      });
+      return lines.join('\n');
     }
 
-    // ── CLOSE RATE / OUTCOMES ─────────────────────────────────────────────
-    if (q.includes('close rate') || q.includes('outcome') || q.includes('closed') || q.includes('won') || q.includes('lost')) {
-      const byDate = q.includes('week') ? weekStart : q.includes('month') ? monthStart : null;
-      const relevantOutcomes = byDate
-        ? outcomes?.filter(o => new Date(o.close_date || o.created_at) >= byDate) || []
-        : outcomes || [];
-      if (!relevantOutcomes.length) return 'No outcome data recorded yet.';
-      const total  = relevantOutcomes.length;
-      const won    = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('won') || o.outcome?.toLowerCase().includes('closed')).length;
-      const lost   = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('lost')).length;
-      const noShow = relevantOutcomes.filter(o => o.outcome?.toLowerCase().includes('no_show') || o.outcome?.toLowerCase().includes('no show')).length;
-      const revenue = relevantOutcomes.reduce((sum, o) => sum + (parseFloat(o.closed_revenue) || 0), 0);
-      const period  = q.includes('week') ? 'this week' : q.includes('month') ? 'this month' : 'all time';
-      return [
-        `Sales outcomes ${period}:`,
-        `Total calls with outcomes: ${total}`,
-        `Won/Closed: ${won} (${total > 0 ? Math.round(won/total*100) : 0}%)`,
-        `Lost: ${lost}`,
-        `No-shows: ${noShow}`,
-        revenue > 0 ? `Revenue closed: $${revenue.toLocaleString()}` : '',
-      ].filter(Boolean).join('\n');
+    // ── CLOSER PERFORMANCE ─────────────────────────────────────────────────
+    if (q.includes('closer') || q.includes('jonathan') || q.includes('jose') || q.includes('close rate') || q.includes('closed') || q.includes('cancel') || q.includes('no-show') || q.includes('qualified calls')) {
+      const fromStr = q.includes('month') ? monthStartStr : weekStartStr;
+      const period  = q.includes('month') ? 'this month' : 'this week';
+      const rows    = filterByDate(closerRows, 'report_date', fromStr);
+
+      if (!rows.length) return `No closer EOD data found for ${period}.`;
+
+      const byPerson = {};
+      rows.forEach(r => {
+        const name = resolveSalesMember(r.closer_id);
+        if (!byPerson[name]) byPerson[name] = { scheduled: 0, canceled: 0, no_shows: 0, qualified: 0, bookings: 0, installment: 0, full: 0, days: 0 };
+        byPerson[name].scheduled   += r.scheduled_calls   || 0;
+        byPerson[name].canceled    += r.canceled_calls    || 0;
+        byPerson[name].no_shows    += r.no_shows          || 0;
+        byPerson[name].qualified   += r.qualified_calls   || 0;
+        byPerson[name].bookings    += r.bookings          || 0;
+        byPerson[name].installment += r.installment_closes || 0;
+        byPerson[name].full        += r.full_closes       || 0;
+        byPerson[name].days++;
+      });
+
+      const lines = [`Closer performance ${period}:`];
+      Object.entries(byPerson).forEach(([name, c]) => {
+        const closeRate = c.qualified > 0 ? Math.round((c.full + c.installment) / c.qualified * 100) : 0;
+        lines.push(`\n${name} (${c.days} day(s) with EOD):`);
+        lines.push(`  Scheduled: ${c.scheduled} | Canceled: ${c.canceled} | No-shows: ${c.no_shows}`);
+        lines.push(`  Qualified calls: ${c.qualified} | Bookings: ${c.bookings}`);
+        lines.push(`  Closes: ${c.full} full + ${c.installment} installment | Close rate: ${closeRate}%`);
+      });
+      return lines.join('\n');
     }
 
-    // ── DEFAULT: PIPELINE SUMMARY ─────────────────────────────────────────
-    const scheduled = appts.filter(a => new Date(a.scheduled_start) >= now).length;
-    const thisWeek  = appts.filter(a => new Date(a.scheduled_start) >= weekStart).length;
-    const withOutcome = Object.keys(outcomeMap).length;
-    const won = outcomes?.filter(o => o.outcome?.toLowerCase().includes('won') || o.outcome?.toLowerCase().includes('closed')).length || 0;
+    // ── PROSPECT LOOKUP ────────────────────────────────────────────────────
+    const matchedProspect = appts.find(a => a.prospect?.full_name && q.includes(a.prospect.full_name.toLowerCase().split(' ')[0]));
+    if (matchedProspect) {
+      const closer  = resolveSalesMember(matchedProspect.closer_id);
+      const time    = matchedProspect.scheduled_start ? new Date(matchedProspect.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'not scheduled';
+      const outcome = outcomeMap[matchedProspect.id];
+      const lines   = [
+        `Prospect: ${matchedProspect.prospect?.full_name || 'Unknown'}`,
+        `Company: ${matchedProspect.prospect?.company || 'N/A'}`,
+        `Closer: ${closer}`,
+        `Setter: not available from iClosed — check GHL for setter assignment`,
+        `Scheduled: ${time} CR`,
+        `Attended: ${matchedProspect.attended === true ? 'Yes' : matchedProspect.attended === false ? 'No — ' + (matchedProspect.no_show_reason || 'no reason given') : 'Not recorded'}`,
+        matchedProspect.reschedule_count > 0 ? `Rescheduled: ${matchedProspect.reschedule_count}x` : '',
+        outcome ? `Outcome: ${outcome.outcome}` : 'Outcome: not recorded yet',
+        outcome?.closed_revenue ? `Revenue closed: $${outcome.closed_revenue}` : '',
+        outcome?.lost_reason ? `Lost reason: ${outcome.lost_reason}` : '',
+      ].filter(Boolean);
+      return lines.join('\n');
+    }
+
+    // ── DEFAULT: PIPELINE SUMMARY ──────────────────────────────────────────
+    const upcoming       = appts.filter(a => a.scheduled_start && new Date(a.scheduled_start) >= now).length;
+    const thisWeekAppts  = appts.filter(a => a.scheduled_start && new Date(a.scheduled_start) >= weekStart).length;
+    const totalCloses    = closerRows.reduce((sum, r) => sum + (r.full_closes || 0) + (r.installment_closes || 0), 0);
+    const thisWeekCloses = filterByDate(closerRows, 'report_date', weekStartStr).reduce((sum, r) => sum + (r.full_closes || 0) + (r.installment_closes || 0), 0);
+    const thisWeekConvos = filterByDate(setterRows, 'report_date', weekStartStr).reduce((sum, r) => sum + (r.new_conversations || 0), 0);
+
     return [
       `Sales pipeline summary:`,
-      `Total appointments on record: ${appts.length}`,
-      `Upcoming (not yet held): ${scheduled}`,
-      `This week: ${thisWeek}`,
-      `Outcomes recorded: ${withOutcome}`,
-      won > 0 ? `Deals closed: ${won}` : 'No closed deals recorded yet',
+      `Appointments on record: ${appts.length} | Upcoming: ${upcoming} | This week: ${thisWeekAppts}`,
+      `New conversations this week (setters): ${thisWeekConvos}`,
+      `Closes this week: ${thisWeekCloses} | All time: ${totalCloses}`,
+      Object.keys(outcomeMap).length > 0 ? `Outcomes recorded: ${Object.keys(outcomeMap).length}` : 'No outcomes recorded yet',
     ].join('\n');
 
   } catch (err) {
@@ -2115,7 +2188,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
-          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: which setter booked a call, call outcomes, close rates, how many calls today/this week, prospect lookup by name, setter performance stats, pipeline summary. Covers revops_appointments, revops_sales_outcomes, and revops_prospects tables.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Debbanny — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
