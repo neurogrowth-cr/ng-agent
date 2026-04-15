@@ -671,6 +671,27 @@ function registerDynamicCron(task) {
     const job = cron.schedule(task.cron_expression, async () => {
       console.log(`Running dynamic cron: ${task.name}`);
 
+      // Inject live email + calendar context into scheduled report prompts
+      let liveContext = '';
+      try {
+        const todayEvents = await getCalendarEvents(0, 1);
+        if (todayEvents && !todayEvents.includes('error') && !todayEvents.includes('No events')) {
+          liveContext += `\n\nTODAY'S CALENDAR:\n${todayEvents}`;
+        }
+        const tomorrowEvents = await getCalendarEvents(1, 1);
+        if (tomorrowEvents && !tomorrowEvents.includes('error') && !tomorrowEvents.includes('No events')) {
+          liveContext += `\n\nTOMORROW'S CALENDAR:\n${tomorrowEvents}`;
+        }
+        const emails = await getRecentEmails();
+        if (emails && !emails.includes('error')) {
+          liveContext += `\n\nRECENT EMAILS (unread):\n${emails}`;
+        }
+      } catch (e) { console.error('Live context fetch error for scheduled task:', e.message); }
+
+      const enrichedPrompt = liveContext
+        ? `${task.prompt}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : task.prompt;
+
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
       let lastErr = null;
@@ -679,7 +700,7 @@ function registerDynamicCron(task) {
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          reply = await callClaude([{ role: 'user', content: task.prompt }]);
+          reply = await callClaude([{ role: 'user', content: enrichedPrompt }]);
           lastErr = null;
           break;
         } catch (err) {
@@ -1780,6 +1801,22 @@ async function runNightlyLearning() {
       const messages = await readSlackChannel(ch, 20);
       if (!messages.includes('not found')) digest += `\n\n=== ${ch} ===\n${messages}`;
     }
+    // Pull recent emails into nightly digest
+    try {
+      const emails = await getRecentEmails();
+      if (emails && !emails.includes('error')) {
+        digest += `\n\n=== GMAIL (recent unread) ===\n${emails}`;
+      }
+    } catch (e) { console.error('Nightly learning — email fetch error:', e.message); }
+
+    // Pull tomorrow's calendar events into nightly digest
+    try {
+      const tomorrowEvents = await getCalendarEvents(1, 1);
+      if (tomorrowEvents && !tomorrowEvents.includes('error')) {
+        digest += `\n\n=== CALENDAR (tomorrow) ===\n${tomorrowEvents}`;
+      }
+    } catch (e) { console.error('Nightly learning — calendar fetch error:', e.message); }
+
     try {
       const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type').eq('is_active', true);
       const { data: templates }  = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
@@ -1803,7 +1840,7 @@ async function runNightlyLearning() {
     } catch (portalErr) { console.error('Portal snapshot error in nightly learning:', portalErr.message); }
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n\n${digest}`;
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
@@ -1820,7 +1857,7 @@ async function runNightlyLearning() {
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSlack channels scanned: 5 | Knowledge entries saved: ${saved}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar | Knowledge entries saved: ${saved}`);
   } catch (err) {
     console.error('Nightly learning error:', err.message);
     try {
