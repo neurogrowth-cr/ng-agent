@@ -1574,8 +1574,39 @@ async function getPortalAlerts() {
         alerts.push(`🟡 AT RISK — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}`);
       }
     }
-    if (!alerts.length) return '✅ No critical alerts. Some clients still in onboarding phases but within timeline.';
-    return `Launch & block alerts (${alerts.length} clients):\n\n` + alerts.join('\n');
+    // ── Phase 0 alerts — pre-portal clients stuck or ready for handoff ──────────
+    const { data: phase0 } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('id, email, first_name, last_name, company, phase0_step, days_in_phase0')
+      .order('days_in_phase0', { ascending: false });
+
+    const phase0Alerts = [];
+    for (const r of (phase0 || [])) {
+      const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+      const co   = r.company ? ` (${r.company})` : '';
+      const days = r.days_in_phase0 ?? 0;
+      const stepLabels = {
+        '1_awaiting_signup':          'awaiting portal signup',
+        '2_awaiting_terms':           'awaiting T&C acceptance',
+        '3_awaiting_form':            'awaiting onboarding form',
+        '4_awaiting_activation_call': 'awaiting activation call booking',
+        '5_ready_for_handoff':        'ready for Phase 1 handoff',
+      };
+      const stepStr = stepLabels[r.phase0_step] || r.phase0_step;
+      if (r.phase0_step === '5_ready_for_handoff') {
+        phase0Alerts.push(`🟢 PHASE 0 HANDOFF READY — ${name}${co} | ${stepStr} | Day ${days} — move to Phase 1`);
+      } else if (days >= 14) {
+        phase0Alerts.push(`🔴 PHASE 0 OVERDUE — ${name}${co} | ${stepStr} | Day ${days} (past 14-day threshold)`);
+      } else if (days >= 7) {
+        phase0Alerts.push(`🟡 PHASE 0 AT RISK — ${name}${co} | ${stepStr} | Day ${days}`);
+      }
+    }
+
+    const allAlerts = [...phase0Alerts, ...alerts];
+    if (!allAlerts.length) return '✅ No critical alerts. All clients on track across Phase 0 and active portal.';
+    const p0Header = phase0Alerts.length ? `\n📋 Phase 0 Pre-Portal (${phase0Alerts.length}):\n${phase0Alerts.join('\n')}\n` : '';
+    const p1Header = alerts.length      ? `\n🚨 Active Portal (${alerts.length}):\n${alerts.join('\n')}\n` : '';
+    return `Launch & block alerts (${allAlerts.length} clients):${p0Header}${p1Header}`;
   } catch (err) {
     return `Portal alerts error: ${err.message}`;
   }
@@ -1988,6 +2019,24 @@ async function runMondayGapDetection() {
         gaps.push(`🟡 STALE — ${dash.client_name} (Day ${daysSince}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`);
       }
     }
+    // ── Phase 0 gaps: stuck ≥7 days ───────────────────────────────────────────
+    const { data: phase0Gaps } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
+      .gte('days_in_phase0', 7)
+      .order('days_in_phase0', { ascending: false });
+    const stepLabels = {
+      '1_awaiting_signup': 'awaiting portal signup', '2_awaiting_terms': 'awaiting T&C',
+      '3_awaiting_form': 'awaiting onboarding form', '4_awaiting_activation_call': 'awaiting activation call',
+      '5_ready_for_handoff': 'ready for Phase 1 handoff — not moved',
+    };
+    for (const r of (phase0Gaps || [])) {
+      const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+      const co   = r.company ? ` (${r.company})` : '';
+      const label = r.days_in_phase0 >= 14 ? '🔴 PHASE 0 OVERDUE' : '🟡 PHASE 0 STALE';
+      gaps.push(`${label} — ${name}${co} | ${stepLabels[r.phase0_step] || r.phase0_step} | Day ${r.days_in_phase0} (Tania to unblock)`);
+    }
+
     if (!gaps.length) { console.log('Gap detection: no critical gaps found.'); return; }
     const today   = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     const message = `Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
@@ -2181,6 +2230,33 @@ async function runProactiveDMs() {
       const msg = `These clients are currently blocked: ${names}. If the block is on the client side — missing onboarding form, unresponsive, contract issue — this needs a proactive outreach before it becomes a bigger problem. Can you check what's needed and follow up?`;
       await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
       console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
+    }
+
+    // ── DM Tania: Phase 0 clients stuck ≥7 days in same step ──────────────────
+    const { data: stuckPhase0 } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
+      .gte('days_in_phase0', 7)
+      .order('days_in_phase0', { ascending: false });
+
+    if (stuckPhase0 && stuckPhase0.length > 0) {
+      const stepLabels = {
+        '1_awaiting_signup':          'awaiting portal signup',
+        '2_awaiting_terms':           'awaiting T&C acceptance',
+        '3_awaiting_form':            'awaiting onboarding form',
+        '4_awaiting_activation_call': 'awaiting activation call booking',
+        '5_ready_for_handoff':        'ready for Phase 1 handoff — not moved yet',
+      };
+      const lines = stuckPhase0.map(r => {
+        const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+        const co   = r.company ? ` (${r.company})` : '';
+        return `• ${name}${co} — ${stepLabels[r.phase0_step] || r.phase0_step} — Day ${r.days_in_phase0}`;
+      }).join('\n');
+      const urgentCount = stuckPhase0.filter(r => r.days_in_phase0 >= 14).length;
+      const urgentNote  = urgentCount > 0 ? ` ${urgentCount} of them are past 14 days — that's critical.` : '';
+      const msg = `Phase 0 alert — ${stuckPhase0.length} client${stuckPhase0.length > 1 ? 's' : ''} stuck in pre-portal onboarding for 7+ days.${urgentNote}\n\n${lines}\n\nCan you reach out to each one and unblock whatever step they're on?`;
+      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      console.log(`Proactive DM sent to Tania: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
     }
 
     // ── DM Tania: clients hitting Day 20 in Phase 3 (stabilization) ──
