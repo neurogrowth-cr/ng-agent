@@ -1815,6 +1815,43 @@ async function readSlackChannel(channelName, messageCount = 20) {
   } catch (err) { return `Error reading channel: ${err.message}`; }
 }
 
+// ─── SLACK: ONE-OFF SCHEDULED REMINDER ───────────────────────────────────────
+// Wraps chat.scheduleMessage. `target` accepts a channel name (#foo or foo),
+// a channel ID (C…), or a user ID (U…) for DMs. `postAt` is an ISO 8601
+// string (e.g. 2026-04-24T15:00:00-06:00). Must be future and within 120 days.
+async function createSlackReminder(target, message, postAt) {
+  try {
+    if (!target || !message || !postAt) return 'Reminder error: target, message, and postAt are all required.';
+    const ts = Math.floor(new Date(postAt).getTime() / 1000);
+    if (!Number.isFinite(ts)) return `Reminder error: could not parse postAt "${postAt}" — use ISO 8601 like 2026-04-24T15:00:00-06:00.`;
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (ts <= nowSec) return `Reminder error: postAt is in the past (${new Date(postAt).toISOString()}).`;
+    if (ts - nowSec > 120 * 24 * 60 * 60) return 'Reminder error: Slack only allows scheduling up to 120 days out.';
+
+    let channelId;
+    if (/^[CUDG][A-Z0-9]+$/.test(target)) {
+      channelId = target;
+    } else {
+      const linkMatch = target.match(/<#([A-Z0-9]+)\|[^>]+>/);
+      if (linkMatch) {
+        channelId = linkMatch[1];
+      } else {
+        const cleanName = target.replace(/^#/, '');
+        const channels  = await getCachedChannelList();
+        const channel   = channels.find(c => c.name === cleanName);
+        if (!channel) return `Reminder error: channel "${target}" not found or Max is not a member.`;
+        channelId = channel.id;
+      }
+    }
+
+    const res = await slack.client.chat.scheduleMessage({ channel: channelId, text: message, post_at: ts });
+    const when = new Date(postAt).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', dateStyle: 'medium', timeStyle: 'short' });
+    return `Reminder scheduled for ${when} CR in ${target}. scheduled_message_id: ${res.scheduled_message_id}`;
+  } catch (err) {
+    return `Reminder error: ${err.data?.error || err.message}`;
+  }
+}
+
 // ─── PORTAL: WEEKLY TREND ANALYSIS ───────────────────────────────────────────
 async function runWeeklyPortalTrends() {
   console.log('Running weekly portal trend analysis...');
@@ -2237,6 +2274,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
           { name: 'get_phase0_clients',   description: 'ALWAYS use this tool for Phase 0 (pre-portal onboarding) status — flywheel-ai clients who signed up but have not gone live yet. Covers: portal signup, T&C acceptance, onboarding form, activation call booking, handoff to Phase 1. Use in every fulfillment report to show the Phase 0 pipeline before get_client_status covers Phase 1+.',                                                                                                       input_schema: { type: 'object', properties: {} } },
+          { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Debbanny — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
@@ -2269,6 +2307,7 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
         else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
         else if (toolUse.name === 'get_phase0_clients')     result = await getPhase0Clients();
+        else if (toolUse.name === 'create_slack_reminder')  result = await createSlackReminder(toolUse.input.target, toolUse.input.message, toolUse.input.postAt);
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
