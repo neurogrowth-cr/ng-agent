@@ -2846,9 +2846,14 @@ slack.message(async ({ message, say }) => {
 // Runs hourly Mon–Fri. Queries revops_appointments for calls in the next 3.5–5h,
 // fetches GHL conversation history for the prospect, and DMs the assigned closer
 // with a prep brief. Deduplicates via agent_knowledge so each call gets one brief.
+// closer_id in revops_appointments is stored as email (iClosed API format)
 const CLOSER_SLACK = {
-  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999', // Jonathan
-  'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN', // Jose
+  'jonathan.madriz.neurogrowth@gmail.com': 'U0APYAE0999', // Jonathan
+  'jose.neurogrowth@gmail.com':            'U0AMTEKDCPN', // Jose
+  'ronny.duarte@neurogrowth.io':           'U05HXGX18H3', // Ron (when he's the closer)
+  // GHL user ID fallbacks (in case format changes)
+  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999',
+  'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN',
 };
 
 async function fetchGHLConvoForContact(contactId) {
