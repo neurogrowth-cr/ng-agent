@@ -2742,6 +2742,177 @@ slack.message(async ({ message, say }) => {
 // are still wired to their schedules below — these are infrastructure-level and not
 // configurable via Slack, so they stay hardcoded.
 
+// ─── FULFILLMENT MORNING STANDUP ──────────────────────────────────────────────
+// Fires 9:00 AM CR Mon–Fri. DMs each fulfillment team member with their
+// specific priorities for the day — no meeting needed.
+async function runFulfillmentStandup() {
+  console.log('Running fulfillment morning standup DMs...');
+  try {
+    const now = Date.now();
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+
+    // ── Fetch all active client data once ──────────────────────────────────────
+    const { data: dashboards } = await portalSupabase
+      .from('client_dashboards')
+      .select('id, client_name, email, customer_status, customer_type, created_at, stabilization_started_at, linkedin_handler')
+      .eq('is_active', true);
+
+    const { data: templates } = await portalSupabase
+      .from('customer_activity_templates')
+      .select('id, title, order_index');
+    const tMap = {};
+    (templates || []).forEach(t => { tMap[t.id] = t.title; });
+
+    const { data: allActivities } = await portalSupabase
+      .from('customer_activities')
+      .select('customer_id, template_id, status, assigned_to, completed_at, notes')
+      .in('status', ['phase_1', 'phase_2', 'blocked']);
+
+    const actsByClient = {};
+    (allActivities || []).forEach(a => {
+      (actsByClient[a.customer_id] = actsByClient[a.customer_id] || []).push(a);
+    });
+
+    const { data: phase0 } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
+      .order('days_in_phase0', { ascending: false });
+
+    // Helper: day count anchored to activation call or created_at
+    function getDayCount(dash) {
+      return dash.created_at ? Math.floor((now - new Date(dash.created_at).getTime()) / (1000 * 60 * 60 * 24)) : null;
+    }
+
+    // Helper: phase label
+    const phaseLabel = { phase_1: 'Phase 1', phase_2: 'Phase 2', phase_3: 'Phase 3', live: 'Live', blocked: 'BLOCKED' };
+
+    const clients = dashboards || [];
+    const blocked   = clients.filter(d => d.customer_status === 'blocked');
+    const phase1    = clients.filter(d => d.customer_status === 'phase_1');
+    const phase2    = clients.filter(d => d.customer_status === 'phase_2');
+    const phase3    = clients.filter(d => d.customer_status === 'phase_3');
+    const hitting14Today = clients.filter(d => getDayCount(d) === 14);
+    const hitting7Today  = clients.filter(d => getDayCount(d) === 7);
+
+    // ── DM Josue — pipeline owner, activation calls, overall ops ──────────────
+    const josueLines = [`Good morning Josue! Here's your ${today} ops brief:\n`];
+
+    if (blocked.length) {
+      josueLines.push(`🔴 *Blocked (${blocked.length}) — needs resolution today:*`);
+      blocked.forEach(d => {
+        const acts = actsByClient[d.id] || [];
+        const blockedActs = acts.filter(a => a.status === 'blocked').map(a => tMap[a.template_id] || 'Unknown').join(', ');
+        josueLines.push(`• ${d.client_name} — Day ${getDayCount(d)}${blockedActs ? ` | blocked on: ${blockedActs}` : ''}`);
+      });
+      josueLines.push('');
+    }
+
+    if (hitting14Today.length) {
+      josueLines.push(`🚨 *Hitting Day 14 TODAY — must launch:*`);
+      hitting14Today.forEach(d => josueLines.push(`• ${d.client_name} (${phaseLabel[d.customer_status] || d.customer_status})`));
+      josueLines.push('');
+    }
+
+    if (hitting7Today.length) {
+      josueLines.push(`⚠️ *Hitting Day 7 today — at-risk threshold:*`);
+      hitting7Today.forEach(d => josueLines.push(`• ${d.client_name} (${phaseLabel[d.customer_status] || d.customer_status})`));
+      josueLines.push('');
+    }
+
+    if (phase0 && phase0.length) {
+      const needsCall = phase0.filter(r => r.phase0_step === '4_awaiting_activation_call');
+      const handoff   = phase0.filter(r => r.phase0_step === '5_ready_for_handoff');
+      if (needsCall.length) {
+        josueLines.push(`📞 *Activation calls needed (Phase 0):*`);
+        needsCall.forEach(r => {
+          const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+          josueLines.push(`• ${name}${r.company ? ` (${r.company})` : ''} — Day ${r.days_in_phase0}`);
+        });
+        josueLines.push('');
+      }
+      if (handoff.length) {
+        josueLines.push(`✅ *Ready for Phase 1 handoff:*`);
+        handoff.forEach(r => {
+          const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+          josueLines.push(`• ${name}${r.company ? ` (${r.company})` : ''}`);
+        });
+        josueLines.push('');
+      }
+    }
+
+    josueLines.push(`📊 *Pipeline snapshot:* ${phase1.length} Phase 1 | ${phase2.length} Phase 2 | ${phase3.length} Phase 3 | ${blocked.length} Blocked | ${(phase0||[]).length} Phase 0`);
+    josueLines.push(`\nAnything blocking you today? Flag it here and I'll help unblock.`);
+
+    await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: josueLines.join('\n') });
+    console.log('Standup DM sent to Josue');
+
+    // ── DM Valeria — delivery docs, Phase 1 ───────────────────────────────────
+    const valeriaLines = [`Good morning Valeria! Here's your ${today} delivery brief:\n`];
+
+    if (phase1.length) {
+      valeriaLines.push(`📄 *Phase 1 clients — delivery docs focus (${phase1.length}):*`);
+      phase1.forEach(d => {
+        const acts = actsByClient[d.id] || [];
+        const pending = acts.filter(a => a.status === 'phase_1').slice(0, 2).map(a => tMap[a.template_id] || 'Unknown').join(', ');
+        const day = getDayCount(d);
+        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : '';
+        valeriaLines.push(`• ${d.client_name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`);
+      });
+      valeriaLines.push('');
+    } else {
+      valeriaLines.push(`✅ No clients in Phase 1 right now.\n`);
+    }
+
+    if (blocked.length) {
+      valeriaLines.push(`🔴 *Blocked clients (${blocked.length}) — check if any docs are holding these up:*`);
+      blocked.forEach(d => valeriaLines.push(`• ${d.client_name}`));
+      valeriaLines.push('');
+    }
+
+    valeriaLines.push(`Any docs blocked or waiting on client input? Let Josue know so he can follow up.`);
+
+    await slack.client.chat.postMessage({ channel: 'U09Q3BXJ18B', text: valeriaLines.join('\n') });
+    console.log('Standup DM sent to Valeria');
+
+    // ── DM Felipe — campaigns, Prosp, Phase 2 ─────────────────────────────────
+    const felipeLines = [`Good morning Felipe! Here's your ${today} campaign brief:\n`];
+
+    if (phase2.length) {
+      felipeLines.push(`🚀 *Phase 2 clients — campaign launch focus (${phase2.length}):*`);
+      phase2.forEach(d => {
+        const acts = actsByClient[d.id] || [];
+        const pending = acts.filter(a => a.status === 'phase_2').slice(0, 2).map(a => tMap[a.template_id] || 'Unknown').join(', ');
+        const day = getDayCount(d);
+        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : '';
+        felipeLines.push(`• ${d.client_name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`);
+      });
+      felipeLines.push('');
+    } else {
+      felipeLines.push(`✅ No clients in Phase 2 right now.\n`);
+    }
+
+    if (phase3.length) {
+      felipeLines.push(`📈 *Phase 3 (stabilization) — monitor performance (${phase3.length}):*`);
+      phase3.forEach(d => {
+        const anchor = d.stabilization_started_at ? new Date(d.stabilization_started_at) : new Date(d.created_at);
+        const stabDay = Math.floor((now - anchor.getTime()) / (1000 * 60 * 60 * 24));
+        felipeLines.push(`• ${d.client_name} — Stabilization Day ${stabDay}`);
+      });
+      felipeLines.push('');
+    }
+
+    felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so Josue can sequence it.`);
+
+    await slack.client.chat.postMessage({ channel: 'U09TNMVML3F', text: felipeLines.join('\n') });
+    console.log('Standup DM sent to Felipe');
+
+    console.log('Fulfillment standup DMs complete.');
+  } catch (err) {
+    console.error('Fulfillment standup error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Fulfillment standup cron failed: ${err.message}` });
+  }
+}
+
 // Nightly learning — 11:30 PM CR (infrastructure — reads all channels, saves knowledge)
 cron.schedule('30 5 * * *',  async () => { await runNightlyLearning(); },     { timezone: 'America/Costa_Rica' });
 
@@ -2757,6 +2928,9 @@ cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); },     { 
 
 // Proactive team DMs — 8:00 PM CR weekdays (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
 cron.schedule('0 2 * * 2-6', async () => { await runProactiveDMs(); },        { timezone: 'America/Costa_Rica' });
+
+// Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
+cron.schedule('0 9 * * 1-5', async () => { await runFulfillmentStandup(); },  { timezone: 'America/Costa_Rica' });
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
