@@ -2192,20 +2192,20 @@ async function runProactiveDMs() {
       if (dash.customer_status === 'phase_2' && daysSince >= 4) stalledPhase2.push(dash);
     }
 
-    // ── DM Josue: clients hitting Day 14 tomorrow ──
+    // ── DM Josue: clients hitting Day 14 today ──
     if (hitting14Tomorrow.length > 0) {
       const names = hitting14Tomorrow.map(d => `${d.client_name} (Day 13)`).join(', ');
-      const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} their 14-day launch deadline tomorrow: ${names}. If campaigns are not live by end of day tomorrow, we miss the SLA. What needs to happen tonight or first thing tomorrow to make sure they launch on time?`;
+      const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} their 14-day launch deadline today: ${names}. If campaigns are not live by end of day, we miss the SLA. What needs to happen right now to make sure they launch on time?`;
       await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
-      console.log(`Proactive DM sent to Josue: ${hitting14Tomorrow.length} client(s) hitting Day 14 tomorrow`);
+      console.log(`Proactive DM sent to Josue: ${hitting14Tomorrow.length} client(s) hitting Day 14 today`);
     }
 
-    // ── DM Josue: clients hitting at-risk threshold tomorrow ──
+    // ── DM Josue: clients hitting at-risk threshold today ──
     if (hitting7Tomorrow.length > 0) {
       const names = hitting7Tomorrow.map(d => `${d.client_name} (Day 6)`).join(', ');
-      const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} Day 7 tomorrow, which is the at-risk threshold: ${names}. Worth checking their progress today so we're not scrambling next week.`;
+      const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} Day 7 today, which is the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling next week.`;
       await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
-      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) hitting Day 7 tomorrow`);
+      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) hitting Day 7 today`);
     }
 
     // ── DM Valeria: clients stalled in phase_1 ──
@@ -2906,6 +2906,78 @@ async function runFulfillmentStandup() {
     await slack.client.chat.postMessage({ channel: 'U09TNMVML3F', text: felipeLines.join('\n') });
     console.log('Standup DM sent to Felipe');
 
+    // ── DM Tania — Phase 0 owner, SLA enforcer, Phase 3 client success ─────────
+    const taniaLines = [`Good morning Tania! Here's your ${today} client success brief:\n`];
+
+    // Section 1: Phase 0 pipeline — Tania owns steps 1–4
+    const { data: phase0All } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
+      .order('phase0_step', { ascending: true })
+      .order('days_in_phase0', { ascending: false });
+
+    const p0StepLabels = {
+      '1_awaiting_signup':          'awaiting portal signup',
+      '2_awaiting_terms':           'awaiting T&C acceptance',
+      '3_awaiting_form':            'awaiting onboarding form',
+      '4_awaiting_activation_call': 'awaiting activation call booking',
+      '5_ready_for_handoff':        'ready for Phase 1 → Josue to kick off',
+    };
+
+    if (phase0All && phase0All.length) {
+      taniaLines.push(`📋 *Phase 0 pipeline — ${phase0All.length} client${phase0All.length > 1 ? 's' : ''} in pre-portal onboarding (you own steps 1–4):*`);
+      phase0All.forEach(r => {
+        const name  = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+        const co    = r.company ? ` (${r.company})` : '';
+        const days  = r.days_in_phase0 ?? 0;
+        const flag  = days >= 14 ? ' 🔴 OVERDUE' : days >= 7 ? ' ⚠️ at risk' : '';
+        taniaLines.push(`• ${name}${co} — ${p0StepLabels[r.phase0_step] || r.phase0_step} | Day ${days}${flag}`);
+      });
+      taniaLines.push('');
+    } else {
+      taniaLines.push(`📋 *Phase 0:* No clients in pre-portal onboarding.\n`);
+    }
+
+    // Section 2: SLA watch — Day 14 due today + overdue
+    const slaDueToday = clients.filter(d => getDayCount(d) === 14);
+    const slaOverdue  = clients.filter(d => (getDayCount(d) || 0) > 14 && ['phase_1','phase_2'].includes(d.customer_status));
+
+    if (slaDueToday.length || slaOverdue.length) {
+      taniaLines.push(`🚨 *SLA watch:*`);
+      slaDueToday.forEach(d => taniaLines.push(`• ${d.client_name} — Day 14 TODAY | ${phaseLabel[d.customer_status] || d.customer_status} | must activate by EOD`));
+      slaOverdue.forEach(d  => taniaLines.push(`• ${d.client_name} — Day ${getDayCount(d)} | ${phaseLabel[d.customer_status] || d.customer_status} | past 14-day SLA window`));
+      taniaLines.push('');
+    } else {
+      taniaLines.push(`✅ *SLA watch:* No clients at or past the 14-day activation deadline today.\n`);
+    }
+
+    // Section 3: Phase 3 stabilization — all clients, flag near/at Day 20 for 1:1
+    const phase3Clients = clients.filter(d => d.customer_status === 'phase_3');
+    if (phase3Clients.length) {
+      taniaLines.push(`📈 *Phase 3 stabilization — ${phase3Clients.length} client${phase3Clients.length > 1 ? 's' : ''} (your follow-up + 1:1 sessions):*`);
+      phase3Clients.forEach(d => {
+        const anchor  = d.stabilization_started_at ? new Date(d.stabilization_started_at) : new Date(d.created_at);
+        const stabDay = Math.floor((now - anchor.getTime()) / (1000 * 60 * 60 * 24));
+        const flag    = stabDay >= 20 ? ' 🔴 1:1 overdue — schedule now' : stabDay >= 18 ? ' 📅 1:1 due in ~2 days' : '';
+        taniaLines.push(`• ${d.client_name} — Stabilization Day ${stabDay}${flag}`);
+      });
+      taniaLines.push('');
+    } else {
+      taniaLines.push(`📈 *Phase 3:* No clients in stabilization.\n`);
+    }
+
+    // Section 4: Blocked clients (only if any)
+    if (blocked.length) {
+      taniaLines.push(`🔴 *Blocked — needs client-side outreach (${blocked.length}):*`);
+      blocked.forEach(d => taniaLines.push(`• ${d.client_name} — Day ${getDayCount(d)}`));
+      taniaLines.push('');
+    }
+
+    taniaLines.push(`Anything you need from me to move any of these forward? I can draft client emails, schedule 1:1 reminders, or pull activity details on any client.`);
+
+    await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: taniaLines.join('\n') });
+    console.log('Standup DM sent to Tania');
+
     console.log('Fulfillment standup DMs complete.');
   } catch (err) {
     console.error('Fulfillment standup error:', err.message);
@@ -2926,8 +2998,8 @@ cron.schedule('0 14 * * 1',  async () => { await runMondayGapDetection(); },  { 
 cron.schedule('0 15 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
 cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
 
-// Proactive team DMs — 8:00 PM CR weekdays (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
-cron.schedule('0 2 * * 2-6', async () => { await runProactiveDMs(); },        { timezone: 'America/Costa_Rica' });
+// Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
+cron.schedule('0 8 * * 1-5', async () => { await runProactiveDMs(); },        { timezone: 'America/Costa_Rica' });
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
 cron.schedule('0 9 * * 1-5', async () => { await runFulfillmentStandup(); },  { timezone: 'America/Costa_Rica' });
