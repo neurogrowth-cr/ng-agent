@@ -1081,7 +1081,63 @@ async function getCalendarEvents(daysFromNow = 0, daysRange = 1) {
   const res = await calendar.events.list({ calendarId: 'primary', timeMin: startDate.toISOString(), timeMax: endDate.toISOString(), singleEvents: true, orderBy: 'startTime' });
   const events = res.data.items || [];
   if (!events.length) return 'No events found in that range.';
-  return events.map(e => `${e.start.dateTime || e.start.date} — ${e.summary}`).join('\n');
+  return events.map(e => {
+    const when = e.start.dateTime || e.start.date;
+    const guestCount = (e.attendees || []).length;
+    return `${when} — ${e.summary} [id: ${e.id}${guestCount ? ` | ${guestCount} guests` : ''}]`;
+  }).join('\n');
+}
+
+// ─── GOOGLE CALENDAR: ADD ATTENDEES TO EXISTING EVENT ────────────────────────
+// Fetches the event, merges new attendees with existing (no dupes), patches,
+// and sends invite emails to all attendees via sendUpdates: 'all'.
+async function addCalendarAttendees(eventId, attendees, sendUpdates = 'all') {
+  try {
+    if (!eventId) return 'Add attendees error: eventId is required. Use get_calendar_events first to find the event ID.';
+    const emails = Array.isArray(attendees) ? attendees : String(attendees || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!emails.length) return 'Add attendees error: no valid email addresses provided.';
+    const auth     = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const { data: event } = await calendar.events.get({ calendarId: 'primary', eventId });
+    const existing = new Set((event.attendees || []).map(a => (a.email || '').toLowerCase()));
+    const toAdd    = emails.filter(e => !existing.has(e.toLowerCase()));
+    if (!toAdd.length) return `All ${emails.length} attendees are already on "${event.summary}". No changes made.`;
+    const merged = [...(event.attendees || []), ...toAdd.map(email => ({ email }))];
+    await calendar.events.patch({
+      calendarId: 'primary',
+      eventId,
+      sendUpdates,
+      requestBody: { attendees: merged },
+    });
+    return `Added ${toAdd.length} guest(s) to "${event.summary}": ${toAdd.join(', ')}. Google sent invite emails (sendUpdates=${sendUpdates}).`;
+  } catch (err) {
+    return `Add attendees error: ${err.response?.data?.error?.message || err.message}`;
+  }
+}
+
+// ─── GOOGLE CALENDAR: CREATE NEW EVENT ───────────────────────────────────────
+async function createCalendarEvent(summary, startISO, endISO, attendees = [], description = '', location = '') {
+  try {
+    if (!summary || !startISO || !endISO) return 'Create event error: summary, startISO, and endISO are required.';
+    const auth     = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const emails   = Array.isArray(attendees) ? attendees : String(attendees || '').split(',').map(s => s.trim()).filter(Boolean);
+    const { data: event } = await calendar.events.insert({
+      calendarId: 'primary',
+      sendUpdates: 'all',
+      requestBody: {
+        summary,
+        description: description || undefined,
+        location: location || undefined,
+        start: { dateTime: startISO, timeZone: 'America/Costa_Rica' },
+        end:   { dateTime: endISO,   timeZone: 'America/Costa_Rica' },
+        attendees: emails.map(email => ({ email })),
+      },
+    });
+    return `Created "${event.summary}" for ${event.start.dateTime}. ${emails.length} guests invited. Event link: ${event.htmlLink}`;
+  } catch (err) {
+    return `Create event error: ${err.response?.data?.error?.message || err.message}`;
+  }
 }
 
 // ─── GOOGLE DRIVE ─────────────────────────────────────────────────────────────
@@ -2275,6 +2331,8 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
           { name: 'get_phase0_clients',   description: 'ALWAYS use this tool for Phase 0 (pre-portal onboarding) status — flywheel-ai clients who signed up but have not gone live yet. Covers: portal signup, T&C acceptance, onboarding form, activation call booking, handoff to Phase 1. Use in every fulfillment report to show the Phase 0 pipeline before get_client_status covers Phase 1+.',                                                                                                       input_schema: { type: 'object', properties: {} } },
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
+          { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
+          { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
           { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Debbanny — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
@@ -2308,6 +2366,8 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
         else if (toolUse.name === 'get_phase0_clients')     result = await getPhase0Clients();
         else if (toolUse.name === 'create_slack_reminder')  result = await createSlackReminder(toolUse.input.target, toolUse.input.message, toolUse.input.postAt);
+        else if (toolUse.name === 'add_calendar_attendees') result = await addCalendarAttendees(toolUse.input.eventId, toolUse.input.attendees);
+        else if (toolUse.name === 'create_calendar_event')  result = await createCalendarEvent(toolUse.input.summary, toolUse.input.startISO, toolUse.input.endISO, toolUse.input.attendees || [], toolUse.input.description || '', toolUse.input.location || '');
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
