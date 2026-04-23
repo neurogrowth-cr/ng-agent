@@ -21,6 +21,16 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
 
+const { Pool } = require('pg');
+const portalPg = process.env.PORTAL_READONLY_DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.PORTAL_READONLY_DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 3,
+      idleTimeoutMillis: 30_000,
+    })
+  : null;
+
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 
@@ -33,6 +43,8 @@ const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 4. Never use markdown formatting in Slack messages. No ##, no **, no ---, no tables, no bullet points unless the information genuinely requires a list. Write like a colleague sending a message, not a report.
 
 5. When asked to reply or post in a Slack channel, always use draft_channel_post to prepare the message and show Ron the draft for approval. Never post directly to a channel unless triggered from within that channel.
+
+6. When Ron asks for a portal data field that the pre-built tools don't cover (anything beyond onboarding phase status, Phase 0 pipeline, alerts, or sales intelligence — e.g. client emails, LinkedIn handles, any ad-hoc lookup), do NOT guess table names and do NOT say you lack access. Call search_portal_schema with keywords from Ron's question, pick the best-matching table from the grouped result, then call query_portal_db with a SELECT statement. Only fall back to list_portal_tables if schema search returns nothing.
 
 ---
 
@@ -1511,6 +1523,86 @@ async function getPhase0Clients() {
   }
 }
 
+// ─── PORTAL: READ-ONLY SQL (natural-language schema browsing) ─────────────────
+const PORTAL_SQL_MAX_ROWS = 500;
+
+function ensurePortalPg() {
+  if (!portalPg) return 'Portal read-only DB not configured. Set PORTAL_READONLY_DATABASE_URL in .env.';
+  return null;
+}
+
+async function listPortalTables() {
+  const err = ensurePortalPg(); if (err) return err;
+  try {
+    const { rows } = await portalPg.query(`
+      SELECT table_name, table_type
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+      ORDER BY table_name`);
+    if (!rows.length) return 'No tables found in public schema.';
+    return rows.map(r => `${r.table_name} (${r.table_type === 'VIEW' ? 'view' : 'table'})`).join('\n');
+  } catch (e) {
+    return `list_portal_tables error: ${e.message}`;
+  }
+}
+
+async function searchPortalSchema(keywords) {
+  const err = ensurePortalPg(); if (err) return err;
+  const tokens = (keywords || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return 'Provide at least one keyword.';
+  try {
+    const likeClauses = tokens.map((_, i) => `(lower(table_name) LIKE $${i+1} OR lower(column_name) LIKE $${i+1})`).join(' OR ');
+    const params = tokens.map(t => `%${t}%`);
+    const sql = `
+      SELECT table_name, column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND (${likeClauses})
+      ORDER BY table_name, ordinal_position`;
+    const { rows } = await portalPg.query(sql, params);
+    if (!rows.length) return `No tables or columns matched: ${keywords}`;
+    const byTable = {};
+    for (const r of rows) (byTable[r.table_name] ||= []).push(`${r.column_name} (${r.data_type})`);
+    return Object.entries(byTable)
+      .map(([t, cols]) => `${t}\n  - ${cols.join('\n  - ')}`)
+      .join('\n\n');
+  } catch (e) {
+    return `search_portal_schema error: ${e.message}`;
+  }
+}
+
+async function describePortalTable(tableName) {
+  const err = ensurePortalPg(); if (err) return err;
+  if (!tableName) return 'tableName is required.';
+  try {
+    const { rows } = await portalPg.query(`
+      SELECT column_name, data_type, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+      ORDER BY ordinal_position`, [tableName]);
+    if (!rows.length) return `No columns found for ${tableName} (table may not exist or no read access).`;
+    return rows.map(r => `${r.column_name}  ${r.data_type}${r.is_nullable === 'NO' ? ' NOT NULL' : ''}`).join('\n');
+  } catch (e) {
+    return `describe_portal_table error: ${e.message}`;
+  }
+}
+
+async function queryPortalDb(sqlText) {
+  const err = ensurePortalPg(); if (err) return err;
+  if (!sqlText || typeof sqlText !== 'string') return 'ERROR: sql is required.';
+  const cleaned = sqlText.trim().replace(/;+\s*$/, '');
+  if (!/^(select|with)\s/i.test(cleaned)) return 'ERROR: only SELECT / WITH queries are allowed.';
+  if (/;/.test(cleaned)) return 'ERROR: multiple statements are not allowed.';
+  try {
+    const wrapped = `SELECT * FROM (${cleaned}) _sub LIMIT ${PORTAL_SQL_MAX_ROWS}`;
+    const { rows, rowCount } = await portalPg.query(wrapped);
+    if (!rowCount) return 'Query returned 0 rows.';
+    const truncated = rowCount >= PORTAL_SQL_MAX_ROWS ? `\n(capped at ${PORTAL_SQL_MAX_ROWS} rows)` : '';
+    return JSON.stringify(rows, null, 2) + truncated;
+  } catch (e) {
+    return `Query error: ${e.message}`;
+  }
+}
+
 // ─── PORTAL: ALERTS ───────────────────────────────────────────────────────────
 async function getPortalAlerts() {
   try {
@@ -2405,6 +2497,10 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
+          { name: 'search_portal_schema', description: "Find portal tables by plain-English keywords. Searches both table and column names (e.g. 'email linkedin client' returns every table that has a matching column, grouped by table). ALWAYS use this first when Ron asks for a field in natural language — do NOT guess table names.", input_schema: { type: 'object', properties: { keywords: { type: 'string', description: 'Space-separated keywords drawn from what Ron asked for.' } }, required: ['keywords'] } },
+          { name: 'list_portal_tables',   description: 'List every table and view in the portal Supabase database. Use when Ron explicitly asks what tables exist, or as a fallback if search_portal_schema returns nothing.', input_schema: { type: 'object', properties: {} } },
+          { name: 'describe_portal_table',description: 'Show full column list for a specific portal table. Call after search_portal_schema has narrowed things down and you need the complete column set before querying.', input_schema: { type: 'object', properties: { tableName: { type: 'string' } }, required: ['tableName'] } },
+          { name: 'query_portal_db',      description: 'Run a read-only SQL query (SELECT or WITH only) against the portal Supabase database. Use for ad-hoc lookups the pre-built tools do not cover — e.g. pulling emails or LinkedIn handles from arbitrary tables. Results capped at 500 rows. For standard onboarding/phase status prefer get_client_status / get_phase0_clients.', input_schema: { type: 'object', properties: { sql: { type: 'string', description: 'A single SELECT or WITH statement. No semicolons, no writes.' } }, required: ['sql'] } },
           { name: 'get_phase0_clients',   description: 'ALWAYS use this tool for Phase 0 (pre-portal onboarding) status — flywheel-ai clients who signed up but have not gone live yet. Covers: portal signup, T&C acceptance, onboarding form, activation call booking, handoff to Phase 1. Use in every fulfillment report to show the Phase 0 pipeline before get_client_status covers Phase 1+.',                                                                                                       input_schema: { type: 'object', properties: {} } },
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
@@ -2441,6 +2537,10 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
         else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
         else if (toolUse.name === 'get_phase0_clients')     result = await getPhase0Clients();
+        else if (toolUse.name === 'search_portal_schema')   result = await searchPortalSchema(toolUse.input.keywords);
+        else if (toolUse.name === 'list_portal_tables')     result = await listPortalTables();
+        else if (toolUse.name === 'describe_portal_table')  result = await describePortalTable(toolUse.input.tableName);
+        else if (toolUse.name === 'query_portal_db')        result = await queryPortalDb(toolUse.input.sql);
         else if (toolUse.name === 'create_slack_reminder')  result = await createSlackReminder(toolUse.input.target, toolUse.input.message, toolUse.input.postAt);
         else if (toolUse.name === 'add_calendar_attendees') result = await addCalendarAttendees(toolUse.input.eventId, toolUse.input.attendees);
         else if (toolUse.name === 'create_calendar_event')  result = await createCalendarEvent(toolUse.input.summary, toolUse.input.startISO, toolUse.input.endISO, toolUse.input.attendees || [], toolUse.input.description || '', toolUse.input.location || '');
@@ -2742,6 +2842,138 @@ slack.message(async ({ message, say }) => {
 // are still wired to their schedules below — these are infrastructure-level and not
 // configurable via Slack, so they stay hardcoded.
 
+// ─── SALES CALL PREP ──────────────────────────────────────────────────────────
+// Runs hourly Mon–Fri. Queries revops_appointments for calls in the next 3.5–5h,
+// fetches GHL conversation history for the prospect, and DMs the assigned closer
+// with a prep brief. Deduplicates via agent_knowledge so each call gets one brief.
+const CLOSER_SLACK = {
+  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999', // Jonathan
+  'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN', // Jose
+};
+
+async function fetchGHLConvoForContact(contactId) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const apiKey     = process.env.GHL_API_KEY;
+  const headers    = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // Get conversations for this contact
+  const convoRes  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&contactId=${contactId}&limit=1`, { headers });
+  const convoData = await convoRes.json();
+  const convoId   = convoData.conversations?.[0]?.id;
+  if (!convoId) return null;
+  // Get recent messages
+  const msgRes  = await fetch(`https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=12`, { headers });
+  const msgData = await msgRes.json();
+  return msgData.messages || [];
+}
+
+async function searchGHLContact(email, name) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const apiKey     = process.env.GHL_API_KEY;
+  const headers    = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // Try by email first, fall back to name
+  const query = email || name;
+  const res  = await fetch(`https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&query=${encodeURIComponent(query)}&limit=1`, { headers });
+  const data = await res.json();
+  return data.contacts?.[0] || null;
+}
+
+async function runSalesCallPrep() {
+  console.log('Running sales call prep...');
+  try {
+    const now       = Date.now();
+    const windowMin = now + (3.5 * 60 * 60 * 1000); // 3.5h from now
+    const windowMax = now + (5   * 60 * 60 * 1000); // 5h from now
+
+    // Query upcoming appointments in the window
+    const { data: upcoming, error } = await portalSupabase
+      .from('revops_appointments')
+      .select(`
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at,
+        prospect:prospect_id ( full_name, company, email, lead_source )
+      `)
+      .gte('scheduled_start', new Date(windowMin).toISOString())
+      .lte('scheduled_start', new Date(windowMax).toISOString())
+      .is('attended', null); // only upcoming (not yet attended/no-showed)
+
+    if (error) throw error;
+    if (!upcoming || !upcoming.length) {
+      console.log('Sales call prep: no calls in window.');
+      return;
+    }
+
+    for (const appt of upcoming) {
+      // Dedup — skip if brief already sent for this appointment
+      const prepKey = `call-prep-${appt.id}`;
+      const { data: existing } = await supabase.from('agent_knowledge').select('id').eq('key', prepKey).limit(1);
+      if (existing && existing.length) {
+        console.log(`Call prep already sent for appointment ${appt.id}`);
+        continue;
+      }
+
+      const prospect    = appt.prospect || {};
+      const prospectName = prospect.full_name || 'Unknown prospect';
+      const company     = prospect.company   || '';
+      const email       = prospect.email     || '';
+      const leadSource  = prospect.lead_source || '';
+      const setterName  = resolveSalesMember(appt.setter_id);
+      const closerName  = resolveSalesMember(appt.closer_id);
+      const closerSlack = CLOSER_SLACK[appt.closer_id] || CLOSER_SLACK[(appt.closer_id || '').toLowerCase()];
+      const callTime    = new Date(appt.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      const hoursOut    = Math.round((new Date(appt.scheduled_start).getTime() - now) / (1000 * 60 * 60) * 10) / 10;
+
+      // GHL conversation lookup
+      let convoSection = 'GHL conversation not found for this prospect.';
+      try {
+        const ghlContact = await searchGHLContact(email, prospectName);
+        if (ghlContact) {
+          const messages = await fetchGHLConvoForContact(ghlContact.id);
+          if (messages && messages.length) {
+            const msgLines = messages
+              .filter(m => m.body || m.text)
+              .slice(-8) // last 8 messages
+              .map(m => {
+                const dir  = m.direction === 'inbound' ? '← Prospect' : '→ Team';
+                const time = m.dateAdded ? new Date(m.dateAdded).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+                return `[${time}] ${dir}: ${(m.body || m.text || '').substring(0, 200)}`;
+              });
+            convoSection = msgLines.join('\n');
+          }
+        }
+      } catch (ghlErr) {
+        console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
+      }
+
+      // Build the brief
+      const brief = [
+        `📞 *CALL PREP — ${prospectName}* | in ${hoursOut}h (${callTime} CR)`,
+        company     ? `🏢 Company: ${company}` : '',
+        email       ? `📧 Email: ${email}` : '',
+        leadSource  ? `🔗 Lead source: ${leadSource}` : '',
+        `👤 Booked by: ${setterName}`,
+        ``,
+        `*GHL CONVERSATION HISTORY:*`,
+        convoSection,
+        ``,
+        `Good luck on the call ${closerName.split(' ')[0]}. Let me know if you need anything before you jump on.`,
+      ].filter(l => l !== null && l !== undefined).join('\n');
+
+      if (!closerSlack) {
+        // Closer not mapped — send to Ron
+        await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Call prep for ${prospectName} — closer ID "${appt.closer_id}" has no Slack mapping. Brief:\n\n${brief}` });
+      } else {
+        await slack.client.chat.postMessage({ channel: closerSlack, text: brief });
+        console.log(`Call prep DM sent to ${closerName} for ${prospectName} (${callTime})`);
+      }
+
+      // Mark as sent in knowledge base
+      await upsertKnowledge('intel', prepKey, `Call prep sent to ${closerName} for ${prospectName} on ${callTime}`, 'system');
+    }
+  } catch (err) {
+    console.error('Sales call prep error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Sales call prep cron failed: ${err.message}` });
+  }
+}
+
 // ─── FULFILLMENT MORNING STANDUP ──────────────────────────────────────────────
 // Fires 9:00 AM CR Mon–Fri. DMs each fulfillment team member with their
 // specific priorities for the day — no meeting needed.
@@ -3003,6 +3235,9 @@ cron.schedule('0 8 * * 1-5', async () => { await runProactiveDMs(); },        { 
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
 cron.schedule('0 9 * * 1-5', async () => { await runFulfillmentStandup(); },  { timezone: 'America/Costa_Rica' });
+
+// Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
+cron.schedule('0 * * * 1-5',  async () => { await runSalesCallPrep(); },       { timezone: 'America/Costa_Rica' });
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
