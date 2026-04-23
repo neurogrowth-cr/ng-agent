@@ -2920,17 +2920,22 @@ async function runSalesCallPrep() {
       const company     = prospect.company   || '';
       const email       = prospect.email     || '';
       const leadSource  = prospect.lead_source || '';
-      const setterName  = resolveSalesMember(appt.setter_id);
       const closerName  = resolveSalesMember(appt.closer_id);
       const closerSlack = CLOSER_SLACK[appt.closer_id] || CLOSER_SLACK[(appt.closer_id || '').toLowerCase()];
       const callTime    = new Date(appt.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const hoursOut    = Math.round((new Date(appt.scheduled_start).getTime() - now) / (1000 * 60 * 60) * 10) / 10;
 
-      // GHL conversation lookup
+      // GHL conversation lookup + setter resolution
       let convoSection = 'GHL conversation not found for this prospect.';
+      let setterName   = 'VSL self-booking'; // default — no setter unless GHL says otherwise
       try {
         const ghlContact = await searchGHLContact(email, prospectName);
         if (ghlContact) {
+          // Resolve setter from GHL contact.assignedTo (Appointment Setter pipeline only)
+          if (ghlContact.assignedTo) {
+            const resolved = resolveSalesMember(ghlContact.assignedTo);
+            if (resolved !== ghlContact.assignedTo) setterName = resolved; // mapped = real setter name
+          }
           const messages = await fetchGHLConvoForContact(ghlContact.id);
           if (messages && messages.length) {
             const msgLines = messages
@@ -2954,7 +2959,7 @@ async function runSalesCallPrep() {
         company     ? `🏢 Company: ${company}` : '',
         email       ? `📧 Email: ${email}` : '',
         leadSource  ? `🔗 Lead source: ${leadSource}` : '',
-        `👤 Booked by: ${setterName}`,
+        setterName === 'VSL self-booking' ? `📲 Source: VSL self-booking (no setter)` : `👤 Booked by: ${setterName}`,
         ``,
         `*GHL CONVERSATION HISTORY:*`,
         convoSection,
