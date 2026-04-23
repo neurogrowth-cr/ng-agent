@@ -1407,6 +1407,54 @@ async function getClientStatus(clientName = null) {
   }
 }
 
+// ─── PORTAL: PHASE 0 (PRE-PORTAL ONBOARDING) ─────────────────────────────────
+// Reads v_phase0_fulfillment in the neurogrowth-proposals project. Phase 0 =
+// clients who signed up for flywheel-ai but haven't gone live yet (go_live_at IS NULL).
+// The view exposes a derived phase0_step:
+//   1_awaiting_signup, 2_awaiting_terms, 3_awaiting_form,
+//   4_awaiting_activation_call, 5_ready_for_handoff
+async function getPhase0Clients() {
+  try {
+    const { data, error } = await portalSupabase
+      .from('v_phase0_fulfillment')
+      .select('id, email, first_name, last_name, company, status, phase0_step, days_in_phase0, terms_accepted_at, onboarding_completed_at, booking_calendar_url, dashboard_created, created_at')
+      .order('phase0_step', { ascending: true })
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    if (!data || !data.length) return 'Phase 0 — no clients currently in pre-portal onboarding.';
+
+    const stepLabel = {
+      '1_awaiting_signup':          '🟠 Awaiting portal signup',
+      '2_awaiting_terms':           '🟡 Awaiting T&C acceptance',
+      '3_awaiting_form':            '🔵 Awaiting onboarding form',
+      '4_awaiting_activation_call': '🟣 Awaiting activation call booking',
+      '5_ready_for_handoff':        '🟢 Ready for Phase 1 handoff',
+    };
+
+    const grouped = data.reduce((acc, r) => {
+      (acc[r.phase0_step] = acc[r.phase0_step] || []).push(r);
+      return acc;
+    }, {});
+
+    const sections = Object.keys(grouped).sort().map(step => {
+      const rows = grouped[step];
+      const lines = rows.map(r => {
+        const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
+        const co   = r.company ? ` (${r.company})` : '';
+        const days = r.days_in_phase0 != null ? `Day ${r.days_in_phase0}` : '?';
+        return `• ${name}${co} — ${days} | ${r.email}`;
+      });
+      return `${stepLabel[step] || step} (${rows.length}):\n${lines.join('\n')}`;
+    });
+
+    const counts = Object.entries(grouped).map(([k, v]) => `${k}: ${v.length}`).join(' | ');
+    const header = `Phase 0 — ${data.length} clients in pre-portal onboarding | ${counts}\n\n`;
+    return header + sections.join('\n\n');
+  } catch (err) {
+    return `Phase 0 clients error: ${err.message}`;
+  }
+}
+
 // ─── PORTAL: ALERTS ───────────────────────────────────────────────────────────
 async function getPortalAlerts() {
   try {
@@ -2188,6 +2236,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
+          { name: 'get_phase0_clients',   description: 'ALWAYS use this tool for Phase 0 (pre-portal onboarding) status — flywheel-ai clients who signed up but have not gone live yet. Covers: portal signup, T&C acceptance, onboarding form, activation call booking, handoff to Phase 1. Use in every fulfillment report to show the Phase 0 pipeline before get_client_status covers Phase 1+.',                                                                                                       input_schema: { type: 'object', properties: {} } },
           { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Debbanny — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
@@ -2219,6 +2268,7 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
         else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
         else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
+        else if (toolUse.name === 'get_phase0_clients')     result = await getPhase0Clients();
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
