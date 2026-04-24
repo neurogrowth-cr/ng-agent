@@ -1603,6 +1603,24 @@ async function queryPortalDb(sqlText) {
   }
 }
 
+// ─── PORTAL: WRITE-BACK ───────────────────────────────────────────────────────
+const PORTAL_WRITE_WHITELIST = {
+  client_dashboards:  ['notes', 'linkedin_handler', 'customer_status', 'is_active'],
+  customer_onboarding: ['notes'],
+};
+
+async function updatePortalRecord(table, id, fields) {
+  if (!PORTAL_WRITE_WHITELIST[table])
+    return `Write blocked: table "${table}" is not on the write whitelist. Allowed: ${Object.keys(PORTAL_WRITE_WHITELIST).join(', ')}`;
+  const allowed  = PORTAL_WRITE_WHITELIST[table];
+  const filtered = Object.fromEntries(Object.entries(fields).filter(([k]) => allowed.includes(k)));
+  if (!Object.keys(filtered).length)
+    return `Write blocked: none of the provided fields are writable on "${table}". Allowed: ${allowed.join(', ')}`;
+  const { error } = await portalSupabase.from(table).update(filtered).eq('id', id);
+  if (error) return `Update error: ${error.message}`;
+  return `Updated ${Object.keys(filtered).join(', ')} on ${table} row ${id}.`;
+}
+
 // ─── PORTAL: ALERTS ───────────────────────────────────────────────────────────
 async function getPortalAlerts() {
   try {
@@ -2511,6 +2529,7 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
           { name: 'clean_duplicate_tasks',description: 'Find and hard-delete duplicate scheduled tasks. Queries ALL rows including inactive. Keeps oldest clean-named version of each task.',                                                                                                                                               input_schema: { type: 'object', properties: {} } },
           { name: 'delete_scheduled_task',description: 'Deactivate and stop a scheduled task by its ID.',                                        input_schema: { type: 'object', properties: { taskId: { type: 'string', description: 'The task ID from list_scheduled_tasks' } }, required: ['taskId'] } },
+          { name: 'update_portal_record', description: 'Update specific fields on a portal Supabase record. Whitelisted tables/fields only — use to log notes, correct LinkedIn handles, or update status after completing a task. Allowed tables: client_dashboards (notes, linkedin_handler, customer_status, is_active), customer_onboarding (notes).', input_schema: { type: 'object', properties: { table: { type: 'string', description: 'Table name e.g. client_dashboards' }, id: { type: 'string', description: 'Row UUID' }, fields: { type: 'object', description: 'Key-value pairs to update' } }, required: ['table', 'id', 'fields'] } },
           { name: 'get_meta_ads_summary', description: 'Get NeuroGrowth Meta Ads account-level performance summary — spend, impressions, reach, clicks, CTR, CPC, CPM, leads, and CPL.', input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'Date range: today, yesterday, last_7d (default), last_14d, last_30d, last_month, this_month, this_quarter' } } } },
           { name: 'get_meta_campaigns',   description: 'Get Meta Ads campaign-level breakdown.',                                                  input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' }, limit: { type: 'number', description: 'Number of campaigns, default 10' } } } },
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
@@ -2550,6 +2569,7 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
         else if (toolUse.name === 'clean_duplicate_tasks')  result = await cleanDuplicateTasks();
         else if (toolUse.name === 'delete_scheduled_task')  result = await deleteScheduledTask(toolUse.input.taskId);
+        else if (toolUse.name === 'update_portal_record')   result = await updatePortalRecord(toolUse.input.table, toolUse.input.id, toolUse.input.fields);
         else if (toolUse.name === 'get_meta_ads_summary')   result = await getMetaAdsSummary(toolUse.input.datePreset || 'last_7d');
         else if (toolUse.name === 'get_meta_campaigns')     result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
         else if (toolUse.name === 'get_meta_adsets')        result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
@@ -3368,6 +3388,41 @@ async function handleGHLWebhook(req, res) {
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
 }
 
+// ─── INNER CIRCLE HUDDLE EVENT LOOKUP (CACHED) ───────────────────────────────
+async function getInnerCircleHuddleEvent() {
+  const auth     = getGoogleAuth();
+  const calendar = google.calendar({ version: 'v3', auth });
+
+  // 1. Try cached event ID first
+  const { data: cached } = await supabase
+    .from('agent_knowledge')
+    .select('value')
+    .eq('category', 'config')
+    .eq('key', 'inner_circle_huddle_event_id')
+    .single();
+  if (cached?.value) {
+    try {
+      const { data: event } = await calendar.events.get({ calendarId: 'primary', eventId: cached.value });
+      if (event) return event; // Cache hit
+    } catch (_) { /* Stale ID — fall through to search */ }
+  }
+
+  // 2. Search calendar (next 30 days)
+  const timeMin = new Date().toISOString();
+  const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const res     = await calendar.events.list({ calendarId: 'primary', q: 'Inner Circle Huddle', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 5 });
+  const event   = (res.data.items || [])[0];
+  if (!event) return null;
+
+  // 3. Cache the ID for next time
+  await supabase.from('agent_knowledge').upsert(
+    { category: 'config', key: 'inner_circle_huddle_event_id', value: event.id, source: 'auto', updated_at: new Date().toISOString() },
+    { onConflict: 'category,key' }
+  );
+  console.log(`Cached Inner Circle Huddle event ID: ${event.id}`);
+  return event;
+}
+
 // ─── SUPABASE WEBHOOK HANDLER ────────────────────────────────────────────────
 async function handlePhase3Transition(record) {
   const { email, client_name } = record;
@@ -3376,14 +3431,7 @@ async function handlePhase3Transition(record) {
     return;
   }
   try {
-    // Search for the Inner Circle Huddle recurring event over next 30 days
-    const auth     = getGoogleAuth();
-    const calendar = google.calendar({ version: 'v3', auth });
-    const timeMin  = new Date().toISOString();
-    const timeMax  = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    const res      = await calendar.events.list({ calendarId: 'primary', q: 'Inner Circle Huddle', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 5 });
-    const events   = res.data.items || [];
-    const event    = events[0];
+    const event = await getInnerCircleHuddleEvent();
     if (!event) {
       await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${client_name} just moved to Phase 3 but I couldn't find "Inner Circle Huddle" in your calendar (next 30 days). Add their invite manually: ${email}` });
       return;
@@ -3394,6 +3442,47 @@ async function handlePhase3Transition(record) {
   } catch (err) {
     console.error('handlePhase3Transition error:', err.message);
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${client_name} moved to Phase 3 but the calendar invite failed: ${err.message}. Add manually: ${email}` });
+  }
+}
+
+// ─── MONTHLY PHASE 3 RECONCILIATION ──────────────────────────────────────────
+async function runPhase3Reconciliation() {
+  try {
+    // 1. Get all active phase_3 clients from portal
+    const { rows } = await portalPg.query(
+      `SELECT client_name, email FROM client_dashboards WHERE customer_status = 'phase_3' AND is_active = true AND email IS NOT NULL`
+    );
+    if (!rows.length) { console.log('Phase 3 reconciliation: no active phase_3 clients.'); return; }
+
+    // 2. Find Inner Circle Huddle (cached)
+    const event = await getInnerCircleHuddleEvent();
+    if (!event) {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Phase 3 reconciliation: couldn't find Inner Circle Huddle in calendar. ${rows.length} phase_3 clients on file — check manually.` });
+      return;
+    }
+
+    // 3. Get full attendee list from the event
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const { data: fullEvent } = await calendar.events.get({ calendarId: 'primary', eventId: event.id });
+    const existing = new Set((fullEvent.attendees || []).map(a => a.email.toLowerCase()));
+    const missing  = rows.filter(r => !existing.has(r.email.toLowerCase()));
+    if (!missing.length) { console.log('Phase 3 reconciliation: all clients already on Huddle.'); return; }
+
+    // 4. Add missing clients
+    const added = [];
+    for (const client of missing) {
+      const result = await addCalendarAttendees(event.id, [client.email]);
+      if (!result.startsWith('Add attendees error')) added.push(client.client_name);
+    }
+    if (added.length) {
+      await slack.client.chat.postMessage({
+        channel: RON_SLACK_ID,
+        text: `🔁 Monthly Phase 3 reconciliation: added ${added.length} missing client(s) to Inner Circle Huddle — ${added.join(', ')}.`
+      });
+    }
+  } catch (err) {
+    console.error('Phase 3 reconciliation error:', err.message);
   }
 }
 
@@ -3454,6 +3543,9 @@ healthServer.listen(process.env.PORT || 3000, () => {
   await slack.start();
   console.log('NeuroGrowth PM Agent is running.');
   await loadAndRegisterDynamicCrons();
+  // Static infrastructure crons (not stored in DB)
+  cron.schedule('0 7 15 * *', runPhase3Reconciliation, { timezone: 'America/Costa_Rica' });
+  console.log('Registered static cron: Phase 3 reconciliation (0 7 15 * *)');
 })();
 
 // ─── MEMBER JOINED CHANNEL ────────────────────────────────────────────────────
