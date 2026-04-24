@@ -409,19 +409,19 @@ const ROLE_PERMISSIONS = {
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: true,
   },
   client_success: {
-    canReadChannels: ['ng-fullfillment-ops','ng-new-client-alerts','ng-ops-management','ng-pm-agent'],
+    canReadChannels: ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-ops-management','ng-app-and-systems-improvents','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-new-client-alerts'],
     canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
   tech_ops: {
-    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents','ng-pm-agent'],
+    canReadChannels: ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-ops-management','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents'],
     canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
   tech_lead: {
-    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents','ng-ops-management','ng-pm-agent'],
+    canReadChannels: ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-ops-management','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents'],
     canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
@@ -470,7 +470,9 @@ function buildRoleSystemPrompt(userId) {
   const roleContext = {
     client_success: `You are speaking with Tania, the Client Success Operations Manager at NeuroGrowth. She is the operational backbone of the business — hybrid Chief of Staff and Client Success role reporting to Ron.
 
-PORTAL FOCUS: When Tania asks about clients, lead with the accounts she is responsible for — her book of business first, then expand. She can ask about any client — answer freely, but default scope is hers. Prioritize client health, onboarding phase, AR status, and renewal signals.
+CROSS-ROLE CONTEXT: Fulfillment and sales are not siloed from Tania. When she asks about a client, surface both sides — delivery status AND sales history (what was promised on the close call, renewal timing, setter notes). When she asks about a prospect or renewal, pull delivery reputation (on-time launch, blockers, satisfaction signals) since that shapes retention and case-study potential.
+
+PORTAL FOCUS: Lead with her book of business first, then expand. She can ask about any client, prospect, or deal — answer freely. Prioritize client health, onboarding phase, AR status, renewal signals, and any sale-to-delivery handoff gaps.
 
 Her 3 pillars:
 - Executive Ops (30%): Draft and manage all contracts and SLAs, maintain contract repo with renewal dates, prepare pre-meeting research packages for Ron, own OKR tracking and sprint completion monitoring, produce weekly 5-min ops summary for Ron.
@@ -483,7 +485,9 @@ When Tania asks about a client, give her full health context: engagement level, 
 
     tech_ops: `You are speaking with Josue, the Technical Operations Manager at NeuroGrowth. He reports to Ron (CEO) and is the single point of accountability for technical campaign excellence across all clients.
 
-PORTAL FOCUS: Lead with fulfillment pipeline health — phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. He can ask about sales, setters, or any client — answer freely.
+CROSS-ROLE CONTEXT: Sales context matters to Josue. When a new client lands in delivery, the close-call promises, price tier, and setter-to-closer notes shape how he scopes the 14-day build. When a client is blocked or at-risk, sales needs to know before the next renewal or case-study ask. Surface both sides freely.
+
+PORTAL FOCUS: Lead with fulfillment pipeline health — phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. He can ask about sales, setters, or any client — answer freely, and flag cross-over risks (e.g. a stalled client whose renewal is near).
 
 His role is split:
 - 60% Build & Release: Own the complete 14-day launch cycle from client activation through technical deployment. Phase 1 (Days 1-3): client activation & onboarding. Phase 2 (Days 4-10): fulfillment coordination. Phase 3 (Days 11-13): technical QA. Phase 4 (Day 14): launch execution & handoff.
@@ -497,7 +501,9 @@ When Josue asks about a client, pull from knowledge base and fulfillment channel
 
     tech_lead: `You are speaking with David, the Lead Technology and Automation specialist at NeuroGrowth. He builds and maintains Make.com scenarios, Supabase infrastructure, and the Neurogrowth Portal. Help him with technical questions, systems channel activity, and process documentation.
 
-PORTAL FOCUS: Lead with system health, Make.com scenario activity, portal data integrity, and automation failure signals. He can ask about any client or team data — answer freely.
+CROSS-ROLE CONTEXT: System issues rarely stay in the system channel. A Make.com failure can cascade into fulfillment delays, stuck onboarding phases, or missed sales handoffs. When David asks about infrastructure, also surface which active clients or sales workflows are affected downstream.
+
+PORTAL FOCUS: Lead with system health, Make.com scenario activity, portal data integrity, and automation failure signals. He can ask about any client, team, or sales data — answer freely, and flag when a tech issue is touching live client or deal work.
 
 He cannot access Ron's email or calendar.`,
 
