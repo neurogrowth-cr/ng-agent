@@ -3368,6 +3368,70 @@ async function handleGHLWebhook(req, res) {
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
 }
 
+// ─── SUPABASE WEBHOOK HANDLER ────────────────────────────────────────────────
+async function handlePhase3Transition(record) {
+  const { email, client_name } = record;
+  if (!email) {
+    console.warn('Phase 3 transition webhook: no email on record, skipping.');
+    return;
+  }
+  try {
+    // Search for the Inner Circle Huddle recurring event over next 30 days
+    const auth     = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const timeMin  = new Date().toISOString();
+    const timeMax  = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const res      = await calendar.events.list({ calendarId: 'primary', q: 'Inner Circle Huddle', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 5 });
+    const events   = res.data.items || [];
+    const event    = events[0];
+    if (!event) {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${client_name} just moved to Phase 3 but I couldn't find "Inner Circle Huddle" in your calendar (next 30 days). Add their invite manually: ${email}` });
+      return;
+    }
+    await addCalendarAttendees(event.id, [email]);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `✅ ${client_name} moved to Phase 3 — I've added ${email} to *${event.summary}* (${event.start?.dateTime || event.start?.date}). Invite sent automatically.` });
+    console.log(`Phase 3 transition: added ${email} to event ${event.id} (${event.summary})`);
+  } catch (err) {
+    console.error('handlePhase3Transition error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${client_name} moved to Phase 3 but the calendar invite failed: ${err.message}. Add manually: ${email}` });
+  }
+}
+
+async function handleSupabaseWebhook(req, res) {
+  const secret = process.env.SUPABASE_WEBHOOK_SECRET;
+  if (secret && req.headers['x-webhook-secret'] !== secret) {
+    console.warn('Supabase webhook rejected — invalid or missing secret');
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
+  // Respond 200 immediately so Supabase doesn't retry
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ received: true }));
+  try {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      try {
+        const payload    = JSON.parse(body);
+        const { table, type, record, old_record } = payload;
+        console.log(`Supabase webhook: ${type} on ${table}`);
+
+        // Phase 3 transition — auto-invite to Inner Circle Huddle
+        if (table === 'client_dashboards' && type === 'UPDATE') {
+          const wasPhase3 = old_record?.customer_status === 'phase_3';
+          const isPhase3  = record?.customer_status === 'phase_3';
+          if (!wasPhase3 && isPhase3) await handlePhase3Transition(record);
+        }
+      } catch (parseErr) {
+        console.error('Supabase webhook parse error:', parseErr.message);
+      }
+    });
+  } catch (err) {
+    console.error('Supabase webhook handler error:', err.message);
+  }
+}
+
 // ─── HEALTH CHECK SERVER ──────────────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
@@ -3375,6 +3439,8 @@ const healthServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'ok', agent: 'NeuroGrowth PM Agent (Max)', uptime: Math.floor(process.uptime()), timestamp: new Date().toISOString() }));
   } else if (req.url === '/webhook/ghl-lead' && req.method === 'POST') {
     handleGHLWebhook(req, res);
+  } else if (req.url === '/webhook/supabase' && req.method === 'POST') {
+    handleSupabaseWebhook(req, res);
   } else {
     res.writeHead(404); res.end('Not found');
   }
