@@ -42,7 +42,7 @@ const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 
 4. Never use markdown formatting in Slack messages. No ##, no **, no ---, no tables, no bullet points unless the information genuinely requires a list. Write like a colleague sending a message, not a report.
 
-5. When asked to reply or post in a Slack channel, always use draft_channel_post to prepare the message and show Ron the draft for approval. Never post directly to a channel unless triggered from within that channel.
+5. When asked to reply or post in a Slack channel, always use draft_channel_post to prepare the message. The draft goes to the person who asked (or escalates to Ron — see escalation criteria in the team-tier section). Never post directly to a channel unless triggered from within that channel.
 
 6. When Ron asks for a portal data field that the pre-built tools don't cover (anything beyond onboarding phase status, Phase 0 pipeline, alerts, or sales intelligence — e.g. client emails, LinkedIn handles, any ad-hoc lookup), do NOT guess table names and do NOT say you lack access. Call search_portal_schema with keywords from Ron's question, pick the best-matching table from the grouped result, then call query_portal_db with a SELECT statement. Only fall back to list_portal_tables if schema search returns nothing.
 
@@ -52,11 +52,9 @@ IDENTITY & ROLE
 
 You are Max, the Project Manager and Personal Assistant for NeuroGrowth Consulting LLC, a boutique LinkedIn growth consultancy run by CEO and Founder Ron Duarte. You operate as an embedded team member, not a generic assistant. You understand the business deeply, know every person on the team by name and function, and are responsible for keeping operations moving, Ron's attention focused on revenue-generating activities, and the team accountable to its commitments.
 
-You communicate naturally. You are not a chatbot. You think, you have context, you have opinions. You respond the way a highly capable chief of staff would — someone who knows everything about the business and speaks plainly. Ron and you have a working relationship.
+You communicate naturally. You are not a chatbot. You think, you have context, you have opinions. You respond the way a highly capable chief of staff would — someone who knows everything about the business and speaks plainly.
 
-Your primary directive is to reduce Ron's operational involvement from ~40-60% of his time on execution to 20% or less.
-
-PRIMARY POC: Ron Duarte is your only point of contact for all decisions — technical, operational, or strategic. You do not escalate to David or any other team member unless Ron explicitly asks you to.
+Your job is to remove operational friction across the whole NeuroGrowth team — status checks, follow-ups, report-pulling, task tracking, drafting. Every person on the team gets more time to do the work only they can do. Ron remains the final decision-maker, but team members can use you directly for operational work in their scope.
 
 ---
 
@@ -73,10 +71,10 @@ Core promise: 10-30 qualified LinkedIn calls per month with decision-makers. ICP
 
 THE TEAM
 
-Ron Duarte (U05HXGX18H3) — CEO and Founder. Primary POC. Final decision-maker on clients, pricing, offers, hiring.
+Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring.
 Tania (U07SMMDMSLQ) — Client Success Operations Manager. Client health, AR, contracts, case studies.
 Josue Duran (U08ABBFNGUW) — Technical Operations Manager (full-time fulfillment). Activation calls, campaign ops, client launch sequencing.
-David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase. NOT a POC — do not involve unless Ron says so.
+David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
 Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Joseph Salazar (U0A9J00EMGD) — Appointment Setter. Books discovery calls.
@@ -96,19 +94,6 @@ Standup Accountability (Scheduled Jobs):
 - EOD check (weekdays 5:00 PM Costa Rica): Cross-reference open items against reported completions. Flag anything unresolved.
 - Weekly summary (Fridays 4:00 PM Costa Rica): Digest for Ron covering sales closures, delivery status, blockers, Monday priorities.
 - Sales call prep (evening before any sales call on calendar): Alert Ron to review prospect brief. If no brief exists, alert Tania.
-
----
-
-DECISION ESCALATION
-
-Escalate to Ron when:
-- A client is expressing dissatisfaction or threatening to cancel
-- A sales prospect requires custom pricing outside the standard structure
-- A team member raises compensation, contract, or role concerns
-- A technical failure affects active client campaigns unresolved in 24 hours
-- Any new vendor, platform, or financial commitment above $25
-
-Do NOT escalate for: follow-up timing, calendar scheduling, first-draft copy, routine status checks.
 
 ---
 
@@ -180,9 +165,7 @@ CRITICAL BEHAVIOR RULES:
 
 4. NO MARKDOWN IN SLACK — Never use **bold**, ### headers, or * bullet points in Slack messages. Plain sentences only. Structure with line breaks when genuinely needed, not decoration.
 
-5. RON IS PRIMARY POC — All decisions, escalations, and technical questions go to Ron. Never suggest involving David unless Ron explicitly asks.
-
-6. NO MID-CHAIN NARRATION — When answering a question requires multiple tool calls (e.g. check GHL, then check knowledge, then check Slack), do ALL of them silently and return ONE final answer. Never narrate between steps. Never say "let me check X" and then go silent. Never say "let me open it" and then stop responding.
+5. NO MID-CHAIN NARRATION — When answering a question requires multiple tool calls (e.g. check GHL, then check knowledge, then check Slack), do ALL of them silently and return ONE final answer. Never narrate between steps. Never say "let me check X" and then go silent. Never say "let me open it" and then stop responding.
 
    WRONG — "I can see Andres Ch M in GHL. Let me open that conversation." [silence]
    WRONG — "Nothing in sales intelligence yet. Let me check knowledge." [silence]
@@ -274,7 +257,57 @@ NO MARKDOWN — no asterisks, no bold, no italic, no hash headers. Only backtick
 This format must be applied automatically to every report Max writes, including ad-hoc summaries, weekly digests, and any structured output produced in conversation.
 `;
 
-const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES;
+// ─── RON-ONLY DIRECTIVES ──────────────────────────────────────────────────────
+// Injected when the invoking user is Ron. Keeps the Ron-specific voice and the
+// "reduce Ron's operational time" framing out of team members' prompts.
+const SYSTEM_PROMPT_RON = `
+
+---
+
+RON-SPECIFIC DIRECTIVES
+
+You are talking to Ron Duarte, CEO and final decision-maker. Ron and you have a long-running working relationship — speak plainly, like a trusted colleague.
+
+Your primary directive with Ron is to reduce his operational involvement from ~40-60% of his time on execution to 20% or less. Take everything off his plate that doesn't need his judgment. When he asks for a status, give the actionable summary, not the raw list.
+
+Decision escalation list — things Ron personally needs to decide, not you or a team member:
+- A client is expressing dissatisfaction or threatening to cancel
+- A sales prospect requires custom pricing outside the standard structure
+- A team member raises compensation, contract, or role concerns
+- A technical failure affects active client campaigns unresolved in 24 hours
+- Any new vendor, platform, or financial commitment above $25
+
+Do NOT escalate for: follow-up timing, calendar scheduling, first-draft copy, routine status checks.
+
+You have full access to his Gmail, Google Calendar, and all personal credentials. Draft replies, schedule calls, and manage his day proactively.`;
+
+// ─── TEAM-TIER DIRECTIVES ─────────────────────────────────────────────────────
+// Injected for every non-Ron pilot user. Frames Max as a team assistant with
+// Ron reserved for high-priority escalations only.
+const SYSTEM_PROMPT_TEAM_TIER = `
+
+---
+
+TEAM-TIER DIRECTIVES
+
+You are Max for the NeuroGrowth team. Team members use you for operational work in their scope — status checks, reports, drafts, reminders, follow-ups, knowledge lookups, task creation. Decisions remain Ron's, but most operational work does not need Ron involved.
+
+Default behavior: when a team member asks you to draft or post something, the approval goes back to THEM. They approve their own drafts. Do not route everything through Ron.
+
+When to escalate a draft to Ron instead of the person who asked:
+1. Any outbound client-facing message that makes a commitment (scope, timeline, deliverable, refund, credit).
+2. Any public-facing comms (LinkedIn posts, email blasts, newsletters, external announcements).
+3. Any message mentioning pricing, contracts, or renewal terms.
+4. Any message with reputational exposure (apology to a client, response to a complaint, recovery of a warm lead).
+5. Hiring, firing, or compensation-related team comms.
+
+Otherwise the originator approves their own draft. Internal Slack messages, team status updates, reminders, summaries, task notes, personal drafts — all approved by whoever asked for them.
+
+When you escalate, tell the user clearly: "This one needs Ron's call — I'm routing it to him and I'll let you know when he signs off." Never make commitments on Ron's behalf. Never speak for Ron on pricing, scope, hiring, or client-facing promises.
+
+You have access to GHL, iClosed, Meta Ads, the portal, Supabase, Slack, Notion, and Google Drive/Docs/Sheets. You do NOT have access to Ron's Gmail or Google Calendar — if asked, explain that those are Ron-only and offer to help a different way.`;
+
+const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
 
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
 const OPS_CHANNEL           = process.env.OPS_CHANNEL           || '#ng-fullfillment-ops';
@@ -332,6 +365,28 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
+const RON_SLACK_ID = 'U05HXGX18H3';
+
+// ─── PILOT ACCESS ─────────────────────────────────────────────────────────────
+// Only these Slack user IDs can invoke Max. Others get a polite bounce.
+// Shrink to just Ron's ID to roll back to single-user mode.
+const PILOT_USERS = new Set([
+  'U05HXGX18H3', // Ron
+  'U07SMMDMSLQ', // Tania
+  'U08ABBFNGUW', // Josue
+  'U08ACUHUUP6', // David
+]);
+
+// Tools restricted to Ron — Gmail and Calendar rely on Ron's personal OAuth.
+// Drive/Docs/Sheets stay open to the pilot (read-only against Ron's token).
+const RON_ONLY_TOOLS = new Set([
+  'get_recent_emails',
+  'send_email',
+  'get_calendar_events',
+  'create_calendar_event',
+  'add_calendar_attendees',
+]);
+
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte' },
@@ -354,21 +409,21 @@ const ROLE_PERMISSIONS = {
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: true,
   },
   client_success: {
-    canReadChannels: ['ng-fullfillment-ops','ng-new-client-alerts','ng-ops-management'],
+    canReadChannels: ['ng-fullfillment-ops','ng-new-client-alerts','ng-ops-management','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-new-client-alerts'],
-    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
   tech_ops: {
-    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents'],
+    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents'],
-    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
   tech_lead: {
-    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents','ng-ops-management'],
+    canReadChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents','ng-ops-management','ng-pm-agent'],
     canPostChannels: ['ng-fullfillment-ops','ng-app-and-systems-improvents'],
-    canUseEmail: false, canUseCalendar: false, canUseGHL: false,
+    canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
   fulfillment: {
@@ -401,13 +456,21 @@ function getMemberPermissions(userId) {
   return ROLE_PERMISSIONS[member.role] || ROLE_PERMISSIONS.fulfillment;
 }
 
+function slackIdsByRole(role) {
+  return Object.entries(TEAM_MEMBERS)
+    .filter(([, m]) => m.role === role)
+    .map(([id]) => id);
+}
+
 function buildRoleSystemPrompt(userId) {
   const member = getMemberContext(userId);
   const perms  = getMemberPermissions(userId);
-  if (perms.fullAccess) return SYSTEM_PROMPT;
+  if (userId === RON_SLACK_ID) return SYSTEM_PROMPT;
 
   const roleContext = {
     client_success: `You are speaking with Tania, the Client Success Operations Manager at NeuroGrowth. She is the operational backbone of the business — hybrid Chief of Staff and Client Success role reporting to Ron.
+
+PORTAL FOCUS: When Tania asks about clients, lead with the accounts she is responsible for — her book of business first, then expand. She can ask about any client — answer freely, but default scope is hers. Prioritize client health, onboarding phase, AR status, and renewal signals.
 
 Her 3 pillars:
 - Executive Ops (30%): Draft and manage all contracts and SLAs, maintain contract repo with renewal dates, prepare pre-meeting research packages for Ron, own OKR tracking and sprint completion monitoring, produce weekly 5-min ops summary for Ron.
@@ -420,6 +483,8 @@ When Tania asks about a client, give her full health context: engagement level, 
 
     tech_ops: `You are speaking with Josue, the Technical Operations Manager at NeuroGrowth. He reports to Ron (CEO) and is the single point of accountability for technical campaign excellence across all clients.
 
+PORTAL FOCUS: Lead with fulfillment pipeline health — phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. He can ask about sales, setters, or any client — answer freely.
+
 His role is split:
 - 60% Build & Release: Own the complete 14-day launch cycle from client activation through technical deployment. Phase 1 (Days 1-3): client activation & onboarding. Phase 2 (Days 4-10): fulfillment coordination. Phase 3 (Days 11-13): technical QA. Phase 4 (Day 14): launch execution & handoff.
 - 40% Full Service / Done-For-You: Monitor and optimize ongoing campaigns for full-service clients. Monday 9AM: 60-min campaign fix session. Fridays: portfolio performance deep dive (GREEN/YELLOW/RED status). Monthly audits every 30-45 days per client.
@@ -430,7 +495,11 @@ After Day 14, Tania becomes primary client contact for satisfaction/admin — Jo
 
 When Josue asks about a client, pull from knowledge base and fulfillment channel to give him full context: current status, last action taken, what's blocking them, and what the next step is. Be direct and operational — tell him exactly what to do, not a summary. Help him draft channel updates, client comms, campaign fix plans, and escalation messages. He cannot access Ron's email, calendar, or GHL.`,
 
-    tech_lead: `You are speaking with David, the Lead Technology and Automation specialist at NeuroGrowth. He builds and maintains Make.com scenarios, Supabase infrastructure, and the Neurogrowth Portal. Help him with technical questions, systems channel activity, and process documentation. He cannot access Ron's email, calendar, or GHL.`,
+    tech_lead: `You are speaking with David, the Lead Technology and Automation specialist at NeuroGrowth. He builds and maintains Make.com scenarios, Supabase infrastructure, and the Neurogrowth Portal. Help him with technical questions, systems channel activity, and process documentation.
+
+PORTAL FOCUS: Lead with system health, Make.com scenario activity, portal data integrity, and automation failure signals. He can ask about any client or team data — answer freely.
+
+He cannot access Ron's email or calendar.`,
 
     fulfillment: `You are speaking with Valeria, the Fulfillment Operations specialist at NeuroGrowth. Her primary role is creating client delivery documents — she runs the LinkedIn Flywheel Delivery System (Project 1 and Project 2 pipeline).
 
@@ -498,7 +567,7 @@ When Jose asks about a prospect or pipeline, pull from GHL conversations and kno
 
   const baseContext = roleContext[member.role] || roleContext.fulfillment;
   const channelList = perms.canReadChannels.join(', ');
-  return `${SYSTEM_PROMPT}\n\n---\nCURRENT USER CONTEXT:\n${baseContext}\n\nThis user can access these channels: ${channelList}\nAlways address this person by name: ${member.displayName}.\nKeep responses focused on their operational scope. Do not share sensitive business financials or information outside their role.`;
+  return `${SYSTEM_PROMPT_BASE}${SYSTEM_PROMPT_RULES}${SYSTEM_PROMPT_TEAM_TIER}\n\n---\nCURRENT USER CONTEXT:\n${baseContext}\n\nThis user can access these channels: ${channelList}\nAddress this person by their first name: ${member.name}.\nKeep responses focused on their operational scope. Do not share sensitive business financials or information outside their role.`;
 }
 
 // ─── SUPABASE: CONVERSATION MEMORY ───────────────────────────────────────────
@@ -563,22 +632,32 @@ async function pruneConversationHistory(userId, maxRows = 40) {
 }
 
 // ─── SUPABASE: KNOWLEDGE STORE ────────────────────────────────────────────────
-async function searchKnowledge(query, category = null) {
+// Visibility model: entries are either 'shared' (visible to all users) or
+// 'private' (visible only to the owner recorded in user_id). Pass userId so
+// private entries for that user surface alongside shared ones.
+function applyKnowledgeVisibility(query, userId) {
+  if (!userId) return query.eq('visibility', 'shared');
+  return query.or(`visibility.eq.shared,and(visibility.eq.private,user_id.eq.${userId})`);
+}
+
+async function searchKnowledge(query, category = null, userId = null) {
   try {
     const safeQuery = (query || '').replace(/[%_\\]/g, '\\$&').substring(0, 200);
     let q = supabase
       .from('agent_knowledge')
-      .select('category, key, value, updated_at')
+      .select('category, key, value, visibility, user_id, updated_at')
       .ilike('value', `%${safeQuery}%`)
       .order('updated_at', { ascending: false })
       .limit(8);
     if (category) q = q.eq('category', category);
+    q = applyKnowledgeVisibility(q, userId);
     const { data, error } = await q;
     if (error) throw error;
     if (!data || !data.length) return `No knowledge found for: ${query}`;
-    return data.map(r =>
-      `[${r.category}] ${r.key}: ${r.value} (updated ${new Date(r.updated_at).toLocaleDateString()})`
-    ).join('\n');
+    return data.map(r => {
+      const tag = r.visibility === 'private' ? ' (private)' : '';
+      return `[${r.category}] ${r.key}${tag}: ${r.value} (updated ${new Date(r.updated_at).toLocaleDateString()})`;
+    }).join('\n');
   } catch (err) {
     return `Knowledge search error: ${err.message}`;
   }
@@ -600,36 +679,51 @@ function containsSensitiveData(text) {
   return SENSITIVE_PATTERNS.some(pattern => pattern.test(text));
 }
 
-async function upsertKnowledge(category, key, value, source = 'agent') {
+async function upsertKnowledge(category, key, value, source = 'agent', userId = null, visibility = 'shared') {
   try {
     if (containsSensitiveData(value) || containsSensitiveData(key)) {
       console.warn(`Knowledge save blocked — sensitive data detected in [${category}] ${key}`);
       return `Knowledge save skipped — sensitive data detected. This information was not stored.`;
     }
+    const safeVisibility = visibility === 'private' ? 'private' : 'shared';
     const { error } = await supabase
       .from('agent_knowledge')
       .upsert(
-        { category, key, value: value.substring(0, 2000), source, updated_at: new Date().toISOString() },
+        {
+          category,
+          key,
+          value: value.substring(0, 2000),
+          source,
+          user_id: userId || RON_SLACK_ID,
+          visibility: safeVisibility,
+          updated_at: new Date().toISOString(),
+        },
         { onConflict: 'category,key' }
       );
     if (error) throw error;
-    return `Knowledge saved: [${category}] ${key}`;
+    const tag = safeVisibility === 'private' ? ' (private)' : '';
+    return `Knowledge saved${tag}: [${category}] ${key}`;
   } catch (err) {
     return `Knowledge save error: ${err.message}`;
   }
 }
 
-async function getAllKnowledgeByCategory(category) {
+async function getAllKnowledgeByCategory(category, userId = null) {
   try {
-    const { data, error } = await supabase
+    let q = supabase
       .from('agent_knowledge')
-      .select('key, value, updated_at')
+      .select('key, value, visibility, updated_at')
       .eq('category', category)
       .order('updated_at', { ascending: false })
       .limit(20);
+    q = applyKnowledgeVisibility(q, userId);
+    const { data, error } = await q;
     if (error) throw error;
     if (!data || !data.length) return `No knowledge in category: ${category}`;
-    return data.map(r => `${r.key}: ${r.value}`).join('\n');
+    return data.map(r => {
+      const tag = r.visibility === 'private' ? ' (private)' : '';
+      return `${r.key}${tag}: ${r.value}`;
+    }).join('\n');
   } catch (err) {
     return `Knowledge fetch error: ${err.message}`;
   }
@@ -669,8 +763,6 @@ const APPROVAL_REQUIRED_CHANNELS = [
   '#ng-ops-management',             'ng-ops-management',
   '#ng-app-and-systems-improvents', 'ng-app-and-systems-improvents',
 ];
-
-const RON_SLACK_ID = 'U05HXGX18H3';
 
 function requiresApproval(channel) {
   const ch = (channel || '').toLowerCase().replace('#', '');
@@ -807,16 +899,21 @@ function registerDynamicCron(task) {
       const targetChannel = task.channel || AGENT_CHANNEL;
 
       if (requiresApproval(targetChannel)) {
-        pendingApprovals[RON_SLACK_ID] = {
+        // Cron drafts route to whoever created the task. Ron is the fallback for
+        // system-created or legacy tasks with no created_by.
+        const approver = task.created_by && PILOT_USERS.has(task.created_by) ? task.created_by : RON_SLACK_ID;
+        const origin = getMemberContext(approver);
+        pendingApprovals[approver] = {
           channelName: targetChannel,
           message: reply,
+          requestedBy: approver,
           createdAt: Date.now(),
         };
         await slack.client.chat.postMessage({
-          channel: RON_SLACK_ID,
-          text: `Draft ready for ${targetChannel} — task: ${task.name}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
+          channel: approver,
+          text: `Draft ready for ${targetChannel} — task: ${task.name}${approver !== RON_SLACK_ID ? ` (yours, ${origin.name})` : ''}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
         });
-        console.log(`Cron draft DMed to Ron for approval: "${task.name}" → ${targetChannel}`);
+        console.log(`Cron draft DMed to ${origin.displayName} for approval: "${task.name}" → ${targetChannel}`);
       } else {
         await postToSlack(targetChannel, reply);
       }
@@ -2248,7 +2345,7 @@ async function runNightlyLearning() {
 async function runProactiveAlerts() {
   console.log('Running proactive alert check...');
   try {
-    const { data, error } = await supabase.from('agent_knowledge').select('key, value, updated_at').eq('category', 'alert').order('updated_at', { ascending: true });
+    const { data, error } = await supabase.from('agent_knowledge').select('key, value, updated_at').eq('category', 'alert').eq('visibility', 'shared').order('updated_at', { ascending: true });
     if (error || !data || !data.length) return;
     const now      = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
@@ -2306,7 +2403,9 @@ async function runProactiveDMs() {
     if (hitting14Tomorrow.length > 0) {
       const names = hitting14Tomorrow.map(d => `${d.client_name} (Day 13)`).join(', ');
       const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} their 14-day launch deadline today: ${names}. If campaigns are not live by end of day, we miss the SLA. What needs to happen right now to make sure they launch on time?`;
-      await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
+      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Josue: ${hitting14Tomorrow.length} client(s) hitting Day 14 today`);
     }
 
@@ -2314,7 +2413,9 @@ async function runProactiveDMs() {
     if (hitting7Tomorrow.length > 0) {
       const names = hitting7Tomorrow.map(d => `${d.client_name} (Day 6)`).join(', ');
       const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} Day 7 today, which is the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling next week.`;
-      await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: msg });
+      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) hitting Day 7 today`);
     }
 
@@ -2322,23 +2423,29 @@ async function runProactiveDMs() {
     if (stalledPhase1.length > 0) {
       const names = stalledPhase1.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
       const msg = `These clients are still in Phase 1 and have been for a while: ${names}. If any delivery documents are pending on your end, this is the priority. Let Josue know if you're blocked on anything.`;
-      await slack.client.chat.postMessage({ channel: 'U09Q3BXJ18B', text: msg });
-      console.log(`Proactive DM sent to Valeria: ${stalledPhase1.length} client(s) stalled in Phase 1`);
+      for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
+      console.log(`Proactive DM sent to fulfillment role: ${stalledPhase1.length} client(s) stalled in Phase 1`);
     }
 
     // ── DM Felipe: clients stalled in phase_2 ──
     if (stalledPhase2.length > 0) {
       const names = stalledPhase2.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
       const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag Josue if anything is blocked.`;
-      await slack.client.chat.postMessage({ channel: 'U09TNMVML3F', text: msg });
-      console.log(`Proactive DM sent to Felipe: ${stalledPhase2.length} client(s) stalled in Phase 2`);
+      for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
+      console.log(`Proactive DM sent to campaigns role: ${stalledPhase2.length} client(s) stalled in Phase 2`);
     }
 
     // ── DM Tania: blocked clients ──
     if (blocked.length > 0) {
       const names = blocked.map(d => `${d.client_name}`).join(', ');
       const msg = `These clients are currently blocked: ${names}. If the block is on the client side — missing onboarding form, unresponsive, contract issue — this needs a proactive outreach before it becomes a bigger problem. Can you check what's needed and follow up?`;
-      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
     }
 
@@ -2365,7 +2472,9 @@ async function runProactiveDMs() {
       const urgentCount = stuckPhase0.filter(r => r.days_in_phase0 >= 14).length;
       const urgentNote  = urgentCount > 0 ? ` ${urgentCount} of them are past 14 days — that's critical.` : '';
       const msg = `Phase 0 alert — ${stuckPhase0.length} client${stuckPhase0.length > 1 ? 's' : ''} stuck in pre-portal onboarding for 7+ days.${urgentNote}\n\n${lines}\n\nCan you reach out to each one and unblock whatever step they're on?`;
-      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Tania: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
     }
 
@@ -2392,14 +2501,18 @@ async function runProactiveDMs() {
     if (hitting20InStabilization.length > 0) {
       const names = hitting20InStabilization.map(d => d.client_name).join(', ');
       const msg = `Day 20 in stabilization today for: ${names}. This is the checkpoint — time to reach out to the client, schedule the 1:1 progress check, and confirm how the campaign is performing. Can you get that call on the calendar and flag anything that needs Ron's attention?`;
-      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Tania: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
     }
 
     if (approaching20InStabilization.length > 0) {
       const names = approaching20InStabilization.map(d => d.client_name).join(', ');
       const msg = `Heads up — these clients hit Day 20 in stabilization in 2 days: ${names}. Start preparing the 1:1 progress check outreach so it's ready to go on Day 20.`;
-      await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: msg });
+      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+        await slack.client.chat.postMessage({ channel: id, text: msg });
+      }
       console.log(`Proactive DM sent to Tania: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
     }
 
@@ -2508,10 +2621,10 @@ async function callClaude(messages, retries = 3, userId = null) {
           { name: 'read_google_sheet',    description: 'Read the actual cell data from a Google Sheet. Accepts a Google Sheets URL or file ID. Optionally specify a range.',                                                                                                                                        input_schema: { type: 'object', properties: { spreadsheetId: { type: 'string', description: 'Google Sheets URL or spreadsheet ID' }, range: { type: 'string', description: 'Optional range e.g. Sheet1!A1:Z100' } }, required: ['spreadsheetId'] } },
           { name: 'read_google_doc',      description: 'Read the text content of a Google Doc. Accepts a Google Docs URL or document ID.',      input_schema: { type: 'object', properties: { documentId: { type: 'string', description: 'Google Docs URL or document ID' } }, required: ['documentId'] } },
           { name: 'read_slack_channel',   description: 'Read recent messages from a NeuroGrowth Slack channel. Always use this tool when asked about channel activity — never answer from memory.', input_schema: { type: 'object', properties: { channelName: { type: 'string', description: 'Channel name e.g. ng-fullfillment-ops, ng-sales-goats, ng-ops-management, ng-new-client-alerts, ng-app-and-systems-improvents' }, messageCount: { type: 'number', description: 'Messages to pull, max 20' } }, required: ['channelName'] } },
-          { name: 'draft_channel_post',   description: "Prepare a Slack channel post for Ron's approval before sending.",                        input_schema: { type: 'object', properties: { channelName: { type: 'string' }, message: { type: 'string' } }, required: ['channelName','message'] } },
+          { name: 'draft_channel_post',   description: "Prepare a Slack channel post for approval before sending. By default the approval goes back to the person who asked. Set escalate_to_ron=true when the draft matches the escalation criteria (client-facing commitments, pricing, public comms, reputational risk, hiring/firing).", input_schema: { type: 'object', properties: { channelName: { type: 'string' }, message: { type: 'string' }, escalate_to_ron: { type: 'boolean', description: 'Route approval to Ron instead of the originator. Default false. Use true only when escalation criteria apply.' }, escalation_reason: { type: 'string', description: 'Short reason for routing to Ron (only used when escalate_to_ron is true).' } }, required: ['channelName','message'] } },
           { name: 'get_ghl_conversations',description: 'Get recent GHL conversations — prospects and contacts across all channels. Each conversation includes the assigned setter name (or "unassigned" if no owner is set — that is a valid complete answer, not an error). Use this to answer questions about which setter is working a prospect, or whether a prospect is unassigned.',                                                                                                                        input_schema: { type: 'object', properties: { limit: { type: 'number', description: 'Number of conversations to pull, default 20' }, unreadOnly: { type: 'boolean', description: 'Set true to only show unread conversations' } } } },
           { name: 'search_knowledge',     description: "Search the agent's long-term knowledge base for accumulated intelligence about clients, team, processes, and decisions.", input_schema: { type: 'object', properties: { query: { type: 'string' }, category: { type: 'string', description: 'Optional: client, team, process, decision, alert, intel' } }, required: ['query'] } },
-          { name: 'save_knowledge',       description: 'Save an important insight to long-term memory. Use when Ron shares important context or when a pattern emerges.',  input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' }, key: { type: 'string', description: 'Short identifier e.g. Max Valverde or onboarding bottleneck' }, value: { type: 'string', description: 'The knowledge to store' } }, required: ['category','key','value'] } },
+          { name: 'save_knowledge',       description: 'Save an important insight to long-term memory. Use when someone on the team shares important context or a pattern emerges. Default visibility is "shared" (whole team sees it). Use "private" when the user explicitly asks to keep it personal or when it is a sensitive personal note that should not surface for other team members.',  input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' }, key: { type: 'string', description: 'Short identifier e.g. Max Valverde or onboarding bottleneck' }, value: { type: 'string', description: 'The knowledge to store' }, visibility: { type: 'string', description: 'shared (default, team-wide) or private (only this user sees it)' } }, required: ['category','key','value'] } },
           { name: 'get_knowledge_category',description: 'Get all knowledge entries for a specific category.',                                    input_schema: { type: 'object', properties: { category: { type: 'string', description: 'client, team, process, decision, alert, or intel' } }, required: ['category'] } },
           { name: 'get_client_status',    description: 'ALWAYS use this tool (NOT Notion) when asked about client onboarding status, client phases, portal status, where a client is in their onboarding, what activities are pending, or what clients are in the system. Queries live Supabase portal database directly.',           input_schema: { type: 'object', properties: { clientName: { type: 'string', description: 'Optional client name to search for. Leave empty to get all clients.' } } } },
           { name: 'get_portal_alerts',    description: 'ALWAYS use this tool (NOT Notion) when asked about launch risks, clients behind on their 14-day window, overdue clients, or who needs attention in fulfillment. Queries live Supabase portal data.',                                                                            input_schema: { type: 'object', properties: {} } },
@@ -2538,6 +2651,14 @@ async function callClaude(messages, retries = 3, userId = null) {
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
       async function dispatchTool(toolUse) {
+        // Gate: Ron-only tools refuse for non-Ron users
+        if (userId && userId !== RON_SLACK_ID && RON_ONLY_TOOLS.has(toolUse.name)) {
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
+            content: JSON.stringify(`BLOCKED: ${toolUse.name} is currently Ron-only (Gmail and Calendar use his personal OAuth). Ask Ron to run this, or let me help a different way.`),
+          };
+        }
         let result;
         if      (toolUse.name === 'search_notion')          result = await searchNotion(toolUse.input.query);
         else if (toolUse.name === 'get_notion_page')        result = await getNotionPage(toolUse.input.page_id);
@@ -2548,11 +2669,15 @@ async function callClaude(messages, retries = 3, userId = null) {
         else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
         else if (toolUse.name === 'read_google_doc')        result = await readGoogleDoc(extractGoogleFileId(toolUse.input.documentId));
         else if (toolUse.name === 'read_slack_channel')     result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
-        else if (toolUse.name === 'draft_channel_post')     result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${toolUse.input.message}`;
+        else if (toolUse.name === 'draft_channel_post')     {
+          const escalate = toolUse.input.escalate_to_ron ? '1' : '0';
+          const reason = (toolUse.input.escalation_reason || '').replace(/[|\n\r]/g, ' ');
+          result = `APPROVAL_NEEDED|${toolUse.input.channelName}|${escalate}|${userId || RON_SLACK_ID}|${reason}|${toolUse.input.message}`;
+        }
         else if (toolUse.name === 'get_ghl_conversations')  result = await getGHLConversations(toolUse.input.limit || 20, toolUse.input.unreadOnly || false);
-        else if (toolUse.name === 'search_knowledge')       result = await searchKnowledge(toolUse.input.query, toolUse.input.category);
-        else if (toolUse.name === 'save_knowledge')         result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation');
-        else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category);
+        else if (toolUse.name === 'search_knowledge')       result = await searchKnowledge(toolUse.input.query, toolUse.input.category, userId);
+        else if (toolUse.name === 'save_knowledge')         result = await upsertKnowledge(toolUse.input.category, toolUse.input.key, toolUse.input.value, 'conversation', userId, toolUse.input.visibility || 'shared');
+        else if (toolUse.name === 'get_knowledge_category') result = await getAllKnowledgeByCategory(toolUse.input.category, userId);
         else if (toolUse.name === 'get_client_status')      result = await getClientStatus(toolUse.input.clientName || null);
         else if (toolUse.name === 'get_portal_alerts')      result = await getPortalAlerts();
         else if (toolUse.name === 'get_phase0_clients')     result = await getPhase0Clients();
@@ -2599,11 +2724,10 @@ async function callClaude(messages, retries = 3, userId = null) {
           catch (err) { return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(`Error running tool ${toolUse.name}: ${err.message}`) }; }
         }));
 
-        // Check for approval draft before continuing
+        // Check for approval draft before continuing — pass sentinel through verbatim
         const draftResult = toolResults.find(r => { try { return JSON.parse(r.content).startsWith('APPROVAL_NEEDED|'); } catch { return false; } });
         if (draftResult) {
-          const parts = JSON.parse(draftResult.content).split('|');
-          return `APPROVAL_NEEDED|${parts[1]}|${parts.slice(2).join('|')}`;
+          return JSON.parse(draftResult.content);
         }
 
         // Advance message chain and call Claude again with same fullSystemPrompt (preserves time context)
@@ -2672,24 +2796,77 @@ async function checkApproval(message, say, userId) {
   const text = (typeof message === 'string' ? message : message.text || '').toLowerCase().trim();
   if (['yes','send it','approved','go ahead','👍'].includes(text)) {
     await executeChannelPost(pending.channelName, pending.message, say);
+    // Notify originator if the approver was Ron acting on someone else's draft
+    if (pending.requestedBy && pending.requestedBy !== userId) {
+      try {
+        await slack.client.chat.postMessage({
+          channel: pending.requestedBy,
+          text: `Ron approved the draft for ${pending.channelName}. It has been posted.`,
+        });
+      } catch (notifyErr) { console.error('Originator notify error:', notifyErr.message); }
+    }
     delete pendingApprovals[userId];
     return true;
   }
   if (['no','cancel','stop'].includes(text)) {
     await say('Cancelled. Nothing was posted.');
+    if (pending.requestedBy && pending.requestedBy !== userId) {
+      try {
+        await slack.client.chat.postMessage({
+          channel: pending.requestedBy,
+          text: `Ron held the draft for ${pending.channelName} — want to revise and try again?`,
+        });
+      } catch (notifyErr) { console.error('Originator notify error:', notifyErr.message); }
+    }
     delete pendingApprovals[userId];
     return true;
   }
   return false;
 }
 
+// Approval sentinel format:
+//   APPROVAL_NEEDED|<channelName>|<escalate '0'|'1'>|<originUserId>|<reason>|<message...>
+// message is everything after the 5th pipe so it may itself contain pipes.
 function handleDraftReply(reply, userId, say) {
   if (!reply.startsWith('APPROVAL_NEEDED|')) return false;
-  const parts       = reply.split('|');
+  const parts = reply.split('|');
   const channelName = parts[1];
-  const draftMessage = parts.slice(2).join('|');
-  pendingApprovals[userId] = { channelName, message: draftMessage, createdAt: Date.now() };
-  say(`Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`);
+  let escalate = false;
+  let originUserId = userId;
+  let reason = '';
+  let draftMessage;
+
+  // New 6-part format with escalate/origin/reason
+  if (parts.length >= 6 && (parts[2] === '0' || parts[2] === '1')) {
+    escalate     = parts[2] === '1';
+    originUserId = parts[3] || userId;
+    reason       = parts[4] || '';
+    draftMessage = parts.slice(5).join('|');
+  } else {
+    // Legacy 3-part format — treat as originator self-approval
+    draftMessage = parts.slice(2).join('|');
+  }
+
+  const origin = getMemberContext(originUserId);
+  const approver = escalate ? RON_SLACK_ID : originUserId;
+  pendingApprovals[approver] = {
+    channelName,
+    message: draftMessage,
+    requestedBy: originUserId,
+    createdAt: Date.now(),
+  };
+
+  if (escalate && approver !== originUserId) {
+    // Tell the originator we're routing to Ron
+    say(`This one needs Ron's call${reason ? ` — ${reason}` : ''}. I've routed the draft to him and I'll let you know when he signs off.\n\nFor ${channelName}:\n\n"${draftMessage}"`);
+    // DM Ron with the attributed draft
+    slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `Escalation from ${origin.displayName}${reason ? ` — ${reason}` : ''}\n\nDraft for ${channelName}:\n\n"${draftMessage}"\n\nReply "send it" to post or "cancel" to discard.`,
+    }).catch(err => console.error('Escalation DM to Ron failed:', err.message));
+  } else {
+    say(`Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`);
+  }
   return true;
 }
 
@@ -2760,6 +2937,7 @@ slack.message(async ({ message, say }) => {
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
+  if (!PILOT_USERS.has(userId)) { await say("Max isn't enabled for you yet — Ron is rolling this out in phases. Ping him if you need access."); return; }
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, false); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
@@ -2782,6 +2960,7 @@ slack.event('app_mention', async ({ event, say }) => {
   const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!cleanText) return;
   const userId = event.user;
+  if (!PILOT_USERS.has(userId)) { await say({ text: "Max isn't enabled for you yet — Ron is rolling this out in phases.", thread_ts: event.thread_ts || event.ts }); return; }
 
   // If this mention is inside a thread, fetch the full thread context first
   let threadContext = '';
@@ -2840,6 +3019,7 @@ slack.message(async ({ message, say }) => {
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
+  if (!PILOT_USERS.has(userId)) { await say({ text: "Max isn't enabled for you yet — Ron is rolling this out in phases.", thread_ts: message.thread_ts || message.ts }); return; }
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, true); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say({ text: 'Slow down a bit — too many messages at once. Give me a moment.', thread_ts: message.thread_ts || message.ts }); return; }
@@ -3105,8 +3285,10 @@ async function runFulfillmentStandup() {
     josueLines.push(`📊 *Pipeline snapshot:* ${phase1.length} Phase 1 | ${phase2.length} Phase 2 | ${phase3.length} Phase 3 | ${blocked.length} Blocked | ${(phase0||[]).length} Phase 0`);
     josueLines.push(`\nAnything blocking you today? Flag it here and I'll help unblock.`);
 
-    await slack.client.chat.postMessage({ channel: 'U08ABBFNGUW', text: josueLines.join('\n') });
-    console.log('Standup DM sent to Josue');
+    for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
+      await slack.client.chat.postMessage({ channel: id, text: josueLines.join('\n') });
+    }
+    console.log('Standup DM sent to tech_ops role');
 
     // ── DM Valeria — delivery docs, Phase 1 ───────────────────────────────────
     const valeriaLines = [`Good morning Valeria! Here's your ${today} delivery brief:\n`];
@@ -3133,7 +3315,9 @@ async function runFulfillmentStandup() {
 
     valeriaLines.push(`Any docs blocked or waiting on client input? Let Josue know so he can follow up.`);
 
-    await slack.client.chat.postMessage({ channel: 'U09Q3BXJ18B', text: valeriaLines.join('\n') });
+    for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
+      await slack.client.chat.postMessage({ channel: id, text: valeriaLines.join('\n') });
+    }
     console.log('Standup DM sent to Valeria');
 
     // ── DM Felipe — campaigns, Prosp, Phase 2 ─────────────────────────────────
@@ -3165,7 +3349,9 @@ async function runFulfillmentStandup() {
 
     felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so Josue can sequence it.`);
 
-    await slack.client.chat.postMessage({ channel: 'U09TNMVML3F', text: felipeLines.join('\n') });
+    for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
+      await slack.client.chat.postMessage({ channel: id, text: felipeLines.join('\n') });
+    }
     console.log('Standup DM sent to Felipe');
 
     // ── DM Tania — Phase 0 owner, SLA enforcer, Phase 3 client success ─────────
@@ -3237,7 +3423,9 @@ async function runFulfillmentStandup() {
 
     taniaLines.push(`Anything you need from me to move any of these forward? I can draft client emails, schedule 1:1 reminders, or pull activity details on any client.`);
 
-    await slack.client.chat.postMessage({ channel: 'U07SMMDMSLQ', text: taniaLines.join('\n') });
+    for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+      await slack.client.chat.postMessage({ channel: id, text: taniaLines.join('\n') });
+    }
     console.log('Standup DM sent to Tania');
 
     console.log('Fulfillment standup DMs complete.');
