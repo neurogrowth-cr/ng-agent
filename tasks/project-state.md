@@ -1,6 +1,11 @@
 # ng-agent — Project State
 
-Last updated: 2026-04-23
+Last updated: 2026-04-25
+
+## Recent changes
+
+- **2026-04-25 — Phase 1 anomaly detection layer.** New tables `metric_observations` + `metric_baselines` in primary Supabase. Daily 6am Costa Rica cron scrapes 8 business metrics (Meta CPL, close rate, setter calls, Phase 0→1 conversion, Phase 1/2 cycle days, Day 7 at-risk count, GHL response time), recomputes 28-day rolling baselines, and DMs domain-routed roles when any metric drifts ≥1.5σ. Anomalies persist to `agent_knowledge` (category `alert`, visibility `shared`). Two new tools: `detect_anomalies` (ad-hoc dry-run) and `query_metric_history`. Bootstraps with 7-day warmup window — silently skips metrics with sample_size < 7. Routing constant `ANOMALY_ROUTING` in [index.js](../index.js) at the top of the anomaly block.
+- **2026-04-24 — Team-wide pilot rollout.** Max opened to Ron + Tania + Josue + David. See git log `0700aac` and `6ebc8dc`.
 
 ## What this is
 

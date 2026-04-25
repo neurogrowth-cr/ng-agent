@@ -2595,6 +2595,394 @@ async function runProactiveDMs(_correlationId) {
   }
 }
 
+// ─── ANOMALY DETECTION (Phase 1 — intelligence layer) ────────────────────────
+// Scrapes business metrics daily, maintains rolling baselines, detects anomalies
+// at >= 1.5σ, persists alerts to agent_knowledge, and DMs domain-routed roles.
+
+const ANOMALY_THRESHOLD_SIGMA = 1.5;
+const ANOMALY_MIN_SAMPLE      = 7;
+const ANOMALY_WINDOW_DAYS     = 28;
+
+// Domain → roles that should be DM'd when an anomaly fires.
+// Ron sees everything; the rest of the team only their lanes. Recipients deduped.
+const ANOMALY_ROUTING = {
+  marketing:      ['ceo'],
+  sales:          ['ceo'],
+  fulfillment:    ['ceo', 'tech_ops', 'fulfillment', 'client_success', 'tech_lead'],
+  client_success: ['ceo', 'client_success', 'tech_lead'],
+};
+
+function _resolveAnomalyRecipients(domain) {
+  const roles = ANOMALY_ROUTING[domain] || ['ceo'];
+  const ids = new Set();
+  for (const role of roles) {
+    const matched = slackIdsByRole(role);
+    if (matched.length) matched.forEach(id => ids.add(id));
+  }
+  if (!ids.size) ids.add(RON_SLACK_ID);
+  return [...ids];
+}
+
+async function recordObservation(metric, domain, value, source = 'scraper', meta = null) {
+  const safeValue = Number(value);
+  if (!Number.isFinite(safeValue)) {
+    console.warn(`Anomaly: skipping ${metric} — value is not a finite number (${value})`);
+    return null;
+  }
+  const { data, error } = await supabase
+    .from('metric_observations')
+    .insert({ metric, domain, value: safeValue, source, meta })
+    .select()
+    .single();
+  if (error) { console.error(`Anomaly: insert failed for ${metric}:`, error.message); return null; }
+  return data;
+}
+
+async function recomputeBaseline(metric, windowDays = ANOMALY_WINDOW_DAYS) {
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('metric_observations')
+    .select('value, domain')
+    .eq('metric', metric)
+    .gte('observed_at', since);
+  if (error) { console.error(`Anomaly: baseline read failed for ${metric}:`, error.message); return null; }
+  if (!data || data.length === 0) return null;
+
+  const values = data.map(r => Number(r.value)).filter(Number.isFinite);
+  const n = values.length;
+  if (n === 0) return null;
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const variance = n > 1 ? values.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0;
+  const stdDev = Math.sqrt(variance);
+  const domain = data[0].domain;
+
+  const { error: upErr } = await supabase
+    .from('metric_baselines')
+    .upsert(
+      { metric, domain, mean, std_dev: stdDev, sample_size: n, window_days: windowDays, last_computed: new Date().toISOString() },
+      { onConflict: 'metric' }
+    );
+  if (upErr) { console.error(`Anomaly: baseline upsert failed for ${metric}:`, upErr.message); return null; }
+  return { metric, domain, mean, stdDev, sampleSize: n };
+}
+
+async function detectAnomaly(metric, threshold = ANOMALY_THRESHOLD_SIGMA) {
+  const { data: latestRows } = await supabase
+    .from('metric_observations')
+    .select('value, observed_at, meta')
+    .eq('metric', metric)
+    .order('observed_at', { ascending: false })
+    .limit(1);
+  const latest = latestRows?.[0];
+  if (!latest) return null;
+
+  const { data: baseline } = await supabase
+    .from('metric_baselines')
+    .select('*')
+    .eq('metric', metric)
+    .single();
+  if (!baseline) return null;
+  if (baseline.sample_size < ANOMALY_MIN_SAMPLE) {
+    console.log(`Anomaly: ${metric} still warming up (n=${baseline.sample_size} < ${ANOMALY_MIN_SAMPLE})`);
+    return null;
+  }
+  if (Number(baseline.std_dev) === 0) return null; // flat metric, can't z-score
+
+  const value = Number(latest.value);
+  const z = (value - Number(baseline.mean)) / Number(baseline.std_dev);
+  const triggered = Math.abs(z) >= threshold;
+  return {
+    metric,
+    domain: baseline.domain,
+    value,
+    mean: Number(baseline.mean),
+    stdDev: Number(baseline.std_dev),
+    sampleSize: baseline.sample_size,
+    z,
+    triggered,
+    observedAt: latest.observed_at,
+    meta: latest.meta,
+  };
+}
+
+async function narrateAnomaly(snapshot) {
+  try {
+    const direction = snapshot.z > 0 ? 'above' : 'below';
+    const prompt = `Metric "${snapshot.metric}" (domain: ${snapshot.domain}) is ${Math.abs(snapshot.z).toFixed(1)}σ ${direction} its ${snapshot.sampleSize}-sample baseline.\nLatest value: ${snapshot.value}. Baseline mean: ${snapshot.mean.toFixed(2)} (std dev ${snapshot.stdDev.toFixed(2)}).\n\nWrite ONE short sentence (no markdown, no preamble) on what this likely means in plain business English and what to watch next. Max 30 words.`;
+    const res = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    return text || null;
+  } catch (err) {
+    console.error(`Anomaly narration error for ${snapshot.metric}:`, err.message);
+    return null;
+  }
+}
+
+// ── Metric scrapers (one per metric, returns numeric value or null) ─────────
+async function _scrapeMetaCplToday() {
+  const accountId = process.env.META_AD_ACCOUNT_ID;
+  const token     = process.env.META_ACCESS_TOKEN;
+  if (!accountId || !token) return null;
+  const fields = 'spend,actions';
+  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/insights?fields=${fields}&date_preset=today&access_token=${token}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  const row = data.data?.[0];
+  if (!row) return null;
+  const spend = parseFloat(row.spend || 0);
+  const leads = parseInt((row.actions || []).find(a => a.action_type === 'lead')?.value || '0', 10);
+  if (leads <= 0) return null; // no leads today, undefined CPL
+  return +(spend / leads).toFixed(2);
+}
+
+async function _scrapeCloseRateYesterday() {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await portalSupabase
+    .from('revops_closer_eod_daily')
+    .select('full_closes, qualified_calls')
+    .eq('report_date', yesterday);
+  if (error) throw new Error(error.message);
+  if (!data || !data.length) return null;
+  const closes = data.reduce((a, r) => a + (r.full_closes || 0), 0);
+  const qualified = data.reduce((a, r) => a + (r.qualified_calls || 0), 0);
+  if (qualified <= 0) return null;
+  return +(closes / qualified).toFixed(4);
+}
+
+async function _scrapeSetterCallsBookedYesterday() {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await portalSupabase
+    .from('revops_setter_eod_daily')
+    .select('scheduled_calls')
+    .eq('report_date', yesterday);
+  if (error) throw new Error(error.message);
+  if (!data || !data.length) return null;
+  return data.reduce((a, r) => a + (r.scheduled_calls || 0), 0);
+}
+
+async function _scrapePhase0ToPhase1Conv7d() {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  // Numerator: clients now in phase_1+ that were created within last 7 days
+  const { data: promoted, error: pErr } = await portalSupabase
+    .from('client_dashboards')
+    .select('id')
+    .gte('created_at', sevenDaysAgo)
+    .in('customer_status', ['phase_1','phase_2','phase_3','live']);
+  if (pErr) throw new Error(pErr.message);
+  // Denominator: total active clients created in last 7 days (any status including phase_0)
+  const { data: total, error: tErr } = await portalSupabase
+    .from('client_dashboards')
+    .select('id')
+    .gte('created_at', sevenDaysAgo)
+    .eq('is_active', true);
+  if (tErr) throw new Error(tErr.message);
+  const denom = total?.length || 0;
+  if (denom === 0) return null;
+  return +((promoted?.length || 0) / denom).toFixed(4);
+}
+
+async function _scrapePhaseCycleP50(targetStatus) {
+  // Median days between activation_call.completed_at and current snapshot for clients
+  // currently in `targetStatus` (rough proxy for "time spent in this phase").
+  const { data: dashboards, error } = await portalSupabase
+    .from('client_dashboards')
+    .select('id, created_at, customer_status')
+    .eq('is_active', true)
+    .eq('customer_status', targetStatus);
+  if (error) throw new Error(error.message);
+  if (!dashboards || !dashboards.length) return null;
+
+  const { data: templates } = await portalSupabase
+    .from('customer_activity_templates')
+    .select('id, title');
+  const tmap = {};
+  (templates || []).forEach(t => { tmap[t.id] = (t.title || '').toLowerCase(); });
+
+  const days = [];
+  for (const d of dashboards) {
+    const { data: acts } = await portalSupabase
+      .from('customer_activities')
+      .select('template_id, completed_at')
+      .eq('customer_id', d.id);
+    const activation = (acts || []).find(a => (tmap[a.template_id] || '').includes('activation call') && a.completed_at);
+    const start = activation ? new Date(activation.completed_at) : (d.created_at ? new Date(d.created_at) : null);
+    if (!start) continue;
+    days.push(Math.floor((Date.now() - start.getTime()) / (24 * 60 * 60 * 1000)));
+  }
+  if (!days.length) return null;
+  days.sort((a, b) => a - b);
+  return days[Math.floor(days.length / 2)];
+}
+
+async function _scrapeDay7AtRiskCount() {
+  const { data: dashboards, error } = await portalSupabase
+    .from('client_dashboards')
+    .select('id, created_at, customer_status')
+    .eq('is_active', true)
+    .in('customer_status', ['phase_1', 'phase_2']);
+  if (error) throw new Error(error.message);
+  if (!dashboards) return 0;
+
+  const { data: templates } = await portalSupabase
+    .from('customer_activity_templates')
+    .select('id, title');
+  const tmap = {};
+  (templates || []).forEach(t => { tmap[t.id] = (t.title || '').toLowerCase(); });
+
+  let count = 0;
+  for (const d of dashboards) {
+    const { data: acts } = await portalSupabase
+      .from('customer_activities')
+      .select('template_id, completed_at')
+      .eq('customer_id', d.id);
+    const activation = (acts || []).find(a => (tmap[a.template_id] || '').includes('activation call') && a.completed_at);
+    const start = activation ? new Date(activation.completed_at) : (d.created_at ? new Date(d.created_at) : null);
+    if (!start) continue;
+    const days = Math.floor((Date.now() - start.getTime()) / (24 * 60 * 60 * 1000));
+    if (days >= 7) count++;
+  }
+  return count;
+}
+
+async function _scrapeGhlResponseTimeP50Min() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const apiKey     = process.env.GHL_API_KEY;
+  if (!locationId || !apiKey) return null;
+  const headers = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const res = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=50`, { headers });
+  const data = await res.json();
+  const convos = (data.conversations || []).filter(c => c.lastMessageDirection === 'inbound');
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recent = convos.filter(c => c.lastMessageDate && c.lastMessageDate >= sevenDaysAgo).slice(0, 50);
+  if (!recent.length) return null;
+
+  const deltas = [];
+  for (const c of recent) {
+    try {
+      const msgRes = await fetch(`https://services.leadconnectorhq.com/conversations/${c.id}/messages?limit=20`, { headers });
+      const msgData = await msgRes.json();
+      const msgs = (msgData.messages?.messages || msgData.messages || []).slice().reverse(); // chronological
+      let lastInbound = null;
+      for (const m of msgs) {
+        const ts = m.dateAdded ? new Date(m.dateAdded).getTime() : null;
+        if (!ts) continue;
+        if (m.direction === 'inbound') lastInbound = ts;
+        else if (m.direction === 'outbound' && lastInbound) {
+          deltas.push((ts - lastInbound) / 60000);
+          lastInbound = null;
+        }
+      }
+    } catch (msgErr) {
+      console.warn(`GHL response-time fetch failed for convo ${c.id}: ${msgErr.message}`);
+    }
+  }
+  if (!deltas.length) return null;
+  deltas.sort((a, b) => a - b);
+  return Math.round(deltas[Math.floor(deltas.length / 2)]);
+}
+
+// ── Metric registry — single source of truth for what gets scraped ──────────
+const METRIC_REGISTRY = [
+  { name: 'meta_cpl_today',           domain: 'marketing',   scrape: _scrapeMetaCplToday,             label: 'Meta CPL (today)' },
+  { name: 'close_rate_yesterday',     domain: 'sales',       scrape: _scrapeCloseRateYesterday,       label: 'Close rate (yesterday)' },
+  { name: 'setter_calls_booked_yest', domain: 'sales',       scrape: _scrapeSetterCallsBookedYesterday, label: 'Setter calls booked (yesterday)' },
+  { name: 'phase0_to_phase1_conv_7d', domain: 'fulfillment', scrape: _scrapePhase0ToPhase1Conv7d,     label: 'Phase 0 → Phase 1 conversion (7d)' },
+  { name: 'phase1_cycle_days_p50',    domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_1'), label: 'Phase 1 cycle days (p50)' },
+  { name: 'phase2_cycle_days_p50',    domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_2'), label: 'Phase 2 cycle days (p50)' },
+  { name: 'day7_at_risk_count',       domain: 'fulfillment', scrape: _scrapeDay7AtRiskCount,          label: 'Day 7+ at-risk client count' },
+  { name: 'ghl_response_time_p50_min',domain: 'sales',       scrape: _scrapeGhlResponseTimeP50Min,    label: 'GHL response time p50 (min)' },
+];
+
+async function runAnomalyDetection({ dryRun = false, threshold = ANOMALY_THRESHOLD_SIGMA } = {}) {
+  console.log(`Anomaly detection starting (dryRun=${dryRun}, threshold=${threshold}σ)`);
+  const results = { scraped: [], skipped: [], anomalies: [], errors: [] };
+
+  // 1. Scrape every metric. One failing scraper does not stop the others.
+  for (const m of METRIC_REGISTRY) {
+    try {
+      const value = await m.scrape();
+      if (value === null || value === undefined) {
+        results.skipped.push({ metric: m.name, reason: 'no value' });
+        continue;
+      }
+      if (!dryRun) await recordObservation(m.name, m.domain, value, 'anomaly-cron');
+      results.scraped.push({ metric: m.name, domain: m.domain, value });
+    } catch (err) {
+      console.error(`Anomaly scrape error for ${m.name}:`, err.message);
+      results.errors.push({ metric: m.name, error: err.message });
+    }
+  }
+
+  if (dryRun) { console.log('Anomaly dry run — skipping baselines, knowledge, DMs.'); return results; }
+
+  // 2. Recompute baselines for every metric we have observations for.
+  for (const m of METRIC_REGISTRY) {
+    try { await recomputeBaseline(m.name); }
+    catch (err) { console.error(`Anomaly baseline error for ${m.name}:`, err.message); }
+  }
+
+  // 3. Detect anomalies and dispatch.
+  for (const m of METRIC_REGISTRY) {
+    try {
+      const snap = await detectAnomaly(m.name, threshold);
+      if (!snap || !snap.triggered) continue;
+      results.anomalies.push(snap);
+
+      const narration = await narrateAnomaly(snap);
+      const direction = snap.z > 0 ? '↑' : '↓';
+      const today = new Date().toISOString().slice(0, 10);
+      const knowledgeKey = `anomaly:${snap.metric}:${today}`;
+      const structured = `${m.label} ${direction} ${snap.value} (baseline ${snap.mean.toFixed(2)} ± ${snap.stdDev.toFixed(2)}, ${snap.z >= 0 ? '+' : ''}${snap.z.toFixed(2)}σ on n=${snap.sampleSize})`;
+      const fullMessage = narration ? `${structured}\n${narration}` : structured;
+
+      // Persist to long-term memory so it surfaces in future searches
+      await upsertKnowledge('alert', knowledgeKey, fullMessage, 'anomaly-detection', null, 'shared');
+
+      // DM the routed roles
+      const recipients = _resolveAnomalyRecipients(snap.domain);
+      for (const id of recipients) {
+        try {
+          await slack.client.chat.postMessage({
+            channel: id,
+            text: `Anomaly detected — ${m.label}\n\n${fullMessage}`,
+          });
+        } catch (dmErr) {
+          console.error(`Anomaly DM failed for ${id}:`, dmErr.message);
+        }
+      }
+      console.log(`Anomaly fired: ${snap.metric} z=${snap.z.toFixed(2)} → ${recipients.length} recipient(s)`);
+    } catch (err) {
+      console.error(`Anomaly detection error for ${m.name}:`, err.message);
+      results.errors.push({ metric: m.name, error: err.message });
+    }
+  }
+
+  console.log(`Anomaly detection complete — scraped ${results.scraped.length}, skipped ${results.skipped.length}, anomalies ${results.anomalies.length}, errors ${results.errors.length}`);
+  return results;
+}
+
+async function queryMetricHistory(metric, days = 30) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('metric_observations')
+    .select('value, observed_at, source')
+    .eq('metric', metric)
+    .gte('observed_at', since)
+    .order('observed_at', { ascending: true });
+  if (error) return `Metric history error: ${error.message}`;
+  if (!data || !data.length) return `No observations for ${metric} in the last ${days} days.`;
+  const lines = data.map(r => `${r.observed_at.slice(0, 10)}  ${r.value}`);
+  const baseline = await supabase.from('metric_baselines').select('*').eq('metric', metric).single();
+  const baseStr = baseline?.data
+    ? `\nBaseline (n=${baseline.data.sample_size}, ${baseline.data.window_days}d): mean ${Number(baseline.data.mean).toFixed(2)}, stddev ${Number(baseline.data.std_dev).toFixed(2)}`
+    : '';
+  return `${metric} — last ${days} days (${data.length} obs):\n${lines.join('\n')}${baseStr}`;
+}
+
 // ─── FILE PROCESSING ──────────────────────────────────────────────────────────
 async function downloadSlackFile(fileUrl) {
   const res = await fetch(fileUrl, { headers: { 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` } });
@@ -2723,6 +3111,8 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
           { name: 'get_meta_campaigns',   description: 'Get Meta Ads campaign-level breakdown.',                                                  input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' }, limit: { type: 'number', description: 'Number of campaigns, default 10' } } } },
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
+          { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
+          { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
       ];
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
@@ -2775,6 +3165,17 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
         else if (toolUse.name === 'get_meta_campaigns')     result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
         else if (toolUse.name === 'get_meta_adsets')        result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
         else if (toolUse.name === 'get_meta_ads')           result = await getMetaAds(toolUse.input.adSetId || null, toolUse.input.datePreset || 'last_7d');
+        else if (toolUse.name === 'detect_anomalies')       {
+          const dryRun = toolUse.input.dry_run !== false;
+          const out = await runAnomalyDetection({ dryRun });
+          result = `Anomaly check (${dryRun ? 'dry-run' : 'live'}) — scraped ${out.scraped.length}, skipped ${out.skipped.length}, anomalies ${out.anomalies.length}, errors ${out.errors.length}\n\n` +
+            (out.anomalies.length
+              ? out.anomalies.map(a => `${a.metric} (${a.domain}): value=${a.value}, mean=${a.mean.toFixed(2)}, ${a.z >= 0 ? '+' : ''}${a.z.toFixed(2)}σ`).join('\n')
+              : 'No metrics currently outside baseline thresholds.') +
+            (out.skipped.length ? `\n\nSkipped: ${out.skipped.map(s => s.metric + ' (' + s.reason + ')').join(', ')}` : '') +
+            (out.errors.length ? `\n\nErrors: ${out.errors.map(e => e.metric + ': ' + e.error).join('; ')}` : '');
+        }
+        else if (toolUse.name === 'query_metric_history')   result = await queryMetricHistory(toolUse.input.metric, Math.min(toolUse.input.days || 30, 90));
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
       }
 
@@ -3644,6 +4045,17 @@ cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlert
 
 // Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
 cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
+
+// Phase 1 anomaly detection: daily 6am Costa Rica. Scrapes 8 metrics, recomputes
+// rolling baselines, fires DMs at >= 1.5σ deltas. See ANOMALY_ROUTING for who gets pinged.
+cron.schedule('0 6 * * *',   async () => {
+  try { await runAnomalyDetection(); }
+  catch (err) {
+    console.error('Anomaly cron hard failure:', err.message);
+    try { await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `Anomaly cron crashed: ${err.message}` }); }
+    catch (_) {}
+  }
+}, { timezone: 'America/Costa_Rica' });
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
 cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
