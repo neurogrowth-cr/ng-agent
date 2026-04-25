@@ -1,4 +1,5 @@
 require('dotenv').config();
+const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -30,6 +31,45 @@ const portalPg = process.env.PORTAL_READONLY_DATABASE_URL
       idleTimeoutMillis: 30_000,
     })
   : null;
+
+function logLlmFromAnthropicResponse(response, durationMs, correlation_id) {
+  if (!response) return;
+  logActivity({
+    event_type: 'llm_call',
+    event_source: 'internal',
+    action: 'anthropic.messages.create',
+    model: response.model,
+    tokens_in: response.usage?.input_tokens,
+    tokens_out: response.usage?.output_tokens,
+    duration_ms: durationMs,
+    correlation_id,
+  });
+}
+
+function wrapCronJob(actionName, jobFn) {
+  return async () => {
+    const correlation_id = newCorrelationId();
+    const started = Date.now();
+    let errored = null;
+    logActivity({ event_type: 'cron_run', event_source: 'cron', action: actionName, status: 'started', correlation_id });
+    try {
+      await jobFn(correlation_id);
+    } catch (err) {
+      errored = err;
+      throw err;
+    } finally {
+      logActivity({
+        event_type: 'cron_run',
+        event_source: 'cron',
+        action: actionName,
+        status: errored ? 'error' : 'ok',
+        duration_ms: Date.now() - started,
+        error_message: errored ? String(errored.message || errored).slice(0, 2000) : null,
+        correlation_id,
+      });
+    }
+  };
+}
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
@@ -779,6 +819,13 @@ function registerDynamicCron(task) {
   try {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
     const job = cron.schedule(task.cron_expression, async () => {
+      const correlation_id = newCorrelationId();
+      const started = Date.now();
+      const cronAction = `dynamic_cron:${task.name}`;
+      let errored = null;
+      let lastErr = null;
+      logActivity({ event_type: 'cron_run', event_source: 'cron', action: cronAction, status: 'started', correlation_id, metadata: { task_id: task.id } });
+      try {
       console.log(`Running dynamic cron: ${task.name}`);
 
       // Inject live email + calendar context into scheduled report prompts
@@ -804,13 +851,12 @@ function registerDynamicCron(task) {
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
-      let lastErr = null;
       const maxAttempts = 3;
       const retryDelays = [15000, 30000, 60000]; // 15s, 30s, 60s
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          reply = await callClaude([{ role: 'user', content: enrichedPrompt }]);
+          reply = await callClaude([{ role: 'user', content: enrichedPrompt }], 3, null, correlation_id);
           lastErr = null;
           break;
         } catch (err) {
@@ -828,6 +874,7 @@ function registerDynamicCron(task) {
 
       // If all retries failed — DM Ron, never post to team channel
       if (lastErr) {
+        errored = lastErr;
         console.error(`Dynamic cron error (${task.name}):`, lastErr.message);
         try {
           await slack.client.chat.postMessage({
@@ -885,7 +932,7 @@ function registerDynamicCron(task) {
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
             { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
-          ]);
+          ], 3, null, correlation_id);
           if (finalReply && isValidFinalReport(finalReply, task.name)) {
             reply = finalReply;
             console.log(`Cron "${task.name}": re-prompt passed validation (${reply.trim().length} chars)`);
@@ -924,6 +971,19 @@ function registerDynamicCron(task) {
         await postToSlack(targetChannel, reply);
       }
 
+    } catch (e) { errored = e; throw e; } finally {
+      const doneErr = errored || lastErr;
+      logActivity({
+        event_type: 'cron_run',
+        event_source: 'cron',
+        action: cronAction,
+        status: doneErr ? 'error' : 'ok',
+        duration_ms: Date.now() - started,
+        error_message: doneErr ? String(doneErr.message || doneErr).slice(0, 2000) : null,
+        correlation_id,
+        metadata: { task_id: task.id },
+      });
+    }
     }, { timezone: 'America/Costa_Rica' });
     activeDynamicCrons[task.id] = job;
     console.log(`Registered dynamic cron: "${task.name}" (${task.cron_expression})`);
@@ -951,11 +1011,14 @@ Reply with ONLY the cron expression, nothing else. Examples:
 - "every Monday at 8:30am" -> 30 8 * * 1
 - "every day at 6pm" -> 0 18 * * *
 - "every Friday at 4pm" -> 0 16 * * 5`;
+    const cIdTask = newCorrelationId();
+    const tCronLlm = Date.now();
     const cronResponse = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 50,
       messages: [{ role: 'user', content: cronPrompt }]
     });
+    logLlmFromAnthropicResponse(cronResponse, Date.now() - tCronLlm, cIdTask);
     const cronExpression = cronResponse.content
       .filter(b => b.type === 'text').map(b => b.text).join('').trim()
       .replace(/[^0-9*,/\- ]/g, '').trim();
@@ -2153,7 +2216,7 @@ async function createSlackReminder(target, message, postAt) {
 }
 
 // ─── PORTAL: WEEKLY TREND ANALYSIS ───────────────────────────────────────────
-async function runWeeklyPortalTrends() {
+async function runWeeklyPortalTrends(_correlationId) {
   console.log('Running weekly portal trend analysis...');
   try {
     const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, customer_status, customer_type, created_at').eq('is_active', true);
@@ -2185,7 +2248,7 @@ async function runWeeklyPortalTrends() {
 }
 
 // ─── PORTAL: MONDAY GAP DETECTION ────────────────────────────────────────────
-async function runMondayGapDetection() {
+async function runMondayGapDetection(_correlationId) {
   console.log('Running Monday gap detection...');
   try {
     const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true).in('customer_status', ['phase_1','phase_2','blocked']);
@@ -2268,7 +2331,7 @@ async function runMondayGapDetection() {
 }
 
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
-async function runNightlyLearning() {
+async function runNightlyLearning(correlationId) {
   console.log('Running nightly learning cycle...');
   try {
     const channels = ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-ops-management'];
@@ -2317,7 +2380,9 @@ async function runNightlyLearning() {
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n\n${digest}`;
+    const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
     let saved = 0;
@@ -2348,7 +2413,7 @@ async function runNightlyLearning() {
 }
 
 // ─── PROACTIVE ALERTS ─────────────────────────────────────────────────────────
-async function runProactiveAlerts() {
+async function runProactiveAlerts(correlationId) {
   console.log('Running proactive alert check...');
   try {
     const { data, error } = await supabase.from('agent_knowledge').select('key, value, updated_at').eq('category', 'alert').eq('visibility', 'shared').order('updated_at', { ascending: true });
@@ -2359,7 +2424,9 @@ async function runProactiveAlerts() {
     if (!staleAlerts.length) return;
     const alertText = staleAlerts.map(a => `${a.key}: ${a.value}`).join('\n\n');
     const prompt    = `You are the NeuroGrowth PM agent checking on unresolved alerts.\n\nThese items have been flagged as alerts and have not been updated in over 24 hours:\n\n${alertText}\n\nWrite a brief, direct message to Ron (2-4 sentences) summarizing what is still unresolved and what needs his attention today. No markdown formatting. Sound like a colleague, not a report.`;
+    const tPa = Date.now();
     const response  = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId);
     const message   = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     await postToSlack(AGENT_CHANNEL, message);
     console.log(`Proactive alert posted. ${staleAlerts.length} unresolved items flagged.`);
@@ -2369,7 +2436,7 @@ async function runProactiveAlerts() {
 // ─── PROACTIVE TEAM DMs ───────────────────────────────────────────────────────
 // Runs nightly. Checks portal for clients hitting critical milestones tomorrow
 // and DMs the responsible team member before they even have to ask.
-async function runProactiveDMs() {
+async function runProactiveDMs(_correlationId) {
   console.log('Running proactive team DMs...');
   try {
     const { data: dashboards } = await portalSupabase
@@ -2549,7 +2616,7 @@ async function resizeImageIfNeeded(fileBuffer, mimeType) {
   } catch (err) { console.error('Image resize error:', err.message); return { buffer: fileBuffer, mimeType }; }
 }
 
-async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt) {
+async function processFileWithClaude(fileBuffer, mimeType, userInstruction, systemPrompt, correlationId) {
   let finalBuffer = fileBuffer, finalMimeType = mimeType;
   if (mimeType.startsWith('image/')) {
     const resized = await resizeImageIfNeeded(fileBuffer, mimeType);
@@ -2564,10 +2631,12 @@ async function processFileWithClaude(fileBuffer, mimeType, userInstruction, syst
   } else {
     return 'Unsupported file type. I can process images (PNG, JPG, GIF, WEBP) and PDFs.';
   }
+  const t0 = Date.now();
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6', max_tokens: 1024, system: systemPrompt,
     messages: [{ role: 'user', content: [contentBlock, { type: 'text', text: userInstruction || 'Analyze this file and provide a useful summary. Extract any action items, key information, or insights relevant to NeuroGrowth operations.' }] }],
   });
+  logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId);
   return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
 }
 
@@ -2604,7 +2673,8 @@ async function transcribeAudio(fileBuffer, filename) {
 }
 
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
-async function callClaude(messages, retries = 3, userId = null) {
+async function callClaude(messages, retries = 3, userId = null, correlationId = null) {
+  const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -2709,6 +2779,7 @@ async function callClaude(messages, retries = 3, userId = null) {
       }
 
       // ── Initial call ─────────────────────────────────────────────────────────
+      const tInitial = Date.now();
       let response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 2048,
@@ -2716,6 +2787,7 @@ async function callClaude(messages, retries = 3, userId = null) {
         messages,
         tools: TOOLS,
       });
+      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id);
 
       // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
       const MAX_TOOL_ROUNDS = 5;
@@ -2726,8 +2798,32 @@ async function callClaude(messages, retries = 3, userId = null) {
 
         const toolUses = response.content.filter(b => b.type === 'tool_use');
         const toolResults = await Promise.all(toolUses.map(async (toolUse) => {
-          try { return await dispatchTool(toolUse); }
-          catch (err) { return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(`Error running tool ${toolUse.name}: ${err.message}`) }; }
+          const tTool = Date.now();
+          let errored = false;
+          let err = null;
+          let res;
+          try {
+            res = await dispatchTool(toolUse);
+          } catch (e) {
+            errored = true;
+            err = e;
+            res = { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(`Error running tool ${toolUse.name}: ${e.message}`) };
+          }
+          const duration_ms = Date.now() - tTool;
+          const resultSummary = res && res.content != null ? String(res.content).slice(0, 2000) : '';
+          logActivity({
+            event_type: 'tool_call',
+            event_source: 'internal',
+            action: toolUse.name,
+            tool_name: toolUse.name,
+            input: toolUse.input,
+            output: { summary: resultSummary },
+            status: errored ? 'error' : 'ok',
+            error_message: errored && err && err.message ? err.message.slice(0, 2000) : null,
+            duration_ms,
+            correlation_id,
+          });
+          return res;
         }));
 
         // Check for approval draft before continuing — pass sentinel through verbatim
@@ -2742,6 +2838,7 @@ async function callClaude(messages, retries = 3, userId = null) {
         let nextResponse = null;
         for (let fuAttempt = 0; fuAttempt < 3; fuAttempt++) {
           try {
+            const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
               model: 'claude-sonnet-4-6',
               max_tokens: 1024,
@@ -2749,6 +2846,7 @@ async function callClaude(messages, retries = 3, userId = null) {
               messages: currentMessages,
               tools: TOOLS,
             });
+            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id);
             break;
           } catch (fuErr) {
             if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
@@ -2787,41 +2885,57 @@ async function postToSlack(channel, text, threadTs = null) {
   await slack.client.chat.postMessage(payload);
 }
 
-async function executeChannelPost(channelName, message, say) {
+async function executeChannelPost(channelName, message, say, correlationId) {
   try {
     const channels = await getCachedChannelList();
     const channel  = channels.find(c => c.name === channelName.replace('#', ''));
     if (!channel) { await say(`Could not find channel ${channelName}.`); }
-    else { await slack.client.chat.postMessage({ channel: channel.id, text: message }); await say(`Posted to ${channelName}.`); }
+    else {
+      await slack.client.chat.postMessage({ channel: channel.id, text: message });
+      if (correlationId) {
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: channel.id, output: { text: String(message).slice(0, 2000) }, correlation_id: correlationId });
+      }
+      await say(`Posted to ${channelName}.`);
+      if (correlationId) {
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: `Posted to ${channelName}.`.slice(0, 2000) }, correlation_id: correlationId });
+      }
+    }
   } catch (err) { await say(`Something went wrong posting: ${err.message}`); }
 }
 
 async function checkApproval(message, say, userId) {
   const pending = pendingApprovals[userId];
   if (!pending) return false;
+  const approvalCid = newCorrelationId();
   const text = (typeof message === 'string' ? message : message.text || '').toLowerCase().trim();
   if (['yes','send it','approved','go ahead','👍'].includes(text)) {
-    await executeChannelPost(pending.channelName, pending.message, say);
+    await executeChannelPost(pending.channelName, pending.message, say, approvalCid);
     // Notify originator if the approver was Ron acting on someone else's draft
     if (pending.requestedBy && pending.requestedBy !== userId) {
       try {
+        const t = `Ron approved the draft for ${pending.channelName}. It has been posted.`;
         await slack.client.chat.postMessage({
           channel: pending.requestedBy,
-          text: `Ron approved the draft for ${pending.channelName}. It has been posted.`,
+          text: t,
         });
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: pending.requestedBy, output: { text: t.slice(0, 2000) }, correlation_id: approvalCid });
       } catch (notifyErr) { console.error('Originator notify error:', notifyErr.message); }
     }
     delete pendingApprovals[userId];
     return true;
   }
   if (['no','cancel','stop'].includes(text)) {
-    await say('Cancelled. Nothing was posted.');
+    const cancelT = 'Cancelled. Nothing was posted.';
+    await say(cancelT);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: cancelT.slice(0, 2000) }, correlation_id: approvalCid });
     if (pending.requestedBy && pending.requestedBy !== userId) {
       try {
+        const t2 = `Ron held the draft for ${pending.channelName} — want to revise and try again?`;
         await slack.client.chat.postMessage({
           channel: pending.requestedBy,
-          text: `Ron held the draft for ${pending.channelName} — want to revise and try again?`,
+          text: t2,
         });
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: pending.requestedBy, output: { text: t2.slice(0, 2000) }, correlation_id: approvalCid });
       } catch (notifyErr) { console.error('Originator notify error:', notifyErr.message); }
     }
     delete pendingApprovals[userId];
@@ -2833,7 +2947,7 @@ async function checkApproval(message, say, userId) {
 // Approval sentinel format:
 //   APPROVAL_NEEDED|<channelName>|<escalate '0'|'1'>|<originUserId>|<reason>|<message...>
 // message is everything after the 5th pipe so it may itself contain pipes.
-function handleDraftReply(reply, userId, say) {
+function handleDraftReply(reply, userId, say, correlationId) {
   if (!reply.startsWith('APPROVAL_NEEDED|')) return false;
   const parts = reply.split('|');
   const channelName = parts[1];
@@ -2864,20 +2978,40 @@ function handleDraftReply(reply, userId, say) {
 
   if (escalate && approver !== originUserId) {
     // Tell the originator we're routing to Ron
-    say(`This one needs Ron's call${reason ? ` — ${reason}` : ''}. I've routed the draft to him and I'll let you know when he signs off.\n\nFor ${channelName}:\n\n"${draftMessage}"`);
+    const tO = `This one needs Ron's call${reason ? ` — ${reason}` : ''}. I've routed the draft to him and I'll let you know when he signs off.\n\nFor ${channelName}:\n\n"${draftMessage}"`;
+    say(tO);
+    if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: tO.slice(0, 2000) }, correlation_id: correlationId });
     // DM Ron with the attributed draft
-    slack.client.chat.postMessage({
-      channel: RON_SLACK_ID,
-      text: `Escalation from ${origin.displayName}${reason ? ` — ${reason}` : ''}\n\nDraft for ${channelName}:\n\n"${draftMessage}"\n\nReply "send it" to post or "cancel" to discard.`,
-    }).catch(err => console.error('Escalation DM to Ron failed:', err.message));
+    const tR = `Escalation from ${origin.displayName}${reason ? ` — ${reason}` : ''}\n\nDraft for ${channelName}:\n\n"${draftMessage}"\n\nReply "send it" to post or "cancel" to discard.`;
+    slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: tR })
+      .then(() => {
+        if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: RON_SLACK_ID, output: { text: tR.slice(0, 2000) }, correlation_id: correlationId });
+      })
+      .catch(err => console.error('Escalation DM to Ron failed:', err.message));
   } else {
-    say(`Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`);
+    const tA = `Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`;
+    say(tA);
+    if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: tA.slice(0, 2000) }, correlation_id: correlationId });
   }
   return true;
 }
 
 // ─── SHARED FILE HANDLER ──────────────────────────────────────────────────────
 async function handleFileMessage(message, say, userId, threadReply = false) {
+  const correlation_id = newCorrelationId();
+  const fActor = getMemberContext(userId);
+  logActivity({
+    event_type: 'slack_message',
+    event_source: 'slack',
+    action: 'inbound',
+    actor_user_id: userId,
+    actor_name: fActor.displayName,
+    channel_id: message.channel,
+    thread_ts: message.thread_ts,
+    input: { text: (message.text || '').slice(0, 2000) },
+    correlation_id,
+  });
+
   const file        = message.files[0];
   const instruction = message.text || null;
   const mimeType    = getFileMimeType(file.name, file.mimetype);
@@ -2885,30 +3019,35 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
   if (isAudioFile(mimeType, file.name)) {
     const ack = threadReply ? { text: '🎙️ Got the voice note. Transcribing...', thread_ts: message.thread_ts || message.ts } : '🎙️ Got the voice note. Transcribing...';
     await say(ack);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: (typeof ack === 'string' ? ack : ack.text).slice(0, 2000) }, correlation_id });
     try {
       const fileBuffer = await downloadSlackFile(file.url_private);
       const transcript = await transcribeAudio(fileBuffer, file.name);
       if (!transcript || !transcript.trim()) {
         const errMsg = "Couldn't make out anything in that audio. Try again?";
         await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: errMsg.slice(0, 2000) }, correlation_id });
         return;
       }
       console.log(`Audio transcribed (${file.name}): ${transcript.substring(0, 100)}...`);
       const transcriptNotice = `_Transcript:_ "${transcript.substring(0, 200)}${transcript.length > 200 ? '...' : ''}"`;
       await say(threadReply ? { text: transcriptNotice, thread_ts: message.thread_ts || message.ts } : transcriptNotice);
+      logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: transcriptNotice.slice(0, 2000) }, correlation_id });
       const history = await loadHistory(userId);
       history.push({ role: 'user', content: `[Voice note transcript]: ${transcript}` });
-      let reply = await callClaude(history, 3, userId);
-      if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId);
+      let reply = await callClaude(history, 3, userId, correlation_id);
+      if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId, correlation_id);
       if (!reply || !reply.trim()) return;
-      if (handleDraftReply(reply, userId, say)) return;
+      if (handleDraftReply(reply, userId, say, correlation_id)) return;
       await saveMessage(userId, 'user', `[Voice note]: ${transcript}`);
       await saveMessage(userId, 'assistant', reply);
       await say(threadReply ? { text: reply, thread_ts: message.thread_ts || message.ts } : reply);
+      logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: String(reply).slice(0, 2000) }, correlation_id });
     } catch (err) {
       console.error('Audio processing error:', err);
       const errMsg = `Had trouble with that audio — ${err.message}`;
       await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+      logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: errMsg.slice(0, 2000) }, correlation_id });
     }
     return;
   }
@@ -2917,20 +3056,24 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
   if (!supported.includes(mimeType)) {
     const errMsg = `I can process images (PNG, JPG, GIF, WEBP), PDFs, and audio files. This file type (${mimeType}) isn't supported yet.`;
     await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: errMsg.slice(0, 2000) }, correlation_id });
     return;
   }
   const ackMsg = `Got the ${mimeType.includes('pdf') ? 'PDF' : 'image'}. Give me a moment to analyze it...`;
   await say(threadReply ? { text: ackMsg, thread_ts: message.thread_ts || message.ts } : ackMsg);
+  logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: ackMsg.slice(0, 2000) }, correlation_id });
   try {
     const fileBuffer = await downloadSlackFile(file.url_private);
-    const result     = await processFileWithClaude(fileBuffer, mimeType, instruction, buildRoleSystemPrompt(userId));
+    const result     = await processFileWithClaude(fileBuffer, mimeType, instruction, buildRoleSystemPrompt(userId), correlation_id);
     await saveMessage(userId, 'user', `[File: ${file.name}] ${instruction || 'analyze this'}`);
     await saveMessage(userId, 'assistant', result);
     await say(threadReply ? { text: result, thread_ts: message.thread_ts || message.ts } : result);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: String(result).slice(0, 2000) }, correlation_id });
   } catch (err) {
     console.error('File processing error:', err);
     const errMsg = `Had trouble processing that file — ${err.message}`;
     await say(threadReply ? { text: errMsg, thread_ts: message.thread_ts || message.ts } : errMsg);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: errMsg.slice(0, 2000) }, correlation_id });
   }
 }
 
@@ -2947,16 +3090,30 @@ slack.message(async ({ message, say }) => {
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, false); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
+  const correlation_id = newCorrelationId();
+  const dmCtx = getMemberContext(userId);
+  logActivity({
+    event_type: 'slack_message',
+    event_source: 'slack',
+    action: 'inbound',
+    actor_user_id: userId,
+    actor_name: dmCtx.displayName,
+    channel_id: message.channel,
+    thread_ts: message.thread_ts,
+    input: { text: (message.text || '').slice(0, 2000) },
+    correlation_id,
+  });
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
   try {
-    let reply = await callClaude(history, 3, userId);
-    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId); }
+    let reply = await callClaude(history, 3, userId, correlation_id);
+    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
     if (!reply || !reply.trim()) return;
-    if (handleDraftReply(reply, userId, say)) return;
+    if (handleDraftReply(reply, userId, say, correlation_id)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
     await say(reply);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: String(reply).slice(0, 2000) }, correlation_id });
   } catch (err) { console.error('Claude API error (DM):', err); await say('Got turned around for a second — go ahead and ask again.'); }
 });
 
@@ -3002,15 +3159,31 @@ slack.event('app_mention', async ({ event, say }) => {
 
   const history = await loadHistory(userId);
   const fullMessage = threadContext ? `${threadContext}\n\nMY TASK (what I was just tagged to do): ${cleanText}` : cleanText;
+  const mentionChannelInfo = await slack.client.conversations.info({ channel: event.channel }).catch(() => null);
+  const mentionCid = newCorrelationId();
+  const menCtx = getMemberContext(userId);
+  logActivity({
+    event_type: 'slack_message',
+    event_source: 'slack',
+    action: 'inbound',
+    actor_user_id: userId,
+    actor_name: menCtx.displayName,
+    channel_id: event.channel,
+    channel_name: mentionChannelInfo?.channel?.name,
+    thread_ts: event.thread_ts,
+    input: { text: (event.text || '').slice(0, 2000) },
+    correlation_id: mentionCid,
+  });
   history.push({ role: 'user', content: fullMessage });
   try {
-    let reply = await callClaude(history, 3, userId);
-    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId); }
+    let reply = await callClaude(history, 3, userId, mentionCid);
+    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId, mentionCid); }
     if (!reply || !reply.trim()) return;
-    if (handleDraftReply(reply, userId, say)) return;
+    if (handleDraftReply(reply, userId, say, mentionCid)) return;
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: event.thread_ts || event.ts });
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: event.channel, thread_ts: event.thread_ts || event.ts, output: { text: String(reply).slice(0, 2000) }, correlation_id: mentionCid });
   } catch (err) { console.error('Claude API error (mention):', err); await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts }); }
 });
 
@@ -3029,16 +3202,31 @@ slack.message(async ({ message, say }) => {
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, true); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say({ text: 'Slow down a bit — too many messages at once. Give me a moment.', thread_ts: message.thread_ts || message.ts }); return; }
+  const chCid = newCorrelationId();
+  const chCtx = getMemberContext(userId);
+  logActivity({
+    event_type: 'slack_message',
+    event_source: 'slack',
+    action: 'inbound',
+    actor_user_id: userId,
+    actor_name: chCtx.displayName,
+    channel_id: message.channel,
+    channel_name: channelName,
+    thread_ts: message.thread_ts,
+    input: { text: (message.text || '').slice(0, 2000) },
+    correlation_id: chCid,
+  });
   const history = await loadHistory(userId);
   history.push({ role: 'user', content: message.text });
   try {
-    let reply = await callClaude(history, 3, userId);
-    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId); }
+    let reply = await callClaude(history, 3, userId, chCid);
+    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId, chCid); }
     if (!reply || !reply.trim()) return;
-    if (handleDraftReply(reply, userId, say)) return;
+    if (handleDraftReply(reply, userId, say, chCid)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: message.thread_ts || message.ts });
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts || message.ts, output: { text: String(reply).slice(0, 2000) }, correlation_id: chCid });
   } catch (err) { console.error('Claude API error (channel):', err); }
 });
 
@@ -3088,7 +3276,7 @@ async function searchGHLContact(email, name) {
   return data.contacts?.[0] || null;
 }
 
-async function runSalesCallPrep() {
+async function runSalesCallPrep(_correlationId) {
   console.log('Running sales call prep...');
   try {
     const now       = Date.now();
@@ -3193,7 +3381,7 @@ async function runSalesCallPrep() {
 // ─── FULFILLMENT MORNING STANDUP ──────────────────────────────────────────────
 // Fires 9:00 AM CR Mon–Fri. DMs each fulfillment team member with their
 // specific priorities for the day — no meeting needed.
-async function runFulfillmentStandup() {
+async function runFulfillmentStandup(_correlationId) {
   console.log('Running fulfillment morning standup DMs...');
   try {
     const now = Date.now();
@@ -3442,26 +3630,26 @@ async function runFulfillmentStandup() {
 }
 
 // Nightly learning — 11:30 PM CR (infrastructure — reads all channels, saves knowledge)
-cron.schedule('30 5 * * *',  async () => { await runNightlyLearning(); },     { timezone: 'America/Costa_Rica' });
+cron.schedule('30 5 * * *',  wrapCronJob('runNightlyLearning', runNightlyLearning),     { timezone: 'America/Costa_Rica' });
 
 // Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
-cron.schedule('30 22 * * 5', async () => { await runWeeklyPortalTrends(); },  { timezone: 'America/Costa_Rica' });
+cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
 
 // Monday gap detection — 8:00 AM CR (infrastructure — posts to ops channel)
-cron.schedule('0 14 * * 1',  async () => { await runMondayGapDetection(); },  { timezone: 'America/Costa_Rica' });
+cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => { await runMondayGapDetection(c); }),  { timezone: 'America/Costa_Rica' });
 
 // Proactive alerts — 9:00 AM and 2:00 PM CR (infrastructure — posts stale alerts to agent channel)
-cron.schedule('0 15 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
-cron.schedule('0 20 * * *',  async () => { await runProactiveAlerts(); },     { timezone: 'America/Costa_Rica' });
+cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
+cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 
 // Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
-cron.schedule('0 8 * * 1-5', async () => { await runProactiveDMs(); },        { timezone: 'America/Costa_Rica' });
+cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
-cron.schedule('0 9 * * 1-5', async () => { await runFulfillmentStandup(); },  { timezone: 'America/Costa_Rica' });
+cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
 
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
-cron.schedule('0 * * * 1-5',  async () => { await runSalesCallPrep(); },       { timezone: 'America/Costa_Rica' });
+cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
@@ -3557,12 +3745,16 @@ async function handleGHLWebhook(req, res) {
         const ghlLink      = contactId ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : 'https://app.gohighlevel.com';
         const setterSlackId = resolveSetterSlackId(resolvedAssignedTo);
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. Their first action (reach out now, check GHL). Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
+        const ghlCorr = newCorrelationId();
+        const tGhl = Date.now();
         const briefingResponse = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
+        logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr);
         const briefing = briefingResponse.content.filter(b => b.type === 'text').map(b => b.text).join('');
         if (!briefing || !briefing.trim()) { console.error('GHL webhook: empty briefing from Claude'); return; }
 
         if (setterSlackId) {
           await slack.client.chat.postMessage({ channel: setterSlackId, text: briefing });
+          logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: setterSlackId, output: { text: briefing.slice(0, 2000) }, correlation_id: ghlCorr });
           console.log(`GHL lead briefing sent to setter ${assignedTo} (${setterSlackId})`);
         } else {
           console.log(`GHL lead received but setter not resolved. assignedTo: "${assignedTo}". Add to GHL_TO_SLACK map if needed.`);
@@ -3577,6 +3769,7 @@ async function handleGHLWebhook(req, res) {
           contactId          ? `🔗 ${ghlLink}` : null,
         ].filter(Boolean).join('\n');
         await slack.client.chat.postMessage({ channel: 'C0AJANQBYUE', text: channelNote });
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: 'C0AJANQBYUE', output: { text: channelNote.slice(0, 2000) }, correlation_id: ghlCorr });
       } catch (parseErr) { console.error('GHL webhook parse error:', parseErr.message); }
     });
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
@@ -3640,7 +3833,7 @@ async function handlePhase3Transition(record) {
 }
 
 // ─── MONTHLY PHASE 3 RECONCILIATION ──────────────────────────────────────────
-async function runPhase3Reconciliation() {
+async function runPhase3Reconciliation(_correlationId) {
   try {
     // 1. Get all active phase_3 clients from portal
     const { rows } = await portalPg.query(
@@ -3738,7 +3931,7 @@ healthServer.listen(process.env.PORT || 3000, () => {
   console.log('NeuroGrowth PM Agent is running.');
   await loadAndRegisterDynamicCrons();
   // Static infrastructure crons (not stored in DB)
-  cron.schedule('0 7 15 * *', runPhase3Reconciliation, { timezone: 'America/Costa_Rica' });
+  cron.schedule('0 7 15 * *', wrapCronJob('runPhase3Reconciliation', async (c) => { await runPhase3Reconciliation(c); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Phase 3 reconciliation (0 7 15 * *)');
 })();
 
@@ -3762,9 +3955,11 @@ slack.event('member_joined_channel', async ({ event }) => {
     };
     const roleIntro = roleIntros[member.role] || `You are greeting a new NeuroGrowth team member named ${member.displayName}. Welcome them warmly and briefly explain what you can help with.`;
     const prompt    = `You are Max, the NeuroGrowth PM Agent. A new team member just joined the #ng-pm-agent channel.\n\n${roleIntro}\n\nAddress them by name: ${member.displayName}.\nSound like a sharp, friendly colleague — not a corporate bot. No markdown formatting. No bullet points. Conversational tone.`;
-    const greeting  = await callClaude([{ role: 'user', content: prompt }]);
+    const mjCid = newCorrelationId();
+    const greeting  = await callClaude([{ role: 'user', content: prompt }], 3, event.user, mjCid);
     if (!greeting || !greeting.trim()) return;
     await slack.client.chat.postMessage({ channel: event.channel, text: greeting });
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: event.channel, output: { text: String(greeting).slice(0, 2000) }, correlation_id: mjCid });
     console.log(`Greeted ${member.displayName} (${member.role}) in #ng-pm-agent`);
   } catch (err) { console.error('member_joined_channel error:', err.message); }
 });
