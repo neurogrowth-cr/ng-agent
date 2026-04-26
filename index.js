@@ -754,6 +754,50 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
   }
 }
 
+// ── Report feedback learning loop ────────────────────────────────────────────
+
+// When a team member @mentions Max in a thread on a Max-posted report, extract
+// the lesson from their feedback and store it so future reports apply the fix.
+async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId) {
+  try {
+    const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
+    const res = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    if (!lesson) return null;
+    const key = `report_lesson:${channelName}:${new Date().toISOString().slice(0, 10)}`;
+    await upsertKnowledge('process', key, lesson, 'report-feedback', userId, 'shared');
+    console.log(`Report lesson saved for #${channelName}: ${lesson.substring(0, 100)}`);
+    return lesson;
+  } catch (err) {
+    console.error('extractAndSaveReportLesson error:', err.message);
+    return null;
+  }
+}
+
+// Retrieve the last N lessons for a channel (last 90 days) to prepend to reports.
+async function getReportLessons(channelName) {
+  try {
+    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const { data } = await supabase
+      .from('agent_knowledge')
+      .select('value, updated_at')
+      .eq('category', 'process')
+      .eq('source', 'report-feedback')
+      .ilike('key', `report_lesson:${channelName}:%`)
+      .gte('updated_at', cutoff)
+      .order('updated_at', { ascending: false })
+      .limit(5);
+    return data || [];
+  } catch (err) {
+    console.error('getReportLessons error:', err.message);
+    return [];
+  }
+}
+
 async function getAllKnowledgeByCategory(category, userId = null) {
   try {
     let q = supabase
@@ -845,9 +889,15 @@ function registerDynamicCron(task) {
         }
       } catch (e) { console.error('Live context fetch error for scheduled task:', e.message); }
 
+      // Inject any lessons learned from team feedback on previous reports for this channel
+      const taskChannel = (task.channel || AGENT_CHANNEL).replace(/^#/, '');
+      const taskLessons = await getReportLessons(taskChannel);
+      const lessonContext = taskLessons.length
+        ? `\n\nPREVIOUS FEEDBACK FROM TEAM (apply these corrections to this report):\n${taskLessons.map(l => `• ${l.value}`).join('\n')}`
+        : '';
       const enrichedPrompt = liveContext
-        ? `${task.prompt}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
-        : task.prompt;
+        ? `${task.prompt}${lessonContext}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : `${task.prompt}${lessonContext}`;
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
@@ -951,25 +1001,15 @@ function registerDynamicCron(task) {
 
       const targetChannel = task.channel || AGENT_CHANNEL;
 
-      if (requiresApproval(targetChannel)) {
-        // Cron drafts route to whoever created the task. Ron is the fallback for
-        // system-created or legacy tasks with no created_by.
-        const approver = task.created_by && PILOT_USERS.has(task.created_by) ? task.created_by : RON_SLACK_ID;
-        const origin = getMemberContext(approver);
-        pendingApprovals[approver] = {
-          channelName: targetChannel,
-          message: reply,
-          requestedBy: approver,
-          createdAt: Date.now(),
-        };
-        await slack.client.chat.postMessage({
-          channel: approver,
-          text: `Draft ready for ${targetChannel} — task: ${task.name}${approver !== RON_SLACK_ID ? ` (yours, ${origin.name})` : ''}\n\n${reply}\n\nReply "send it" to post or "cancel" to discard.`,
-        });
-        console.log(`Cron draft DMed to ${origin.displayName} for approval: "${task.name}" → ${targetChannel}`);
-      } else {
-        await postToSlack(targetChannel, reply);
+      // Scheduled reports post directly — feedback learning loop handles quality
+      // (user-initiated draft_channel_post requests still use the approval flow)
+      const lessons = await getReportLessons(targetChannel.replace(/^#/, ''));
+      let finalReply = reply;
+      if (lessons.length) {
+        const lessonNote = `[Corrections applied from team feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`;
+        finalReply = lessonNote + reply;
       }
+      await postToSlack(targetChannel, finalReply);
 
     } catch (e) { errored = e; throw e; } finally {
       const doneErr = errored || lastErr;
@@ -2425,18 +2465,15 @@ async function runMondayGapDetection(_correlationId) {
 
     if (!gaps.length) { console.log('Gap detection: no critical gaps found.'); return; }
     const today   = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
-    const message = `Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
-    // Route through Ron for approval before posting to team channel
-    pendingApprovals[RON_SLACK_ID] = {
-      channelName: OPS_CHANNEL,
-      message,
-      createdAt: Date.now(),
-    };
-    await slack.client.chat.postMessage({
-      channel: RON_SLACK_ID,
-      text: `Draft ready for ${OPS_CHANNEL} — Monday Gap Detection\n\n${message}\n\nReply "send it" to post or "cancel" to discard.`,
-    });
-    console.log(`Gap detection: ${gaps.length} gap(s) DMed to Ron for approval.`);
+    // Prepend any lessons learned from team feedback on previous gap reports
+    const gapLessons = await getReportLessons('ng-ops-management');
+    const lessonNote = gapLessons.length
+      ? `[Corrections applied from team feedback]\n${gapLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
+      : '';
+    const message = `${lessonNote}Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
+    // Post directly — team reviews and threads corrections to Max for learning
+    await executeChannelPost(OPS_CHANNEL, message, null, correlationId);
+    console.log(`Gap detection: ${gaps.length} gap(s) posted directly to ${OPS_CHANNEL}.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
 }
 
@@ -3734,6 +3771,27 @@ slack.event('app_mention', async ({ event, say }) => {
           `Thread tagged for Max on ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica' })} in #${channelInfo?.channel?.name || 'unknown'}. Last action: "${cleanText.substring(0, 200)}"`,
           'thread-mention'
         );
+
+        // If the thread root was posted by Max (a report), extract the lesson from
+        // the user's feedback before responding — so Max can acknowledge it.
+        const rootMessage = threadMessages[0];
+        const isMaxBotPost = rootMessage && !rootMessage.user && rootMessage.bot_id;
+        if (isMaxBotPost) {
+          try {
+            const lesson = await extractAndSaveReportLesson(
+              rootMessage.text || '',
+              cleanText,
+              channelName,
+              userId,
+              newCorrelationId()
+            );
+            if (lesson) {
+              threadContext += `\n\nIMPORTANT: This person is giving feedback on a report Max posted. A lesson has been extracted and saved: "${lesson}". Acknowledge this in your reply — confirm what you learned and that you will apply it to future reports for this channel. Keep it to 1-2 sentences, plain text.`;
+            }
+          } catch (lessonErr) {
+            console.error('Lesson extraction error:', lessonErr.message);
+          }
+        }
       }
     } catch (threadErr) {
       console.error('Thread context fetch error:', threadErr.message);
