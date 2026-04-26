@@ -768,7 +768,8 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
     });
     const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     if (!lesson) return null;
-    const key = `report_lesson:${channelName}:${new Date().toISOString().slice(0, 10)}`;
+    const reportId = inferReportId(originalReport, channelName);
+    const key = `report_lesson:${reportId}:${new Date().toISOString().slice(0, 10)}`;
     await upsertKnowledge('process', key, lesson, 'report-feedback', userId, 'shared');
     console.log(`Report lesson saved for #${channelName}: ${lesson.substring(0, 100)}`);
     return lesson;
@@ -778,8 +779,23 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
   }
 }
 
-// Retrieve the last N lessons for a channel (last 90 days) to prepend to reports.
-async function getReportLessons(channelName) {
+// Map a report's root message text to a stable report ID so lessons are scoped
+// by report type rather than just channel (handles DM reports too).
+function inferReportId(messageText, fallbackChannel) {
+  const t = (messageText || '').toLowerCase();
+  if (t.includes('setter brief'))                                        return 'sales-standup-setter';
+  if (t.includes('closer brief'))                                        return 'sales-standup-closer';
+  if (t.includes('weekly sales') && t.includes('marketing recap'))       return 'weekly-sales-marketing-recap';
+  if (t.includes('monday delivery gap report') || t.includes('gap report')) return 'gap-detection';
+  if (t.includes('fulfillment standup') || t.includes('delivery standup')) return 'fulfillment-standup';
+  if (t.includes('eod pulse') || t.includes('end of day pulse'))         return 'fulfillment-eod';
+  if (t.includes('week in review') || t.includes('friday delivery'))     return 'friday-delivery-wrap';
+  if (t.includes('anomaly') || t.includes('drifted') || t.includes('σ')) return 'anomaly-alert';
+  return fallbackChannel || 'general-report';
+}
+
+// Retrieve the last N lessons for a report (last 90 days) to prepend to reports.
+async function getReportLessons(reportId) {
   try {
     const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
@@ -787,7 +803,7 @@ async function getReportLessons(channelName) {
       .select('value, updated_at')
       .eq('category', 'process')
       .eq('source', 'report-feedback')
-      .ilike('key', `report_lesson:${channelName}:%`)
+      .ilike('key', `report_lesson:${reportId}:%`)
       .gte('updated_at', cutoff)
       .order('updated_at', { ascending: false })
       .limit(5);
@@ -2466,7 +2482,7 @@ async function runMondayGapDetection(_correlationId) {
     if (!gaps.length) { console.log('Gap detection: no critical gaps found.'); return; }
     const today   = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     // Prepend any lessons learned from team feedback on previous gap reports
-    const gapLessons = await getReportLessons('ng-ops-management');
+    const gapLessons = await getReportLessons('gap-detection');
     const lessonNote = gapLessons.length
       ? `[Corrections applied from team feedback]\n${gapLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
       : '';
@@ -4328,9 +4344,14 @@ async function runSalesStandup(_correlationId) {
       .limit(7);
     const weeklyScheduled = (weeklyEOD || []).reduce((s, r) => s + (r.scheduled_calls || 0), 0);
 
+    const setterLessons = await getReportLessons('sales-standup-setter');
+    const setterLessonNote = setterLessons.length
+      ? `[Corrections applied from feedback]\n${setterLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
+      : '';
+
     for (const setter of setters) {
       try {
-        const lines = [`Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
+        const lines = [`${setterLessonNote}Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
 
         // Yesterday stats
         lines.push(`📊 Yesterday: ${totalScheduled} calls booked | ${totalConvos} new convos | ${totalQualified} leads qualified`);
@@ -4360,6 +4381,7 @@ async function runSalesStandup(_correlationId) {
           lines.push('');
         }
 
+        lines.push('See something off? Thread on this message and tag @Max with the correction.');
         await slack.client.chat.postMessage({ channel: setter.slackId, text: lines.join('\n') });
         console.log(`Sales standup DM sent to setter ${setter.name}`);
       } catch (setterErr) {
@@ -4416,6 +4438,11 @@ async function runSalesStandup(_correlationId) {
       .filter(([email, slackId]) => slackId && email.includes('@') && slackId !== RON_SLACK_ID)
       .map(([email, slackId]) => ({ email, slackId, name: resolveSalesMember(email) }));
 
+    const closerLessons = await getReportLessons('sales-standup-closer');
+    const closerLessonNote = closerLessons.length
+      ? `[Corrections applied from feedback]\n${closerLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
+      : '';
+
     for (const closer of closers) {
       try {
         const eod           = closerEODMap[closer.email] || {};
@@ -4427,7 +4454,7 @@ async function runSalesStandup(_correlationId) {
         const myTodayCalls = (todayCalls || []).filter(a => a.closer_id === closer.email);
         const myUnlogged   = unloggedByCloser[closer.email] || [];
 
-        const lines = [`Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
+        const lines = [`${closerLessonNote}Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
 
         // Yesterday stats
         lines.push(`📊 Yesterday: ${heldCalls} calls held | ${closes} closes | ${closeRatePct}% close rate | ${noShows} no-shows`);
@@ -4455,6 +4482,7 @@ async function runSalesStandup(_correlationId) {
           lines.push('');
         }
 
+        lines.push('See something off? Thread on this message and tag @Max with the correction.');
         await slack.client.chat.postMessage({ channel: closer.slackId, text: lines.join('\n') });
         console.log(`Sales standup DM sent to closer ${closer.name}`);
       } catch (closerErr) {
@@ -4546,6 +4574,13 @@ async function runWeeklySalesMarketingRecap(_correlationId) {
         parts.push(`• ${a.key} — ${(a.value || '').substring(0, 120)}`);
       });
     }
+
+    const recapLessons = await getReportLessons('weekly-sales-marketing-recap');
+    if (recapLessons.length) {
+      parts.unshift(`[Corrections applied from feedback]\n${recapLessons.map(l => `• ${l.value}`).join('\n')}\n`);
+    }
+    parts.push('');
+    parts.push('See something off? Reply to this message tagging @Max with the correction.');
 
     const msg = parts.join('\n');
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: msg });
