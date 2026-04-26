@@ -1425,18 +1425,23 @@ async function getMetaAdsSummary(datePreset = 'last_7d') {
     const insightRes  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/insights?fields=${fields}&date_preset=${datePreset}&access_token=${token}`);
     const insightData = await insightRes.json();
     if (insightData.error) throw new Error(insightData.error.message);
-    const d     = insightData.data?.[0] || {};
-    const leads = (d.actions || []).find(a => a.action_type === 'lead')?.value || '0';
-    const spend = parseFloat(d.spend || 0).toFixed(2);
-    const ctr   = parseFloat(d.ctr   || 0).toFixed(2);
-    const cpc   = parseFloat(d.cpc   || 0).toFixed(2);
-    const cpm   = parseFloat(d.cpm   || 0).toFixed(2);
-    const cpl   = leads > 0 ? (parseFloat(spend) / parseInt(leads)).toFixed(2) : 'N/A';
+    const d        = insightData.data?.[0] || {};
+    const leads    = (d.actions || []).find(a => a.action_type === 'lead')?.value     || '0';
+    const purchases= (d.actions || []).find(a => a.action_type === 'purchase')?.value || '0';
+    const spend    = parseFloat(d.spend || 0).toFixed(2);
+    const ctr      = parseFloat(d.ctr   || 0).toFixed(2);
+    const cpc      = parseFloat(d.cpc   || 0).toFixed(2);
+    const cpm      = parseFloat(d.cpm   || 0).toFixed(2);
+    // Form funnel CPL (lead action = Form campaigns only; VSL funnel not counted here)
+    const formCpl  = parseInt(leads) > 0 ? (parseFloat(spend) / parseInt(leads)).toFixed(2) : 'N/A';
+    // CAC = spend / iClosed sales (purchase pixel fires when closer marks outcome = sale)
+    const cac      = parseInt(purchases) > 0 ? (parseFloat(spend) / parseInt(purchases)).toFixed(2) : 'N/A';
     return [
       `Meta Ads — ${datePreset.replace(/_/g,' ')}:`,
       `Spend: $${spend} | Impressions: ${parseInt(d.impressions||0).toLocaleString()} | Reach: ${parseInt(d.reach||0).toLocaleString()}`,
       `Clicks: ${parseInt(d.clicks||0).toLocaleString()} | CTR: ${ctr}% | CPC: $${cpc} | CPM: $${cpm}`,
-      leads !== '0' ? `Leads: ${leads} | CPL: $${cpl}` : 'No lead conversions tracked in this period.',
+      leads !== '0'     ? `Form leads: ${leads} | Form CPL: $${formCpl}` : 'Form leads: 0 (no lead pixel fires — VSL funnel not counted)',
+      purchases !== '0' ? `iClosed sales (purchase pixel): ${purchases} | CAC: $${cac}` : 'iClosed sales (purchase pixel): 0',
     ].join('\n');
   } catch (err) { return `Meta Ads summary error: ${err.message}`; }
 }
@@ -2723,20 +2728,120 @@ async function narrateAnomaly(snapshot) {
 }
 
 // ── Metric scrapers (one per metric, returns numeric value or null) ─────────
-async function _scrapeMetaCplToday() {
+
+// Helper: fetch Meta account-level insights for a date_preset, returns the first data row
+async function _metaAccountInsights(datePreset = 'today') {
   const accountId = process.env.META_AD_ACCOUNT_ID;
   const token     = process.env.META_ACCESS_TOKEN;
   if (!accountId || !token) return null;
-  const fields = 'spend,actions';
-  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/insights?fields=${fields}&date_preset=today&access_token=${token}`);
+  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/insights?fields=spend,actions&date_preset=${datePreset}&access_token=${token}`);
   const data = await res.json();
   if (data.error) throw new Error(data.error.message);
-  const row = data.data?.[0];
+  return data.data?.[0] || null;
+}
+
+// Form funnel CPL — spend / leads across campaigns that fire the `lead` action_type.
+// VSL campaigns never fire `lead`, so this naturally isolates the Form funnel.
+async function _scrapeMetaFormCplToday() {
+  const accountId = process.env.META_AD_ACCOUNT_ID;
+  const token     = process.env.META_ACCESS_TOKEN;
+  if (!accountId || !token) return null;
+  const fields = 'id,name,insights.date_preset(today){spend,actions}';
+  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=${fields}&limit=20&access_token=${token}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  let totalSpend = 0, totalLeads = 0;
+  for (const c of (data.data || [])) {
+    const ins   = c.insights?.data?.[0];
+    if (!ins) continue;
+    const leads = parseInt((ins.actions || []).find(a => a.action_type === 'lead')?.value || '0', 10);
+    if (leads > 0) {
+      totalSpend += parseFloat(ins.spend || 0);
+      totalLeads += leads;
+    }
+  }
+  if (totalLeads <= 0) return null;
+  return +(totalSpend / totalLeads).toFixed(2);
+}
+
+// CAC (iClosed sales, attributed via Meta `purchase` pixel fired on sale outcome)
+async function _scrapeMetaCacToday() {
+  const row = await _metaAccountInsights('today');
+  if (!row) return null;
+  const spend    = parseFloat(row.spend || 0);
+  const sales    = parseInt((row.actions || []).find(a => a.action_type === 'purchase')?.value || '0', 10);
+  if (sales <= 0) return null;
+  return +(spend / sales).toFixed(2);
+}
+
+/// Cost-per-booking: Meta total spend today / iClosed calls booked today
+async function _scrapeMetaCostPerBookingToday() {
+  const row = await _metaAccountInsights('today');
   if (!row) return null;
   const spend = parseFloat(row.spend || 0);
-  const leads = parseInt((row.actions || []).find(a => a.action_type === 'lead')?.value || '0', 10);
-  if (leads <= 0) return null; // no leads today, undefined CPL
-  return +(spend / leads).toFixed(2);
+  if (spend <= 0) return null;
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const { count, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id', { count: 'exact', head: true })
+    .gte('booked_at', `${todayStr}T00:00:00`)
+    .lt('booked_at',  `${todayStr}T23:59:59`);
+  if (error) throw new Error(error.message);
+  if (!count || count <= 0) return null;
+  return +(spend / count).toFixed(2);
+}
+
+// GHL new contacts today (both funnels — universal lead-volume signal)
+async function _scrapeGhlNewContactsToday() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const apiKey     = process.env.GHL_API_KEY;
+  if (!locationId || !apiKey) return null;
+  const headers  = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28' };
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const res  = await fetch(
+    `https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&startDate=${todayStr}&endDate=${todayStr}&limit=100`,
+    { headers }
+  );
+  const data = await res.json();
+  if (data.meta?.total !== undefined) return data.meta.total;
+  return (data.contacts || []).length;
+}
+
+// iClosed calls booked yesterday (both funnels via revops_appointments)
+async function _scrapeIclosedCallsBookedYesterday() {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id')
+    .gte('booked_at', `${yesterday}T00:00:00`)
+    .lt('booked_at',  `${yesterday}T23:59:59`);
+  if (error) throw new Error(error.message);
+  return (data || []).length;
+}
+
+// iClosed calls held yesterday (attended = true)
+async function _scrapeIclosedCallsHeldYesterday() {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id')
+    .eq('attended', true)
+    .gte('scheduled_start', `${yesterday}T00:00:00`)
+    .lt('scheduled_start',  `${yesterday}T23:59:59`);
+  if (error) throw new Error(error.message);
+  return (data || []).length;
+}
+
+// iClosed sales yesterday (full_closes from closer EOD table — same source as close_rate)
+async function _scrapeIclosedSalesYesterday() {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await portalSupabase
+    .from('revops_closer_eod_daily')
+    .select('full_closes')
+    .eq('report_date', yesterday);
+  if (error) throw new Error(error.message);
+  if (!data || !data.length) return null;
+  return data.reduce((a, r) => a + (r.full_closes || 0), 0);
 }
 
 async function _scrapeCloseRateYesterday() {
@@ -2848,53 +2953,25 @@ async function _scrapeDay7AtRiskCount() {
   return count;
 }
 
-async function _scrapeGhlResponseTimeP50Min() {
-  const locationId = process.env.GHL_LOCATION_ID;
-  const apiKey     = process.env.GHL_API_KEY;
-  if (!locationId || !apiKey) return null;
-  const headers = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
-  const res = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=50`, { headers });
-  const data = await res.json();
-  const convos = (data.conversations || []).filter(c => c.lastMessageDirection === 'inbound');
-  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const recent = convos.filter(c => c.lastMessageDate && c.lastMessageDate >= sevenDaysAgo).slice(0, 50);
-  if (!recent.length) return null;
-
-  const deltas = [];
-  for (const c of recent) {
-    try {
-      const msgRes = await fetch(`https://services.leadconnectorhq.com/conversations/${c.id}/messages?limit=20`, { headers });
-      const msgData = await msgRes.json();
-      const msgs = (msgData.messages?.messages || msgData.messages || []).slice().reverse(); // chronological
-      let lastInbound = null;
-      for (const m of msgs) {
-        const ts = m.dateAdded ? new Date(m.dateAdded).getTime() : null;
-        if (!ts) continue;
-        if (m.direction === 'inbound') lastInbound = ts;
-        else if (m.direction === 'outbound' && lastInbound) {
-          deltas.push((ts - lastInbound) / 60000);
-          lastInbound = null;
-        }
-      }
-    } catch (msgErr) {
-      console.warn(`GHL response-time fetch failed for convo ${c.id}: ${msgErr.message}`);
-    }
-  }
-  if (!deltas.length) return null;
-  deltas.sort((a, b) => a - b);
-  return Math.round(deltas[Math.floor(deltas.length / 2)]);
-}
-
 // ── Metric registry — single source of truth for what gets scraped ──────────
 const METRIC_REGISTRY = [
-  { name: 'meta_cpl_today',           domain: 'marketing',   scrape: _scrapeMetaCplToday,             label: 'Meta CPL (today)' },
-  { name: 'close_rate_yesterday',     domain: 'sales',       scrape: _scrapeCloseRateYesterday,       label: 'Close rate (yesterday)' },
-  { name: 'setter_calls_booked_yest', domain: 'sales',       scrape: _scrapeSetterCallsBookedYesterday, label: 'Setter calls booked (yesterday)' },
-  { name: 'phase0_to_phase1_conv_7d', domain: 'fulfillment', scrape: _scrapePhase0ToPhase1Conv7d,     label: 'Phase 0 → Phase 1 conversion (7d)' },
-  { name: 'phase1_cycle_days_p50',    domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_1'), label: 'Phase 1 cycle days (p50)' },
-  { name: 'phase2_cycle_days_p50',    domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_2'), label: 'Phase 2 cycle days (p50)' },
-  { name: 'day7_at_risk_count',       domain: 'fulfillment', scrape: _scrapeDay7AtRiskCount,          label: 'Day 7+ at-risk client count' },
-  { name: 'ghl_response_time_p50_min',domain: 'sales',       scrape: _scrapeGhlResponseTimeP50Min,    label: 'GHL response time p50 (min)' },
+  // Marketing — per-funnel CPL signals (blended CPL is meaningless across two funnels)
+  { name: 'meta_form_cpl_today',          domain: 'marketing',   scrape: _scrapeMetaFormCplToday,          label: 'Meta Form CPL (today)' },
+  { name: 'meta_cac_today',               domain: 'marketing',   scrape: _scrapeMetaCacToday,               label: 'Meta CAC via iClosed purchase pixel (today)' },
+  { name: 'meta_cost_per_booking_today',  domain: 'marketing',   scrape: _scrapeMetaCostPerBookingToday,    label: 'Meta cost-per-booking (today)' },
+  // Lead volume — GHL is the universal truth-source (covers both VSL + Form funnels)
+  { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'GHL new contacts (today)' },
+  // Call pipeline — iClosed revops_appointments is the truth-source for booked/held
+  { name: 'iclosed_calls_booked_yest',    domain: 'sales',       scrape: _scrapeIclosedCallsBookedYesterday, label: 'iClosed calls booked (yesterday)' },
+  { name: 'iclosed_calls_held_yest',      domain: 'sales',       scrape: _scrapeIclosedCallsHeldYesterday,   label: 'iClosed calls held (yesterday)' },
+  { name: 'iclosed_sales_yest',           domain: 'sales',       scrape: _scrapeIclosedSalesYesterday,       label: 'iClosed sales / full closes (yesterday)' },
+  { name: 'close_rate_yesterday',         domain: 'sales',       scrape: _scrapeCloseRateYesterday,          label: 'Close rate (yesterday)' },
+  { name: 'setter_calls_booked_yest',     domain: 'sales',       scrape: _scrapeSetterCallsBookedYesterday,  label: 'Setter calls booked EOD (yesterday)' },
+  // Fulfillment
+  { name: 'phase0_to_phase1_conv_7d',     domain: 'fulfillment', scrape: _scrapePhase0ToPhase1Conv7d,        label: 'Phase 0 → Phase 1 conversion (7d)' },
+  { name: 'phase1_cycle_days_p50',        domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_1'), label: 'Phase 1 cycle days (p50)' },
+  { name: 'phase2_cycle_days_p50',        domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_2'), label: 'Phase 2 cycle days (p50)' },
+  { name: 'day7_at_risk_count',           domain: 'fulfillment', scrape: _scrapeDay7AtRiskCount,              label: 'Day 7+ at-risk client count' },
 ];
 
 async function runAnomalyDetection({ dryRun = false, threshold = ANOMALY_THRESHOLD_SIGMA } = {}) {
@@ -4046,7 +4123,7 @@ cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlert
 // Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
 cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
 
-// Phase 1 anomaly detection: daily 6am Costa Rica. Scrapes 8 metrics, recomputes
+// Phase 1 anomaly detection: daily 6am Costa Rica. Scrapes 13 metrics (v2 — per-funnel), recomputes
 // rolling baselines, fires DMs at >= 1.5σ deltas. See ANOMALY_ROUTING for who gets pinged.
 cron.schedule('0 6 * * *',   async () => {
   try { await runAnomalyDetection(); }
