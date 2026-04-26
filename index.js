@@ -2318,6 +2318,111 @@ async function runMondayGapDetection(_correlationId) {
       gaps.push(`${label} — ${name}${co} | ${stepLabels[r.phase0_step] || r.phase0_step} | Day ${r.days_in_phase0} (Tania to unblock)`);
     }
 
+    // ── Sales gap detection ────────────────────────────────────────────────────
+    try {
+      const nowTs = Date.now();
+      const salesGapLines = [];
+
+      // a. No-shows with no reschedule in last 7 days
+      const sevenDaysAgo = new Date(nowTs - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: noShows } = await portalSupabase
+        .from('revops_appointments')
+        .select('id, prospect_id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+        .eq('attended', false)
+        .gte('scheduled_start', sevenDaysAgo);
+
+      if (noShows && noShows.length) {
+        const noShowFlags = [];
+        for (const appt of noShows) {
+          const { data: future } = await portalSupabase
+            .from('revops_appointments')
+            .select('id')
+            .eq('prospect_id', appt.prospect_id)
+            .gt('scheduled_start', new Date().toISOString())
+            .limit(1);
+          if (!future || !future.length) {
+            const pName = appt.prospect?.full_name || 'Unknown';
+            const dStr  = new Date(appt.scheduled_start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Costa_Rica' });
+            const closerName = resolveSalesMember(appt.closer_id);
+            noShowFlags.push(`• ${pName} — ${dStr}, closer: ${closerName}`);
+          }
+        }
+        if (noShowFlags.length) {
+          salesGapLines.push(`No-shows, no reschedule (last 7d):\n${noShowFlags.join('\n')}`);
+        }
+      }
+
+      // b. Outcomes not logged (attended ≥48h ago, no outcome record)
+      const fortyEightHAgo = new Date(nowTs - 48 * 60 * 60 * 1000).toISOString();
+      const fourteenDaysAgo = new Date(nowTs - 14 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: attended } = await portalSupabase
+        .from('revops_appointments')
+        .select('id, prospect_id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+        .eq('attended', true)
+        .lte('scheduled_start', fortyEightHAgo)
+        .gte('scheduled_start', fourteenDaysAgo);
+
+      if (attended && attended.length) {
+        const attendedIds = attended.map(a => a.id);
+        const { data: outcomes } = await portalSupabase
+          .from('revops_sales_outcomes')
+          .select('appointment_id')
+          .in('appointment_id', attendedIds);
+        const loggedSet = new Set((outcomes || []).map(o => o.appointment_id));
+        const unlogged = attended.filter(a => !loggedSet.has(a.id));
+        if (unlogged.length) {
+          const unloggedLines = unlogged.map(a => {
+            const pName = a.prospect?.full_name || 'Unknown';
+            const dStr  = new Date(a.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            const closerName = resolveSalesMember(a.closer_id);
+            return `• ${pName} — ${dStr} — please log in iClosed`;
+          });
+          salesGapLines.push(`Outcomes not logged (held >48h, no iClosed entry):\n${unloggedLines.join('\n')}`);
+        }
+      }
+
+      // c. Stale inbound leads >72h with no setter response
+      const ghlRaw = await getGHLConversations(100);
+      if (typeof ghlRaw === 'string' && ghlRaw.includes('|')) {
+        // getGHLConversations returns a formatted string — re-fetch raw for filtering
+      }
+      // Re-fetch raw GHL data for filtering
+      try {
+        const locationId = process.env.GHL_LOCATION_ID;
+        const apiKey     = process.env.GHL_API_KEY;
+        const ghlRes  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=100`, {
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' }
+        });
+        const ghlData = await ghlRes.json();
+        const convos  = ghlData.conversations || [];
+        const seventyTwoHAgo = nowTs - 72 * 60 * 60 * 1000;
+        const staleInbound = convos.filter(c => c.lastMessageDirection === 'inbound' && c.lastMessageDate < seventyTwoHAgo);
+        if (staleInbound.length) {
+          const GHL_USERS_GAP = {
+            'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+            '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
+          };
+          const staleLines = staleInbound.map(c => {
+            const contactName = c.contactName || c.fullName || 'Unknown';
+            const assignedId  = c.assignedTo || c.userId || '';
+            const setterName  = GHL_USERS_GAP[assignedId] || GHL_USERS_GAP[assignedId.toLowerCase()] || (assignedId ? assignedId : 'unassigned');
+            const daysAgo     = Math.floor((nowTs - c.lastMessageDate) / (24 * 60 * 60 * 1000));
+            return `• ${contactName} | setter: ${setterName} | last: ${daysAgo}d ago`;
+          });
+          salesGapLines.push(`Stale inbound leads (setter no response >72h):\n${staleLines.join('\n')}`);
+        }
+      } catch (ghlGapErr) {
+        console.error('Sales gap — GHL fetch error:', ghlGapErr.message);
+      }
+
+      if (salesGapLines.length) {
+        const totalSalesGaps = salesGapLines.reduce((sum, s) => sum + (s.match(/^•/gm) || []).length, 0);
+        gaps.push(`\nSALES GAPS — ${totalSalesGaps} item${totalSalesGaps !== 1 ? 's' : ''} need attention\n\n${salesGapLines.join('\n\n')}`);
+      }
+    } catch (salesGapErr) {
+      console.error('Sales gap detection error:', salesGapErr.message);
+    }
+
     if (!gaps.length) { console.log('Gap detection: no critical gaps found.'); return; }
     const today   = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     const message = `Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
@@ -4107,11 +4212,300 @@ async function runFulfillmentStandup(_correlationId) {
   }
 }
 
+// ─── SALES MORNING STANDUP ────────────────────────────────────────────────────
+// Fires 9:00 AM CR Mon–Fri. DMs each setter with GHL pipeline context and each
+// closer with today's call deck + unlogged outcomes. No approval flow.
+async function runSalesStandup(_correlationId) {
+  console.log('Running sales morning standup DMs...');
+  try {
+    const now      = Date.now();
+    const today    = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+    const yesterday = new Date(now - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    // ── Fetch GHL conversations for setter brief filtering ─────────────────
+    let ghlConvos = [];
+    try {
+      const locationId = process.env.GHL_LOCATION_ID;
+      const apiKey     = process.env.GHL_API_KEY;
+      const ghlRes  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=100`, {
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' }
+      });
+      const ghlData = await ghlRes.json();
+      ghlConvos = ghlData.conversations || [];
+    } catch (ghlErr) {
+      console.error('Sales standup — GHL fetch error:', ghlErr.message);
+    }
+
+    const fortyEightHMs = 48 * 60 * 60 * 1000;
+    const twentyFourHMs = 24 * 60 * 60 * 1000;
+
+    const needsFollowUp = ghlConvos.filter(c =>
+      c.lastMessageDirection === 'inbound' && (now - c.lastMessageDate) > fortyEightHMs
+    );
+    const newLeads = ghlConvos.filter(c =>
+      (now - c.lastMessageDate) < twentyFourHMs && c.unreadCount > 0
+    );
+
+    // ── DM each setter ─────────────────────────────────────────────────────
+    const setters = [
+      { slackId: 'U0A9J00EMGD', name: 'Joseph' },
+      { slackId: 'U0AR16QVDB3', name: 'Debbanny' },
+    ];
+
+    // Fetch yesterday's setter EOD aggregate (team total)
+    const { data: setterEOD } = await portalSupabase
+      .from('revops_setter_eod_daily')
+      .select('scheduled_calls, new_conversations, qualified_leads')
+      .eq('report_date', yesterday);
+
+    const totalScheduled  = (setterEOD || []).reduce((s, r) => s + (r.scheduled_calls      || 0), 0);
+    const totalConvos     = (setterEOD || []).reduce((s, r) => s + (r.new_conversations    || 0), 0);
+    const totalQualified  = (setterEOD || []).reduce((s, r) => s + (r.qualified_leads      || 0), 0);
+
+    // Weekly total: last 7 rows for scheduled_calls (team aggregate)
+    const { data: weeklyEOD } = await portalSupabase
+      .from('revops_setter_eod_daily')
+      .select('scheduled_calls')
+      .order('report_date', { ascending: false })
+      .limit(7);
+    const weeklyScheduled = (weeklyEOD || []).reduce((s, r) => s + (r.scheduled_calls || 0), 0);
+
+    for (const setter of setters) {
+      try {
+        const lines = [`Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
+
+        // Yesterday stats
+        lines.push(`📊 Yesterday: ${totalScheduled} calls booked | ${totalConvos} new convos | ${totalQualified} leads qualified`);
+        lines.push(`📈 This week: ${weeklyScheduled} calls booked total`);
+        lines.push('');
+
+        // Needs follow-up
+        if (needsFollowUp.length) {
+          lines.push(`🔥 Needs your reply (${needsFollowUp.length} prospects waiting >48h):`);
+          needsFollowUp.slice(0, 10).forEach(c => {
+            const name    = c.contactName || c.fullName || 'Unknown';
+            const preview = (c.lastMessageBody || '').substring(0, 80);
+            const daysAgo = Math.floor((now - c.lastMessageDate) / (24 * 60 * 60 * 1000));
+            lines.push(`• ${name} | last: "${preview}" (${daysAgo}d ago)`);
+          });
+          lines.push('');
+        }
+
+        // New leads
+        if (newLeads.length) {
+          lines.push(`📥 New leads to work (${newLeads.length} unread, last 24h):`);
+          newLeads.slice(0, 10).forEach(c => {
+            const name    = c.contactName || c.fullName || 'Unknown';
+            const preview = (c.lastMessageBody || '').substring(0, 80);
+            lines.push(`• ${name} | "${preview}"`);
+          });
+          lines.push('');
+        }
+
+        await slack.client.chat.postMessage({ channel: setter.slackId, text: lines.join('\n') });
+        console.log(`Sales standup DM sent to setter ${setter.name}`);
+      } catch (setterErr) {
+        console.error(`Sales standup — DM to ${setter.name} failed:`, setterErr.message);
+      }
+    }
+
+    // ── DM each closer ─────────────────────────────────────────────────────
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const todayEnd   = new Date(); todayEnd.setHours(23, 59, 59, 999);
+    const todayStartISO = todayStart.toISOString();
+    const todayEndISO   = todayEnd.toISOString();
+
+    // Today's appointments
+    const { data: todayCalls } = await portalSupabase
+      .from('revops_appointments')
+      .select('id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+      .gte('scheduled_start', todayStartISO)
+      .lte('scheduled_start', todayEndISO)
+      .order('scheduled_start', { ascending: true });
+
+    // Yesterday's attended with no outcome logged
+    const ystStart = new Date(now - 24 * 60 * 60 * 1000); ystStart.setHours(0, 0, 0, 0);
+    const ystEnd   = new Date(now - 24 * 60 * 60 * 1000); ystEnd.setHours(23, 59, 59, 999);
+    const { data: ystAttended } = await portalSupabase
+      .from('revops_appointments')
+      .select('id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+      .eq('attended', true)
+      .gte('scheduled_start', ystStart.toISOString())
+      .lte('scheduled_start', ystEnd.toISOString());
+
+    let unloggedByCloser = {};
+    if (ystAttended && ystAttended.length) {
+      const ystIds = ystAttended.map(a => a.id);
+      const { data: ystOutcomes } = await portalSupabase
+        .from('revops_sales_outcomes')
+        .select('appointment_id')
+        .in('appointment_id', ystIds);
+      const loggedSet = new Set((ystOutcomes || []).map(o => o.appointment_id));
+      ystAttended.filter(a => !loggedSet.has(a.id)).forEach(a => {
+        (unloggedByCloser[a.closer_id] = unloggedByCloser[a.closer_id] || []).push(a);
+      });
+    }
+
+    // Yesterday's closer EOD stats
+    const { data: closerEOD } = await portalSupabase
+      .from('revops_closer_eod_daily')
+      .select('closer_id, full_closes, qualified_calls, no_shows')
+      .eq('report_date', yesterday);
+    const closerEODMap = {};
+    (closerEOD || []).forEach(r => { closerEODMap[r.closer_id] = r; });
+
+    const closers = Object.entries(CLOSER_SLACK)
+      .filter(([email, slackId]) => slackId && email.includes('@') && slackId !== RON_SLACK_ID)
+      .map(([email, slackId]) => ({ email, slackId, name: resolveSalesMember(email) }));
+
+    for (const closer of closers) {
+      try {
+        const eod           = closerEODMap[closer.email] || {};
+        const heldCalls     = eod.qualified_calls || 0;
+        const closes        = eod.full_closes     || 0;
+        const noShows       = eod.no_shows        || 0;
+        const closeRatePct  = heldCalls > 0 ? Math.round((closes / heldCalls) * 100) : 0;
+
+        const myTodayCalls = (todayCalls || []).filter(a => a.closer_id === closer.email);
+        const myUnlogged   = unloggedByCloser[closer.email] || [];
+
+        const lines = [`Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
+
+        // Yesterday stats
+        lines.push(`📊 Yesterday: ${heldCalls} calls held | ${closes} closes | ${closeRatePct}% close rate | ${noShows} no-shows`);
+        lines.push('');
+
+        // Today on deck
+        if (myTodayCalls.length) {
+          lines.push(`📞 Today on deck (${myTodayCalls.length} calls):`);
+          myTodayCalls.forEach(a => {
+            const pName  = a.prospect?.full_name || 'Unknown';
+            const timeStr = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            lines.push(`• ${pName} — ${timeStr} CR time`);
+          });
+          lines.push('');
+        }
+
+        // Outcomes not logged
+        if (myUnlogged.length) {
+          lines.push(`⚠️ Outcome not logged (${myUnlogged.length} calls):`);
+          myUnlogged.forEach(a => {
+            const pName  = a.prospect?.full_name || 'Unknown';
+            const dStr   = new Date(a.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            lines.push(`• ${pName} — ${dStr} — please log in iClosed`);
+          });
+          lines.push('');
+        }
+
+        await slack.client.chat.postMessage({ channel: closer.slackId, text: lines.join('\n') });
+        console.log(`Sales standup DM sent to closer ${closer.name}`);
+      } catch (closerErr) {
+        console.error(`Sales standup — DM to ${closer.name} failed:`, closerErr.message);
+      }
+    }
+
+    console.log('Sales standup DMs complete.');
+  } catch (err) {
+    console.error('Sales standup error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Sales standup cron failed: ${err.message}` });
+  }
+}
+
+// ─── WEEKLY SALES & MARKETING RECAP ──────────────────────────────────────────
+// Fires Friday 5 PM CR. DMs Ron only with 7-day sales + marketing summary.
+async function runWeeklySalesMarketingRecap(_correlationId) {
+  console.log('Running weekly sales & marketing recap...');
+  try {
+    // Date range labels for the week (Mon–Fri)
+    const now     = new Date();
+    const dayOfWk = now.getDay(); // 0=Sun, 5=Fri
+    const monday  = new Date(now); monday.setDate(now.getDate() - (dayOfWk === 0 ? 6 : dayOfWk - 1)); monday.setHours(0,0,0,0);
+    const monLabel = monday.toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+    const friLabel = now.toLocaleDateString('en-US',    { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+
+    // ── Meta Ads summary ──────────────────────────────────────────────────
+    const metaSummary = await getMetaAdsSummary('last_7d');
+
+    // ── metric_observations from primary supabase ─────────────────────────
+    async function fetchMetric(metricName) {
+      const { data } = await supabase
+        .from('metric_observations')
+        .select('metric, value, observed_at')
+        .eq('metric', metricName)
+        .order('observed_at', { ascending: false })
+        .limit(7);
+      return data || [];
+    }
+
+    const [newContacts, callsBooked, callsHeld, salesRows, closeRates] = await Promise.all([
+      fetchMetric('ghl_new_contacts_today'),
+      fetchMetric('iclosed_calls_booked_yest'),
+      fetchMetric('iclosed_calls_held_yest'),
+      fetchMetric('iclosed_sales_yest'),
+      fetchMetric('close_rate_yesterday'),
+    ]);
+
+    const sumMetric  = rows => rows.reduce((s, r) => s + (parseFloat(r.value) || 0), 0);
+    const avgMetric  = rows => rows.length ? (sumMetric(rows) / rows.length) : 0;
+
+    const totalContacts  = Math.round(sumMetric(newContacts));
+    const avgContactsDay = newContacts.length ? (totalContacts / newContacts.length).toFixed(1) : 'N/A';
+    const totalBooked    = Math.round(sumMetric(callsBooked));
+    const totalHeld      = Math.round(sumMetric(callsHeld));
+    const showRatePct    = totalBooked > 0 ? Math.round((totalHeld / totalBooked) * 100) : 0;
+    const totalSales     = Math.round(sumMetric(salesRows));
+    const avgCloseRate   = avgMetric(closeRates).toFixed(1);
+
+    // ── Anomalies from agent_knowledge ────────────────────────────────────
+    const sevenDaysAgoISO = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: alerts } = await supabase
+      .from('agent_knowledge')
+      .select('key, value')
+      .eq('category', 'alert')
+      .gte('updated_at', sevenDaysAgoISO)
+      .order('updated_at', { ascending: false })
+      .limit(20);
+
+    // ── Build message ─────────────────────────────────────────────────────
+    const parts = [
+      `📈 Weekly Sales & Marketing Recap — Week of ${monLabel} to ${friLabel}`,
+      '',
+      `💰 META SPEND`,
+      metaSummary,
+      '',
+      `📥 LEAD VOLUME (GHL — both funnels)`,
+      `New contacts this week: ${totalContacts} total (avg ${avgContactsDay}/day)`,
+      '',
+      `📞 SALES PIPELINE`,
+      `Calls booked: ${totalBooked} | Calls held: ${totalHeld} | Show rate: ${showRatePct}%`,
+      `Closes: ${totalSales} | Avg close rate: ${avgCloseRate}%`,
+    ];
+
+    if (alerts && alerts.length) {
+      parts.push('');
+      parts.push(`🚨 ANOMALIES THIS WEEK (${alerts.length})`);
+      alerts.forEach(a => {
+        parts.push(`• ${a.key} — ${(a.value || '').substring(0, 120)}`);
+      });
+    }
+
+    const msg = parts.join('\n');
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: msg });
+    console.log('Weekly sales & marketing recap sent to Ron.');
+  } catch (err) {
+    console.error('Weekly sales & marketing recap error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Weekly sales & marketing recap cron failed: ${err.message}` });
+  }
+}
+
 // Nightly learning — 11:30 PM CR (infrastructure — reads all channels, saves knowledge)
 cron.schedule('30 5 * * *',  wrapCronJob('runNightlyLearning', runNightlyLearning),     { timezone: 'America/Costa_Rica' });
 
 // Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
 cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
+
+// Weekly sales & marketing recap — Friday 5:00 PM CR (DMs Ron with 7-day sales + marketing summary)
+cron.schedule('0 17 * * 5',  wrapCronJob('runWeeklySalesMarketingRecap', async (c) => { await runWeeklySalesMarketingRecap(c); }), { timezone: 'America/Costa_Rica' });
 
 // Monday gap detection — 8:00 AM CR (infrastructure — posts to ops channel)
 cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => { await runMondayGapDetection(c); }),  { timezone: 'America/Costa_Rica' });
@@ -4136,6 +4530,9 @@ cron.schedule('0 6 * * *',   async () => {
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
 cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
+
+// Sales morning standup — 9:00 AM CR Mon–Fri (DMs setters and closers with role-specific briefs)
+cron.schedule('0 9 * * 1-5', wrapCronJob('runSalesStandup', async (c) => { await runSalesStandup(c); }),              { timezone: 'America/Costa_Rica' });
 
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
 cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
