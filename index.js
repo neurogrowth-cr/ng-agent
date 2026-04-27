@@ -955,6 +955,12 @@ function registerDynamicCron(task) {
 
       if (!reply || !reply.trim()) return;
 
+      // Strip APPROVAL_NEEDED sentinel if Claude used draft_channel_post tool
+      if (reply.startsWith('APPROVAL_NEEDED|')) {
+        const parts = reply.split('|');
+        reply = parts.slice(5).join('|').trim();
+      }
+
       // ── STRUCTURAL WHITELIST GUARD ───────────────────────────────────────────
       // Rejects any reply that doesn't contain the expected section headers.
       // This is a WHITELIST check — the reply must prove it is a final report
@@ -969,7 +975,8 @@ function registerDynamicCron(task) {
         'Fulfillment EOD Pulse':      ['WINS TODAY', 'DELIVERY STATUS', 'BLOCKERS', 'SLA WATCH', 'TOMORROW'],
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
-        'Sales Call Prep Reminder':   [], // short task, skip header check
+        'Sales Call Prep Reminder':         [], // short task, skip header check
+        'Blocked Client Report — MWF':      [], // short report, no fixed headers
       };
 
       function isValidFinalReport(text, taskName) {
@@ -1025,6 +1032,8 @@ function registerDynamicCron(task) {
         const lessonNote = `[Corrections applied from team feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`;
         finalReply = lessonNote + reply;
       }
+      // Strip Markdown bold — Slack uses *bold* not **bold**
+      finalReply = finalReply.replace(/\*\*(.+?)\*\*/g, '$1');
       await postToSlack(targetChannel, finalReply);
 
     } catch (e) { errored = e; throw e; } finally {
@@ -4002,6 +4011,10 @@ async function runSalesCallPrep(_correlationId) {
         }
       } catch (ghlErr) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
+      }
+
+      if (setterName === 'VSL self-booking' && convoSection === 'GHL conversation not found for this prospect.') {
+        convoSection = 'VSL direct booking — prospect self-scheduled via the sales page. No setter contact, no GHL conversation.';
       }
 
       // Build the brief
