@@ -4772,7 +4772,7 @@ async function getInnerCircleHuddleEvent() {
   const auth     = getGoogleAuth();
   const calendar = google.calendar({ version: 'v3', auth });
 
-  // 1. Try cached event ID first
+  // 1. Try cached event ID first — only if it's still in the future
   const { data: cached } = await supabase
     .from('agent_knowledge')
     .select('value')
@@ -4782,13 +4782,14 @@ async function getInnerCircleHuddleEvent() {
   if (cached?.value) {
     try {
       const { data: event } = await calendar.events.get({ calendarId: 'primary', eventId: cached.value });
-      if (event) return event; // Cache hit
+      const start = event?.start?.dateTime || event?.start?.date;
+      if (event && start && new Date(start) > new Date()) return event; // Cache hit — future event
     } catch (_) { /* Stale ID — fall through to search */ }
   }
 
-  // 2. Search calendar (next 30 days)
+  // 2. Search calendar (next 90 days — huddle is monthly, 30-day window was too short)
   const timeMin = new Date().toISOString();
-  const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const timeMax = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
   const res     = await calendar.events.list({ calendarId: 'primary', q: 'Inner Circle Huddle', timeMin, timeMax, singleEvents: true, orderBy: 'startTime', maxResults: 5 });
   const event   = (res.data.items || [])[0];
   if (!event) return null;
