@@ -814,6 +814,45 @@ async function getReportLessons(reportId) {
   }
 }
 
+// Extract client-level context from any thread where Max is tagged.
+// Uses Haiku (cheap) — runs on every thread mention.
+async function extractClientContext(threadMessages, mentionText, channelName, userId) {
+  try {
+    const threadText = threadMessages.map(m => m.text || '').join('\n').substring(0, 2000);
+    const prompt = `A team member tagged Max in a Slack thread in #${channelName}.\n\nThread:\n${threadText}\n\nTag: ${mentionText}\n\nDoes this thread contain a specific update about a named client? If yes, respond with JSON: {"client": "<client name>", "context": "<1-2 sentence summary of the update, blocker, status change, or action item>"}. If no specific client is mentioned, respond with: {"client": null}. No preamble, JSON only.`;
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const parsed = JSON.parse(raw);
+    if (!parsed.client || !parsed.context) return null;
+    return parsed;
+  } catch (_) { return null; }
+}
+
+// Retrieve recent knowledge for a specific client (last N days) from agent_knowledge.
+// Matches entries saved by both nightly learning and thread-context extraction.
+async function getClientContext(clientName, days = 30) {
+  try {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const slug = clientName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const { data } = await supabase
+      .from('agent_knowledge')
+      .select('value, updated_at')
+      .eq('category', 'client')
+      .ilike('key', `client:${slug}:%`)
+      .gte('updated_at', cutoff)
+      .order('updated_at', { ascending: false })
+      .limit(5);
+    return data || [];
+  } catch (err) {
+    console.error('getClientContext error:', err.message);
+    return [];
+  }
+}
+
 async function getAllKnowledgeByCategory(category, userId = null) {
   try {
     let q = supabase
@@ -911,9 +950,19 @@ function registerDynamicCron(task) {
       const lessonContext = taskLessons.length
         ? `\n\nPREVIOUS FEEDBACK FROM TEAM (apply these corrections to this report):\n${taskLessons.map(l => `• ${l.value}`).join('\n')}`
         : '';
+      const { data: recentClientCtx } = await supabase
+        .from('agent_knowledge')
+        .select('key, value')
+        .eq('category', 'client')
+        .gte('updated_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+        .order('updated_at', { ascending: false })
+        .limit(15);
+      const clientCtxBlock = recentClientCtx?.length
+        ? `\n\nRECENT CLIENT UPDATES FROM TEAM (last 7 days — apply where relevant):\n${recentClientCtx.map(r => `• ${(r.key.split(':')[1] || r.key).replace(/-/g, ' ')}: ${r.value}`).join('\n')}`
+        : '';
       const enrichedPrompt = liveContext
-        ? `${task.prompt}${lessonContext}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
-        : `${task.prompt}${lessonContext}`;
+        ? `${task.prompt}${lessonContext}${clientCtxBlock}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : `${task.prompt}${lessonContext}${clientCtxBlock}`;
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
@@ -2355,14 +2404,20 @@ async function runMondayGapDetection(_correlationId) {
       const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000*60*60*24)) : 0;
 
       const staleActs = acts.filter(a => { const u = a.updated_at ? new Date(a.updated_at).getTime() : 0; return (now - u) > (72*60*60*1000); });
+      let gapLine = '';
       if (dash.customer_status === 'blocked') {
         const blockedTitles = acts.filter(a=>a.status==='blocked').map(a=>tMap[a.template_id]||'Unknown').join(', ');
-        gaps.push(`🔴 BLOCKED — ${dash.client_name} (Day ${daysSince}): ${blockedTitles}`);
+        gapLine = `🔴 BLOCKED — ${dash.client_name} (Day ${daysSince}): ${blockedTitles}`;
       } else if (daysSince >= 14) {
-        gaps.push(`🔴 OVERDUE — ${dash.client_name} still in ${dash.customer_status} at Day ${daysSince} (past 14-day window)`);
+        gapLine = `🔴 OVERDUE — ${dash.client_name} still in ${dash.customer_status} at Day ${daysSince} (past 14-day window)`;
       } else if (daysSince >= 7 && staleActs.length > 0) {
         const assignees = [...new Set(staleActs.map(a=>(a.assigned_to||'').split('@')[0]))].join(', ');
-        gaps.push(`🟡 STALE — ${dash.client_name} (Day ${daysSince}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`);
+        gapLine = `🟡 STALE — ${dash.client_name} (Day ${daysSince}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`;
+      }
+      if (gapLine) {
+        const clientCtx = await getClientContext(dash.client_name);
+        const ctxNote = clientCtx.length ? `\n   Team context: ${clientCtx.map(r => r.value).join(' | ')}` : '';
+        gaps.push(gapLine + ctxNote);
       }
     }
     // ── Phase 0 gaps: stuck ≥7 days ───────────────────────────────────────────
@@ -2566,7 +2621,13 @@ async function runNightlyLearning(correlationId) {
         const category = rawCategory.toLowerCase().replace(/[^a-z]/g, '').trim();
         const VALID_CATEGORIES = new Set(['client','team','process','decision','alert','intel']);
         const value = valueParts.join('|').trim();
-        if (category && VALID_CATEGORIES.has(category) && key && value) { await upsertKnowledge(category, key, value, 'nightly-learning'); saved++; }
+        if (category && VALID_CATEGORIES.has(category) && key && value) {
+          const normalizedKey = category === 'client'
+            ? `client:${key.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}:${new Date().toISOString().slice(0, 10)}`
+            : key;
+          await upsertKnowledge(category, normalizedKey, value, 'nightly-learning');
+          saved++;
+        }
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
@@ -3817,6 +3878,18 @@ slack.event('app_mention', async ({ event, say }) => {
             console.error('Lesson extraction error:', lessonErr.message);
           }
         }
+
+        // Extract and store client-specific context from any thread (not just Max bot posts)
+        try {
+          const clientCtx = await extractClientContext(threadMessages, cleanText, channelName, userId);
+          if (clientCtx) {
+            const key = `client:${clientCtx.client.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}:${new Date().toISOString().slice(0, 10)}`;
+            await upsertKnowledge('client', key, clientCtx.context, 'thread-context', userId, 'shared');
+            console.log(`Client context saved for "${clientCtx.client}" from #${channelName}`);
+          }
+        } catch (ctxErr) {
+          console.error('Client context extraction error:', ctxErr.message);
+        }
       }
     } catch (threadErr) {
       console.error('Thread context fetch error:', threadErr.message);
@@ -4585,6 +4658,23 @@ async function runWeeklySalesMarketingRecap(_correlationId) {
       parts.push(`🚨 ANOMALIES THIS WEEK (${alerts.length})`);
       alerts.forEach(a => {
         parts.push(`• ${a.key} — ${(a.value || '').substring(0, 120)}`);
+      });
+    }
+
+    // Pull client-level updates from team threads and nightly learning this week
+    const { data: clientUpdates } = await supabase
+      .from('agent_knowledge')
+      .select('key, value')
+      .eq('category', 'client')
+      .gte('updated_at', sevenDaysAgoISO)
+      .order('updated_at', { ascending: false })
+      .limit(10);
+    if (clientUpdates && clientUpdates.length) {
+      parts.push('');
+      parts.push(`👥 CLIENT UPDATES FROM TEAM (this week)`);
+      clientUpdates.forEach(r => {
+        const clientName = (r.key.split(':')[1] || r.key).replace(/-/g, ' ');
+        parts.push(`• ${clientName}: ${(r.value || '').substring(0, 150)}`);
       });
     }
 
