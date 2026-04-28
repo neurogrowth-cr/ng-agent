@@ -853,6 +853,59 @@ async function getClientContext(clientName, days = 30) {
   }
 }
 
+// ── Standup delta helpers ─────────────────────────────────────────────────────
+
+async function saveStandupSnapshot(role, snapshot) {
+  const key = `standup:${role}:${new Date().toISOString().slice(0, 10)}`;
+  await upsertKnowledge('process', key, JSON.stringify(snapshot), 'fulfillment-standup');
+}
+
+async function getYesterdayStandupSnapshot(role) {
+  try {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const { data } = await supabase
+      .from('agent_knowledge')
+      .select('value')
+      .eq('category', 'process')
+      .eq('key', `standup:${role}:${yesterday}`)
+      .single();
+    return data?.value ? JSON.parse(data.value) : null;
+  } catch (_) { return null; }
+}
+
+// Returns { new, resolved, unchanged } between two name arrays
+function diffStandupList(todayNames = [], yesterdayNames = []) {
+  const prev = new Set(yesterdayNames || []);
+  const curr = new Set(todayNames);
+  return {
+    new:       todayNames.filter(n => !prev.has(n)),
+    resolved:  (yesterdayNames || []).filter(n => !curr.has(n)),
+    unchanged: todayNames.filter(n => prev.has(n)),
+  };
+}
+
+// Render a delta section — full detail for new, count for unchanged, celebrate resolved
+function renderDelta(label, newItems, resolvedItems, unchangedItems, renderItem) {
+  const lines = [];
+  if (newItems.length) {
+    lines.push(`🆕 *${label} — new/changed (${newItems.length}):*`);
+    newItems.forEach(i => lines.push(`• ${renderItem(i)}`));
+    lines.push('');
+  }
+  if (resolvedItems.length) {
+    lines.push(`✅ *Resolved since yesterday:* ${resolvedItems.join(', ')}`);
+    lines.push('');
+  }
+  if (unchangedItems.length && !newItems.length && !resolvedItems.length) {
+    lines.push(`📋 *${label}:* ${unchangedItems.length} client${unchangedItems.length > 1 ? 's' : ''} — same as yesterday, no new flags`);
+    lines.push('');
+  } else if (unchangedItems.length) {
+    lines.push(`📋 *${unchangedItems.length} unchanged* — holding steady`);
+    lines.push('');
+  }
+  return lines;
+}
+
 async function getAllKnowledgeByCategory(category, userId = null) {
   try {
     let q = supabase
@@ -1021,7 +1074,7 @@ function registerDynamicCron(task) {
       // task, we check for its headers. Unknown tasks fall back to length check.
       const TASK_HEADERS = {
         'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
-        'Fulfillment EOD Pulse':      ['WINS TODAY', 'DELIVERY STATUS', 'BLOCKERS', 'SLA WATCH', 'TOMORROW'],
+        'Fulfillment EOD Pulse':      ['WINS TODAY', 'BLOCKERS', 'TOMORROW'],
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
         'Sales Call Prep Reminder':         [], // short task, skip header check
@@ -4174,114 +4227,125 @@ async function runFulfillmentStandup(_correlationId) {
     const hitting7Today  = clients.filter(d => getDayCount(d) === 7);
 
     // ── DM Josue — pipeline owner, activation calls, overall ops ──────────────
+    const josueSnap = await getYesterdayStandupSnapshot('josue');
     const josueLines = [`Good morning Josue! Here's your ${today} ops brief:\n`];
 
-    if (blocked.length) {
-      josueLines.push(`🔴 *Blocked (${blocked.length}) — needs resolution today:*`);
-      blocked.forEach(d => {
-        const acts = actsByClient[d.id] || [];
-        const blockedActs = acts.filter(a => a.status === 'blocked').map(a => tMap[a.template_id] || 'Unknown').join(', ');
-        josueLines.push(`• ${d.client_name} — Day ${getDayCount(d)}${blockedActs ? ` | blocked on: ${blockedActs}` : ''}`);
-      });
-      josueLines.push('');
-    }
+    const blockedNames    = blocked.map(d => d.client_name);
+    const hitting14Names  = hitting14Today.map(d => d.client_name);
+    const hitting7Names   = hitting7Today.map(d => d.client_name);
+    const needsCallItems  = (phase0||[]).filter(r => r.phase0_step === '4_awaiting_activation_call');
+    const handoffItems    = (phase0||[]).filter(r => r.phase0_step === '5_ready_for_handoff');
+    const needsCallNames  = needsCallItems.map(r => [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email);
+    const handoffNames    = handoffItems.map(r => [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email);
 
-    if (hitting14Today.length) {
-      josueLines.push(`🚨 *Hitting Day 14 TODAY — must launch:*`);
-      hitting14Today.forEach(d => josueLines.push(`• ${d.client_name} (${phaseLabel[d.customer_status] || d.customer_status})`));
-      josueLines.push('');
-    }
+    const dBlocked   = diffStandupList(blockedNames,   josueSnap?.blocked);
+    const dH14       = diffStandupList(hitting14Names, josueSnap?.hitting14);
+    const dH7        = diffStandupList(hitting7Names,  josueSnap?.hitting7);
+    const dNeedsCall = diffStandupList(needsCallNames, josueSnap?.phase0Needing);
+    const dHandoff   = diffStandupList(handoffNames,   josueSnap?.phase0Handoff);
 
-    if (hitting7Today.length) {
-      josueLines.push(`⚠️ *Hitting Day 7 today — at-risk threshold:*`);
-      hitting7Today.forEach(d => josueLines.push(`• ${d.client_name} (${phaseLabel[d.customer_status] || d.customer_status})`));
-      josueLines.push('');
-    }
+    josueLines.push(...renderDelta('Blocked', dBlocked.new, dBlocked.resolved, dBlocked.unchanged, name => {
+      const d = blocked.find(x => x.client_name === name);
+      const acts = d ? (actsByClient[d.id] || []).filter(a => a.status === 'blocked').map(a => tMap[a.template_id] || 'Unknown').join(', ') : '';
+      return `${name} — Day ${d ? getDayCount(d) : '?'}${acts ? ` | blocked on: ${acts}` : ''}`;
+    }));
+    josueLines.push(...renderDelta('Day 14 TODAY', dH14.new, dH14.resolved, dH14.unchanged, name => {
+      const d = hitting14Today.find(x => x.client_name === name);
+      return `${name} (${d ? phaseLabel[d.customer_status] || d.customer_status : ''}) — must launch today`;
+    }));
+    josueLines.push(...renderDelta('Day 7 at-risk', dH7.new, dH7.resolved, dH7.unchanged, name => {
+      const d = hitting7Today.find(x => x.client_name === name);
+      return `${name} (${d ? phaseLabel[d.customer_status] || d.customer_status : ''})`;
+    }));
+    josueLines.push(...renderDelta('Activation calls needed', dNeedsCall.new, dNeedsCall.resolved, dNeedsCall.unchanged, name => {
+      const r = needsCallItems.find(x => ([x.first_name, x.last_name].filter(Boolean).join(' ') || x.email) === name);
+      return `${name}${r?.company ? ` (${r.company})` : ''} — Day ${r?.days_in_phase0 ?? '?'}`;
+    }));
+    josueLines.push(...renderDelta('Ready for Phase 1 handoff', dHandoff.new, dHandoff.resolved, dHandoff.unchanged, name => {
+      const r = handoffItems.find(x => ([x.first_name, x.last_name].filter(Boolean).join(' ') || x.email) === name);
+      return `${name}${r?.company ? ` (${r.company})` : ''}`;
+    }));
 
-    if (phase0 && phase0.length) {
-      const needsCall = phase0.filter(r => r.phase0_step === '4_awaiting_activation_call');
-      const handoff   = phase0.filter(r => r.phase0_step === '5_ready_for_handoff');
-      if (needsCall.length) {
-        josueLines.push(`📞 *Activation calls needed (Phase 0):*`);
-        needsCall.forEach(r => {
-          const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
-          josueLines.push(`• ${name}${r.company ? ` (${r.company})` : ''} — Day ${r.days_in_phase0}`);
-        });
-        josueLines.push('');
-      }
-      if (handoff.length) {
-        josueLines.push(`✅ *Ready for Phase 1 handoff:*`);
-        handoff.forEach(r => {
-          const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
-          josueLines.push(`• ${name}${r.company ? ` (${r.company})` : ''}`);
-        });
-        josueLines.push('');
-      }
-    }
-
-    josueLines.push(`📊 *Pipeline snapshot:* ${phase1.length} Phase 1 | ${phase2.length} Phase 2 | ${phase3.length} Phase 3 | ${blocked.length} Blocked | ${(phase0||[]).length} Phase 0`);
+    josueLines.push(`📊 *Pipeline:* ${phase1.length} Phase 1 | ${phase2.length} Phase 2 | ${phase3.length} Phase 3 | ${blocked.length} Blocked | ${(phase0||[]).length} Phase 0`);
     josueLines.push(`\nAnything blocking you today? Flag it here and I'll help unblock.`);
 
     for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
       await slack.client.chat.postMessage({ channel: id, text: josueLines.join('\n') });
     }
+    await saveStandupSnapshot('josue', { blocked: blockedNames, hitting14: hitting14Names, hitting7: hitting7Names, phase0Needing: needsCallNames, phase0Handoff: handoffNames, counts: { phase1: phase1.length, phase2: phase2.length, phase3: phase3.length, blocked: blocked.length, phase0: (phase0||[]).length } });
     console.log('Standup DM sent to tech_ops role');
 
     // ── DM Valeria — delivery docs, Phase 1 ───────────────────────────────────
+    const valeriaSnap = await getYesterdayStandupSnapshot('valeria');
     const valeriaLines = [`Good morning Valeria! Here's your ${today} delivery brief:\n`];
 
-    if (phase1.length) {
-      valeriaLines.push(`📄 *Phase 1 clients — delivery docs focus (${phase1.length}):*`);
-      phase1.forEach(d => {
+    const phase1Names   = phase1.map(d => d.client_name);
+    const stalledP1     = phase1.filter(d => (getDayCount(d) || 0) >= 4).map(d => d.client_name);
+    const vBlockedNames = blockedNames;
+
+    const dP1      = diffStandupList(phase1Names,   valeriaSnap?.phase1Clients?.map(c => c.name));
+    const dStalledP1 = diffStandupList(stalledP1,   valeriaSnap?.stalledGe4);
+    const dVBlocked  = diffStandupList(vBlockedNames, valeriaSnap?.blocked);
+
+    if (phase1.length === 0 && !valeriaSnap?.phase1Clients?.length) {
+      valeriaLines.push(`✅ No clients in Phase 1 right now.\n`);
+    } else {
+      valeriaLines.push(...renderDelta('Phase 1 clients', dP1.new, dP1.resolved, dP1.unchanged, name => {
+        const d = phase1.find(x => x.client_name === name);
+        if (!d) return name;
         const acts = actsByClient[d.id] || [];
         const pending = acts.filter(a => a.status === 'phase_1').slice(0, 2).map(a => tMap[a.template_id] || 'Unknown').join(', ');
         const day = getDayCount(d);
-        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : '';
-        valeriaLines.push(`• ${d.client_name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`);
-      });
-      valeriaLines.push('');
-    } else {
-      valeriaLines.push(`✅ No clients in Phase 1 right now.\n`);
+        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : day >= 4 ? ' ⚡ stalled' : '';
+        return `${name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`;
+      }));
+      valeriaLines.push(...renderDelta('Phase 1 stalled (>= Day 4)', dStalledP1.new, dStalledP1.resolved, [], name => `${name} — no activity in 4+ days`));
     }
 
-    if (blocked.length) {
-      valeriaLines.push(`🔴 *Blocked clients (${blocked.length}) — check if any docs are holding these up:*`);
-      blocked.forEach(d => valeriaLines.push(`• ${d.client_name}`));
-      valeriaLines.push('');
-    }
-
+    valeriaLines.push(...renderDelta('Blocked', dVBlocked.new, dVBlocked.resolved, dVBlocked.unchanged, name => `${name} — check if docs are holding this up`));
     valeriaLines.push(`Any docs blocked or waiting on client input? Let Josue know so he can follow up.`);
 
     for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
       await slack.client.chat.postMessage({ channel: id, text: valeriaLines.join('\n') });
     }
+    await saveStandupSnapshot('valeria', { phase1Clients: phase1.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP1, blocked: vBlockedNames });
     console.log('Standup DM sent to Valeria');
 
-    // ── DM Felipe — campaigns, Prosp, Phase 2 ─────────────────────────────────
+    // ── DM Felipe — campaigns, Phase 2 ───────────────────────────────────────
+    const felipeSnap = await getYesterdayStandupSnapshot('felipe');
     const felipeLines = [`Good morning Felipe! Here's your ${today} campaign brief:\n`];
 
-    if (phase2.length) {
-      felipeLines.push(`🚀 *Phase 2 clients — campaign launch focus (${phase2.length}):*`);
-      phase2.forEach(d => {
+    const phase2Names  = phase2.map(d => d.client_name);
+    const stalledP2    = phase2.filter(d => (getDayCount(d) || 0) >= 4).map(d => d.client_name);
+    const phase3Names  = phase3.map(d => d.client_name);
+
+    const dP2       = diffStandupList(phase2Names,  felipeSnap?.phase2Clients?.map(c => c.name));
+    const dStalledP2 = diffStandupList(stalledP2,   felipeSnap?.stalledGe4);
+    const dP3       = diffStandupList(phase3Names,  felipeSnap?.phase3Clients?.map(c => c.name));
+
+    if (phase2.length === 0 && !felipeSnap?.phase2Clients?.length) {
+      felipeLines.push(`✅ No clients in Phase 2 right now.\n`);
+    } else {
+      felipeLines.push(...renderDelta('Phase 2 clients', dP2.new, dP2.resolved, dP2.unchanged, name => {
+        const d = phase2.find(x => x.client_name === name);
+        if (!d) return name;
         const acts = actsByClient[d.id] || [];
         const pending = acts.filter(a => a.status === 'phase_2').slice(0, 2).map(a => tMap[a.template_id] || 'Unknown').join(', ');
         const day = getDayCount(d);
-        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : '';
-        felipeLines.push(`• ${d.client_name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`);
-      });
-      felipeLines.push('');
-    } else {
-      felipeLines.push(`✅ No clients in Phase 2 right now.\n`);
+        const urgency = day >= 10 ? ' ⚠️ urgent' : day >= 7 ? ' 👀 watch' : day >= 4 ? ' ⚡ stalled' : '';
+        return `${name} — Day ${day}${urgency}${pending ? ` | next: ${pending}` : ''}`;
+      }));
+      felipeLines.push(...renderDelta('Phase 2 stalled (>= Day 4)', dStalledP2.new, dStalledP2.resolved, [], name => `${name} — no activity in 4+ days`));
     }
 
-    if (phase3.length) {
-      felipeLines.push(`📈 *Phase 3 (stabilization) — monitor performance (${phase3.length}):*`);
-      phase3.forEach(d => {
+    if (phase3.length || felipeSnap?.phase3Clients?.length) {
+      felipeLines.push(...renderDelta('Phase 3 stabilization', dP3.new, dP3.resolved, dP3.unchanged, name => {
+        const d = phase3.find(x => x.client_name === name);
+        if (!d) return name;
         const anchor = d.stabilization_started_at ? new Date(d.stabilization_started_at) : new Date(d.created_at);
         const stabDay = Math.floor((now - anchor.getTime()) / (1000 * 60 * 60 * 24));
-        felipeLines.push(`• ${d.client_name} — Stabilization Day ${stabDay}`);
-      });
-      felipeLines.push('');
+        return `${name} — Stabilization Day ${stabDay}`;
+      }));
     }
 
     felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so Josue can sequence it.`);
@@ -4289,12 +4353,13 @@ async function runFulfillmentStandup(_correlationId) {
     for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
       await slack.client.chat.postMessage({ channel: id, text: felipeLines.join('\n') });
     }
+    await saveStandupSnapshot('felipe', { phase2Clients: phase2.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP2, phase3Clients: phase3.map(d => ({ name: d.client_name })) });
     console.log('Standup DM sent to Felipe');
 
     // ── DM Tania — Phase 0 owner, SLA enforcer, Phase 3 client success ─────────
+    const taniaSnap = await getYesterdayStandupSnapshot('tania');
     const taniaLines = [`Good morning Tania! Here's your ${today} client success brief:\n`];
 
-    // Section 1: Phase 0 pipeline — Tania owns steps 1–4
     const { data: phase0All } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
@@ -4309,60 +4374,68 @@ async function runFulfillmentStandup(_correlationId) {
       '5_ready_for_handoff':        'ready for Phase 1 → Josue to kick off',
     };
 
-    if (phase0All && phase0All.length) {
-      taniaLines.push(`📋 *Phase 0 pipeline — ${phase0All.length} client${phase0All.length > 1 ? 's' : ''} in pre-portal onboarding (you own steps 1–4):*`);
-      phase0All.forEach(r => {
-        const name  = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
-        const co    = r.company ? ` (${r.company})` : '';
-        const days  = r.days_in_phase0 ?? 0;
-        const flag  = days >= 14 ? ' 🔴 OVERDUE' : days >= 7 ? ' ⚠️ at risk' : '';
-        taniaLines.push(`• ${name}${co} — ${p0StepLabels[r.phase0_step] || r.phase0_step} | Day ${days}${flag}`);
-      });
-      taniaLines.push('');
+    // Phase 0 delta
+    const p0Names = (phase0All || []).map(r => [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email);
+    const dP0 = diffStandupList(p0Names, taniaSnap?.phase0Clients);
+    if (phase0All?.length || taniaSnap?.phase0Clients?.length) {
+      taniaLines.push(...renderDelta('Phase 0 pipeline', dP0.new, dP0.resolved, dP0.unchanged, name => {
+        const r = (phase0All || []).find(x => ([x.first_name, x.last_name].filter(Boolean).join(' ') || x.email) === name);
+        if (!r) return name;
+        const days = r.days_in_phase0 ?? 0;
+        const flag = days >= 14 ? ' 🔴 OVERDUE' : days >= 7 ? ' ⚠️ at risk' : '';
+        return `${name}${r.company ? ` (${r.company})` : ''} — ${p0StepLabels[r.phase0_step] || r.phase0_step} | Day ${days}${flag}`;
+      }));
     } else {
       taniaLines.push(`📋 *Phase 0:* No clients in pre-portal onboarding.\n`);
     }
 
-    // Section 2: SLA watch — Day 14 due today + overdue
-    const slaDueToday = clients.filter(d => getDayCount(d) === 14);
-    const slaOverdue  = clients.filter(d => (getDayCount(d) || 0) > 14 && ['phase_1','phase_2'].includes(d.customer_status));
-
-    if (slaDueToday.length || slaOverdue.length) {
-      taniaLines.push(`🚨 *SLA watch:*`);
-      slaDueToday.forEach(d => taniaLines.push(`• ${d.client_name} — Day 14 TODAY | ${phaseLabel[d.customer_status] || d.customer_status} | must activate by EOD`));
-      slaOverdue.forEach(d  => taniaLines.push(`• ${d.client_name} — Day ${getDayCount(d)} | ${phaseLabel[d.customer_status] || d.customer_status} | past 14-day SLA window`));
-      taniaLines.push('');
+    // SLA watch delta
+    const slaDueToday  = clients.filter(d => getDayCount(d) === 14);
+    const slaOverdue   = clients.filter(d => (getDayCount(d) || 0) > 14 && ['phase_1','phase_2'].includes(d.customer_status));
+    const slaNames     = [...slaDueToday, ...slaOverdue].map(d => d.client_name);
+    const dSla = diffStandupList(slaNames, taniaSnap?.slaWatch);
+    if (slaNames.length || taniaSnap?.slaWatch?.length) {
+      taniaLines.push(...renderDelta('SLA watch', dSla.new, dSla.resolved, dSla.unchanged, name => {
+        const due  = slaDueToday.find(d => d.client_name === name);
+        const over = slaOverdue.find(d => d.client_name === name);
+        if (due)  return `${name} — Day 14 TODAY | ${phaseLabel[due.customer_status] || due.customer_status} | must activate by EOD`;
+        if (over) return `${name} — Day ${getDayCount(over)} | ${phaseLabel[over.customer_status] || over.customer_status} | past 14-day SLA`;
+        return name;
+      }));
     } else {
       taniaLines.push(`✅ *SLA watch:* No clients at or past the 14-day activation deadline today.\n`);
     }
 
-    // Section 3: Phase 3 stabilization — all clients, flag near/at Day 20 for 1:1
+    // Phase 3 stabilization delta
     const phase3Clients = clients.filter(d => d.customer_status === 'phase_3');
-    if (phase3Clients.length) {
-      taniaLines.push(`📈 *Phase 3 stabilization — ${phase3Clients.length} client${phase3Clients.length > 1 ? 's' : ''} (your follow-up + 1:1 sessions):*`);
-      phase3Clients.forEach(d => {
+    const p3StabNames   = phase3Clients.map(d => d.client_name);
+    const dP3Stab = diffStandupList(p3StabNames, taniaSnap?.phase3StabClients);
+    if (phase3Clients.length || taniaSnap?.phase3StabClients?.length) {
+      taniaLines.push(...renderDelta('Phase 3 stabilization', dP3Stab.new, dP3Stab.resolved, dP3Stab.unchanged, name => {
+        const d = phase3Clients.find(x => x.client_name === name);
+        if (!d) return name;
         const anchor  = d.stabilization_started_at ? new Date(d.stabilization_started_at) : new Date(d.created_at);
         const stabDay = Math.floor((now - anchor.getTime()) / (1000 * 60 * 60 * 24));
         const flag    = stabDay >= 20 ? ' 🔴 1:1 overdue — schedule now' : stabDay >= 18 ? ' 📅 1:1 due in ~2 days' : '';
-        taniaLines.push(`• ${d.client_name} — Stabilization Day ${stabDay}${flag}`);
-      });
-      taniaLines.push('');
+        return `${name} — Stabilization Day ${stabDay}${flag}`;
+      }));
     } else {
       taniaLines.push(`📈 *Phase 3:* No clients in stabilization.\n`);
     }
 
-    // Section 4: Blocked clients (only if any)
-    if (blocked.length) {
-      taniaLines.push(`🔴 *Blocked — needs client-side outreach (${blocked.length}):*`);
-      blocked.forEach(d => taniaLines.push(`• ${d.client_name} — Day ${getDayCount(d)}`));
-      taniaLines.push('');
-    }
+    // Blocked delta
+    const dTBlocked = diffStandupList(blockedNames, taniaSnap?.blocked);
+    taniaLines.push(...renderDelta('Blocked — needs client-side outreach', dTBlocked.new, dTBlocked.resolved, dTBlocked.unchanged, name => {
+      const d = blocked.find(x => x.client_name === name);
+      return `${name}${d ? ` — Day ${getDayCount(d)}` : ''}`;
+    }));
 
     taniaLines.push(`Anything you need from me to move any of these forward? I can draft client emails, schedule 1:1 reminders, or pull activity details on any client.`);
 
     for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
       await slack.client.chat.postMessage({ channel: id, text: taniaLines.join('\n') });
     }
+    await saveStandupSnapshot('tania', { phase0Clients: p0Names, slaWatch: slaNames, phase3StabClients: p3StabNames, blocked: blockedNames });
     console.log('Standup DM sent to Tania');
 
     console.log('Fulfillment standup DMs complete.');
@@ -4711,7 +4784,8 @@ cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlert
 cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 
 // Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
-cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
+// runProactiveDMs merged into runFulfillmentStandup (9 AM) — stalled flags now inline per role
+// cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
 
 // Phase 1 anomaly detection: daily 6am Costa Rica. Scrapes 13 metrics (v2 — per-funnel), recomputes
 // rolling baselines, fires DMs at >= 1.5σ deltas. See ANOMALY_ROUTING for who gets pinged.
