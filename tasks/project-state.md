@@ -1,9 +1,10 @@
 # ng-agent — Project State
 
-Last updated: 2026-04-25
+Last updated: 2026-04-28
 
 ## Recent changes
 
+- **2026-04-28 — VSL · WhatsApp Help Click intake workflow + `context` field.** New GHL workflow "VSL · WhatsApp Help Click — Intake & Setter Handoff" fires on WhatsApp helper click → setter chat → opportunity on setter pipeline → existing `/webhook/ghl-lead`. Webhook payload now includes a `context` custom field (e.g. `"VSL · WhatsApp Help Click — booking friction"`) explaining why the lead is showing up. `handleGHLWebhook` in [index.js](../index.js) now reads `cd.context`, threads it into Max's setter-DM briefing prompt with adjusted action guidance, and adds a `📝` line to the `#ng-sales-goats` channel post. Commit `97a3bdd`.
 - **2026-04-25 — Phase 1 anomaly detection layer.** New tables `metric_observations` + `metric_baselines` in primary Supabase. Daily 6am Costa Rica cron scrapes 8 business metrics (Meta CPL, close rate, setter calls, Phase 0→1 conversion, Phase 1/2 cycle days, Day 7 at-risk count, GHL response time), recomputes 28-day rolling baselines, and DMs domain-routed roles when any metric drifts ≥1.5σ. Anomalies persist to `agent_knowledge` (category `alert`, visibility `shared`). Two new tools: `detect_anomalies` (ad-hoc dry-run) and `query_metric_history`. Bootstraps with 7-day warmup window — silently skips metrics with sample_size < 7. Routing constant `ANOMALY_ROUTING` in [index.js](../index.js) at the top of the anomaly block.
 - **2026-04-24 — Team-wide pilot rollout.** Max opened to Ron + Tania + Josue + David. See git log `0700aac` and `6ebc8dc`.
 
