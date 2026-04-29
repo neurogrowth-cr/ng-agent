@@ -4874,6 +4874,7 @@ async function handleGHLWebhook(req, res) {
         const assignedTo  = cd.assignedTo || cd['opportunity.assignedTo'] || payload.assignedTo || payload['opportunity.assignedTo'] || payload.assigned_user || payload.contact_owner || ct.assignedTo || ct.assigned_user || '';
         const contactId   = cd.contactId  || payload.contactId  || payload.contact_id || ct.id || payload.id || '';
         const locationId  = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
+        const leadContext = cd.context || payload.context || '';
 
         let resolvedAssignedTo = assignedTo;
         if (!resolvedAssignedTo && contactId) {
@@ -4900,7 +4901,11 @@ async function handleGHLWebhook(req, res) {
 
         const ghlLink      = contactId ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : 'https://app.gohighlevel.com';
         const setterSlackId = resolveSetterSlackId(resolvedAssignedTo);
-        const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. Their first action (reach out now, check GHL). Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
+        const contextLine = leadContext ? `\n- Context: ${leadContext}` : '';
+        const actionGuidance = leadContext
+          ? `Their first action should reflect the Context above (e.g. if it mentions booking friction, the setter should call/DM the lead now to unblock the booking, not just "reach out").`
+          : `Their first action (reach out now, check GHL).`;
+        const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}${contextLine}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. ${actionGuidance} Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
         const ghlCorr = newCorrelationId();
         const tGhl = Date.now();
         const briefingResponse = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
@@ -4922,6 +4927,7 @@ async function handleGHLWebhook(req, res) {
           phone             ? `📱 ${phone}`   : null,
           source && source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
           resolvedAssignedTo ? `👤 Assigned to: ${resolvedAssignedTo}` : null,
+          leadContext        ? `📝 ${leadContext}` : null,
           contactId          ? `🔗 ${ghlLink}` : null,
         ].filter(Boolean).join('\n');
         await slack.client.chat.postMessage({ channel: 'C0AJANQBYUE', text: channelNote });
