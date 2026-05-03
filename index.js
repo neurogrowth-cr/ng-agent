@@ -5411,13 +5411,22 @@ slack.event('reaction_added', async ({ event }) => {
         throw new Error(`GHL PUT /contacts/${meta.contact_id} → ${putRes.status}: ${errBody.slice(0, 200)}`);
       }
 
-      // 2. Reassign every opportunity tied to this contact (downstream reports anchor on opp ownership, not contact)
+      // 2. Reassign opportunities tied to this contact — but ONLY in setter pipelines.
+      //    VSL self-bookings live in a separate pipeline and must NOT be reassigned.
+      //    Allow-list comes from GHL_SETTER_PIPELINE_IDS env var (comma-separated).
+      const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1lQuaN8aNB1lfRpvP4')
+        .split(',').map(s => s.trim()).filter(Boolean);
       const oppsRes = await fetch(
         `https://services.leadconnectorhq.com/opportunities/search?location_id=${meta.location_id}&contact_id=${meta.contact_id}`,
         { headers: ghlAuth },
       );
       const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
-      const opps = oppsData.opportunities || [];
+      const allOpps = oppsData.opportunities || [];
+      const opps = allOpps.filter(o => setterPipelineIds.includes(o.pipelineId));
+      const skippedNonSetterOpps = allOpps.length - opps.length;
+      if (skippedNonSetterOpps > 0) {
+        console.log(`Skipped ${skippedNonSetterOpps} non-setter-pipeline opp(s) for contact ${meta.contact_id}`);
+      }
       const oppResults = await Promise.all(opps.map(async (opp) => {
         try {
           const r = await fetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
@@ -5442,11 +5451,12 @@ slack.event('reaction_added', async ({ event }) => {
         }
       }
 
+      const skipNote = skippedNonSetterOpps > 0 ? ` (${skippedNonSetterOpps} non-setter opp${skippedNonSetterOpps === 1 ? '' : 's'} left untouched)` : '';
       const oppNote = opps.length === 0
-        ? ' (no opportunities found to reassign — contact only)'
+        ? ` (no setter-pipeline opportunities to reassign${skipNote ? skipNote : ' — contact only'})`
         : oppsFail === 0
-          ? ` and ${oppsOk} opportunit${oppsOk === 1 ? 'y' : 'ies'}`
-          : ` (${oppsOk}/${opps.length} opportunities reassigned, ${oppsFail} failed — check logs)`;
+          ? ` and ${oppsOk} setter opportunit${oppsOk === 1 ? 'y' : 'ies'}${skipNote}`
+          : ` (${oppsOk}/${opps.length} setter opportunities reassigned, ${oppsFail} failed — check logs)${skipNote}`;
       await slack.client.chat.postMessage({
         channel, thread_ts: timestamp,
         text: `✅ Claimed by <@${event.user}>. GHL contact${oppNote}.`,
@@ -5455,7 +5465,7 @@ slack.event('reaction_added', async ({ event }) => {
       logActivity({
         event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
         user_id: event.user, channel_id: channel,
-        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_total: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail },
+        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_in_setter_pipelines: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail, opps_skipped_non_setter: skippedNonSetterOpps },
         correlation_id: claimCorr,
       });
       console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
