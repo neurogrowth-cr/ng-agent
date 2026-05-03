@@ -4820,6 +4820,7 @@ const GHL_USER_NAMES = {
   '5orsahkh2joujb5fczrp': 'Debbanny',       '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+  'zogw530idnpofqqnfssc': 'Ron Duarte',     'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 
 const GHL_TO_SLACK = {
@@ -5581,15 +5582,25 @@ slack.event('reaction_added', async ({ event }) => {
         }
       }
 
-      const skipNote = skippedNonSetterOpps > 0 ? ` (${skippedNonSetterOpps} non-setter opp${skippedNonSetterOpps === 1 ? '' : 's'} left untouched)` : '';
-      const oppNote = opps.length === 0
-        ? ` (no setter-pipeline opportunities to reassign${skipNote ? skipNote : ' — contact only'})`
-        : oppsFail === 0
-          ? ` and ${oppsOk} setter opportunit${oppsOk === 1 ? 'y' : 'ies'}${skipNote}`
-          : ` (${oppsOk}/${opps.length} setter opportunities reassigned, ${oppsFail} failed — check logs)${skipNote}`;
+      const lines = [`✅ Claimed by <@${event.user}>.`];
+      if (opps.length === 0) {
+        lines.push(`• GHL contact reassigned to you.`);
+        lines.push(`• No opportunity on the Appointment Setting Pipeline for this lead.`);
+      } else if (oppsFail === 0) {
+        const oppWord = oppsOk === 1 ? 'opportunity' : 'opportunities';
+        lines.push(`• GHL contact reassigned to you.`);
+        lines.push(`• ${oppsOk} setter ${oppWord} on the Appointment Setting Pipeline reassigned to you.`);
+      } else {
+        lines.push(`• GHL contact reassigned to you.`);
+        lines.push(`• ${oppsOk} of ${opps.length} setter opportunities reassigned, ${oppsFail} failed — check logs.`);
+      }
+      if (skippedNonSetterOpps > 0) {
+        const oppWord = skippedNonSetterOpps === 1 ? 'opportunity' : 'opportunities';
+        lines.push(`• ${skippedNonSetterOpps} ${oppWord} on another pipeline (e.g. VSL self-booking) left as-is.`);
+      }
       await slack.client.chat.postMessage({
         channel, thread_ts: timestamp,
-        text: `✅ Claimed by <@${event.user}>. GHL contact${oppNote}.`,
+        text: lines.join('\n'),
       });
 
       logActivity({
