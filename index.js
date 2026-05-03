@@ -5494,7 +5494,9 @@ slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
     if (event.item.channel !== LEAD_CHANNEL_ID) return;
-    if (!LEAD_CLAIM_EMOJIS.has(event.reaction)) return;
+    // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
+    const baseEmoji = String(event.reaction || '').split('::')[0];
+    if (!LEAD_CLAIM_EMOJIS.has(baseEmoji)) return;
     if (event.user === process.env.SLACK_BOT_USER_ID) return;
 
     const channel   = event.item.channel;
