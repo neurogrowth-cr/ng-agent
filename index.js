@@ -5400,42 +5400,65 @@ slack.event('reaction_added', async ({ event }) => {
     }
 
     const claimCorr = newCorrelationId();
+    const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
     try {
+      // 1. Reassign the contact
       const putRes = await fetch(`https://services.leadconnectorhq.com/contacts/${meta.contact_id}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
-          'Version': '2021-07-28',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ assignedTo: ghlUserId }),
+        method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
       });
       if (!putRes.ok) {
         const errBody = await putRes.text();
         throw new Error(`GHL PUT /contacts/${meta.contact_id} → ${putRes.status}: ${errBody.slice(0, 200)}`);
       }
 
+      // 2. Reassign every opportunity tied to this contact (downstream reports anchor on opp ownership, not contact)
+      const oppsRes = await fetch(
+        `https://services.leadconnectorhq.com/opportunities/search?location_id=${meta.location_id}&contact_id=${meta.contact_id}`,
+        { headers: ghlAuth },
+      );
+      const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
+      const opps = oppsData.opportunities || [];
+      const oppResults = await Promise.all(opps.map(async (opp) => {
+        try {
+          const r = await fetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
+            method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
+          });
+          if (!r.ok) {
+            const eb = await r.text();
+            console.warn(`opp PUT ${opp.id} → ${r.status}: ${eb.slice(0, 150)}`);
+            return { id: opp.id, ok: false };
+          }
+          return { id: opp.id, ok: true };
+        } catch (e) { console.warn(`opp PUT ${opp.id} threw:`, e.message); return { id: opp.id, ok: false }; }
+      }));
+      const oppsOk = oppResults.filter(r => r.ok).length;
+      const oppsFail = oppResults.length - oppsOk;
+
       // Mark message as claimed (idempotency anchor for future reactions)
       try { await slack.client.reactions.add({ channel, timestamp, name: LEAD_CLAIMED_EMOJI }); }
       catch (reactErr) {
-        // already_reacted is the race-loser path — safe to ignore
         if (!String(reactErr.data?.error || reactErr.message).includes('already_reacted')) {
           console.warn('reactions.add failed:', reactErr.message);
         }
       }
 
+      const oppNote = opps.length === 0
+        ? ' (no opportunities found to reassign — contact only)'
+        : oppsFail === 0
+          ? ` and ${oppsOk} opportunit${oppsOk === 1 ? 'y' : 'ies'}`
+          : ` (${oppsOk}/${opps.length} opportunities reassigned, ${oppsFail} failed — check logs)`;
       await slack.client.chat.postMessage({
         channel, thread_ts: timestamp,
-        text: `✅ Claimed by <@${event.user}>. GHL contact reassigned.`,
+        text: `✅ Claimed by <@${event.user}>. GHL contact${oppNote}.`,
       });
 
       logActivity({
         event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
         user_id: event.user, channel_id: channel,
-        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name },
+        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_total: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail },
         correlation_id: claimCorr,
       });
-      console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}`);
+      console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
     } catch (apiErr) {
       console.error('Lead claim GHL write failed:', apiErr.message);
       await slack.client.chat.postMessage({
