@@ -118,7 +118,8 @@ David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com,
 Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Joseph Salazar (U0A9J00EMGD) — Appointment Setter. Books discovery calls.
-Debbanny Romero (U0AR16QVDB3) — Appointment Setter. Books discovery calls.
+Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
+William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999) — High-Ticket Closers. They close deals after setting.
 
 ---
@@ -244,7 +245,7 @@ When reading, summarizing, or posting to #ng-sales-goats, you only surface and a
 - Prospect quality and pipeline health (how qualified is the book, what are conversion rates)
 - Objection patterns (what objections are showing up repeatedly, how they are being handled)
 - No-show and follow-up status (who ghosted, who needs re-engagement, FU sequence stage)
-- EOD reports from Joseph, Debbanny, and Jose (calls booked, pipeline updates, actions needed)
+- EOD reports from Joseph, Oscar, William, and Jose (calls booked, pipeline updates, actions needed)
 - Sales performance signals (close rate trends, setter-to-closer handoff quality)
 - Lead source quality (where are booked calls coming from, which sources convert)
 
@@ -436,7 +437,8 @@ const TEAM_MEMBERS = {
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria'    },
   'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe'     },
   'U0A9J00EMGD': { name: 'Joseph',   role: 'setter',         displayName: 'Joseph'     },
-  'U0AR16QVDB3': { name: 'Debbanny', role: 'setter',         displayName: 'Debbanny'   },
+  'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar'      },
+  'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William'    },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza' },
   'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
@@ -592,7 +594,7 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Joseph and Debbanny and close them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Joseph, Oscar, and William and close them into paying clients.
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
@@ -2067,7 +2069,9 @@ async function getPortalAlerts() {
 const SALES_TEAM_MAP = {
   // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
-  '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
+  'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
+  'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
+  '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero', // historical — no longer active
 
   // ── CLOSERS — iClosed identifies hosts by email address ─────────────────
   'ronny.duarte@neurogrowth.io':  'Ron Duarte',
@@ -2075,9 +2079,11 @@ const SALES_TEAM_MAP = {
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
 
   // ── SETTERS — iClosed EOD email IDs ─────────────────────────────────────
-  'debbanny.neurogrowth@gmail.com': 'Debbanny Romero',
   'joseph.neurogrowth@gmail.com':   'Joseph Salazar',
   'Salazcamjos@gmail.com':          'Joseph Salazar',
+  'oscar.neurogrowth@gmail.com':    'Oscar M',
+  'william.neurogrowth@gmail.com':  'William B',
+  'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
 
   // ── FALLBACK — GHL user IDs for closers if iClosed uses those instead ───
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
@@ -2191,7 +2197,7 @@ async function getSalesIntelligence(query) {
     }
 
     // ── SETTER PERFORMANCE ─────────────────────────────────────────────────
-    if (q.includes('setter') || q.includes('joseph') || q.includes('debbanny') || q.includes('booked') || q.includes('conversations') || q.includes('qualified leads')) {
+    if (q.includes('setter') || q.includes('joseph') || q.includes('oscar') || q.includes('william') || q.includes('debbanny') || q.includes('booked') || q.includes('conversations') || q.includes('qualified leads')) {
       const fromStr = q.includes('month') ? monthStartStr : weekStartStr;
       const period  = q.includes('month') ? 'this month' : 'this week';
       const rows    = filterByDate(setterRows, 'report_date', fromStr);
@@ -2311,9 +2317,11 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
     // GHL user ID to name map for setter resolution
     const GHL_USERS = {
       'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+      'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
+      'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
       '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-      'izlta0jy5orkymsyltjv': 'Jose Carranza', 'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+      'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
     };
     const lines = convos.map(c => {
       const lastDate  = new Date(c.lastMessageDate).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -2573,6 +2581,8 @@ async function runMondayGapDetection(_correlationId) {
         if (staleInbound.length) {
           const GHL_USERS_GAP = {
             'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+            'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
+            'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
             '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
           };
           const staleLines = staleInbound.map(c => {
@@ -3458,7 +3468,7 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Debbanny — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Debbanny is no longer active but historical rows resolve to her name), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
@@ -4482,7 +4492,8 @@ async function runSalesStandup(_correlationId) {
     // ── DM each setter ─────────────────────────────────────────────────────
     const setters = [
       { slackId: 'U0A9J00EMGD', name: 'Joseph' },
-      { slackId: 'U0AR16QVDB3', name: 'Debbanny' },
+      { slackId: 'U0B1S1UMH9P', name: 'Oscar' },
+      { slackId: 'U0B16P6DQ2F', name: 'William' },
     ];
 
     // Fetch yesterday's setter EOD aggregate (team total)
@@ -4817,25 +4828,32 @@ cron.schedule('0 18 * * 3,6', wrapCronJob('runSetterLeaderboard', async (c) => {
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
-  '5orsahkh2joujb5fczrp': 'Debbanny',       '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
+  'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
+  'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+  '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — no longer active
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-  'izlta0jy5orkymsyltjv': 'Jose Carranza',  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
-  'zogw530idnpofqqnfssc': 'Ron Duarte',     'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
+  'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+  'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 
 const GHL_TO_SLACK = {
   'joseph': 'U0A9J00EMGD', 'joseph salazar': 'U0A9J00EMGD',
-  'debbanny': 'U0AR16QVDB3', 'debanny': 'U0AR16QVDB3', 'debbanny neurogrowth': 'U0AR16QVDB3', 'debbanny romero': 'U0AR16QVDB3',
+  'oscar': 'U0B1S1UMH9P', 'oscar m': 'U0B1S1UMH9P', 'oscar neurogrowth': 'U0B1S1UMH9P',
+  'william': 'U0B16P6DQ2F', 'william b': 'U0B16P6DQ2F', 'william neurogrowth': 'U0B16P6DQ2F',
+  'debbanny': 'U0AR16QVDB3', 'debanny': 'U0AR16QVDB3', 'debbanny neurogrowth': 'U0AR16QVDB3', 'debbanny romero': 'U0AR16QVDB3', // historical
   'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
   'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD', '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',
+  'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P', 'n8mvtuhbbby7qppqnmr7': 'U0B16P6DQ2F',
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
 };
 
 // Reverse map for lead-claim flow: Slack user → GHL user ID (used by reaction_added handler)
+// Active setters only — Debbanny was removed when she rolled off 2026-05-03.
 const SLACK_TO_GHL_USER = {
   'U0A9J00EMGD': 'cUTTPGov7ZTLvyjKHdX8', // Joseph Salazar
-  'U0AR16QVDB3': '5OrSaHkh2joUjB5FCZrP', // Debbanny
+  'U0B1S1UMH9P': 'ZcmdIz2EEraPd80W2zop', // Oscar M
+  'U0B16P6DQ2F': 'N8mvtuHbbbY7QppqNMr7', // William B
   'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
   'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyltjV', // Jose Carranza
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
@@ -5147,9 +5165,10 @@ async function runStalledProspectFollowups(correlationId) {
 
   const ghlUserNames = {
     'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
-    '5orsahkh2joujb5fczrp': 'Debbanny',       '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
+    'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
+    'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
     'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-    'izlta0jy5orkymsyltjv': 'Jose Carranza',  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+    'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
   };
 
   const skipCounts = {};
@@ -5263,12 +5282,14 @@ async function runSetterLeaderboard(correlationId) {
     if (ghlId) claimsByGhl[ghlId] = (claimsByGhl[ghlId] || 0) + n;
   }
 
-  // 4. Build per-setter rows for the four canonical setters (skip Ron — testing only)
+  // 4. Build per-setter rows for the active setters (skip Ron — testing only)
+  // Closers (Jonathan, Jose) excluded — they don't submit setter EOD reports.
+  // Debbanny excluded — rolled off 2026-05-03; her historical rows still resolve via GHL_USER_NAMES
+  // for ad-hoc lookups but she's not on the active leaderboard.
   const SETTER_GHL_IDS = [
     'cuttpcov7ztlvyjkhdx8', // Joseph Salazar
-    '5orsahkh2joujb5fczrp', // Debbanny
-    'gqymykpddltdxvbkfl2c', // Jonathan Madriz
-    'izlta0jy5orkymsyltjv', // Jose Carranza
+    'zcmdiz2eerapd80w2zop', // Oscar M
+    'n8mvtuhbbby7qppqnmr7', // William B
   ];
   const rows = SETTER_GHL_IDS.map(ghlId => {
     const eod = bySetter[ghlId] || { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
