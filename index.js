@@ -4807,6 +4807,10 @@ cron.schedule('0 9 * * 1-5', wrapCronJob('runSalesStandup', async (c) => { await
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
 cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
 
+// Stalled prospect follow-ups — 11 AM CR Mon–Fri. Dry-run DMs setters their stalled list;
+// live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
+cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
+
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
@@ -4823,6 +4827,18 @@ const GHL_TO_SLACK = {
   'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD', '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
 };
+
+// Reverse map for lead-claim flow: Slack user → GHL user ID (used by reaction_added handler)
+const SLACK_TO_GHL_USER = {
+  'U0A9J00EMGD': 'cUTTPGov7ZTLvyjKHdX8', // Joseph Salazar
+  'U0AR16QVDB3': '5OrSaHkh2joUjB5FCZrP', // Debbanny
+  'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
+  'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyltjV', // Jose Carranza
+};
+
+const LEAD_CHANNEL_ID = 'C0AJANQBYUE'; // #ng-sales-goats
+const LEAD_CLAIM_EMOJIS = new Set(['raised_hand', 'hand', 'white_check_mark', 'heavy_check_mark']);
+const LEAD_CLAIMED_EMOJI = 'white_check_mark';
 
 function resolveSetterSlackId(assignedUser) {
   if (!assignedUser) return null;
@@ -4921,6 +4937,9 @@ async function handleGHLWebhook(req, res) {
           console.log(`GHL lead received but setter not resolved. assignedTo: "${assignedTo}". Add to GHL_TO_SLACK map if needed.`);
         }
 
+        const claimHint = !resolvedAssignedTo
+          ? `\n_React with ✋ to claim this lead — Max will assign you in GHL._`
+          : '';
         const channelNote = [
           `🆕 *New Lead* — ${fullName}`,
           email             ? `📧 ${email}`   : null,
@@ -4929,12 +4948,253 @@ async function handleGHLWebhook(req, res) {
           resolvedAssignedTo ? `👤 Assigned to: ${resolvedAssignedTo}` : null,
           leadContext        ? `📝 ${leadContext}` : null,
           contactId          ? `🔗 ${ghlLink}` : null,
-        ].filter(Boolean).join('\n');
-        await slack.client.chat.postMessage({ channel: 'C0AJANQBYUE', text: channelNote });
-        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: 'C0AJANQBYUE', output: { text: channelNote.slice(0, 2000) }, correlation_id: ghlCorr });
+        ].filter(Boolean).join('\n') + claimHint;
+        await slack.client.chat.postMessage({
+          channel: LEAD_CHANNEL_ID,
+          text: channelNote,
+          metadata: contactId ? {
+            event_type: 'ghl_lead',
+            event_payload: { contact_id: contactId, location_id: locationId, full_name: fullName, correlation_id: ghlCorr },
+          } : undefined,
+        });
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: LEAD_CHANNEL_ID, output: { text: channelNote.slice(0, 2000) }, correlation_id: ghlCorr });
       } catch (parseErr) { console.error('GHL webhook parse error:', parseErr.message); }
     });
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
+}
+
+// ─── STALLED PROSPECT FOLLOW-UPS (Initiative 2 — dry-run by default) ─────────
+// Daily 11 AM CR Mon–Fri. Detects WhatsApp prospects who went silent ≥ 2 business
+// days ago, applies skip gates, then either DMs the assigned setter a dry-run list
+// (default) or auto-sends a re-engagement message (when STALLED_FOLLOWUPS_LIVE='true').
+
+const OPT_OUT_PHRASES = [
+  // English
+  'not interested', 'no thanks', 'no thank you', 'stop messaging', 'unsubscribe',
+  'remove me', 'please stop', "don't contact", 'do not contact', 'take me off',
+  'wrong number', "i'll pass", 'i pass', 'leave me alone',
+  // Spanish
+  'no me interesa', 'no gracias', 'ya no', 'bórrame', 'borrame', 'quítame', 'quitame',
+  'no más', 'no mas', 'dejen de', 'deja de', 'número equivocado', 'numero equivocado',
+  'paso', 'no quiero', 'déjame', 'dejame en paz',
+];
+const DNC_TAGS = new Set(['dnc', 'blocked', 'do_not_contact', 'do-not-contact', 'unsub', 'unsubscribed', 'opt_out', 'opt-out']);
+
+function businessDaysBetween(fromMs, toMs) {
+  if (toMs <= fromMs) return 0;
+  let count = 0;
+  const oneDay = 24 * 60 * 60 * 1000;
+  for (let t = fromMs + oneDay; t <= toMs; t += oneDay) {
+    const weekday = new Date(t).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short' });
+    if (weekday !== 'Sat' && weekday !== 'Sun') count += 1;
+  }
+  return count;
+}
+
+function hasOptOutSignal(messages) {
+  const recent = messages.slice(-10);
+  for (const m of recent) {
+    const body = String(m.body || m.message || '').toLowerCase();
+    if (!body) continue;
+    for (const phrase of OPT_OUT_PHRASES) {
+      if (body.includes(phrase)) return phrase;
+    }
+  }
+  return null;
+}
+
+async function ghlGetConversationMessages(conversationId) {
+  const res = await fetch(`https://services.leadconnectorhq.com/conversations/${conversationId}/messages?limit=20`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  });
+  if (!res.ok) throw new Error(`GHL messages fetch ${res.status}`);
+  const data = await res.json();
+  // GHL returns oldest-first or newest-first depending on endpoint version; normalize to oldest-first
+  const msgs = (data.messages?.messages || data.messages || []).slice();
+  msgs.sort((a, b) => new Date(a.dateAdded || a.createdAt || 0) - new Date(b.dateAdded || b.createdAt || 0));
+  return msgs;
+}
+
+async function ghlGetContact(contactId) {
+  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.contact || data || null;
+}
+
+async function hasFutureBooking(contact) {
+  // iClosed booking lookup via revops_iclosed_bookings — match on email or phone
+  try {
+    const email = (contact.email || '').toLowerCase();
+    const phone = (contact.phone || '').replace(/\D/g, '');
+    const orFilters = [];
+    if (email) orFilters.push(`email.eq.${email}`);
+    if (phone) orFilters.push(`phone.like.%${phone.slice(-9)}%`);
+    if (!orFilters.length) return null;
+    const { data, error } = await supabase
+      .from('revops_iclosed_bookings')
+      .select('event_at, event_status')
+      .or(orFilters.join(','))
+      .gte('event_at', new Date().toISOString())
+      .order('event_at', { ascending: true })
+      .limit(1);
+    if (error || !data || !data.length) return null;
+    return data[0];
+  } catch (_) { return null; }
+}
+
+async function hasAttendedCall(contact) {
+  try {
+    const email = (contact.email || '').toLowerCase();
+    const phone = (contact.phone || '').replace(/\D/g, '');
+    const orFilters = [];
+    if (email) orFilters.push(`email.eq.${email}`);
+    if (phone) orFilters.push(`phone.like.%${phone.slice(-9)}%`);
+    if (!orFilters.length) return null;
+    const { data, error } = await supabase
+      .from('revops_iclosed_bookings')
+      .select('event_at, event_status')
+      .or(orFilters.join(','))
+      .in('event_status', ['Showed', 'Qualified', 'Disqualified'])
+      .order('event_at', { ascending: false })
+      .limit(1);
+    if (error || !data || !data.length) return null;
+    return data[0];
+  } catch (_) { return null; }
+}
+
+async function evaluateStalledCandidate(convo, ghlUserNames) {
+  const reasons = [];
+  const setterGhlId = (convo.assignedTo || '').toString();
+  const setterName  = ghlUserNames[setterGhlId] || ghlUserNames[setterGhlId.toLowerCase()] || null;
+  if (!setterName) return { skip: 'no_setter_match', setterSlackId: null };
+  const setterSlackId = GHL_TO_SLACK[setterName.toLowerCase()] || GHL_TO_SLACK[setterGhlId.toLowerCase()] || null;
+  if (!setterSlackId) return { skip: 'no_setter_slack_map', setterSlackId: null };
+
+  // Re-fetch messages to confirm no outbound after the last inbound
+  let messages;
+  try { messages = await ghlGetConversationMessages(convo.id); }
+  catch (err) { return { skip: `fetch_messages_failed:${err.message}`, setterSlackId }; }
+  if (!messages.length) return { skip: 'no_messages', setterSlackId };
+  if (messages.length < 3) return { skip: 'thread_too_short', setterSlackId };
+
+  const lastInboundIdx = [...messages].reverse().findIndex(m => m.direction === 'inbound');
+  if (lastInboundIdx === -1) return { skip: 'no_inbound', setterSlackId };
+  const realIdx = messages.length - 1 - lastInboundIdx;
+  const tail = messages.slice(realIdx + 1);
+  if (tail.some(m => m.direction === 'outbound')) return { skip: 'setter_already_replied', setterSlackId };
+
+  const lastInbound = messages[realIdx];
+  const lastBody = String(lastInbound.body || lastInbound.message || '').trim();
+  if (!lastBody || lastBody === '[Voice Note]') return { skip: 'voice_note_or_empty', setterSlackId };
+  if (/^[\p{Emoji}\s]+$/u.test(lastBody) && lastBody.length < 6) return { skip: 'emoji_only', setterSlackId };
+
+  const optOut = hasOptOutSignal(messages);
+  if (optOut) return { skip: `opt_out:${optOut}`, setterSlackId };
+
+  // Contact-level checks
+  const contact = await ghlGetContact(convo.contactId);
+  if (!contact) return { skip: 'contact_fetch_failed', setterSlackId };
+  if (!contact.phone) return { skip: 'no_phone', setterSlackId };
+
+  const tags = (contact.tags || []).map(t => String(t).toLowerCase());
+  for (const t of tags) if (DNC_TAGS.has(t)) return { skip: `dnc_tag:${t}`, setterSlackId };
+
+  const futureBooking = await hasFutureBooking(contact);
+  if (futureBooking) return { skip: `already_booked:${futureBooking.event_at}`, setterSlackId };
+
+  const attended = await hasAttendedCall(contact);
+  if (attended) return { skip: `already_attended:${attended.event_status}`, setterSlackId };
+
+  return {
+    skip: null,
+    setterSlackId,
+    setterName,
+    contactName: convo.contactName || convo.fullName || contact.firstName || 'Unknown',
+    lastBody: lastBody.slice(0, 140),
+    ageDays: Math.floor((Date.now() - convo.lastMessageDate) / (24 * 60 * 60 * 1000)),
+    contactId: convo.contactId,
+    conversationId: convo.id,
+  };
+}
+
+async function runStalledProspectFollowups(correlationId) {
+  const isLive = process.env.STALLED_FOLLOWUPS_LIVE === 'true';
+  console.log(`runStalledProspectFollowups starting (mode=${isLive ? 'LIVE' : 'DRY_RUN'})`);
+
+  const locationId = process.env.GHL_LOCATION_ID;
+  const apiKey     = process.env.GHL_API_KEY;
+  const url = `https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=100`;
+  const res = await fetch(url, { headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28' } });
+  if (!res.ok) throw new Error(`GHL conversations.search → ${res.status}`);
+  const data = await res.json();
+  const convos = data.conversations || [];
+
+  const now = Date.now();
+  const candidates = convos.filter(c => {
+    if (c.lastMessageType !== 'TYPE_WHATSAPP') return false;
+    if (c.lastMessageDirection !== 'inbound') return false;
+    if (!c.lastMessageDate) return false;
+    return businessDaysBetween(c.lastMessageDate, now) >= 2;
+  });
+
+  const ghlUserNames = {
+    'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+    '5orsahkh2joujb5fczrp': 'Debbanny',       '5OrSaHkh2joUjB5FCZrP': 'Debbanny',
+    'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+    'izlta0jy5orkymsyltjv': 'Jose Carranza',  'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+  };
+
+  const skipCounts = {};
+  const claimable = [];
+  for (const c of candidates) {
+    const result = await evaluateStalledCandidate(c, ghlUserNames);
+    if (result.skip) {
+      skipCounts[result.skip.split(':')[0]] = (skipCounts[result.skip.split(':')[0]] || 0) + 1;
+      console.log(`stalled-skip ${c.contactId}: ${result.skip}`);
+      continue;
+    }
+    claimable.push(result);
+  }
+
+  // Group by setter Slack ID
+  const bySetter = {};
+  for (const r of claimable) (bySetter[r.setterSlackId] ||= []).push(r);
+
+  // DM each setter their stalled list (dry-run) — or send (live, future)
+  for (const [slackId, list] of Object.entries(bySetter)) {
+    if (!isLive) {
+      const lines = list.map(r => `• ${r.contactName} (${r.ageDays}d, WhatsApp) — last: "${r.lastBody}" → https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${r.contactId}`);
+      const text = `👀 *Stalled prospects* — dry-run (no auto-followup sent yet):\n${lines.join('\n')}\n\n_Reply to nudge them yourself, or sit tight — Max will start auto-following up after dry-run watch period._`;
+      try {
+        await slack.client.chat.postMessage({ channel: slackId, text });
+        logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: slackId, output: { text: text.slice(0, 2000) }, correlation_id: correlationId });
+      } catch (err) { console.error(`stalled DM to ${slackId} failed:`, err.message); }
+    } else {
+      // LIVE path is intentionally not wired in this commit — see rollout step 3.
+      console.warn(`STALLED_FOLLOWUPS_LIVE=true but live send path not yet implemented. Falling back to dry-run DM.`);
+    }
+  }
+
+  // Summary DM to Ron
+  const totalCandidates = candidates.length;
+  const totalSendable   = claimable.length;
+  const totalSkipped    = totalCandidates - totalSendable;
+  const skipBreakdown   = Object.entries(skipCounts).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none';
+  const summary = [
+    `📊 *Stalled prospect dry-run summary* (${isLive ? 'LIVE' : 'DRY-RUN'})`,
+    `Candidates: ${totalCandidates} | Would send: ${totalSendable} | Skipped: ${totalSkipped}`,
+    `Skip breakdown: ${skipBreakdown}`,
+    totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_',
+  ].join('\n');
+  try {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary });
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: RON_SLACK_ID, output: { text: summary }, correlation_id: correlationId });
+  } catch (err) { console.error('stalled summary DM to Ron failed:', err.message); }
+
+  console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}`);
 }
 
 // ─── INNER CIRCLE HUDDLE EVENT LOOKUP (CACHED) ───────────────────────────────
@@ -5097,6 +5357,95 @@ healthServer.listen(process.env.PORT || 3000, () => {
   cron.schedule('0 7 15 * *', wrapCronJob('runPhase3Reconciliation', async (c) => { await runPhase3Reconciliation(c); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Phase 3 reconciliation (0 7 15 * *)');
 })();
+
+// ─── REACTION-DRIVEN LEAD CLAIM ───────────────────────────────────────────────
+// Setter reacts on a #ng-sales-goats lead post → Max writes assignedTo in GHL,
+// posts a ✅ + threaded confirmation. First reactor wins; idempotent on race.
+slack.event('reaction_added', async ({ event }) => {
+  try {
+    if (!event || !event.item || event.item.type !== 'message') return;
+    if (event.item.channel !== LEAD_CHANNEL_ID) return;
+    if (!LEAD_CLAIM_EMOJIS.has(event.reaction)) return;
+    if (event.user === process.env.SLACK_BOT_USER_ID) return;
+
+    const channel   = event.item.channel;
+    const timestamp = event.item.ts;
+
+    const history = await slack.client.conversations.history({
+      channel, latest: timestamp, limit: 1, inclusive: true, include_all_metadata: true,
+    });
+    const msg = history.messages && history.messages[0];
+    if (!msg || msg.ts !== timestamp) return;
+
+    // Gate: must be a Max-posted lead message with metadata
+    const meta = msg.metadata && msg.metadata.event_type === 'ghl_lead' ? msg.metadata.event_payload : null;
+    if (!meta || !meta.contact_id) return;
+
+    // Idempotency: if Max already added the claim emoji, this lead is already taken
+    const reactions = msg.reactions || [];
+    const claimReaction = reactions.find(r => r.name === LEAD_CLAIMED_EMOJI);
+    if (claimReaction && claimReaction.users && claimReaction.users.includes(process.env.SLACK_BOT_USER_ID)) {
+      console.log(`reaction_added: lead ${meta.contact_id} already claimed, ignoring`);
+      return;
+    }
+
+    const ghlUserId = SLACK_TO_GHL_USER[event.user];
+    if (!ghlUserId) {
+      await slack.client.chat.postMessage({
+        channel, thread_ts: timestamp,
+        text: `<@${event.user}> you're not in the GHL setter map yet — ping Ron to add you before claiming leads.`,
+      });
+      return;
+    }
+
+    const claimCorr = newCorrelationId();
+    try {
+      const putRes = await fetch(`https://services.leadconnectorhq.com/contacts/${meta.contact_id}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+          'Version': '2021-07-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ assignedTo: ghlUserId }),
+      });
+      if (!putRes.ok) {
+        const errBody = await putRes.text();
+        throw new Error(`GHL PUT /contacts/${meta.contact_id} → ${putRes.status}: ${errBody.slice(0, 200)}`);
+      }
+
+      // Mark message as claimed (idempotency anchor for future reactions)
+      try { await slack.client.reactions.add({ channel, timestamp, name: LEAD_CLAIMED_EMOJI }); }
+      catch (reactErr) {
+        // already_reacted is the race-loser path — safe to ignore
+        if (!String(reactErr.data?.error || reactErr.message).includes('already_reacted')) {
+          console.warn('reactions.add failed:', reactErr.message);
+        }
+      }
+
+      await slack.client.chat.postMessage({
+        channel, thread_ts: timestamp,
+        text: `✅ Claimed by <@${event.user}>. GHL contact reassigned.`,
+      });
+
+      logActivity({
+        event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
+        user_id: event.user, channel_id: channel,
+        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name },
+        correlation_id: claimCorr,
+      });
+      console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}`);
+    } catch (apiErr) {
+      console.error('Lead claim GHL write failed:', apiErr.message);
+      await slack.client.chat.postMessage({
+        channel, thread_ts: timestamp,
+        text: `<@${event.user}> tried to claim, but GHL update failed: ${apiErr.message}. Reach out to Ron.`,
+      });
+    }
+  } catch (err) {
+    console.error('reaction_added handler error:', err.message);
+  }
+});
 
 // ─── MEMBER JOINED CHANNEL ────────────────────────────────────────────────────
 slack.event('member_joined_channel', async ({ event }) => {
