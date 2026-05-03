@@ -4834,6 +4834,7 @@ const SLACK_TO_GHL_USER = {
   'U0AR16QVDB3': '5OrSaHkh2joUjB5FCZrP', // Debbanny
   'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
   'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyltjV', // Jose Carranza
+  'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
 };
 
 const LEAD_CHANNEL_ID = 'C0AJANQBYUE'; // #ng-sales-goats
