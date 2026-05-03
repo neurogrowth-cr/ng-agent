@@ -4943,7 +4943,7 @@ async function handleGHLWebhook(req, res) {
         }
 
         const claimHint = !resolvedAssignedTo
-          ? `\n_React with ✋ to claim this lead — Max will assign you in GHL._`
+          ? `\n_React with ✋ or ✅ to claim — Max will assign you the contact + the opportunity in GHL._`
           : '';
         const channelNote = [
           `🆕 *New Lead* — ${fullName}`,
@@ -5545,7 +5545,7 @@ slack.event('reaction_added', async ({ event }) => {
       // 2. Reassign opportunities tied to this contact — but ONLY in setter pipelines.
       //    VSL self-bookings live in a separate pipeline and must NOT be reassigned.
       //    Allow-list comes from GHL_SETTER_PIPELINE_IDS env var (comma-separated).
-      const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1lQuaN8aNB1lfRpvP4')
+      const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4')
         .split(',').map(s => s.trim()).filter(Boolean);
       const oppsRes = await fetch(
         `https://services.leadconnectorhq.com/opportunities/search?location_id=${meta.location_id}&contact_id=${meta.contact_id}`,
