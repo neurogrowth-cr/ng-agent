@@ -5234,8 +5234,18 @@ async function runSetterLeaderboard(correlationId) {
   const monthLabel     = monthStart.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'long' });
   const todayLabel     = now.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric' });
 
-  // 1. Portal Supabase — MTD EOD aggregation per setter
-  let bySetter = {};
+  // Canonical roster of active setters. EOD table keys by email; setter_claims keys by Slack ID;
+  // GHL keys by user ID. Walking this list lets us join all three cleanly.
+  // Closers (Jonathan, Jose) excluded — they don't submit setter EOD reports.
+  // Debbanny excluded — rolled off 2026-05-03; historical rows still resolve via display maps.
+  const ACTIVE_SETTERS = [
+    { name: 'Joseph Salazar', email: 'joseph.neurogrowth@gmail.com',  slackId: 'U0A9J00EMGD' },
+    { name: 'Oscar M',        email: 'oscar.neurogrowth@gmail.com',   slackId: 'U0B1S1UMH9P' },
+    { name: 'William B',      email: 'william.neurogrowth@gmail.com', slackId: 'U0B16P6DQ2F' },
+  ];
+
+  // 1. Portal Supabase — MTD EOD aggregation per setter (keyed by email)
+  const byEmail = {};
   try {
     const { data: eodRows, error: eodErr } = await portalSupabase
       .from('revops_setter_eod_daily')
@@ -5245,7 +5255,7 @@ async function runSetterLeaderboard(correlationId) {
     for (const r of (eodRows || [])) {
       const k = (r.setter_id || '').toLowerCase();
       if (!k) continue;
-      const slot = bySetter[k] ||= { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
+      const slot = byEmail[k] ||= { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
       slot.calls_placed    += r.scheduled_calls    || 0;
       slot.qualified_leads += r.qualified_leads    || 0;
       slot.shows           += r.calls_show         || 0;
@@ -5254,11 +5264,10 @@ async function runSetterLeaderboard(correlationId) {
     }
   } catch (err) {
     console.error('runSetterLeaderboard EOD fetch failed:', err.message);
-    bySetter = {}; // continue with claims-only data
   }
 
-  // 2. Primary Supabase — leads claimed MTD from setter_claims
-  let claimsBySlack = {};
+  // 2. Primary Supabase — leads claimed MTD from setter_claims (keyed by Slack user ID)
+  const claimsBySlack = {};
   try {
     const { data: claimRows, error: claimErr } = await supabase
       .from('setter_claims')
@@ -5272,32 +5281,16 @@ async function runSetterLeaderboard(correlationId) {
     }
   } catch (err) {
     console.error('runSetterLeaderboard setter_claims fetch failed:', err.message);
-    claimsBySlack = {};
   }
 
-  // 3. Reconcile: convert Slack-keyed claims to GHL-keyed via SLACK_TO_GHL_USER
-  const claimsByGhl = {};
-  for (const [slackId, n] of Object.entries(claimsBySlack)) {
-    const ghlId = (SLACK_TO_GHL_USER[slackId] || '').toLowerCase();
-    if (ghlId) claimsByGhl[ghlId] = (claimsByGhl[ghlId] || 0) + n;
-  }
-
-  // 4. Build per-setter rows for the active setters (skip Ron — testing only)
-  // Closers (Jonathan, Jose) excluded — they don't submit setter EOD reports.
-  // Debbanny excluded — rolled off 2026-05-03; her historical rows still resolve via GHL_USER_NAMES
-  // for ad-hoc lookups but she's not on the active leaderboard.
-  const SETTER_GHL_IDS = [
-    'cuttpcov7ztlvyjkhdx8', // Joseph Salazar
-    'zcmdiz2eerapd80w2zop', // Oscar M
-    'n8mvtuhbbby7qppqnmr7', // William B
-  ];
-  const rows = SETTER_GHL_IDS.map(ghlId => {
-    const eod = bySetter[ghlId] || { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
+  // 3. Build per-setter rows by walking the canonical roster
+  const rows = ACTIVE_SETTERS.map(s => {
+    const eod = byEmail[s.email.toLowerCase()] || { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
     const callsAttempted = eod.shows + eod.no_shows;
     const showRate = callsAttempted > 0 ? Math.round((eod.shows / callsAttempted) * 100) : null;
     return {
-      name: GHL_USER_NAMES[ghlId] || ghlId,
-      leads_claimed: claimsByGhl[ghlId] || 0,
+      name: s.name,
+      leads_claimed: claimsBySlack[s.slackId] || 0,
       calls_placed: eod.calls_placed,
       engagement: eod.engagement,
       qualified_leads: eod.qualified_leads,
