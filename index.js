@@ -4811,6 +4811,9 @@ cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { awa
 // live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
 cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
 
+// Setter leaderboard — Wed + Sat 6 PM CR. Posts MTD per-setter performance to #ng-sales-goats.
+cron.schedule('0 18 * * 3,6', wrapCronJob('runSetterLeaderboard', async (c) => { await runSetterLeaderboard(c); }), { timezone: 'America/Costa_Rica' });
+
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
@@ -5198,6 +5201,131 @@ async function runStalledProspectFollowups(correlationId) {
   console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}`);
 }
 
+// ─── SETTER LEADERBOARD (Wed + Sat 6 PM CR — MTD post to #ng-sales-goats) ────
+// Pulls MTD setter performance from portal Supabase (revops_setter_eod_daily) +
+// leads-claimed from primary Supabase (setter_claims). Posts a ranked leaderboard
+// to #ng-sales-goats. No LLM call — pure SQL/JS aggregation, deterministic.
+
+async function runSetterLeaderboard(correlationId) {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthStartDate = monthStart.toISOString().slice(0, 10);
+  const monthStartIso  = monthStart.toISOString();
+  const monthLabel     = monthStart.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'long' });
+  const todayLabel     = now.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric' });
+
+  // 1. Portal Supabase — MTD EOD aggregation per setter
+  let bySetter = {};
+  try {
+    const { data: eodRows, error: eodErr } = await portalSupabase
+      .from('revops_setter_eod_daily')
+      .select('setter_id, new_conversations, follow_ups, qualified_leads, scheduled_calls, calls_show, calls_no_show')
+      .gte('report_date', monthStartDate);
+    if (eodErr) throw eodErr;
+    for (const r of (eodRows || [])) {
+      const k = (r.setter_id || '').toLowerCase();
+      if (!k) continue;
+      const slot = bySetter[k] ||= { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
+      slot.calls_placed    += r.scheduled_calls    || 0;
+      slot.qualified_leads += r.qualified_leads    || 0;
+      slot.shows           += r.calls_show         || 0;
+      slot.no_shows        += r.calls_no_show      || 0;
+      slot.engagement      += (r.new_conversations || 0) + (r.follow_ups || 0);
+    }
+  } catch (err) {
+    console.error('runSetterLeaderboard EOD fetch failed:', err.message);
+    bySetter = {}; // continue with claims-only data
+  }
+
+  // 2. Primary Supabase — leads claimed MTD from setter_claims
+  let claimsBySlack = {};
+  try {
+    const { data: claimRows, error: claimErr } = await supabase
+      .from('setter_claims')
+      .select('claimed_by_slack_user_id')
+      .gte('claimed_at', monthStartIso);
+    if (claimErr) throw claimErr;
+    for (const r of (claimRows || [])) {
+      const k = r.claimed_by_slack_user_id;
+      if (!k) continue;
+      claimsBySlack[k] = (claimsBySlack[k] || 0) + 1;
+    }
+  } catch (err) {
+    console.error('runSetterLeaderboard setter_claims fetch failed:', err.message);
+    claimsBySlack = {};
+  }
+
+  // 3. Reconcile: convert Slack-keyed claims to GHL-keyed via SLACK_TO_GHL_USER
+  const claimsByGhl = {};
+  for (const [slackId, n] of Object.entries(claimsBySlack)) {
+    const ghlId = (SLACK_TO_GHL_USER[slackId] || '').toLowerCase();
+    if (ghlId) claimsByGhl[ghlId] = (claimsByGhl[ghlId] || 0) + n;
+  }
+
+  // 4. Build per-setter rows for the four canonical setters (skip Ron — testing only)
+  const SETTER_GHL_IDS = [
+    'cuttpcov7ztlvyjkhdx8', // Joseph Salazar
+    '5orsahkh2joujb5fczrp', // Debbanny
+    'gqymykpddltdxvbkfl2c', // Jonathan Madriz
+    'izlta0jy5orkymsyltjv', // Jose Carranza
+  ];
+  const rows = SETTER_GHL_IDS.map(ghlId => {
+    const eod = bySetter[ghlId] || { calls_placed: 0, qualified_leads: 0, shows: 0, no_shows: 0, engagement: 0 };
+    const callsAttempted = eod.shows + eod.no_shows;
+    const showRate = callsAttempted > 0 ? Math.round((eod.shows / callsAttempted) * 100) : null;
+    return {
+      name: GHL_USER_NAMES[ghlId] || ghlId,
+      leads_claimed: claimsByGhl[ghlId] || 0,
+      calls_placed: eod.calls_placed,
+      engagement: eod.engagement,
+      qualified_leads: eod.qualified_leads,
+      shows: eod.shows,
+      no_shows: eod.no_shows,
+      show_rate: showRate,
+    };
+  });
+
+  // 5. Rank by qualified_leads desc, tiebreak on calls_placed
+  rows.sort((a, b) => (b.qualified_leads - a.qualified_leads) || (b.calls_placed - a.calls_placed));
+  const medals = ['🥇', '🥈', '🥉', '🏅'];
+
+  // 6. Format Slack post
+  const lines = [
+    `📊 *SETTER LEADERBOARD* — ${todayLabel}`,
+    `_Month-to-date for ${monthLabel}_`,
+    '',
+  ];
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i];
+    const showRateStr = r.show_rate === null
+      ? '—'
+      : `${r.show_rate}% (${r.shows} shows / ${r.shows + r.no_shows} booked)`;
+    lines.push(`${medals[i] || '•'} *${r.name}*`);
+    lines.push(`• Leads claimed: ${r.leads_claimed}`);
+    lines.push(`• Calls placed: ${r.calls_placed}`);
+    lines.push(`• Engagement actions: ${r.engagement}`);
+    lines.push(`• Qualified leads: ${r.qualified_leads}`);
+    lines.push(`• Show rate: ${showRateStr}`);
+    lines.push('');
+  }
+  const leader = rows[0];
+  if (leader && leader.qualified_leads > 0) {
+    lines.push(`🏆 Month leader: *${leader.name}* (${leader.qualified_leads} qualified leads)`);
+  } else {
+    lines.push('_No qualified leads recorded yet this month._');
+  }
+
+  const text = lines.join('\n');
+  await slack.client.chat.postMessage({ channel: LEAD_CHANNEL_ID, text });
+  logActivity({
+    event_type: 'slack_message', event_source: 'cron', action: 'setter_leaderboard',
+    channel_id: LEAD_CHANNEL_ID,
+    output: { text: text.slice(0, 2000), rows: rows.length, month: monthLabel },
+    correlation_id: correlationId,
+  });
+  console.log(`runSetterLeaderboard posted to ${LEAD_CHANNEL_ID} — ${rows.length} setters, leader=${leader?.name}`);
+}
+
 // ─── INNER CIRCLE HUDDLE EVENT LOOKUP (CACHED) ───────────────────────────────
 async function getInnerCircleHuddleEvent() {
   const auth     = getGoogleAuth();
@@ -5468,6 +5596,26 @@ slack.event('reaction_added', async ({ event }) => {
         output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_in_setter_pipelines: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail, opps_skipped_non_setter: skippedNonSetterOpps },
         correlation_id: claimCorr,
       });
+
+      // Audit trail — record the claim with seconds-to-claim for offline SLA mining
+      try {
+        const secondsToClaim = Math.max(0, Math.round(Date.now() / 1000 - parseFloat(timestamp)));
+        await supabase.from('setter_claims').insert({
+          ghl_contact_id: meta.contact_id,
+          contact_name: meta.full_name,
+          slack_message_ts: timestamp,
+          slack_channel_id: channel,
+          claimed_by_slack_user_id: event.user,
+          claimed_by_setter_name: GHL_USER_NAMES[ghlUserId] || GHL_USER_NAMES[ghlUserId.toLowerCase()] || null,
+          ghl_user_id: ghlUserId,
+          opps_reassigned: oppsOk,
+          seconds_to_claim: secondsToClaim,
+        });
+      } catch (claimErr) {
+        // Non-fatal — Slack post + GHL writes already succeeded
+        console.error('setter_claims insert failed:', claimErr.message);
+      }
+
       console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
     } catch (apiErr) {
       console.error('Lead claim GHL write failed:', apiErr.message);
