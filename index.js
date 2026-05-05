@@ -359,6 +359,18 @@ const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || '#ng-internal
 
 const pendingApprovals = {};
 
+// ─── EMAIL PROXY: stage-1 setter-review drafts (5-min TTL) ───────────────────
+// pendingDrafts[setterSlackId] = {
+//   kind: 'email_outbound' | 'email_reply',
+//   to, cc, subject, body,                       // for email_outbound
+//   thread,                                      // email_threads row, for email_reply
+//   createdAt,
+// }
+const pendingDrafts = {};
+
+// ─── EMAIL PROXY: feature flag ────────────────────────────────────────────────
+const EMAIL_PROXY_LIVE = String(process.env.EMAIL_PROXY_LIVE || '').toLowerCase() === 'true';
+
 // ─── SLACK CHANNEL LIST CACHE ─────────────────────────────────────────────────
 // conversations.list is rate-limited — cache for 10 minutes instead of calling per-request
 let channelListCache = null;
@@ -401,22 +413,39 @@ setInterval(() => {
   for (const userId of Object.keys(pendingApprovals)) {
     if (now - pendingApprovals[userId].createdAt > 30 * 60 * 1000) {
       console.log(`Cleared stale pending approval for user ${userId}`);
+      // Notify the originating setter that their draft expired (if it was an email send waiting on Ron).
+      const pending = pendingApprovals[userId];
+      if (pending.kind === 'email' && pending.requestedBy && pending.requestedBy !== userId) {
+        const to = pending.email?.to || 'recipient';
+        slack.client.chat.postMessage({
+          channel: pending.requestedBy,
+          text: `⚠️ Your draft for ${to} expired before approval. Please ping Ron and resend if still needed. Contact Ron/admin if you need help.`,
+        }).catch(err => console.error('Expired draft DM failed:', err.message));
+        slack.client.chat.postMessage({
+          channel: RON_SLACK_ID,
+          text: `⚠️ Approval for ${getMemberContext(pending.requestedBy).name}'s email to ${to} expired.`,
+        }).catch(() => {});
+      }
       delete pendingApprovals[userId];
     }
   }
-}, 30 * 60 * 1000);
+  for (const setterId of Object.keys(pendingDrafts)) {
+    if (now - pendingDrafts[setterId].createdAt > 5 * 60 * 1000) {
+      console.log(`Cleared stale pending email draft for setter ${setterId}`);
+      delete pendingDrafts[setterId];
+    }
+  }
+}, 5 * 60 * 1000);
 
 const RON_SLACK_ID = 'U05HXGX18H3';
 
-// ─── PILOT ACCESS ─────────────────────────────────────────────────────────────
-// Only these Slack user IDs can invoke Max. Others get a polite bounce.
-// Shrink to just Ron's ID to roll back to single-user mode.
-const PILOT_USERS = new Set([
-  'U05HXGX18H3', // Ron
-  'U07SMMDMSLQ', // Tania
-  'U08ABBFNGUW', // Josue
-  'U08ACUHUUP6', // David
-]);
+// ─── ACCESS GATE ──────────────────────────────────────────────────────────────
+// Roster-based access: anyone in TEAM_MEMBERS can invoke Max wherever Max is
+// invited. Non-roster users get a polite bounce. To onboard someone, add them
+// to TEAM_MEMBERS below — no other code needs to change.
+function isRosterMember(userId) {
+  return Boolean(userId && TEAM_MEMBERS[userId]);
+}
 
 // Tools restricted to Ron — Gmail and Calendar rely on Ron's personal OAuth.
 // Drive/Docs/Sheets stay open to the pilot (read-only against Ron's token).
@@ -430,16 +459,16 @@ const RON_ONLY_TOOLS = new Set([
 
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
-  'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte' },
-  'U07SMMDMSLQ': { name: 'Tania',    role: 'client_success', displayName: 'Tania'      },
-  'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue'      },
-  'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David'      },
-  'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria'    },
-  'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe'     },
-  'U0A9J00EMGD': { name: 'Joseph',   role: 'setter',         displayName: 'Joseph'     },
-  'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar'      },
-  'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William'    },
-  'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza' },
+  'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte NG' },
+  'U07SMMDMSLQ': { name: 'Tania',    role: 'client_success', displayName: 'Tania Araya NG' },
+  'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' },
+  'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
+  'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
+  'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe Herrera NG' },
+  'U0A9J00EMGD': { name: 'Joseph',   role: 'setter',         displayName: 'Joseph Salazar NG' },
+  'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
+  'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
+  'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
   'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
 
@@ -487,6 +516,12 @@ const ROLE_PERMISSIONS = {
     canReadChannels: ['ng-sales-goats'], canPostChannels: ['ng-sales-goats'],
     canUseEmail: false, canUseCalendar: false, canUseGHL: true,
     canUseDrive: false, canUseNotion: false, canSaveKnowledge: false, fullAccess: false,
+  },
+  ops_management: {
+    canReadChannels: ['ng-ops-management','ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-internal-announcements','ng-pm-agent'],
+    canPostChannels: ['ng-ops-management','ng-fullfillment-ops'],
+    canUseEmail: false, canUseCalendar: true, canUseGHL: true,
+    canUseDrive: true, canUseNotion: true, canSaveKnowledge: true, fullAccess: false,
   },
 };
 
@@ -611,6 +646,20 @@ Key context:
 - Works with Tania on handoff once a client pays
 
 When Jose asks about a prospect or pipeline, pull from GHL conversations and knowledge base. Help him draft follow-up messages, re-engagement scripts, and closing sequences. Help him prep his EOD report. He cannot access Ron's Gmail or calendar.`,
+
+    ops_management: `You are speaking with ${member.displayName}, an Operations Manager at NeuroGrowth. They oversee fulfillment and campaign delivery health across the client portfolio and report to Ron.
+
+CROSS-ROLE CONTEXT: Operations management sits above day-to-day fulfillment and campaigns — they need full visibility into delivery pipeline health, sales→delivery handoff quality, and any signal that a client is at risk. When they ask about a client, give them the full operational picture: phase status, SLA risk, blockers, sales context (close-call promises, price tier), and any cross-team dependencies.
+
+PORTAL FOCUS: Lead with portfolio health — phase transitions, launch risk, SLA compliance, gap detection alerts, fulfillment throughput. They can ask about sales, fulfillment, campaigns, or any client — answer freely and surface cross-team risks (e.g. a stalled fulfillment client whose renewal is near, a sales promise that delivery can't meet).
+
+Their role:
+- Oversight of the 14-day launch cycle and DFY portfolio (works alongside Josue on technical campaign excellence)
+- Owns operational gap detection and escalation: when something is slipping, they're the one who notices and routes it
+- Coordinates between fulfillment (Valeria), campaigns (Felipe), client success (Tania), and tech lead (David)
+- Surfaces operational issues to Ron with recommended actions, not raw status
+
+When they ask about ops health, pull fulfillment channel activity, recent gap detection alerts, SLA status across active clients, and any cross-team dependencies that are blocking. Help them draft escalation summaries for Ron, ops channel updates, and coordination messages between teams. They can use GHL, Drive, Notion, and calendar; they cannot send email on Ron's behalf.`,
   };
 
   const baseContext = roleContext[member.role] || roleContext.fulfillment;
@@ -978,6 +1027,7 @@ function registerDynamicCron(task) {
       const cronAction = `dynamic_cron:${task.name}`;
       let errored = null;
       let lastErr = null;
+      let validationFailure = null;
       logActivity({ event_type: 'cron_run', event_source: 'cron', action: cronAction, status: 'started', correlation_id, metadata: { task_id: task.id } });
       try {
       console.log(`Running dynamic cron: ${task.name}`);
@@ -1079,45 +1129,69 @@ function registerDynamicCron(task) {
         'Fulfillment EOD Pulse':      ['WINS TODAY', 'BLOCKERS', 'TOMORROW'],
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
+        'Monthly Business Review':    ['WINS THIS MONTH', 'GAPS & MISSES', 'KEEP DOING', 'STOP DOING', 'WATCH LIST', 'ONE PRIORITY FOR NEXT MONTH'],
+        'Weekly Closer Comparison':   ['JOSE CARRANZA', 'JONATHAN MADRIZ'],
         'Sales Call Prep Reminder':         [], // short task, skip header check
         'Blocked Client Report — MWF':      [], // short report, no fixed headers
+        'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
+        'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
       };
 
-      function isValidFinalReport(text, taskName) {
-        const upper = text.toUpperCase();
+      function validateFinalReport(text, taskName) {
+        const t = text || '';
+        const upper = t.toUpperCase();
+        const len = t.trim().length;
         const headers = TASK_HEADERS[taskName];
         if (headers === undefined) {
-          // Unknown task — fall back to length check only
-          return text.trim().length >= 300;
+          return { ok: len >= 300, reason: len >= 300 ? null : `length ${len} < 300 (unknown task — length-only check)`, found: [], missing: [], len };
         }
         if (headers.length === 0) {
-          // Short tasks like Sales Call Prep — just check it's not empty
-          return text.trim().length > 20;
+          return { ok: len > 20, reason: len > 20 ? null : `length ${len} <= 20`, found: [], missing: [], len };
         }
-        // Must contain at least half the expected headers to pass
-        const found = headers.filter(h => upper.includes(h)).length;
+        const found = headers.filter(h => upper.includes(h));
+        const missing = headers.filter(h => !upper.includes(h));
         const threshold = Math.ceil(headers.length / 2);
-        return found >= threshold && text.trim().length >= 300;
+        if (found.length < threshold) {
+          return { ok: false, reason: `missing headers (have ${found.length}/${headers.length}, need ${threshold})`, found, missing, len };
+        }
+        if (len < 300) {
+          return { ok: false, reason: `length ${len} < 300`, found, missing, len };
+        }
+        return { ok: true, reason: null, found, missing, len };
       }
 
-      const isValidReport = isValidFinalReport(reply, task.name);
+      const firstCheck = validateFinalReport(reply, task.name);
 
-      if (!isValidReport) {
-        console.log(`Cron "${task.name}": output failed structural validation (${reply.trim().length} chars, missing required headers). Re-prompting...`);
+      if (!firstCheck.ok) {
+        console.log(`Cron "${task.name}": output failed structural validation — ${firstCheck.reason}. Re-prompting...`);
         try {
           const finalReply = await callClaude([
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
             { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
           ], 3, null, correlation_id);
-          if (finalReply && isValidFinalReport(finalReply, task.name)) {
+          const secondCheck = validateFinalReport(finalReply, task.name);
+          if (finalReply && secondCheck.ok) {
             reply = finalReply;
             console.log(`Cron "${task.name}": re-prompt passed validation (${reply.trim().length} chars)`);
           } else {
-            // Re-prompt also failed — DM Ron with an error instead of sending garbage
-            const errMsg = `Scheduled task "${task.name}" failed to produce a valid structured report after 2 attempts. The output did not contain the required section headers. Please trigger this report manually or check Railway logs for details.`;
+            const failingReply = (finalReply || reply || '');
+            const finalReason = (secondCheck && secondCheck.reason) || firstCheck.reason || 'unknown';
+            const finalMissing = (secondCheck && secondCheck.missing) || firstCheck.missing || [];
+            validationFailure = {
+              reason: finalReason,
+              missing: finalMissing,
+              len: failingReply.trim().length,
+              first_attempt_reason: firstCheck.reason,
+              reply_preview: failingReply.trim().slice(0, 500),
+            };
+            const missingStr = finalMissing.length ? ` — missing: ${finalMissing.join(', ')}` : '';
+            const previewStr = validationFailure.reply_preview
+              ? `\nReply preview: "${validationFailure.reply_preview.replace(/\n+/g, ' ').slice(0, 300)}${validationFailure.reply_preview.length > 300 ? '…' : ''}"`
+              : '';
+            const errMsg = `Scheduled task "${task.name}" failed structural validation after 2 attempts.\nReason: ${finalReason}${missingStr}${previewStr}`;
             await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: errMsg });
-            console.error(`Cron "${task.name}": re-prompt also failed validation. Notified Ron.`);
+            console.error(`Cron "${task.name}": re-prompt also failed validation (${finalReason}). Notified Ron.`);
             return;
           }
         } catch (rePromptErr) {
@@ -1150,7 +1224,7 @@ function registerDynamicCron(task) {
         duration_ms: Date.now() - started,
         error_message: doneErr ? String(doneErr.message || doneErr).slice(0, 2000) : null,
         correlation_id,
-        metadata: { task_id: task.id },
+        metadata: { task_id: task.id, ...(validationFailure ? { validation_failure: validationFailure } : {}) },
       });
     }
     }, { timezone: 'America/Costa_Rica' });
@@ -1406,13 +1480,251 @@ async function getRecentEmails() {
   return details.join('\n\n---\n\n');
 }
 
-async function sendEmail(to, subject, body) {
+// ─── RON GMAIL SIGNATURE (cached) ─────────────────────────────────────────────
+// Fetched once and cached for process lifetime. Used by the email-proxy flow.
+let _ronSignatureHtml = null;
+async function getRonSignature() {
+  if (_ronSignatureHtml !== null) return _ronSignatureHtml;
+  try {
+    const auth  = getGoogleAuth();
+    const gmail = google.gmail({ version: 'v1', auth });
+    const res = await gmail.users.settings.sendAs.get({
+      userId: 'me',
+      sendAsEmail: 'ronny.duarte@neurogrowth.io',
+    });
+    _ronSignatureHtml = res.data?.signature || '';
+    if (!_ronSignatureHtml) console.log('Ron signature is empty — Gmail returned no signature for ronny.duarte@neurogrowth.io.');
+    return _ronSignatureHtml;
+  } catch (err) {
+    console.error('getRonSignature failed:', err.message);
+    try {
+      await slack.client.chat.postMessage({
+        channel: RON_SLACK_ID,
+        text: `⚠️ Signature fetch failed at boot. Sends will go without signature until fixed. Error: ${err.message}. Re-auth may be needed (gmail.settings.basic scope).`,
+      });
+    } catch {}
+    _ronSignatureHtml = '';
+    return '';
+  }
+}
+
+// Strip HTML to plain text (signatures may be HTML — we need a plaintext fallback for multipart).
+function htmlToPlainText(html) {
+  if (!html) return '';
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Build a quoted-printable safe-ish RFC 2822 multipart/alternative message.
+// We base64url the whole thing; gmail.users.messages.send accepts that.
+function buildRfc2822Message({ to, cc, subject, body, signatureHtml, inReplyTo, references }) {
+  const boundary = `=_NG_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const headers = [
+    'From: Ron Duarte <ronny.duarte@neurogrowth.io>',
+    `To: ${to}`,
+  ];
+  if (cc) headers.push(`Cc: ${cc}`);
+  headers.push(`Subject: ${subject}`);
+  headers.push('MIME-Version: 1.0');
+  if (inReplyTo)  headers.push(`In-Reply-To: ${inReplyTo}`);
+  if (references) headers.push(`References: ${references}`);
+  headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
+  headers.push('');
+
+  const plainBody = body + (signatureHtml ? '\n\n--\n' + htmlToPlainText(signatureHtml) : '');
+  // Convert plain body to minimal HTML: escape, then \n -> <br>
+  const htmlEscaped = escapeHtml(body).replace(/\r?\n/g, '<br>\n');
+  const htmlBody = `<div>${htmlEscaped}</div>` + (signatureHtml ? `<br><div>--</div><div>${signatureHtml}</div>` : '');
+
+  const parts = [
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: 7bit',
+    '',
+    plainBody,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    'Content-Transfer-Encoding: 7bit',
+    '',
+    htmlBody,
+    '',
+    `--${boundary}--`,
+    '',
+  ];
+
+  return headers.join('\r\n') + '\r\n' + parts.join('\r\n');
+}
+
+// sendEmail — extended for the email-proxy flow.
+//  - Always sends as ronny.duarte@neurogrowth.io with signature appended.
+//  - opts.cc, opts.inReplyTo, opts.references, opts.threadId for replies.
+//  - Returns { gmailMessageId, gmailThreadId, rfc822MessageId } so callers can
+//    persist threading metadata into email_threads.
+async function sendEmail(to, subject, body, opts = {}) {
   const auth  = getGoogleAuth();
   const gmail = google.gmail({ version: 'v1', auth });
-  const message = [`To: ${to}`, `Subject: ${subject}`, '', body].join('\n');
-  const encoded = Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
-  await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded } });
-  return `Email sent to ${to}`;
+  const signatureHtml = await getRonSignature();
+
+  const raw = buildRfc2822Message({
+    to,
+    cc: opts.cc || null,
+    subject,
+    body,
+    signatureHtml,
+    inReplyTo: opts.inReplyTo || null,
+    references: opts.references || null,
+  });
+  const encoded = Buffer.from(raw, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  const requestBody = { raw: encoded };
+  if (opts.threadId) requestBody.threadId = opts.threadId;
+
+  const sendRes = await gmail.users.messages.send({ userId: 'me', requestBody });
+  const gmailMessageId = sendRes.data.id;
+  const gmailThreadId  = sendRes.data.threadId;
+
+  // Re-fetch to capture the server-assigned Message-ID: header (needed for
+  // threading future replies via In-Reply-To / References).
+  let rfc822MessageId = null;
+  try {
+    const msg = await gmail.users.messages.get({
+      userId: 'me',
+      id: gmailMessageId,
+      format: 'metadata',
+      metadataHeaders: ['Message-ID', 'Message-Id'],
+    });
+    const hs = msg.data.payload?.headers || [];
+    rfc822MessageId = hs.find(h => h.name.toLowerCase() === 'message-id')?.value || null;
+  } catch (err) {
+    console.error('sendEmail: Message-ID fetch failed:', err.message);
+  }
+
+  return {
+    ok: true,
+    message: `Email sent to ${to}`,
+    gmailMessageId,
+    gmailThreadId,
+    rfc822MessageId,
+  };
+}
+
+// ─── EMAIL PROXY: hourly reply poller ─────────────────────────────────────────
+// Reads active email_threads rows, calls Gmail threads.get for each, looks for
+// inbound messages newer than the watermark, DMs the setter, advances watermark.
+// Per-tick failure tracking lives in a module-scope counter so we only DM Ron
+// when the same thread fails 3+ times in a row.
+const _replyPollFailureCounts = {};
+async function runEmailReplyPoller(correlationId) {
+  if (!EMAIL_PROXY_LIVE) return;
+  try {
+    const { data: threads, error } = await supabase
+      .from('email_threads')
+      .select('*')
+      .eq('active', true)
+      .order('last_message_at', { ascending: true })
+      .limit(50);
+    if (error) {
+      console.error('runEmailReplyPoller: threads query failed:', error.message);
+      return;
+    }
+    if (!threads || threads.length === 0) return;
+
+    const auth  = getGoogleAuth();
+    const gmail = google.gmail({ version: 'v1', auth });
+    const ourAddress = 'ronny.duarte@neurogrowth.io';
+
+    for (const t of threads) {
+      try {
+        const res = await gmail.users.threads.get({ userId: 'me', id: t.gmail_thread_id, format: 'metadata', metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID', 'Message-Id'] });
+        const messages = res.data.messages || [];
+        const watermark = new Date(t.last_message_at).getTime();
+        const newInbound = messages.filter(m => {
+          const internal = parseInt(m.internalDate, 10) || 0;
+          if (internal <= watermark) return false;
+          const headers = m.payload?.headers || [];
+          const from = (headers.find(h => h.name.toLowerCase() === 'from')?.value || '').toLowerCase();
+          return !from.includes(ourAddress);
+        });
+        if (newInbound.length === 0) {
+          _replyPollFailureCounts[t.id] = 0;
+          continue;
+        }
+
+        // Pull plaintext bodies for each new inbound message.
+        for (const m of newInbound) {
+          let bodySnippet = '';
+          try {
+            const full = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
+            bodySnippet = extractPlainTextBody(full.data.payload).slice(0, 1500) || (full.data.snippet || '').slice(0, 500);
+          } catch (bodyErr) {
+            bodySnippet = '(could not load body — open Gmail to view)';
+          }
+          const headers = m.payload?.headers || [];
+          const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || 'Unknown';
+          await slack.client.chat.postMessage({
+            channel: t.initiated_by_slack_id,
+            text: `📬 Reply on "${t.subject}"\nFrom: ${from}\n\n${bodySnippet}\n\nReply here in DM to send a response (I will draft, you approve, then Ron approves).`,
+          });
+        }
+
+        // Advance watermark to the newest message we just processed.
+        const newest = Math.max(...newInbound.map(m => parseInt(m.internalDate, 10) || 0));
+        await supabase.from('email_threads').update({
+          last_message_at: new Date(newest).toISOString(),
+        }).eq('id', t.id);
+        _replyPollFailureCounts[t.id] = 0;
+      } catch (perThreadErr) {
+        _replyPollFailureCounts[t.id] = (_replyPollFailureCounts[t.id] || 0) + 1;
+        console.error(`runEmailReplyPoller: thread ${t.id} failed (count=${_replyPollFailureCounts[t.id]}):`, perThreadErr.message);
+        if (_replyPollFailureCounts[t.id] >= 3) {
+          try {
+            await slack.client.chat.postMessage({
+              channel: RON_SLACK_ID,
+              text: `🔴 Reply polling broken for thread "${t.subject}" (id ${t.id}). 3+ consecutive failures. Last error: ${perThreadErr.message.slice(0, 200)}. Investigate.`,
+            });
+          } catch {}
+          _replyPollFailureCounts[t.id] = 0; // reset so we don't DM Ron every hour
+        }
+      }
+    }
+  } catch (err) {
+    console.error('runEmailReplyPoller fatal:', err);
+  }
+}
+
+// Helper: pull text/plain body out of a Gmail message payload.
+function extractPlainTextBody(payload) {
+  if (!payload) return '';
+  if (payload.mimeType === 'text/plain' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64').toString('utf8');
+  }
+  if (payload.parts && payload.parts.length) {
+    for (const p of payload.parts) {
+      const found = extractPlainTextBody(p);
+      if (found) return found;
+    }
+  }
+  return '';
 }
 
 // ─── GOOGLE CALENDAR ──────────────────────────────────────────────────────────
@@ -3441,7 +3753,17 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
         hour: '2-digit', minute: '2-digit', hour12: true
       });
       const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
-      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext;
+      const emailProxyGuidance = EMAIL_PROXY_LIVE ? `
+
+EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
+- Mirror the user's language. If they DM in Spanish, respond in Spanish through every step (slot-filling, preview, confirmation). The email body itself stays in whatever language the setter dictated — do NOT translate it.
+- Conversationally collect three required fields: recipient email (to), subject, body. cc is optional.
+- If any required field is missing, name exactly what is missing and ask for it. Do NOT call draft_outbound_email until to + subject + body are all known.
+- Quote values back to the setter for typo-checking before drafting (e.g. "OK so to: acme@x.com, subject: Follow-up — confirm the body before I draft").
+- Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
+- For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
+- Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
+      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + emailProxyGuidance;
 
       const TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
@@ -3481,7 +3803,9 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
-      ];
+          { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
+          { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
+      ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'));
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
       async function dispatchTool(toolUse) {
@@ -3497,7 +3821,7 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
         if      (toolUse.name === 'search_notion')          result = await searchNotion(toolUse.input.query);
         else if (toolUse.name === 'get_notion_page')        result = await getNotionPage(toolUse.input.page_id);
         else if (toolUse.name === 'get_recent_emails')      result = await getRecentEmails();
-        else if (toolUse.name === 'send_email')             result = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body);
+        else if (toolUse.name === 'send_email')             { const r = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body); result = r.message || `Email sent to ${toolUse.input.to}`; }
         else if (toolUse.name === 'get_calendar_events')    result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
         else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? r.substring(0, 4000) + '...[trimmed]' : r; }
         else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
@@ -3544,6 +3868,8 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
             (out.errors.length ? `\n\nErrors: ${out.errors.map(e => e.metric + ': ' + e.error).join('; ')}` : '');
         }
         else if (toolUse.name === 'query_metric_history')   result = await queryMetricHistory(toolUse.input.metric, Math.min(toolUse.input.days || 30, 90));
+        else if (toolUse.name === 'draft_outbound_email')   result = await draftOutboundEmail(toolUse.input, userId);
+        else if (toolUse.name === 'draft_reply_email')      result = await draftReplyEmail(toolUse.input, userId);
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
       }
 
@@ -3596,7 +3922,7 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
         }));
 
         // Check for approval draft before continuing — pass sentinel through verbatim
-        const draftResult = toolResults.find(r => { try { return JSON.parse(r.content).startsWith('APPROVAL_NEEDED|'); } catch { return false; } });
+        const draftResult = toolResults.find(r => { try { const v = JSON.parse(r.content); return typeof v === 'string' && (v.startsWith('APPROVAL_NEEDED|') || v.startsWith('SETTER_REVIEW_NEEDED|')); } catch { return false; } });
         if (draftResult) {
           return JSON.parse(draftResult.content);
         }
@@ -3672,12 +3998,237 @@ async function executeChannelPost(channelName, message, say, correlationId) {
   } catch (err) { await say(`Something went wrong posting: ${err.message}`); }
 }
 
+// ─── EMAIL PROXY: tool handlers ───────────────────────────────────────────────
+// These tool handlers are called by Claude. They DO NOT send anything — they
+// stage a draft for setter review (Stage 1), then return a sentinel that the
+// tool loop intercepts so the conversation pauses. The setter's "looks good"
+// promotes the draft to pendingApprovals[RON_SLACK_ID] (Stage 2).
+
+async function draftOutboundEmail(input, setterSlackId) {
+  const to = String(input.to || '').trim();
+  const subject = String(input.subject || '').trim();
+  const body = String(input.body || '').trim();
+  if (!to || !subject || !body) {
+    return 'Missing one of to / subject / body — collect the missing piece from the setter before calling this tool again.';
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+    return `That doesn't look like a valid email address: "${to}". Ask the setter to confirm.`;
+  }
+  const cc = input.cc ? String(input.cc).trim() : '';
+  pendingDrafts[setterSlackId] = {
+    kind: 'email_outbound',
+    to, cc, subject, body,
+    contactName: input.contact_name || null,
+    createdAt: Date.now(),
+  };
+  return `SETTER_REVIEW_NEEDED|outbound|${setterSlackId}`;
+}
+
+async function draftReplyEmail(input, setterSlackId) {
+  const body = String(input.body || '').trim();
+  if (!body) return 'Reply body is empty — ask the setter what they want to say.';
+
+  // Resolve thread: explicit thread_id wins; else look up the setter's active threads.
+  let thread = null;
+  if (input.thread_id) {
+    const { data, error } = await supabase
+      .from('email_threads')
+      .select('*')
+      .eq('id', input.thread_id)
+      .maybeSingle();
+    if (error) return `Couldn't load that thread: ${error.message}. Contact Ron/admin.`;
+    if (!data) return `No email thread found with id ${input.thread_id}.`;
+    thread = data;
+  } else {
+    const { data, error } = await supabase
+      .from('email_threads')
+      .select('*')
+      .eq('initiated_by_slack_id', setterSlackId)
+      .eq('active', true)
+      .order('last_message_at', { ascending: false });
+    if (error) return `Couldn't load your active threads: ${error.message}. Contact Ron/admin.`;
+    if (!data || data.length === 0) return `You don't have an active email thread to reply to. Use draft_outbound_email to start a new one.`;
+    if (data.length > 1) {
+      const list = data.map(t => `• ${t.subject} → ${(t.to_addresses || []).join(', ')} (id: ${t.id})`).join('\n');
+      return `You have ${data.length} active threads. Ask which one and call draft_reply_email again with thread_id:\n${list}`;
+    }
+    thread = data[0];
+  }
+
+  pendingDrafts[setterSlackId] = {
+    kind: 'email_reply',
+    thread,
+    body,
+    createdAt: Date.now(),
+  };
+  return `SETTER_REVIEW_NEEDED|reply|${setterSlackId}`;
+}
+
+// Stage 1 → Stage 2 promotion. Called from checkApproval when the setter says
+// "looks good". Stages the draft into pendingApprovals[RON_SLACK_ID] and DMs
+// Ron with the preview.
+async function promoteDraftToRon(setterSlackId, say) {
+  const draft = pendingDrafts[setterSlackId];
+  if (!draft) return false;
+
+  const setter = getMemberContext(setterSlackId);
+  let to, cc, subject, body, threadMeta;
+  if (draft.kind === 'email_outbound') {
+    ({ to, cc, subject, body } = draft);
+    threadMeta = null;
+  } else {
+    const t = draft.thread;
+    to = (t.to_addresses || []).join(', ');
+    cc = (t.cc_addresses || []).join(', ');
+    subject = t.subject.toLowerCase().startsWith('re:') ? t.subject : `Re: ${t.subject}`;
+    body = draft.body;
+    threadMeta = {
+      gmailThreadId: t.gmail_thread_id,
+      inReplyTo: t.last_rfc822_message_id,
+      references: ([...(t.rfc822_message_id_chain || []), t.last_rfc822_message_id]).filter(Boolean).join(' '),
+      threadRowId: t.id,
+    };
+  }
+
+  pendingApprovals[RON_SLACK_ID] = {
+    kind: 'email',
+    requestedBy: setterSlackId,
+    email: { to, cc, subject, body, threadMeta },
+    createdAt: Date.now(),
+  };
+  delete pendingDrafts[setterSlackId];
+
+  // DM the setter — handoff confirmation.
+  await say(`Got it — sending to Ron for final approval. I'll DM you when it goes out (or if Ron pushes back).`);
+
+  // DM Ron — preview with setter attribution.
+  const ccLine = cc ? `\nCc: ${cc}` : '';
+  const tR = `📧 Email approval requested by *${setter.displayName}*\n\nTo: ${to}${ccLine}\nSubject: ${subject}\n\n${body}\n\nReply *yes* to send (from ronny.duarte@neurogrowth.io with your signature) or *no* to cancel.`;
+  try {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: tR });
+  } catch (err) {
+    console.error('Ron approval DM failed:', err.message);
+    await say(`⚠️ Couldn't reach Ron's DM (${err.message}). Contact Ron/admin to investigate.`);
+  }
+  return true;
+}
+
+// Build the actual email + persist to email_threads. Called from checkApproval
+// when Ron says "yes" to a kind=email pending approval.
+async function executeEmailSend(pending, say) {
+  const { to, cc, subject, body, threadMeta } = pending.email;
+  const setterId = pending.requestedBy;
+  const setter = getMemberContext(setterId);
+
+  try {
+    const opts = {};
+    if (cc) opts.cc = cc;
+    if (threadMeta) {
+      opts.threadId = threadMeta.gmailThreadId;
+      opts.inReplyTo = threadMeta.inReplyTo;
+      opts.references = threadMeta.references;
+    }
+    const sendRes = await sendEmail(to, subject, body, opts);
+
+    // Persist or update email_threads row.
+    if (threadMeta) {
+      // Reply: update existing row.
+      const newChain = [
+        ...(threadMeta.references ? threadMeta.references.split(/\s+/).filter(Boolean) : []),
+      ];
+      // Append the prior last id if not already in chain.
+      if (threadMeta.inReplyTo && !newChain.includes(threadMeta.inReplyTo)) newChain.push(threadMeta.inReplyTo);
+      await supabase.from('email_threads').update({
+        last_our_message_id: sendRes.gmailMessageId,
+        last_rfc822_message_id: sendRes.rfc822MessageId,
+        rfc822_message_id_chain: newChain,
+        last_message_at: new Date().toISOString(),
+      }).eq('id', threadMeta.threadRowId);
+    } else {
+      await supabase.from('email_threads').insert({
+        gmail_thread_id: sendRes.gmailThreadId,
+        last_our_message_id: sendRes.gmailMessageId,
+        last_rfc822_message_id: sendRes.rfc822MessageId,
+        rfc822_message_id_chain: [],
+        to_addresses: to.split(',').map(s => s.trim()).filter(Boolean),
+        cc_addresses: cc ? cc.split(',').map(s => s.trim()).filter(Boolean) : [],
+        subject,
+        initiated_by_slack_id: setterId,
+        last_message_at: new Date().toISOString(),
+        active: true,
+      });
+    }
+
+    // DM setter — success.
+    await slack.client.chat.postMessage({
+      channel: setterId,
+      text: `✅ Email sent to ${to} — subject: "${subject}". I'll DM you here when they reply.`,
+    });
+    // Confirmation back to Ron.
+    await say(`✅ Sent on behalf of ${setter.displayName} to ${to}.`);
+  } catch (err) {
+    console.error('executeEmailSend failed:', err);
+    const short = (err.response?.data?.error?.message || err.message || 'unknown error').slice(0, 200);
+    try {
+      await slack.client.chat.postMessage({
+        channel: setterId,
+        text: `❌ Send failed: ${short}. Please contact Ron/admin to investigate.`,
+      });
+    } catch {}
+    await say(`🔴 Email send failed for ${setter.displayName} → ${to}. Error: ${short}`);
+  }
+}
+
+const SETTER_APPROVE_PHRASES = /^(looks good|send it|approved|go ahead|👍|ok|okay|yes|yep|yup|se ve bien|envíalo|enviarlo|envialo|aprobado|listo|dale|sí|si)\b/i;
+const SETTER_CANCEL_PHRASES  = /^(cancel|cancelar|cancela|never mind|nevermind|olvídalo|olvidalo|stop|abort|no)\b/i;
+
 async function checkApproval(message, say, userId) {
+  const text = (typeof message === 'string' ? message : message.text || '').trim();
+  const lower = text.toLowerCase();
+
+  // ── Stage 1: setter has a pending email draft ───────────────────────────────
+  if (pendingDrafts[userId]) {
+    if (SETTER_APPROVE_PHRASES.test(lower)) {
+      await promoteDraftToRon(userId, say);
+      return true;
+    }
+    if (SETTER_CANCEL_PHRASES.test(lower)) {
+      delete pendingDrafts[userId];
+      await say('❌ Cancelled. Nothing was sent.');
+      return true;
+    }
+    // Anything else → fall through; let Claude treat it as edit instructions
+    // (the next turn will see a fresh prompt and the setter can clarify).
+  }
+
   const pending = pendingApprovals[userId];
   if (!pending) return false;
   const approvalCid = newCorrelationId();
-  const text = (typeof message === 'string' ? message : message.text || '').toLowerCase().trim();
-  if (['yes','send it','approved','go ahead','👍'].includes(text)) {
+
+  // ── Stage 2 (email): Ron approves an email send ─────────────────────────────
+  if (pending.kind === 'email') {
+    if (['yes','send it','approved','go ahead','👍'].includes(lower)) {
+      await executeEmailSend(pending, say);
+      delete pendingApprovals[userId];
+      return true;
+    }
+    if (['no','cancel','stop'].includes(lower)) {
+      const setterId = pending.requestedBy;
+      try {
+        await slack.client.chat.postMessage({
+          channel: setterId,
+          text: `❌ Ron didn't approve the draft for ${pending.email?.to}. Contact Ron/admin if you need to discuss.`,
+        });
+      } catch {}
+      await say('Cancelled. Email not sent.');
+      delete pendingApprovals[userId];
+      return true;
+    }
+    return false;
+  }
+
+  // ── Stage 2 (legacy channel post) ───────────────────────────────────────────
+  if (['yes','send it','approved','go ahead','👍'].includes(lower)) {
     await executeChannelPost(pending.channelName, pending.message, say, approvalCid);
     // Notify originator if the approver was Ron acting on someone else's draft
     if (pending.requestedBy && pending.requestedBy !== userId) {
@@ -3693,7 +4244,7 @@ async function checkApproval(message, say, userId) {
     delete pendingApprovals[userId];
     return true;
   }
-  if (['no','cancel','stop'].includes(text)) {
+  if (['no','cancel','stop'].includes(lower)) {
     const cancelT = 'Cancelled. Nothing was posted.';
     await say(cancelT);
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: cancelT.slice(0, 2000) }, correlation_id: approvalCid });
@@ -3717,6 +4268,7 @@ async function checkApproval(message, say, userId) {
 //   APPROVAL_NEEDED|<channelName>|<escalate '0'|'1'>|<originUserId>|<reason>|<message...>
 // message is everything after the 5th pipe so it may itself contain pipes.
 function handleDraftReply(reply, userId, say, correlationId) {
+  if (reply.startsWith('SETTER_REVIEW_NEEDED|')) return handleSetterReview(reply, userId, say);
   if (!reply.startsWith('APPROVAL_NEEDED|')) return false;
   const parts = reply.split('|');
   const channelName = parts[1];
@@ -3762,6 +4314,56 @@ function handleDraftReply(reply, userId, say, correlationId) {
     say(tA);
     if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: tA.slice(0, 2000) }, correlation_id: correlationId });
   }
+  return true;
+}
+
+// ─── EMAIL PROXY: active-thread hint for the DM handler ──────────────────────
+// Returns a short system-style note for the user message if the setter has
+// active email threads, so Claude knows when to call draft_reply_email.
+async function getActiveThreadHint(setterSlackId) {
+  if (!EMAIL_PROXY_LIVE) return '';
+  try {
+    const { data, error } = await supabase
+      .from('email_threads')
+      .select('id, subject, to_addresses, last_message_at')
+      .eq('initiated_by_slack_id', setterSlackId)
+      .eq('active', true)
+      .order('last_message_at', { ascending: false })
+      .limit(5);
+    if (error || !data || data.length === 0) return '';
+    if (data.length === 1) {
+      const t = data[0];
+      return `\n\n[CONTEXT: This user has 1 active email thread: subject "${t.subject}" with ${(t.to_addresses || []).join(', ')}. If their message reads like a reply intended for that client, call draft_reply_email. If it is meta (cancel, never mind, a question about something else), respond conversationally.]`;
+    }
+    const list = data.map(t => `  • id=${t.id} — "${t.subject}" with ${(t.to_addresses || []).join(', ')}`).join('\n');
+    return `\n\n[CONTEXT: This user has ${data.length} active email threads:\n${list}\nIf they want to reply to one, ask which thread first, then call draft_reply_email with thread_id.]`;
+  } catch (err) {
+    console.error('getActiveThreadHint error:', err.message);
+    return '';
+  }
+}
+
+// ─── EMAIL PROXY: setter-review sentinel handler ──────────────────────────────
+// Sentinel format: SETTER_REVIEW_NEEDED|<outbound|reply>|<setterSlackId>
+// Reads the staged draft from pendingDrafts and posts a preview to the setter.
+function handleSetterReview(reply, userId, say) {
+  if (!reply.startsWith('SETTER_REVIEW_NEEDED|')) return false;
+  const draft = pendingDrafts[userId];
+  if (!draft) {
+    say("Draft expired. Please start over.").catch(() => {});
+    return true;
+  }
+
+  let preview;
+  if (draft.kind === 'email_outbound') {
+    const ccLine = draft.cc ? `\nCc: ${draft.cc}` : '';
+    preview = `📝 Draft email — review before I send to Ron for approval:\n\nTo: ${draft.to}${ccLine}\nSubject: ${draft.subject}\n\n${draft.body}\n\nReply *looks good* (or *se ve bien*) to send for Ron's approval, *cancel* to drop, or tell me what to change.`;
+  } else {
+    const t = draft.thread;
+    const subj = t.subject.toLowerCase().startsWith('re:') ? t.subject : `Re: ${t.subject}`;
+    preview = `📝 Draft reply on "${t.subject}" — review before I send to Ron for approval:\n\nTo: ${(t.to_addresses || []).join(', ')}\nSubject: ${subj}\n\n${draft.body}\n\nReply *looks good* (or *se ve bien*) to send for Ron's approval, *cancel* to drop, or tell me what to change.`;
+  }
+  say(preview).catch(err => console.error('setter-review preview DM failed:', err.message));
   return true;
 }
 
@@ -3855,7 +4457,7 @@ slack.message(async ({ message, say }) => {
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
-  if (!PILOT_USERS.has(userId)) { await say("Max isn't enabled for you yet — Ron is rolling this out in phases. Ping him if you need access."); return; }
+  if (!isRosterMember(userId)) { await say("You're not on Max's roster yet — ping Ron and he'll add you."); return; }
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, false); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
@@ -3873,7 +4475,8 @@ slack.message(async ({ message, say }) => {
     correlation_id,
   });
   const history = await loadHistory(userId);
-  history.push({ role: 'user', content: message.text });
+  const threadHint = await getActiveThreadHint(userId);
+  history.push({ role: 'user', content: (message.text || '') + threadHint });
   try {
     let reply = await callClaude(history, 3, userId, correlation_id);
     if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
@@ -3892,7 +4495,7 @@ slack.event('app_mention', async ({ event, say }) => {
   const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!cleanText) return;
   const userId = event.user;
-  if (!PILOT_USERS.has(userId)) { await say({ text: "Max isn't enabled for you yet — Ron is rolling this out in phases.", thread_ts: event.thread_ts || event.ts }); return; }
+  if (!isRosterMember(userId)) { await say({ text: "You're not on Max's roster yet — ping Ron and he'll add you.", thread_ts: event.thread_ts || event.ts }); return; }
 
   // If this mention is inside a thread, fetch the full thread context first
   let threadContext = '';
@@ -4000,7 +4603,7 @@ slack.message(async ({ message, say }) => {
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
-  if (!PILOT_USERS.has(userId)) { await say({ text: "Max isn't enabled for you yet — Ron is rolling this out in phases.", thread_ts: message.thread_ts || message.ts }); return; }
+  if (!isRosterMember(userId)) { await say({ text: "You're not on Max's roster yet — ping Ron and he'll add you.", thread_ts: message.thread_ts || message.ts }); return; }
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, true); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say({ text: 'Slow down a bit — too many messages at once. Give me a moment.', thread_ts: message.thread_ts || message.ts }); return; }
@@ -4824,6 +5427,12 @@ cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (
 
 // Setter leaderboard — Wed + Sat 6 PM CR. Posts MTD per-setter performance to #ng-sales-goats.
 cron.schedule('0 18 * * 3,6', wrapCronJob('runSetterLeaderboard', async (c) => { await runSetterLeaderboard(c); }), { timezone: 'America/Costa_Rica' });
+
+// Email proxy reply poller — top of every hour, 8am–8pm CR Mon–Fri.
+// Polls Gmail for new replies on active email_threads rows and DMs the setter.
+if (EMAIL_PROXY_LIVE) {
+  cron.schedule('0 8-20 * * 1-5', wrapCronJob('runEmailReplyPoller', async (c) => { await runEmailReplyPoller(c); }), { timezone: 'America/Costa_Rica' });
+}
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
 const GHL_USER_NAMES = {
