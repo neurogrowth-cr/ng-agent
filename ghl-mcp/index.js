@@ -340,6 +340,28 @@ server.tool(
   }
 );
 
+// ─── TOOL: Send Conversation Message ──────────────────────────────────────────
+
+server.tool(
+  "send_conversation_message",
+  "Send an outbound WhatsApp or SMS message to a GHL contact. Used by recoverable-leads campaigns and (future) auto-followups for stalled prospects. Returns the GHL messageId and conversationId.",
+  {
+    contact_id: z.string().describe("The GHL contact ID to send to"),
+    message: z.string().describe("The message text to send (single sentence preferred, no markdown)"),
+    type: z.enum(["WhatsApp", "SMS"]).default("WhatsApp").describe("Channel — defaults to WhatsApp"),
+  },
+  async ({ contact_id, message, type }) => {
+    const data = await ghlRequest("POST", "/conversations/messages", {}, {
+      type,
+      contactId: contact_id,
+      message,
+    });
+    return {
+      content: [{ type: "text", text: `Message sent.\n${JSON.stringify({ messageId: data.messageId, conversationId: data.conversationId, status: data.status }, null, 2)}` }],
+    };
+  }
+);
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();

@@ -4519,6 +4519,51 @@ slack.message(async ({ message, say }) => {
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, false); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
+
+  // ── Campaign DM commands (deterministic, Ron-only — no LLM needed) ─────────
+  if (userId === RON_SLACK_ID && typeof message.text === 'string') {
+    const campaignMatch = message.text.match(/^campaign\s*:?\s*(.+)$/i);
+    if (campaignMatch) {
+      const raw = campaignMatch[1].trim();
+      const contactIds = raw.split(/[,\s\n]+/).map(s => s.trim()).filter(s => /^[a-zA-Z0-9]{15,30}$/.test(s));
+      if (contactIds.length === 0) {
+        await say('No valid GHL contact IDs found. Format: `campaign: <id1>, <id2>, ...`');
+        return;
+      }
+      if (contactIds.length > 50) {
+        await say(`Capped at 50 contacts per campaign. You sent ${contactIds.length}. Run again with a smaller batch.`);
+        return;
+      }
+      const camCid = newCorrelationId();
+      await say(`Generating drafts for ${contactIds.length} contacts. Posting one DM per draft — react ✅ to send, ❌ to skip.`);
+      runRecoverableLeadsCampaign(contactIds, userId, camCid).catch(err => {
+        console.error('runRecoverableLeadsCampaign failed:', err);
+        slack.client.chat.postMessage({ channel: userId, text: `Campaign run errored: ${err.message}` }).catch(() => {});
+      });
+      return;
+    }
+
+    const reviseMatch = message.text.match(/^revise\s+([a-zA-Z0-9]{15,30})\s*:\s*(.+)$/is);
+    if (reviseMatch) {
+      const [, contactId, newText] = reviseMatch;
+      const trimmed = newText.trim();
+      if (trimmed.length < 5) { await say('Revised message is too short. Send `revise <contact_id>: <new text>` with at least 5 chars.'); return; }
+      if (trimmed.length > 500) { await say('Revised message is too long (max 500 chars).'); return; }
+      const revCid = newCorrelationId();
+      const result = await sendCampaignMessage({
+        contactId, contactName: null, draftText: trimmed,
+        approverSlackId: userId, correlationId: revCid, isRevised: true,
+      });
+      if (result.ok) {
+        await say(`✉️ Sent revised message to contact \`${contactId}\`. Message ID: \`${result.messageId}\``);
+      } else {
+        await say(`❌ Send failed for \`${contactId}\`: ${result.error}`);
+      }
+      return;
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
+
   const correlation_id = newCorrelationId();
   const dmCtx = getMemberContext(userId);
   logActivity({
@@ -5996,6 +6041,199 @@ async function runStalledProspectFollowups(correlationId) {
   console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}`);
 }
 
+// ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─
+// Ron DMs Max `campaign: <contact_id_1>, <contact_id_2>, ...` → Max generates
+// re-engagement WhatsApp drafts → posts each as a separate DM with metadata →
+// Ron reacts ✅ to send (or ❌ to skip). The reaction_added handler reads the
+// `campaign_draft` metadata and calls the GHL send_conversation_message endpoint.
+// No daily auto-send, no business-hours gate, no cooldown — Ron eyeballs every draft.
+
+const NG_OFFER_BRIEF = `NeuroGrowth runs B2B LinkedIn organic-growth campaigns for founders. Next step is a 30-min strategy call with the closer team to scope fit.`;
+
+async function generateCampaignDraft(contact, messages, setterFirstName) {
+  const tail = messages.slice(-8).map(m => {
+    const dir = m.direction === 'inbound' ? 'Prospect' : 'Setter';
+    const body = String(m.body || m.message || '').replace(/\s+/g, ' ').slice(0, 200);
+    return `${dir}: ${body}`;
+  }).join('\n');
+
+  const lastInbound = [...messages].reverse().find(m => m.direction === 'inbound');
+  const lastInboundBody = lastInbound ? String(lastInbound.body || lastInbound.message || '').slice(0, 240) : '(none)';
+  const ageDays = lastInbound?.dateAdded ? Math.floor((Date.now() - new Date(lastInbound.dateAdded).getTime()) / (24 * 60 * 60 * 1000)) : '?';
+
+  const prompt = `You are writing a single-sentence WhatsApp re-engagement message for a NeuroGrowth prospect who went silent ${ageDays} days ago. Match the conversation's language (Spanish or English).
+
+Conversation tail (oldest first):
+${tail || '(no message history available)'}
+
+Last message from prospect: "${lastInboundBody}"
+Prospect name: ${contact.firstName || contact.name || 'there'}
+Setter on the thread: ${setterFirstName || 'the team'}
+Offer brief: ${NG_OFFER_BRIEF}
+
+Write ONE message:
+- Match the conversation language exactly
+- Reference the LAST thing the prospect said
+- One sentence, ≤25 words, end with a question
+- No emoji, no markdown, no quotes
+- Sound like a setter picking up the thread (not a bot, not a marketer)
+- Don't apologize, don't beg, don't offer a discount
+
+Output ONLY the message text. No preamble, no explanation.`;
+
+  const t = Date.now();
+  const corr = newCorrelationId();
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  logLlmFromAnthropicResponse(res, Date.now() - t, corr);
+  const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  return text.replace(/^["']+|["']+$/g, '');
+}
+
+async function runRecoverableLeadsCampaign(contactIds, ronSlackId, correlationId) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  console.log(`runRecoverableLeadsCampaign starting — ${contactIds.length} contacts, requested by ${ronSlackId}`);
+
+  const summary = { drafted: 0, posted: 0, fetch_failed: 0, draft_failed: 0 };
+
+  for (const contactId of contactIds) {
+    let contact, messages;
+    try {
+      contact = await ghlGetContact(contactId);
+      if (!contact) throw new Error('contact not found');
+      // Find conversation by contact_id (contact object doesn't always carry conversation reference)
+      const convRes = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&contactId=${contactId}`, {
+        headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+      });
+      const convData = convRes.ok ? await convRes.json() : { conversations: [] };
+      const convo = (convData.conversations || [])[0];
+      messages = convo?.id ? await ghlGetConversationMessages(convo.id) : [];
+    } catch (err) {
+      console.error(`campaign fetch failed for ${contactId}: ${err.message}`);
+      summary.fetch_failed += 1;
+      continue;
+    }
+
+    let draftText;
+    try {
+      const setterGhlId = (contact.assignedTo || '').toString();
+      const setterName = GHL_USER_NAMES[setterGhlId] || GHL_USER_NAMES[setterGhlId.toLowerCase()] || 'the team';
+      const setterFirstName = setterName.split(' ')[0];
+      draftText = await generateCampaignDraft(contact, messages || [], setterFirstName);
+      if (!draftText) throw new Error('empty draft from LLM');
+      summary.drafted += 1;
+    } catch (err) {
+      console.error(`campaign draft failed for ${contactId}: ${err.message}`);
+      summary.draft_failed += 1;
+      continue;
+    }
+
+    const lastInbound = [...(messages || [])].reverse().find(m => m.direction === 'inbound');
+    const lastBody = lastInbound ? String(lastInbound.body || lastInbound.message || '').slice(0, 200) : '(no inbound)';
+    const ageDays = lastInbound?.dateAdded ? Math.floor((Date.now() - new Date(lastInbound.dateAdded).getTime()) / (24 * 60 * 60 * 1000)) : '?';
+    const fullName = `${contact.firstName || ''} ${contact.lastName || ''}`.trim() || contact.name || 'Unknown';
+    const ghlLink = `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}`;
+
+    const postText = [
+      `📤 *${fullName}* — ${ageDays}d stale | WhatsApp`,
+      `_Last (prospect):_ "${lastBody}"`,
+      ``,
+      `*Draft:*`,
+      `> ${draftText}`,
+      ``,
+      `✅ to send · ❌ to skip · ✏️ revise (DM: \`revise ${contactId}: <new text>\`)`,
+      `🔗 ${ghlLink}`,
+    ].join('\n');
+
+    try {
+      await slack.client.chat.postMessage({
+        channel: ronSlackId,
+        text: postText,
+        metadata: {
+          event_type: 'campaign_draft',
+          event_payload: {
+            contact_id: contactId,
+            contact_name: fullName,
+            draft_text: draftText,
+            correlation_id: correlationId,
+          },
+        },
+      });
+      summary.posted += 1;
+      logActivity({ event_type: 'campaign_draft_posted', event_source: 'slack', action: 'outbound', user_id: ronSlackId, output: { contact_id: contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
+    } catch (err) {
+      console.error(`campaign post failed for ${contactId}: ${err.message}`);
+    }
+  }
+
+  const summaryText = [
+    `🧾 *Campaign drafts ready — ${summary.posted}/${contactIds.length} posted*`,
+    `Drafted: ${summary.drafted} | Posted: ${summary.posted}`,
+    summary.fetch_failed > 0 ? `Fetch failed: ${summary.fetch_failed}` : null,
+    summary.draft_failed > 0 ? `Draft failed: ${summary.draft_failed}` : null,
+    ``,
+    `React ✅ on each draft to approve and send · ❌ to skip · DM \`revise <contact_id>: <new text>\` to override`,
+  ].filter(Boolean).join('\n');
+  await slack.client.chat.postMessage({ channel: ronSlackId, text: summaryText });
+  console.log(`runRecoverableLeadsCampaign done — ${JSON.stringify(summary)}`);
+}
+
+// Direct send helper used by the reaction handler + revise DM. Calls GHL POST /conversations/messages.
+async function sendCampaignMessage({ contactId, contactName, draftText, approverSlackId, correlationId, isRevised }) {
+  let claimRow;
+  try {
+    const { data: inserted } = await supabase.from('campaign_sends').insert({
+      contact_id: contactId,
+      contact_name: contactName,
+      channel: 'WhatsApp',
+      draft_text: draftText,
+      approved_by_slack_id: approverSlackId,
+      status: 'pending',
+      correlation_id: correlationId,
+    }).select('id').single();
+    claimRow = inserted;
+  } catch (err) {
+    console.error('campaign_sends insert failed:', err.message);
+  }
+
+  try {
+    const res = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ type: 'WhatsApp', contactId, message: draftText }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`GHL ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+    const data = await res.json();
+
+    if (claimRow?.id) {
+      await supabase.from('campaign_sends').update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        sent_text: draftText,
+        ghl_message_id: data.messageId,
+        conversation_id: data.conversationId,
+      }).eq('id', claimRow.id);
+    }
+
+    return { ok: true, messageId: data.messageId, conversationId: data.conversationId };
+  } catch (err) {
+    if (claimRow?.id) {
+      await supabase.from('campaign_sends').update({ status: 'failed', error_message: err.message }).eq('id', claimRow.id);
+    }
+    return { ok: false, error: err.message };
+  }
+}
+
 // ─── SETTER LEADERBOARD (Wed + Sat 6 PM CR — MTD post to #ng-sales-goats) ────
 // Pulls MTD setter performance from portal Supabase (revops_setter_eod_daily) +
 // leads-claimed from primary Supabase (setter_claims). Posts a ranked leaderboard
@@ -6280,14 +6518,80 @@ healthServer.listen(process.env.PORT || 3000, () => {
 // ─── REACTION-DRIVEN LEAD CLAIM ───────────────────────────────────────────────
 // Setter reacts on a #ng-sales-goats lead post → Max writes assignedTo in GHL,
 // posts a ✅ + threaded confirmation. First reactor wins; idempotent on race.
+const CAMPAIGN_APPROVE_EMOJIS = new Set(['white_check_mark', 'heavy_check_mark', 'check', 'ballot_box_with_check']);
+const CAMPAIGN_SKIP_EMOJIS    = new Set(['x', 'no_entry', 'no_entry_sign', 'negative_squared_cross_mark']);
+
 slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
-    if (event.item.channel !== LEAD_CHANNEL_ID) return;
+    if (event.user === process.env.SLACK_BOT_USER_ID) return;
+
     // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
     const baseEmoji = String(event.reaction || '').split('::')[0];
+
+    // Route 1: campaign-draft DM (Ron approves/skips a generated re-engagement message)
+    const isCampaignChannel = event.item.channel && event.item.channel.startsWith('D');
+    const isCampaignEmoji   = CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji);
+    if (isCampaignChannel && isCampaignEmoji && event.user === RON_SLACK_ID) {
+      try {
+        const dmHistory = await slack.client.conversations.history({
+          channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
+        });
+        const dmMsg = dmHistory.messages && dmHistory.messages[0];
+        const dmMeta = dmMsg?.metadata?.event_type === 'campaign_draft' ? dmMsg.metadata.event_payload : null;
+        if (dmMeta) {
+          // Already actioned? Look for an existing Max-applied ✅ or ❌ on this message
+          const existing = (dmMsg.reactions || []).find(r => (CAMPAIGN_APPROVE_EMOJIS.has(r.name) || CAMPAIGN_SKIP_EMOJIS.has(r.name)) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+          if (existing) {
+            console.log(`campaign-draft ${dmMeta.contact_id} already actioned, ignoring`);
+            return;
+          }
+
+          if (CAMPAIGN_SKIP_EMOJIS.has(baseEmoji)) {
+            // Skip — log only
+            try {
+              await supabase.from('campaign_sends').insert({
+                contact_id: dmMeta.contact_id,
+                contact_name: dmMeta.contact_name,
+                channel: 'WhatsApp',
+                draft_text: dmMeta.draft_text,
+                approved_by_slack_id: event.user,
+                status: 'skipped',
+                correlation_id: dmMeta.correlation_id,
+              });
+            } catch (err) { console.error('campaign skip insert failed:', err.message); }
+            await slack.client.reactions.add({ channel: event.item.channel, timestamp: event.item.ts, name: 'no_entry' }).catch(() => {});
+            await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `Skipped — no message sent.` });
+            return;
+          }
+
+          // Approve → send
+          const result = await sendCampaignMessage({
+            contactId: dmMeta.contact_id,
+            contactName: dmMeta.contact_name,
+            draftText: dmMeta.draft_text,
+            approverSlackId: event.user,
+            correlationId: dmMeta.correlation_id,
+          });
+          if (result.ok) {
+            await slack.client.reactions.add({ channel: event.item.channel, timestamp: event.item.ts, name: 'white_check_mark' }).catch(() => {});
+            await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `✉️ Sent via GHL. Message ID: \`${result.messageId}\`` });
+          } else {
+            await slack.client.reactions.add({ channel: event.item.channel, timestamp: event.item.ts, name: 'warning' }).catch(() => {});
+            await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `❌ Send failed: ${result.error}` });
+          }
+          return;
+        }
+      } catch (err) {
+        console.error('campaign-draft reaction handler error:', err.message);
+        // Fall through — could still be a non-campaign DM reaction we don't care about
+      }
+      return; // DM reaction was campaign-shaped but no metadata → ignore
+    }
+
+    // Route 2: lead-claim in #ng-sales-goats (existing flow)
+    if (event.item.channel !== LEAD_CHANNEL_ID) return;
     if (!LEAD_CLAIM_EMOJIS.has(baseEmoji)) return;
-    if (event.user === process.env.SLACK_BOT_USER_ID) return;
 
     const channel   = event.item.channel;
     const timestamp = event.item.ts;
