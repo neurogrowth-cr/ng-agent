@@ -2478,14 +2478,21 @@ async function getSalesIntelligence(query) {
 
       if (todayCalls.length) {
         lines.push(`Scheduled calls today (${todayCalls.length}):`);
-        todayCalls.forEach(a => {
+        for (const a of todayCalls) {
           const name    = a.prospect?.full_name || 'Unknown prospect';
           const closer  = resolveSalesMember(a.closer_id);
           const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
           const outcome = outcomeMap[a.id];
           const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
-          lines.push(`  ${name} — ${time} CR — closer: ${closer} — ${status}`);
-        });
+          let setterLabel = 'VSL self-booking';
+          try {
+            const info = await resolveSetterForContact(a.prospect?.email, a.prospect?.full_name);
+            if (info.source === 'appointment-setting') {
+              setterLabel = info.setter || 'appointment-setting pipeline (setter unmapped)';
+            }
+          } catch (_) {}
+          lines.push(`  ${name} — ${time} CR — closer: ${closer} — setter: ${setterLabel} — ${status}`);
+        }
       }
 
       if (todayCloserRows.length) {
@@ -4489,6 +4496,72 @@ slack.message(async ({ message, say }) => {
   } catch (err) { console.error('Claude API error (DM):', err); await say('Got turned around for a second — go ahead and ask again.'); }
 });
 
+// iClosed booking relay — when iClosed posts a "Strategy call booked" notification
+// for an Appointment Setting Pipeline call, post a threaded reply revealing the
+// setter (and broadcast it back to the channel via reply_broadcast: true).
+// VSL self-bookings and other event types are ignored.
+slack.event('message', async ({ event }) => {
+  try {
+    if (!event || event.subtype && event.subtype !== 'bot_message') return;
+    if (event.thread_ts) return; // only react to top-level posts
+    if (event.channel !== LEAD_CHANNEL_ID) return;
+
+    const isFromBot = !!(event.bot_id || event.app_id || (event.subtype === 'bot_message'));
+    if (!isFromBot) return;
+
+    // Bolt sometimes hides the rendered text inside attachments/blocks
+    const flatText = [
+      event.text || '',
+      ...(event.attachments || []).flatMap(a => [a.text || '', a.pretext || '', a.fallback || '', ...(a.fields || []).map(f => `${f.title || ''} ${f.value || ''}`)]),
+      ...(event.blocks || []).flatMap(b => (b.elements || []).flatMap(el => (el.elements || []).map(e => e.text || '')))
+    ].join('\n');
+
+    if (!/Strategy call booked/i.test(flatText)) return;
+    if (!/Event:\s*LinkedIn Flywheel\s*-\s*Appointment/i.test(flatText)) return;
+
+    // Dedup
+    const dedupKey = `iclosed-setter-reveal-${event.ts}`;
+    const { data: prior } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
+    if (prior && prior.length) return;
+
+    // Extract prospect email — first email that isn't a known closer/setter email.
+    const emails = (flatText.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || []);
+    const prospectEmail = emails.find(e => !SALES_TEAM_MAP[e] && !SALES_TEAM_MAP[e.toLowerCase()]) || null;
+
+    // Best-effort prospect name — first line, or text before "(email)"
+    let prospectName = '';
+    const nameMatch = flatText.match(/^([^\n<]+?)\s*[<(]/);
+    if (nameMatch) prospectName = nameMatch[1].trim();
+
+    if (!prospectEmail && !prospectName) {
+      console.log(`iClosed relay: could not extract prospect identity from ts=${event.ts} — skipping.`);
+      return;
+    }
+
+    const setterInfo = await resolveSetterForContact(prospectEmail, prospectName);
+    let replyText;
+    if (setterInfo.source === 'appointment-setting' && setterInfo.setter) {
+      replyText = `👤 Setter: ${setterInfo.setter}`;
+    } else if (setterInfo.source === 'appointment-setting') {
+      replyText = `👤 Setter: appointment-setting pipeline (setter unmapped — check GHL).`;
+    } else {
+      replyText = `👤 Setter: not found in Appointment Setting Pipeline (check GHL).`;
+    }
+
+    await slack.client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.ts,
+      reply_broadcast: true,
+      text: replyText,
+    });
+
+    await upsertKnowledge('intel', dedupKey, `Setter reveal posted for iClosed booking ${prospectEmail || prospectName}: ${replyText}`, 'iclosed-relay');
+    console.log(`iClosed relay: posted setter reveal for ${prospectEmail || prospectName} → ${replyText}`);
+  } catch (err) {
+    console.error('iClosed relay error:', err.message);
+  }
+});
+
 // @mention handler
 slack.event('app_mention', async ({ event, say }) => {
   if (event.bot_id) return;
@@ -4681,6 +4754,43 @@ async function searchGHLContact(email, name) {
   return data.contacts?.[0] || null;
 }
 
+// Determine whether a booked call came from the Appointment Setting Pipeline
+// (setter-booked) or VSL self-booking. Truth source = GHL opportunity in the
+// setter pipeline, NOT contact.assignedTo (which is unreliable).
+// Returns { source: 'appointment-setting'|'vsl', setter: string|null }.
+async function resolveSetterForContact(email, name) {
+  try {
+    const contact = await searchGHLContact(email, name);
+    if (!contact) return { source: 'vsl', setter: null };
+
+    const locationId = process.env.GHL_LOCATION_ID;
+    const apiKey     = process.env.GHL_API_KEY;
+    const headers    = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+    const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4')
+      .split(',').map(s => s.trim()).filter(Boolean);
+
+    const oppsRes  = await fetch(
+      `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}&contact_id=${contact.id}`,
+      { headers }
+    );
+    const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
+    const opps = (oppsData.opportunities || []).filter(o => setterPipelineIds.includes(o.pipelineId));
+    if (!opps.length) return { source: 'vsl', setter: null };
+
+    // Most recent opp wins
+    opps.sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+    const opp = opps[0];
+    const assigneeId = opp.assignedTo || contact.assignedTo || null;
+    const resolved = assigneeId ? resolveSalesMember(assigneeId) : null;
+    // resolveSalesMember returns the raw id when unmapped — treat that as unresolved
+    const setter = (resolved && resolved !== assigneeId) ? resolved : null;
+    return { source: 'appointment-setting', setter };
+  } catch (err) {
+    console.error('resolveSetterForContact error:', err.message);
+    return { source: 'vsl', setter: null };
+  }
+}
+
 async function runSalesCallPrep(_correlationId) {
   console.log('Running sales call prep...');
   try {
@@ -4726,15 +4836,20 @@ async function runSalesCallPrep(_correlationId) {
 
       // GHL conversation lookup + setter resolution
       let convoSection = 'GHL conversation not found for this prospect.';
-      let setterName   = 'VSL self-booking'; // default — no setter unless GHL says otherwise
+      // Truth source: opportunity in the Appointment Setting Pipeline.
+      const setterInfo = await resolveSetterForContact(email, prospectName);
+      let sourceLine;
+      if (setterInfo.source === 'appointment-setting') {
+        sourceLine = setterInfo.setter
+          ? `👤 Booked by: ${setterInfo.setter}`
+          : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
+      } else {
+        sourceLine = `📲 Source: VSL self-booking (no setter)`;
+      }
+
       try {
         const ghlContact = await searchGHLContact(email, prospectName);
         if (ghlContact) {
-          // Resolve setter from GHL contact.assignedTo (Appointment Setter pipeline only)
-          if (ghlContact.assignedTo) {
-            const resolved = resolveSalesMember(ghlContact.assignedTo);
-            if (resolved !== ghlContact.assignedTo) setterName = resolved; // mapped = real setter name
-          }
           const messages = await fetchGHLConvoForContact(ghlContact.id);
           if (messages && messages.length) {
             const msgLines = messages
@@ -4752,7 +4867,7 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      if (setterName === 'VSL self-booking' && convoSection === 'GHL conversation not found for this prospect.') {
+      if (setterInfo.source === 'vsl' && convoSection === 'GHL conversation not found for this prospect.') {
         convoSection = 'VSL direct booking — prospect self-scheduled via the sales page. No setter contact, no GHL conversation.';
       }
 
@@ -4762,7 +4877,7 @@ async function runSalesCallPrep(_correlationId) {
         company     ? `🏢 Company: ${company}` : '',
         email       ? `📧 Email: ${email}` : '',
         leadSource  ? `🔗 Lead source: ${leadSource}` : '',
-        setterName === 'VSL self-booking' ? `📲 Source: VSL self-booking (no setter)` : `👤 Booked by: ${setterName}`,
+        sourceLine,
         ``,
         `*GHL CONVERSATION HISTORY:*`,
         convoSection,
