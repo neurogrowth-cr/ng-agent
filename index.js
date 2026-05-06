@@ -1481,31 +1481,77 @@ async function getRecentEmails() {
 }
 
 // ─── RON GMAIL SIGNATURE (cached) ─────────────────────────────────────────────
-// Fetched once and cached for process lifetime. Used by the email-proxy flow.
+// Resolution order:
+//   1. RON_SIGNATURE_HTML env var (most reliable — Gmail API often returns
+//      empty for the primary account when signature is set under
+//      Settings > General instead of Settings > Accounts > Send mail as).
+//   2. Gmail API sendAs.get for ronny.duarte@neurogrowth.io.
+//   3. Gmail API sendAs.list — look for any entry with a non-empty signature.
+//   4. Empty (sends will go without signature; warning DM to Ron once).
 let _ronSignatureHtml = null;
+let _ronSignatureWarned = false;
 async function getRonSignature() {
-  if (_ronSignatureHtml !== null) return _ronSignatureHtml;
+  if (_ronSignatureHtml) return _ronSignatureHtml;
+
+  // 1. Env var first — most reliable.
+  const envSig = process.env.RON_SIGNATURE_HTML;
+  if (envSig && envSig.trim()) {
+    _ronSignatureHtml = envSig;
+    return _ronSignatureHtml;
+  }
+
+  // 2 + 3. Gmail API.
   try {
     const auth  = getGoogleAuth();
     const gmail = google.gmail({ version: 'v1', auth });
-    const res = await gmail.users.settings.sendAs.get({
-      userId: 'me',
-      sendAsEmail: 'ronny.duarte@neurogrowth.io',
-    });
-    _ronSignatureHtml = res.data?.signature || '';
-    if (!_ronSignatureHtml) console.log('Ron signature is empty — Gmail returned no signature for ronny.duarte@neurogrowth.io.');
-    return _ronSignatureHtml;
+    let sig = '';
+    try {
+      const res = await gmail.users.settings.sendAs.get({
+        userId: 'me',
+        sendAsEmail: 'ronny.duarte@neurogrowth.io',
+      });
+      sig = res.data?.signature || '';
+    } catch (getErr) {
+      console.error('getRonSignature: sendAs.get failed:', getErr.message);
+    }
+    if (!sig) {
+      try {
+        const list = await gmail.users.settings.sendAs.list({ userId: 'me' });
+        const entries = list.data?.sendAs || [];
+        const withSig = entries.find(e => e.signature && e.signature.trim());
+        if (withSig) sig = withSig.signature;
+      } catch (listErr) {
+        console.error('getRonSignature: sendAs.list failed:', listErr.message);
+      }
+    }
+    _ronSignatureHtml = sig || '';
   } catch (err) {
     console.error('getRonSignature failed:', err.message);
+    _ronSignatureHtml = '';
+  }
+
+  if (!_ronSignatureHtml && !_ronSignatureWarned) {
+    _ronSignatureWarned = true;
+    console.log('Ron signature is empty after env+API fallbacks. Set RON_SIGNATURE_HTML in Railway to fix.');
     try {
       await slack.client.chat.postMessage({
         channel: RON_SLACK_ID,
-        text: `⚠️ Signature fetch failed at boot. Sends will go without signature until fixed. Error: ${err.message}. Re-auth may be needed (gmail.settings.basic scope).`,
+        text: '⚠️ No signature found for outbound emails. Sends will go without signature until fixed. To fix: set Railway env var `RON_SIGNATURE_HTML` to your signature HTML (paste from Gmail Settings → General → Signature, view source). Until then proxy emails will send without a signature.',
       });
     } catch {}
-    _ronSignatureHtml = '';
-    return '';
   }
+  return _ronSignatureHtml;
+}
+
+// ─── RFC 2047 header encoding ────────────────────────────────────────────────
+// Headers (Subject, Cc, From-name, etc.) must be ASCII-only by default.
+// If they contain non-ASCII (accents, em-dash, emoji), wrap as
+// =?UTF-8?B?<base64>?= so receivers know to decode.
+function encodeMimeHeader(s) {
+  if (!s) return '';
+  if (/^[\x00-\x7F]*$/.test(s)) return s;
+  const b64 = Buffer.from(s, 'utf8').toString('base64');
+  return `=?UTF-8?B?${b64}?=`;
 }
 
 // Strip HTML to plain text (signatures may be HTML — we need a plaintext fallback for multipart).
@@ -1542,8 +1588,8 @@ function buildRfc2822Message({ to, cc, subject, body, signatureHtml, inReplyTo, 
     'From: Ron Duarte <ronny.duarte@neurogrowth.io>',
     `To: ${to}`,
   ];
-  if (cc) headers.push(`Cc: ${cc}`);
-  headers.push(`Subject: ${subject}`);
+  if (cc) headers.push(`Cc: ${encodeMimeHeader(cc)}`);
+  headers.push(`Subject: ${encodeMimeHeader(subject)}`);
   headers.push('MIME-Version: 1.0');
   if (inReplyTo)  headers.push(`In-Reply-To: ${inReplyTo}`);
   if (references) headers.push(`References: ${references}`);
@@ -1555,18 +1601,23 @@ function buildRfc2822Message({ to, cc, subject, body, signatureHtml, inReplyTo, 
   const htmlEscaped = escapeHtml(body).replace(/\r?\n/g, '<br>\n');
   const htmlBody = `<div>${htmlEscaped}</div>` + (signatureHtml ? `<br><div>--</div><div>${signatureHtml}</div>` : '');
 
+  // Encode body parts as base64 so UTF-8 multibyte sequences (accents, emoji,
+  // em-dash) survive transport regardless of relay 7bit/8bit handling.
+  const plainB64 = Buffer.from(plainBody, 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
+  const htmlB64  = Buffer.from(htmlBody,  'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
+
   const parts = [
     `--${boundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: 7bit',
+    'Content-Transfer-Encoding: base64',
     '',
-    plainBody,
+    plainB64,
     '',
     `--${boundary}`,
     'Content-Type: text/html; charset="UTF-8"',
-    'Content-Transfer-Encoding: 7bit',
+    'Content-Transfer-Encoding: base64',
     '',
-    htmlBody,
+    htmlB64,
     '',
     `--${boundary}--`,
     '',
