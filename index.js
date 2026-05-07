@@ -371,6 +371,13 @@ const pendingDrafts = {};
 // ─── EMAIL PROXY: feature flag ────────────────────────────────────────────────
 const EMAIL_PROXY_LIVE = String(process.env.EMAIL_PROXY_LIVE || '').toLowerCase() === 'true';
 
+// Setters who have earned Ron-approval bypass — Stage-1 "looks good" sends
+// directly without routing to Ron. Add Slack IDs here as setters prove out.
+// Oscar M (U0B1S1UMH9P) — promoted 2026-05-07 after his first clean send.
+const EMAIL_PROXY_AUTOSEND_SETTERS = new Set([
+  'U0B1S1UMH9P', // Oscar M
+]);
+
 // ─── SLACK CHANNEL LIST CACHE ─────────────────────────────────────────────────
 // conversations.list is rate-limited — cache for 10 minutes instead of calling per-request
 let channelListCache = null;
@@ -4149,13 +4156,37 @@ async function promoteDraftToRon(setterSlackId, say) {
     };
   }
 
+  delete pendingDrafts[setterSlackId];
+
+  // ── Autosend bypass: trusted setters skip Ron's Stage-2 approval ──────────
+  // Setter still gets the success/failure DM directly from executeEmailSend;
+  // Ron gets the audit-trail confirmation (or technical error) via the
+  // say-wrapper below so he has visibility into autosent emails without
+  // having to approve each one.
+  if (EMAIL_PROXY_AUTOSEND_SETTERS.has(setterSlackId)) {
+    await say(`Listo, enviando ahora.`);
+    const syntheticPending = {
+      kind: 'email',
+      requestedBy: setterSlackId,
+      email: { to, cc, subject, body, threadMeta },
+      createdAt: Date.now(),
+      autosent: true,
+    };
+    await executeEmailSend(syntheticPending, async (msg) => {
+      try {
+        await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[autosend · ${setter.displayName}] ${msg}` });
+      } catch {}
+    });
+    return true;
+  }
+
+  // ── Standard flow: stage for Ron's approval ───────────────────────────────
   pendingApprovals[RON_SLACK_ID] = {
     kind: 'email',
     requestedBy: setterSlackId,
     email: { to, cc, subject, body, threadMeta },
     createdAt: Date.now(),
   };
-  delete pendingDrafts[setterSlackId];
 
   // DM the setter — handoff confirmation.
   await say(`Got it — sending to Ron for final approval. I'll DM you when it goes out (or if Ron pushes back).`);
@@ -4599,6 +4630,20 @@ slack.message(async ({ message, say }) => {
 // VSL self-bookings and other event types are ignored.
 slack.event('message', async ({ event }) => {
   try {
+    // TEMP diagnostic — fires for every message landing in #ng-sales-goats so we
+    // can confirm message.channels delivery + iClosed post shape. Remove once
+    // setter-reveal is verified working.
+    if (event && event.channel === LEAD_CHANNEL_ID) {
+      console.log('iClosed relay debug:', JSON.stringify({
+        ts: event.ts,
+        subtype: event.subtype,
+        bot_id: event.bot_id,
+        app_id: event.app_id,
+        has_text: !!event.text,
+        n_attachments: (event.attachments || []).length,
+        n_blocks: (event.blocks || []).length,
+      }));
+    }
     if (!event || event.subtype && event.subtype !== 'bot_message') return;
     if (event.thread_ts) return; // only react to top-level posts
     if (event.channel !== LEAD_CHANNEL_ID) return;
@@ -5795,7 +5840,7 @@ async function handleGHLWebhook(req, res) {
           leadContext        ? `📝 ${leadContext}` : null,
           contactId          ? `🔗 ${ghlLink}` : null,
         ].filter(Boolean).join('\n') + claimHint;
-        await slack.client.chat.postMessage({
+        const leadPost = await slack.client.chat.postMessage({
           channel: LEAD_CHANNEL_ID,
           text: channelNote,
           metadata: contactId ? {
@@ -5804,6 +5849,20 @@ async function handleGHLWebhook(req, res) {
           } : undefined,
         });
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: LEAD_CHANNEL_ID, output: { text: channelNote.slice(0, 2000) }, correlation_id: ghlCorr });
+
+        // Persist contact_id → message_ts mapping so /webhook/ghl-claim can mirror
+        // GHL-direct claims back to this Slack post. Non-fatal on insert failure.
+        if (contactId && leadPost?.ts) {
+          try {
+            await supabase.from('lead_posts').upsert({
+              contact_id: contactId,
+              slack_message_ts: leadPost.ts,
+              slack_channel_id: LEAD_CHANNEL_ID,
+            }, { onConflict: 'contact_id' });
+          } catch (lpErr) {
+            console.error('lead_posts insert failed:', lpErr.message);
+          }
+        }
       } catch (parseErr) { console.error('GHL webhook parse error:', parseErr.message); }
     });
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
@@ -6247,7 +6306,9 @@ async function runSetterLeaderboard(correlationId) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const monthStartDate = monthStart.toISOString().slice(0, 10);
   const monthStartIso  = monthStart.toISOString();
-  const monthLabel     = monthStart.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'long' });
+  // Use `now` (not monthStart) so the month label reflects the user-perceived month in CR.
+  // monthStart is anchored to UTC midnight of the 1st → renders as the prior month in CR (UTC-6).
+  const monthLabel     = now.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'long' });
   const todayLabel     = now.toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric' });
 
   // Canonical roster of active setters. EOD table keys by email; setter_claims keys by Slack ID;
