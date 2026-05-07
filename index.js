@@ -1135,6 +1135,7 @@ function registerDynamicCron(task) {
         'Blocked Client Report — MWF':      [], // short report, no fixed headers
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
         'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
+        'Daily iClosed Call Roster':        [], // short on quiet days
       };
 
       function validateFinalReport(text, taskName) {
