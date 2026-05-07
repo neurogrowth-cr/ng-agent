@@ -5605,9 +5605,11 @@ cron.schedule('0 17 * * 5',  wrapCronJob('runWeeklySalesMarketingRecap', async (
 // Monday gap detection — 8:00 AM CR (infrastructure — posts to ops channel)
 cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => { await runMondayGapDetection(c); }),  { timezone: 'America/Costa_Rica' });
 
-// Proactive alerts — 9:00 AM and 2:00 PM CR (infrastructure — posts stale alerts to agent channel)
-cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
-cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
+// Proactive alerts disabled 2026-05-07 — redundant with Monday gap detection,
+// daily standups, anomaly detection, and Friday weekly recap. Posts were recycling
+// the same stale-alert list every day with no fresh signal.
+// cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
+// cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 
 // Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
 // runProactiveDMs merged into runFulfillmentStandup (9 AM) — stalled flags now inline per role
