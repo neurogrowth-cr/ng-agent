@@ -5868,6 +5868,125 @@ async function handleGHLWebhook(req, res) {
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
 }
 
+// ─── REVERSE-MIRROR: GHL claim → Slack post update ───────────────────────────
+// Setter assigns a contact in GHL UI directly (no Slack ✋/✅) → GHL workflow
+// fires this webhook → Max finds the corresponding #ng-sales-goats post via
+// lead_posts lookup → adds ✅ + threaded reply mirroring the GHL claim, and
+// records a setter_claims row with claim_source='ghl_direct'.
+//
+// Required GHL workflow body: { contact_id, assigned_to, location_id }
+// Required header: x-ghl-secret (reuses GHL_WEBHOOK_SECRET env var)
+
+async function handleGHLClaimWebhook(req, res) {
+  const secret = process.env.GHL_WEBHOOK_SECRET;
+  if (secret) {
+    const provided = req.headers['x-ghl-secret'] || req.headers['x-webhook-secret'];
+    if (provided !== secret) {
+      console.warn('GHL claim webhook rejected — invalid or missing secret header');
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+  }
+  try {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      // Always 200 quickly — GHL retries on non-2xx
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ received: true }));
+      try {
+        const payload = JSON.parse(body);
+        const cd = payload.customData || payload.custom_data || {};
+        const contactId  = cd.contact_id || cd.contactId  || payload.contact_id  || payload.contactId  || payload.contact?.id || '';
+        const assignedTo = cd.assigned_to || cd.assignedTo || payload.assigned_to || payload.assignedTo || payload.contact?.assignedTo || '';
+        const locationId = payload.location_id || payload.locationId || process.env.GHL_LOCATION_ID || '';
+        if (!contactId) { console.warn('ghl-claim webhook: no contact_id in payload'); return; }
+        if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (likely an unassign event)`); return; }
+
+        const claimCorr = newCorrelationId();
+        console.log(`ghl-claim webhook: contact=${contactId} assignedTo=${assignedTo}`);
+
+        // 1. Find the Slack lead post for this contact
+        let leadPost;
+        try {
+          const { data, error } = await supabase
+            .from('lead_posts')
+            .select('slack_message_ts, slack_channel_id')
+            .eq('contact_id', contactId)
+            .single();
+          if (error) throw error;
+          leadPost = data;
+        } catch (lookupErr) {
+          console.log(`ghl-claim webhook: no lead_posts row for ${contactId} (lead pre-dates reverse-mirror or wasn't from FB Ads). Logged only.`);
+          return;
+        }
+        if (!leadPost?.slack_message_ts) return;
+
+        // 2. Fetch the message + check if Max already added ✅ (race with Slack reaction)
+        const channel = leadPost.slack_channel_id;
+        const timestamp = leadPost.slack_message_ts;
+        const history = await slack.client.conversations.history({
+          channel, latest: timestamp, limit: 1, inclusive: true, include_all_metadata: true,
+        });
+        const msg = history.messages && history.messages[0];
+        if (!msg || msg.ts !== timestamp) {
+          console.warn(`ghl-claim webhook: message ${timestamp} not found in ${channel}`);
+          return;
+        }
+        const claimReaction = (msg.reactions || []).find(r => r.name === LEAD_CLAIMED_EMOJI);
+        if (claimReaction && claimReaction.users && claimReaction.users.includes(process.env.SLACK_BOT_USER_ID)) {
+          console.log(`ghl-claim webhook: contact ${contactId} already marked claimed in Slack — skipping`);
+          return;
+        }
+
+        // 3. Resolve GHL user → Slack ID for the threaded reply
+        const setterSlackId = SLACK_TO_GHL_USER && Object.entries(SLACK_TO_GHL_USER).find(([, ghl]) => ghl === assignedTo || ghl?.toLowerCase() === assignedTo.toLowerCase())?.[0];
+        const setterName = GHL_USER_NAMES[assignedTo] || GHL_USER_NAMES[assignedTo.toLowerCase()] || assignedTo;
+        const setterMention = setterSlackId ? `<@${setterSlackId}>` : `*${setterName}*`;
+
+        // 4. Add ✅ + threaded reply
+        try { await slack.client.reactions.add({ channel, timestamp, name: LEAD_CLAIMED_EMOJI }); }
+        catch (reactErr) {
+          if (!String(reactErr.data?.error || reactErr.message).includes('already_reacted')) {
+            console.warn('ghl-claim reactions.add failed:', reactErr.message);
+          }
+        }
+        await slack.client.chat.postMessage({
+          channel, thread_ts: timestamp,
+          text: `✅ Claimed in GHL by ${setterMention}. Updated outside Slack — synced here.`,
+        });
+
+        // 5. Record the claim
+        try {
+          await supabase.from('setter_claims').insert({
+            ghl_contact_id: contactId,
+            contact_name: msg.metadata?.event_payload?.full_name || null,
+            slack_message_ts: timestamp,
+            slack_channel_id: channel,
+            claimed_by_slack_user_id: setterSlackId || 'unknown',
+            claimed_by_setter_name: setterName,
+            ghl_user_id: assignedTo,
+            opps_reassigned: 0, // GHL did the assignment; Max didn't reassign opps in this path
+            seconds_to_claim: Math.max(0, Math.round(Date.now() / 1000 - parseFloat(timestamp))),
+            claim_source: 'ghl_direct',
+          });
+        } catch (insErr) { console.error('ghl-claim setter_claims insert failed:', insErr.message); }
+
+        logActivity({
+          event_type: 'ghl_lead_claimed', event_source: 'ghl_webhook', action: 'claim_mirror',
+          channel_id: channel,
+          output: { contact_id: contactId, ghl_user_id: assignedTo, setter_name: setterName },
+          correlation_id: claimCorr,
+        });
+        console.log(`ghl-claim mirrored to Slack — contact ${contactId} → ${setterName}`);
+      } catch (parseErr) {
+        console.error('ghl-claim webhook parse/processing error:', parseErr.message);
+      }
+    });
+  } catch (err) { console.error('ghl-claim webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
+}
+
 // ─── STALLED PROSPECT FOLLOW-UPS (Initiative 2 — dry-run by default) ─────────
 // Daily 11 AM CR Mon–Fri. Detects WhatsApp prospects who went silent ≥ 2 business
 // days ago, applies skip gates, then either DMs the assigned setter a dry-run list
@@ -6559,6 +6678,8 @@ const healthServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'ok', agent: 'NeuroGrowth PM Agent (Max)', uptime: Math.floor(process.uptime()), timestamp: new Date().toISOString() }));
   } else if (req.url === '/webhook/ghl-lead' && req.method === 'POST') {
     handleGHLWebhook(req, res);
+  } else if (req.url === '/webhook/ghl-claim' && req.method === 'POST') {
+    handleGHLClaimWebhook(req, res);
   } else if (req.url === '/webhook/supabase' && req.method === 'POST') {
     handleSupabaseWebhook(req, res);
   } else {
@@ -6780,6 +6901,7 @@ slack.event('reaction_added', async ({ event }) => {
           ghl_user_id: ghlUserId,
           opps_reassigned: oppsOk,
           seconds_to_claim: secondsToClaim,
+          claim_source: 'slack_reaction',
         });
       } catch (claimErr) {
         // Non-fatal — Slack post + GHL writes already succeeded
