@@ -2460,6 +2460,20 @@ const SALES_TEAM_MAP = {
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',       'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
 };
+// iClosed sync stores CR wall-clock time tagged with +00 (UTC) — the value
+// IS already CR time, just mislabeled. To display correctly, format with
+// timeZone:'UTC' so no further conversion is applied. Use this helper at
+// every display site that reads scheduled_start / booked_at from
+// revops_appointments. NOTE: this does NOT fix range/window queries that
+// compare these timestamps against real "now" — those still treat the
+// stored value as a real UTC instant and will be 6h off. Fix the upstream
+// sync to make these timestamps true UTC; this helper is a display-side
+// mitigation only.
+function formatICTime(scheduledStart, opts = { hour: '2-digit', minute: '2-digit' }) {
+  if (!scheduledStart) return null;
+  return new Date(scheduledStart).toLocaleString('en-US', { ...opts, timeZone: 'UTC' });
+}
+
 function resolveSalesMember(id) {
   if (!id) return 'Unknown';
   return SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()] || id;
@@ -2540,10 +2554,7 @@ async function getSalesIntelligence(query) {
         for (const a of todayCalls) {
           const name    = a.prospect?.full_name || 'Unknown prospect';
           const closer  = resolveSalesMember(a.closer_id);
-          // NOTE: iClosed sync stores CR local time tagged as +00 (UTC) — the wall-clock
-          // value is already CR. Format with timeZone:UTC to avoid double-converting and
-          // showing every call 6h early. Fix the upstream sync when possible.
-          const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
+          const time    = formatICTime(a.scheduled_start, { hour: '2-digit', minute: '2-digit' });
           const outcome = outcomeMap[a.id];
           const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
           let setterLabel = 'VSL self-booking';
@@ -2645,7 +2656,7 @@ async function getSalesIntelligence(query) {
     const matchedProspect = appts.find(a => a.prospect?.full_name && q.includes(a.prospect.full_name.toLowerCase().split(' ')[0]));
     if (matchedProspect) {
       const closer  = resolveSalesMember(matchedProspect.closer_id);
-      const time    = matchedProspect.scheduled_start ? new Date(matchedProspect.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'not scheduled';
+      const time    = matchedProspect.scheduled_start ? formatICTime(matchedProspect.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'not scheduled';
       const outcome = outcomeMap[matchedProspect.id];
       const lines   = [
         `Prospect: ${matchedProspect.prospect?.full_name || 'Unknown'}`,
@@ -2904,7 +2915,7 @@ async function runMondayGapDetection(_correlationId) {
             .limit(1);
           if (!future || !future.length) {
             const pName = appt.prospect?.full_name || 'Unknown';
-            const dStr  = new Date(appt.scheduled_start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Costa_Rica' });
+            const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric' });
             const closerName = resolveSalesMember(appt.closer_id);
             noShowFlags.push(`• ${pName} — ${dStr}, closer: ${closerName}`);
           }
@@ -2935,7 +2946,7 @@ async function runMondayGapDetection(_correlationId) {
         if (unlogged.length) {
           const unloggedLines = unlogged.map(a => {
             const pName = a.prospect?.full_name || 'Unknown';
-            const dStr  = new Date(a.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            const dStr  = formatICTime(a.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             const closerName = resolveSalesMember(a.closer_id);
             return `• ${pName} — ${dStr} — please log in iClosed`;
           });
@@ -4975,7 +4986,7 @@ async function runSalesCallPrep(_correlationId) {
       const leadSource  = prospect.lead_source || '';
       const closerName  = resolveSalesMember(appt.closer_id);
       const closerSlack = CLOSER_SLACK[appt.closer_id] || CLOSER_SLACK[(appt.closer_id || '').toLowerCase()];
-      const callTime    = new Date(appt.scheduled_start).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      const callTime    = formatICTime(appt.scheduled_start, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const hoursOut    = Math.round((new Date(appt.scheduled_start).getTime() - now) / (1000 * 60 * 60) * 10) / 10;
 
       // GHL conversation lookup + setter resolution
@@ -5497,7 +5508,7 @@ async function runSalesStandup(_correlationId) {
           lines.push(`📞 Today on deck (${myTodayCalls.length} calls):`);
           myTodayCalls.forEach(a => {
             const pName  = a.prospect?.full_name || 'Unknown';
-            const timeStr = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            const timeStr = formatICTime(a.scheduled_start, { hour: '2-digit', minute: '2-digit' });
             lines.push(`• ${pName} — ${timeStr} CR time`);
           });
           lines.push('');
@@ -5508,7 +5519,7 @@ async function runSalesStandup(_correlationId) {
           lines.push(`⚠️ Outcome not logged (${myUnlogged.length} calls):`);
           myUnlogged.forEach(a => {
             const pName  = a.prospect?.full_name || 'Unknown';
-            const dStr   = new Date(a.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+            const dStr   = formatICTime(a.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             lines.push(`• ${pName} — ${dStr} — please log in iClosed`);
           });
           lines.push('');
