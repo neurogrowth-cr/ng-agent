@@ -4608,6 +4608,31 @@ slack.message(async ({ message, say }) => {
       return;
     }
   }
+
+  // ── Stalled-followup pause/unpause commands (all roster setters) ────────────
+  if (typeof message.text === 'string') {
+    const pauseMatch = message.text.match(/^pause\s+([a-zA-Z0-9]{15,30})\s*$/i);
+    if (pauseMatch) {
+      const [, contactId] = pauseMatch;
+      try {
+        await supabase.from('agent_knowledge').upsert(
+          { category: 'setter_pref', key: `pause:${contactId}`, value: userId, visibility: 'shared', source: 'setter_dm', updated_at: new Date().toISOString() },
+          { onConflict: 'category,key' }
+        );
+        await say(`⏸️ Auto-followups paused for contact \`${contactId}\`. DM \`unpause ${contactId}\` to resume.`);
+      } catch (err) { await say(`Couldn't save the pause: ${err.message}`); }
+      return;
+    }
+    const unpauseMatch = message.text.match(/^unpause\s+([a-zA-Z0-9]{15,30})\s*$/i);
+    if (unpauseMatch) {
+      const [, contactId] = unpauseMatch;
+      try {
+        await supabase.from('agent_knowledge').delete().eq('category', 'setter_pref').eq('key', `pause:${contactId}`);
+        await say(`▶️ Auto-followups resumed for contact \`${contactId}\`.`);
+      } catch (err) { await say(`Couldn't remove the pause: ${err.message}`); }
+      return;
+    }
+  }
   // ───────────────────────────────────────────────────────────────────────────
 
   const correlation_id = newCorrelationId();
@@ -6102,6 +6127,35 @@ async function hasAttendedCall(contact) {
   } catch (_) { return null; }
 }
 
+// Returns true if a setter has DM'd Max `pause <contactId>` for this contact.
+// Pause entries live in agent_knowledge under category=setter_pref, key=pause:<contactId>.
+async function isStalledFollowupPaused(contactId) {
+  try {
+    const { data } = await supabase
+      .from('agent_knowledge')
+      .select('id')
+      .eq('category', 'setter_pref')
+      .eq('key', `pause:${contactId}`)
+      .limit(1);
+    return !!(data && data.length);
+  } catch (_) { return false; }
+}
+
+// Live-send guardrail: returns { lifetime, lastSentMs } for a contact's prospect_followups.
+// Used to enforce 14-day cooldown + 2-lifetime cap before auto-sending again.
+async function getStalledFollowupHistory(contactId) {
+  try {
+    const { data } = await supabase
+      .from('prospect_followups')
+      .select('sent_at, status')
+      .eq('contact_id', contactId)
+      .eq('status', 'sent')
+      .order('sent_at', { ascending: false });
+    if (!data || !data.length) return { lifetime: 0, lastSentMs: null };
+    return { lifetime: data.length, lastSentMs: new Date(data[0].sent_at).getTime() };
+  } catch (_) { return { lifetime: 0, lastSentMs: null }; }
+}
+
 async function evaluateStalledCandidate(convo, ghlUserNames) {
   const reasons = [];
   const setterGhlId = (convo.assignedTo || '').toString();
@@ -6138,6 +6192,8 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
 
   const tags = (contact.tags || []).map(t => String(t).toLowerCase());
   for (const t of tags) if (DNC_TAGS.has(t)) return { skip: `dnc_tag:${t}`, setterSlackId };
+
+  if (await isStalledFollowupPaused(convo.contactId)) return { skip: 'setter_paused', setterSlackId };
 
   const futureBooking = await hasFutureBooking(contact);
   if (futureBooking) return { skip: `already_booked:${futureBooking.event_at}`, setterSlackId };
@@ -6201,7 +6257,20 @@ async function runStalledProspectFollowups(correlationId) {
   const bySetter = {};
   for (const r of claimable) (bySetter[r.setterSlackId] ||= []).push(r);
 
-  // DM each setter their stalled list (dry-run) — or send (live, future)
+  // Live-send guardrails (only consulted when isLive). Tunable via env so we can
+  // raise the daily cap from 3 → 10 after 2 weeks of clean reply quality.
+  const COOLDOWN_DAYS  = 14;
+  const LIFETIME_CAP   = 2;
+  const DAILY_CAP      = parseInt(process.env.STALLED_FOLLOWUPS_DAILY_CAP || '3', 10);
+  const HOUR_LO        = 10; // 10:00 CR inclusive
+  const HOUR_HI        = 18; // 18:00 CR exclusive
+  const crHour         = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/Costa_Rica', hour: 'numeric', hour12: false }), 10);
+  const businessHoursOk = crHour >= HOUR_LO && crHour < HOUR_HI;
+
+  const liveSent = []; // { contactName, contactId, setterSlackId, message, ageDays }
+  const liveSkips = {};
+
+  // DM each setter their stalled list (dry-run) — or generate + send (live).
   for (const [slackId, list] of Object.entries(bySetter)) {
     if (!isLive) {
       const lines = list.map(r => `• ${r.contactName} (${r.ageDays}d, WhatsApp) — last: "${r.lastBody}" → https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${r.contactId}`);
@@ -6210,10 +6279,108 @@ async function runStalledProspectFollowups(correlationId) {
         await slack.client.chat.postMessage({ channel: slackId, text });
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: slackId, output: { text: text.slice(0, 2000) }, correlation_id: correlationId });
       } catch (err) { console.error(`stalled DM to ${slackId} failed:`, err.message); }
-    } else {
-      // LIVE path is intentionally not wired in this commit — see rollout step 3.
-      console.warn(`STALLED_FOLLOWUPS_LIVE=true but live send path not yet implemented. Falling back to dry-run DM.`);
+      continue;
     }
+
+    // ── LIVE path ────────────────────────────────────────────────────────────
+    if (!businessHoursOk) {
+      console.warn(`STALLED_FOLLOWUPS_LIVE=true but outside business hours (${crHour}:00 CR). Skipping live send.`);
+      liveSkips.outside_business_hours = (liveSkips.outside_business_hours || 0) + list.length;
+      continue;
+    }
+
+    for (const r of list) {
+      if (liveSent.length >= DAILY_CAP) {
+        liveSkips.daily_cap_reached = (liveSkips.daily_cap_reached || 0) + 1;
+        continue;
+      }
+
+      const history = await getStalledFollowupHistory(r.contactId);
+      if (history.lifetime >= LIFETIME_CAP) { liveSkips.lifetime_cap = (liveSkips.lifetime_cap || 0) + 1; continue; }
+      if (history.lastSentMs && (Date.now() - history.lastSentMs) < COOLDOWN_DAYS * 24 * 60 * 60 * 1000) {
+        liveSkips.cooldown_active = (liveSkips.cooldown_active || 0) + 1;
+        continue;
+      }
+
+      // Generate the draft (reuses the campaign generator — same spec: single
+      // sentence, conversation language, ≤25 words, ends with question, no markdown).
+      let draftText;
+      try {
+        const messages    = await ghlGetConversationMessages(r.conversationId);
+        const contact     = await ghlGetContact(r.contactId);
+        const setterFirst = (r.setterName || '').split(' ')[0] || 'the team';
+        draftText = await generateCampaignDraft(contact || { firstName: r.contactName }, messages, setterFirst);
+        if (!draftText) throw new Error('empty draft');
+      } catch (err) {
+        console.error(`stalled draft failed ${r.contactId}: ${err.message}`);
+        liveSkips.draft_failed = (liveSkips.draft_failed || 0) + 1;
+        continue;
+      }
+
+      // Send via GHL — same shape as sendCampaignMessage.
+      let ghlMessageId = null, ghlConversationId = null, sendErr = null;
+      try {
+        const sendRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'WhatsApp', contactId: r.contactId, message: draftText }),
+        });
+        if (!sendRes.ok) {
+          const errBody = await sendRes.text();
+          throw new Error(`GHL ${sendRes.status}: ${errBody.slice(0, 200)}`);
+        }
+        const sendData = await sendRes.json();
+        ghlMessageId      = sendData.messageId || null;
+        ghlConversationId = sendData.conversationId || r.conversationId || null;
+      } catch (err) {
+        sendErr = err.message;
+      }
+
+      // Audit row in either branch.
+      try {
+        await supabase.from('prospect_followups').insert({
+          contact_id: r.contactId,
+          contact_name: r.contactName,
+          conversation_id: ghlConversationId,
+          channel: 'WhatsApp',
+          message: draftText,
+          ghl_message_id: ghlMessageId,
+          setter_slack_id: r.setterSlackId,
+          attempt_n: history.lifetime + 1,
+          status: sendErr ? 'failed' : 'sent',
+          error_message: sendErr,
+          correlation_id: correlationId,
+        });
+      } catch (err) { console.error(`prospect_followups insert failed for ${r.contactId}: ${err.message}`); }
+
+      if (sendErr) {
+        console.error(`stalled send failed ${r.contactId}: ${sendErr}`);
+        liveSkips.send_failed = (liveSkips.send_failed || 0) + 1;
+        continue;
+      }
+
+      liveSent.push({ ...r, message: draftText });
+      logActivity({ event_type: 'stalled_followup_sent', event_source: 'cron', action: 'outbound', user_id: r.setterSlackId, output: { contact_id: r.contactId, message: draftText.slice(0, 500) }, correlation_id: correlationId });
+    }
+
+    // DM the setter what was actually sent on their behalf.
+    const sentForThisSetter = liveSent.filter(s => s.setterSlackId === slackId);
+    if (sentForThisSetter.length > 0) {
+      const lines = sentForThisSetter.map(s => `• ${s.contactName} (${s.ageDays}d) — sent: "${s.message.slice(0, 140)}"`);
+      const text = `🤖 *Auto-followups sent on your behalf* — ${sentForThisSetter.length} prospect(s):\n${lines.join('\n')}\n\n_DM \`pause <contact_id>\` to stop future auto-followups for a specific contact._`;
+      try { await slack.client.chat.postMessage({ channel: slackId, text }); }
+      catch (err) { console.error(`stalled live-DM to ${slackId} failed:`, err.message); }
+    }
+  }
+
+  // Cross-post to #ng-sales-goats so the team sees the activity (live mode only).
+  if (isLive && liveSent.length > 0) {
+    try {
+      await slack.client.chat.postMessage({
+        channel: LEAD_CHANNEL_ID,
+        text: `🔔 Auto-followup sent — ${liveSent.length} prospect${liveSent.length === 1 ? '' : 's'} nudged today.`,
+      });
+    } catch (err) { console.error('stalled cross-post to #ng-sales-goats failed:', err.message); }
   }
 
   // Summary DM to Ron
@@ -6221,18 +6388,21 @@ async function runStalledProspectFollowups(correlationId) {
   const totalSendable   = claimable.length;
   const totalSkipped    = totalCandidates - totalSendable;
   const skipBreakdown   = Object.entries(skipCounts).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none';
+  const liveSkipBreakdown = Object.entries(liveSkips).map(([k, v]) => `${k}: ${v}`).join(', ');
   const summary = [
-    `📊 *Stalled prospect dry-run summary* (${isLive ? 'LIVE' : 'DRY-RUN'})`,
-    `Candidates: ${totalCandidates} | Would send: ${totalSendable} | Skipped: ${totalSkipped}`,
+    `📊 *Stalled prospect ${isLive ? 'live' : 'dry-run'} summary* (${isLive ? 'LIVE' : 'DRY-RUN'})`,
+    `Candidates: ${totalCandidates} | Eligible: ${totalSendable} | Skipped: ${totalSkipped}`,
     `Skip breakdown: ${skipBreakdown}`,
-    totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_',
+    isLive
+      ? `Sent: ${liveSent.length}${liveSkipBreakdown ? ` | Live-skip: ${liveSkipBreakdown}` : ''}`
+      : (totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_'),
   ].join('\n');
   try {
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: RON_SLACK_ID, output: { text: summary }, correlation_id: correlationId });
   } catch (err) { console.error('stalled summary DM to Ron failed:', err.message); }
 
-  console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}`);
+  console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}, sent ${liveSent.length} (live=${isLive})`);
 }
 
 // ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─

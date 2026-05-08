@@ -1,9 +1,10 @@
 # ng-agent — Project State
 
-Last updated: 2026-05-07
+Last updated: 2026-05-08
 
 ## Recent changes
 
+- **2026-05-08 — Initiative 2: Stalled-prospect live-send path wired (flag-gated).** After 5 business days of clean dry-run (Mon 5/4 → Fri 5/8 — today's run was 32 candidates / 3 would-send / 27 `setter_already_replied` skips, the right shape), built the live path behind `STALLED_FOLLOWUPS_LIVE='true'`. New migration `008_prospect_followups.sql` (audit table for sent followups, indexed on `(contact_id, sent_at desc)` for cooldown queries). `runStalledProspectFollowups` in [index.js](../index.js) now: generates the message via the existing `generateCampaignDraft` helper (single sentence, conversation language, ≤25 words, ends with question); POSTs `https://services.leadconnectorhq.com/conversations/messages` with `{ type: 'WhatsApp', contactId, message }` (same shape as `sendCampaignMessage`); inserts an audit row in `prospect_followups` whether sent or failed; DMs the setter what was sent on their behalf; cross-posts a `🔔 Auto-followup sent — N prospect(s) nudged today` line to `#ng-sales-goats`. Guardrails: business hours 10:00–18:00 CR, 14-day per-contact cooldown, 2-lifetime cap, daily volume cap default 3 (override via `STALLED_FOLLOWUPS_DAILY_CAP` env var; raise to 10 after 2 weeks of clean reply quality). New skip gate `setter_paused` in `evaluateStalledCandidate` checks `agent_knowledge` for `category=setter_pref, key=pause:<contactId>`. New DM commands available to all roster members: `pause <contactId>` (upserts the pause row) and `unpause <contactId>` (deletes it). **Pre-go-live:** apply migration 008; verify the `ng-pm-agent` GHL PIT has `conversations.write` scope; set `STALLED_FOLLOWUPS_LIVE=true` on Railway. Default behavior unchanged until the env flag is flipped.
 - **2026-05-07 — Daily iClosed Call Roster + Sales EOD setter attribution.** Two changes to scheduled reports, both in `scheduled_tasks` Supabase table (no source code logic change). (a) New cron `Daily iClosed Call Roster` — fires `30 8 * * * America/Costa_Rica`, DMs Ron a roster of every iClosed call booked for today (prospect, time CR, closer, setter, status). Reuses the "today" branch in `getSalesIntelligence` for data + setter resolution. Added `'Daily iClosed Call Roster': []` to `TASK_HEADERS` in [index.js](../index.js) so quiet-day reports pass the relaxed length check (>20 chars) instead of the 300-char default. (b) `Sales EOD Report` prompt updated — STEP 1 now also calls `get_sales_intelligence("today calls")` to pull setter attribution; STRATEGY CALLS BOOKED line now renders `• PROSPECT — date at time CR — with HOST — setter: SETTER FIRST NAME or "VSL self-booking"`. Both prompts are loaded into closures at boot via `registerDynamicCron`, so future prompt edits to either row need a Railway redeploy to take effect.
 - **2026-05-07 — Email proxy: Ron-approval bypass for trusted setters (Oscar M first promoted).** New constant `EMAIL_PROXY_AUTOSEND_SETTERS` in [index.js](../index.js) — set of Slack IDs that skip Stage-2 (Ron's "yes" approval) and auto-send the moment the setter says "se ve bien". Setter still gets the standard ✅ success or ❌ failure DM from `executeEmailSend`; Ron gets a parallel `[autosend · <setter>] ...` audit-trail DM (success or error stack) for visibility without forcing approval. Implemented inside `promoteDraftToRon` — short-circuit before the `pendingApprovals[RON_SLACK_ID]` stage, build a synthetic `pending` with `autosent: true`, call `executeEmailSend` directly with a `say` wrapper that routes Ron-side messages to his DM. Promoted: Oscar M (`U0B1S1UMH9P`) — earned bypass after his first clean send. To promote others, add their Slack ID to the set in source. Vacation responder also disabled today (manual UI toggle, unrelated to proxy — was triggering empty auto-replies to every inbound).
 - **2026-05-07 — Disabled proactive-alert daily Slack posts (3pm + 8pm CR).** Both daily `runProactiveAlerts` cron registrations at [index.js:5608-5609](../index.js) commented out. The posts had stopped adding signal — they recycled the same stale `agent_knowledge` alerts every day ("blocked clients, Make notifications broken, Softon domains expiring…") even when nothing had moved. Coverage is redundant: Monday gap detection (Mon 8am) catches what's still open at week start, Friday weekly recap (Fri 5pm) closes the loop, anomaly detection (daily 6am) flags fresh metric deltas, and the daily fulfillment + sales standups (Mon–Fri 9am) surface stalled clients per owner. `runProactiveAlerts` function definition at [index.js:3082](../index.js) preserved for manual use or future re-enable.
@@ -26,26 +27,25 @@ Last updated: 2026-05-07
 
 End-to-end loop working: ✋/✅ on a `#ng-sales-goats` lead post → GHL contact + Appointment Setting Pipeline opportunity reassigned to claimer → ✅ from Max + threaded confirmation → row written to `setter_claims` with `seconds_to_claim`. No pending work on this initiative.
 
-### Initiative 2 — Stalled prospect auto-follow-up → 🟡 dry-run only, live send NOT yet wired
+### Initiative 2 — Stalled prospect auto-follow-up → 🟢 live-send path shipped, awaiting flip
 
-Currently shipped: WhatsApp stalled-prospect detection cron (Mon–Fri 11 AM CR) running in dry-run mode, DMs the assigned setter their stalled list, all 7 hard skip gates evaluated (no-setter, thread-too-short, voice-note-or-empty, emoji-only, opt-out EN+ES phrase scan, no-phone, DNC tag, future iClosed booking, attended call). Summary DM to Ron with skip breakdown.
+Build complete behind `STALLED_FOLLOWUPS_LIVE` flag. Detection cron (Mon–Fri 11 AM CR) still runs dry-run by default — flipping the env var on Railway is the deliberate go-live moment.
 
-**Not yet shipped (gated behind dry-run validation):**
+**Shipped 2026-05-08:**
+- Migration `008_prospect_followups.sql` (audit table + cooldown/cap source of truth)
+- Live-send branch in `runStalledProspectFollowups` reuses `generateCampaignDraft` (the recoverable-leads campaign generator — same single-sentence/≤25-word/conversation-language spec) and the same `POST /conversations/messages` shape used by `sendCampaignMessage`
+- Send-time guardrails: business hours 10:00–18:00 CR, 14-day per-contact cooldown, 2-lifetime cap, daily cap default 3 (override via `STALLED_FOLLOWUPS_DAILY_CAP`)
+- New skip gate `setter_paused` in `evaluateStalledCandidate` (reads `agent_knowledge` `setter_pref` rows)
+- DM commands `pause <contactId>` / `unpause <contactId>` available to all roster setters
+- Cross-post `🔔 Auto-followup sent — N prospects nudged today.` to `#ng-sales-goats` after live runs that sent ≥1
+- Per-setter DM showing exactly what was sent on their behalf
 
-- [ ] **Live auto-send path.** When `STALLED_FOLLOWUPS_LIVE='true'`, currently falls back to dry-run with a warning log — the actual send call is not wired.
-- [ ] **New GHL MCP tool `send_conversation_message`** in [ghl-mcp/index.js](../ghl-mcp/index.js). POST `/conversations/messages` with `{ type: 'WhatsApp', contactId, message }`. Required scope on the GHL PIT: `conversations.write` (verify before adding).
-- [ ] **`prospect_followups` Supabase migration** — new table tracking auto-sent followups. Schema: `(id, contact_id, sent_at, message, channel, setter_slack_id, attempt_n)` + indexes on `contact_id, sent_at desc`. Used for 14-day cooldown and 2-lifetime cap.
-- [ ] **Claude follow-up generator** — short single-sentence message in conversation language, references last setter message, ≤25 words, ends with question, no emoji/markdown. Inputs: last 8 messages, lead `context` field, setter first name, NeuroGrowth offer brief.
-- [ ] **Send-time guardrails** — business hours only (10:00–18:00 CR), 14-day per-contact cooldown, 2-lifetime cap, daily volume cap (start at 3, raise to 10 after 2 weeks of clean reply quality).
-- [ ] **Setter pause command** — DM Max `pause <contactId>` to add to `agent_knowledge` category `setter_pref` and skip future auto-followups for that contact.
-- [ ] **Cross-post summary to `#ng-sales-goats`** — `🔔 Auto-followup sent — N prospects nudged today.`
-
-**Decision criteria to flip live (per the original rollout plan):**
-1. ≥ 2 business days of clean dry-run output (no spurious candidates, no skip-gate misfires)
-2. Spot-check the dry-run setter DMs to verify the prospects flagged are actually worth nudging
-3. Confirm none of the candidates are in a state Max shouldn't message (closed-lost, manual setter pause, etc.)
-
-**Trigger to plan the build:** the scheduled remote agent firing Mon 2026-05-04 09:00 CR will review the first dry-run + Saturday's leaderboard and recommend whether to flip live.
+**To flip live:**
+1. Apply `migrations/008_prospect_followups.sql` on the primary Supabase (`zbuqpdwjpxgsetduhjeo`)
+2. Verify the `ng-pm-agent` PIT has `conversations.write` scope (it should — `sendCampaignMessage` already uses it)
+3. Set `STALLED_FOLLOWUPS_LIVE=true` on Railway
+4. Watch Monday's 11 AM CR run — Ron's summary DM will show real `Sent: N` counts and any `Live-skip` reasons (cooldown_active, lifetime_cap, daily_cap_reached)
+5. After 2 weeks of clean reply quality, raise daily cap from 3 → 10 via `STALLED_FOLLOWUPS_DAILY_CAP=10`
 
 ### Items deferred from the original spec audit (v1.1 / not in scope for the two-initiatives effort)
 
