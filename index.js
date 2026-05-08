@@ -2540,7 +2540,10 @@ async function getSalesIntelligence(query) {
         for (const a of todayCalls) {
           const name    = a.prospect?.full_name || 'Unknown prospect';
           const closer  = resolveSalesMember(a.closer_id);
-          const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Costa_Rica' });
+          // NOTE: iClosed sync stores CR local time tagged as +00 (UTC) — the wall-clock
+          // value is already CR. Format with timeZone:UTC to avoid double-converting and
+          // showing every call 6h early. Fix the upstream sync when possible.
+          const time    = new Date(a.scheduled_start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
           const outcome = outcomeMap[a.id];
           const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
           let setterLabel = 'VSL self-booking';
