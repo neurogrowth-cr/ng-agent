@@ -2460,18 +2460,15 @@ const SALES_TEAM_MAP = {
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',       'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
 };
-// iClosed sync stores CR wall-clock time tagged with +00 (UTC) — the value
-// IS already CR time, just mislabeled. To display correctly, format with
-// timeZone:'UTC' so no further conversion is applied. Use this helper at
-// every display site that reads scheduled_start / booked_at from
-// revops_appointments. NOTE: this does NOT fix range/window queries that
-// compare these timestamps against real "now" — those still treat the
-// stored value as a real UTC instant and will be 6h off. Fix the upstream
-// sync to make these timestamps true UTC; this helper is a display-side
-// mitigation only.
+// scheduled_start in revops_appointments is now true UTC (upstream sync fixed
+// in dash.neurogrowth.io PR #2 — normalizer prefers iClosed's
+// event.utc_start_time over the mislabeled event.start_time). Format with
+// America/Costa_Rica to display CR wall-clock. Rows inserted before the
+// upstream fix will still display 6h early until they age out — accepted
+// tradeoff in lieu of a one-time backfill.
 function formatICTime(scheduledStart, opts = { hour: '2-digit', minute: '2-digit' }) {
   if (!scheduledStart) return null;
-  return new Date(scheduledStart).toLocaleString('en-US', { ...opts, timeZone: 'UTC' });
+  return new Date(scheduledStart).toLocaleString('en-US', { ...opts, timeZone: 'America/Costa_Rica' });
 }
 
 function resolveSalesMember(id) {
