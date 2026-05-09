@@ -6321,8 +6321,15 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
 }
 
 async function runStalledProspectFollowups(correlationId) {
-  const isLive = process.env.STALLED_FOLLOWUPS_LIVE === 'true';
-  console.log(`runStalledProspectFollowups starting (mode=${isLive ? 'LIVE' : 'DRY_RUN'})`);
+  // Modes: 'dry_run' (default) | 'approval' | 'live'
+  // STALLED_FOLLOWUPS_MODE wins; STALLED_FOLLOWUPS_LIVE='true' kept as legacy shorthand for 'live'.
+  const explicitMode = (process.env.STALLED_FOLLOWUPS_MODE || '').toLowerCase();
+  const mode = ['dry_run', 'approval', 'live'].includes(explicitMode)
+    ? explicitMode
+    : (process.env.STALLED_FOLLOWUPS_LIVE === 'true' ? 'live' : 'dry_run');
+  const isLive     = mode === 'live';
+  const isApproval = mode === 'approval';
+  console.log(`runStalledProspectFollowups starting (mode=${mode.toUpperCase()})`);
 
   const locationId = process.env.GHL_LOCATION_ID;
   const apiKey     = process.env.GHL_API_KEY;
@@ -6375,11 +6382,12 @@ async function runStalledProspectFollowups(correlationId) {
   const businessHoursOk = crHour >= HOUR_LO && crHour < HOUR_HI;
 
   const liveSent = []; // { contactName, contactId, setterSlackId, message, ageDays }
+  const approvalDrafts = []; // { contactName, contactId, setterSlackId, message, ageDays }
   const liveSkips = {};
 
-  // DM each setter their stalled list (dry-run) — or generate + send (live).
+  // DM each setter their stalled list (dry-run) — or generate + (send|post-for-approval).
   for (const [slackId, list] of Object.entries(bySetter)) {
-    if (!isLive) {
+    if (!isLive && !isApproval) {
       const lines = list.map(r => `• ${r.contactName} (${r.ageDays}d, WhatsApp) — last: "${r.lastBody}" → https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${r.contactId}`);
       const text = `👀 *Stalled prospects* — dry-run (no auto-followup sent yet):\n${lines.join('\n')}\n\n_Reply to nudge them yourself, or sit tight — Max will start auto-following up after dry-run watch period._`;
       try {
@@ -6389,15 +6397,21 @@ async function runStalledProspectFollowups(correlationId) {
       continue;
     }
 
-    // ── LIVE path ────────────────────────────────────────────────────────────
+    // ── LIVE / APPROVAL path ─────────────────────────────────────────────────
+    // Both modes apply the same guardrails. The only difference: live POSTs to
+    // GHL immediately; approval posts each draft to Ron's DM with `campaign_draft`
+    // metadata so he can ✅/❌ each one (the existing reaction handler at the
+    // bottom of this file recognizes `source: 'stalled_cron'` and writes to
+    // prospect_followups after a successful send).
     if (!businessHoursOk) {
-      console.warn(`STALLED_FOLLOWUPS_LIVE=true but outside business hours (${crHour}:00 CR). Skipping live send.`);
+      console.warn(`stalled-cron mode=${mode} outside business hours (${crHour}:00 CR). Skipping.`);
       liveSkips.outside_business_hours = (liveSkips.outside_business_hours || 0) + list.length;
       continue;
     }
 
     for (const r of list) {
-      if (liveSent.length >= DAILY_CAP) {
+      const actionedSoFar = isLive ? liveSent.length : approvalDrafts.length;
+      if (actionedSoFar >= DAILY_CAP) {
         liveSkips.daily_cap_reached = (liveSkips.daily_cap_reached || 0) + 1;
         continue;
       }
@@ -6424,7 +6438,47 @@ async function runStalledProspectFollowups(correlationId) {
         continue;
       }
 
-      // Send via GHL — same shape as sendCampaignMessage.
+      if (isApproval) {
+        // Post draft to Ron's DM with campaign_draft metadata. The existing
+        // reaction handler will handle ✅ → send + audit row, ❌ → skip.
+        const ghlLink = `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${r.contactId}`;
+        const postText = [
+          `📤 *${r.contactName}* — ${r.ageDays}d stale | WhatsApp | setter: ${r.setterName}`,
+          `_Last (prospect):_ "${r.lastBody}"`,
+          ``,
+          `*Draft:*`,
+          `> ${draftText}`,
+          ``,
+          `✅ to send · ❌ to skip · ✏️ revise (DM: \`revise ${r.contactId}: <new text>\`)`,
+          `🔗 ${ghlLink}`,
+        ].join('\n');
+        try {
+          await slack.client.chat.postMessage({
+            channel: RON_SLACK_ID,
+            text: postText,
+            metadata: {
+              event_type: 'campaign_draft',
+              event_payload: {
+                contact_id: r.contactId,
+                contact_name: r.contactName,
+                draft_text: draftText,
+                correlation_id: correlationId,
+                source: 'stalled_cron',
+                setter_slack_id: r.setterSlackId,
+                attempt_n: history.lifetime + 1,
+              },
+            },
+          });
+          approvalDrafts.push({ ...r, message: draftText });
+          logActivity({ event_type: 'stalled_followup_draft_posted', event_source: 'cron', action: 'outbound', user_id: RON_SLACK_ID, output: { contact_id: r.contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
+        } catch (err) {
+          console.error(`stalled approval-draft post failed for ${r.contactId}: ${err.message}`);
+          liveSkips.post_failed = (liveSkips.post_failed || 0) + 1;
+        }
+        continue;
+      }
+
+      // ── LIVE: send via GHL — same shape as sendCampaignMessage.
       let ghlMessageId = null, ghlConversationId = null, sendErr = null;
       try {
         const sendRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
@@ -6470,13 +6524,15 @@ async function runStalledProspectFollowups(correlationId) {
       logActivity({ event_type: 'stalled_followup_sent', event_source: 'cron', action: 'outbound', user_id: r.setterSlackId, output: { contact_id: r.contactId, message: draftText.slice(0, 500) }, correlation_id: correlationId });
     }
 
-    // DM the setter what was actually sent on their behalf.
-    const sentForThisSetter = liveSent.filter(s => s.setterSlackId === slackId);
-    if (sentForThisSetter.length > 0) {
-      const lines = sentForThisSetter.map(s => `• ${s.contactName} (${s.ageDays}d) — sent: "${s.message.slice(0, 140)}"`);
-      const text = `🤖 *Auto-followups sent on your behalf* — ${sentForThisSetter.length} prospect(s):\n${lines.join('\n')}\n\n_DM \`pause <contact_id>\` to stop future auto-followups for a specific contact._`;
-      try { await slack.client.chat.postMessage({ channel: slackId, text }); }
-      catch (err) { console.error(`stalled live-DM to ${slackId} failed:`, err.message); }
+    // DM the setter what was actually sent on their behalf (live only).
+    if (isLive) {
+      const sentForThisSetter = liveSent.filter(s => s.setterSlackId === slackId);
+      if (sentForThisSetter.length > 0) {
+        const lines = sentForThisSetter.map(s => `• ${s.contactName} (${s.ageDays}d) — sent: "${s.message.slice(0, 140)}"`);
+        const text = `🤖 *Auto-followups sent on your behalf* — ${sentForThisSetter.length} prospect(s):\n${lines.join('\n')}\n\n_DM \`pause <contact_id>\` to stop future auto-followups for a specific contact._`;
+        try { await slack.client.chat.postMessage({ channel: slackId, text }); }
+        catch (err) { console.error(`stalled live-DM to ${slackId} failed:`, err.message); }
+      }
     }
   }
 
@@ -6496,20 +6552,23 @@ async function runStalledProspectFollowups(correlationId) {
   const totalSkipped    = totalCandidates - totalSendable;
   const skipBreakdown   = Object.entries(skipCounts).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none';
   const liveSkipBreakdown = Object.entries(liveSkips).map(([k, v]) => `${k}: ${v}`).join(', ');
+  const modeLabel = mode.toUpperCase().replace('_', '-');
+  let actionLine;
+  if (isLive)          actionLine = `Sent: ${liveSent.length}${liveSkipBreakdown ? ` | Live-skip: ${liveSkipBreakdown}` : ''}`;
+  else if (isApproval) actionLine = `Drafts posted for approval: ${approvalDrafts.length}${liveSkipBreakdown ? ` | Skip: ${liveSkipBreakdown}` : ''}\n_React ✅ on each draft DM to send · ❌ to skip · DM \`revise <contact_id>: <new text>\` to edit before sending._`;
+  else                 actionLine = totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_';
   const summary = [
-    `📊 *Stalled prospect ${isLive ? 'live' : 'dry-run'} summary* (${isLive ? 'LIVE' : 'DRY-RUN'})`,
+    `📊 *Stalled prospect ${mode.replace('_', '-')} summary* (${modeLabel})`,
     `Candidates: ${totalCandidates} | Eligible: ${totalSendable} | Skipped: ${totalSkipped}`,
     `Skip breakdown: ${skipBreakdown}`,
-    isLive
-      ? `Sent: ${liveSent.length}${liveSkipBreakdown ? ` | Live-skip: ${liveSkipBreakdown}` : ''}`
-      : (totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_'),
+    actionLine,
   ].join('\n');
   try {
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: RON_SLACK_ID, output: { text: summary }, correlation_id: correlationId });
   } catch (err) { console.error('stalled summary DM to Ron failed:', err.message); }
 
-  console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}, sent ${liveSent.length} (live=${isLive})`);
+  console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}, sent ${liveSent.length}, drafts-posted ${approvalDrafts.length} (mode=${mode})`);
 }
 
 // ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─
@@ -7051,6 +7110,34 @@ slack.event('reaction_added', async ({ event }) => {
           if (result.ok) {
             await slack.client.reactions.add({ channel: event.item.channel, timestamp: event.item.ts, name: 'white_check_mark' }).catch(() => {});
             await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `✉️ Sent via GHL. Message ID: \`${result.messageId}\`` });
+
+            // Stalled-cron drafts: also write to prospect_followups so cooldown/
+            // lifetime-cap queries see approval-batch sends. The setter who owns
+            // the thread also gets a confirmation DM.
+            if (dmMeta.source === 'stalled_cron') {
+              try {
+                await supabase.from('prospect_followups').insert({
+                  contact_id: dmMeta.contact_id,
+                  contact_name: dmMeta.contact_name,
+                  conversation_id: result.conversationId || null,
+                  channel: 'WhatsApp',
+                  message: dmMeta.draft_text,
+                  ghl_message_id: result.messageId || null,
+                  setter_slack_id: dmMeta.setter_slack_id || event.user,
+                  attempt_n: dmMeta.attempt_n || 1,
+                  status: 'sent',
+                  correlation_id: dmMeta.correlation_id,
+                });
+              } catch (err) { console.error(`stalled approval-batch followup audit failed: ${err.message}`); }
+              if (dmMeta.setter_slack_id && dmMeta.setter_slack_id !== event.user) {
+                try {
+                  await slack.client.chat.postMessage({
+                    channel: dmMeta.setter_slack_id,
+                    text: `🤖 Auto-followup approved + sent to *${dmMeta.contact_name}*: "${String(dmMeta.draft_text).slice(0, 200)}"\n_DM \`pause ${dmMeta.contact_id}\` to stop future auto-followups for this contact._`,
+                  });
+                } catch (err) { console.error(`stalled approval-batch setter notify failed: ${err.message}`); }
+              }
+            }
           } else {
             await slack.client.reactions.add({ channel: event.item.channel, timestamp: event.item.ts, name: 'warning' }).catch(() => {});
             await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `❌ Send failed: ${result.error}` });
