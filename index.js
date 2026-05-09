@@ -5806,6 +5806,111 @@ async function handleGHLWebhook(req, res) {
         console.log('GHL parsed:', { fullName, email, phone, source, assignedTo: resolvedAssignedTo, contactId });
 
         const ghlLink      = contactId ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : 'https://app.gohighlevel.com';
+
+        // Cross-contact dedup. GHL has multiple workflows that each create a
+        // contact off the same Meta Lead Ads event (FB Lead Form + Paid Social),
+        // so the same human shows up twice within ~30s with different contact_ids.
+        // Look back 30 min on normalized phone/email and, if matched, drop a threaded
+        // note on the original post instead of spamming a second top-level lead post.
+        const phoneLast10 = (phone.match(/\d/g) || []).join('').slice(-10) || null;
+        const emailLower  = (email || '').trim().toLowerCase() || null;
+        const firstNameLower = (fullName || '').trim().toLowerCase().split(/\s+/)[0] || '';
+        const namePrefix3    = firstNameLower.slice(0, 3) || null;
+        let dupOriginal = null;
+        if (contactId && (phoneLast10 || emailLower)) {
+          try {
+            const dupSince = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+            const orFilter = [
+              phoneLast10 ? `phone_last10.eq.${phoneLast10}` : null,
+              emailLower  ? `email_lower.eq.${emailLower}`  : null,
+            ].filter(Boolean).join(',');
+            const { data: dupRows, error: dupErr } = await supabase
+              .from('lead_posts')
+              .select('contact_id, slack_message_ts, slack_channel_id, posted_at')
+              .neq('contact_id', contactId)
+              .gte('posted_at', dupSince)
+              .or(orFilter)
+              .order('posted_at', { ascending: false })
+              .limit(1);
+            if (dupErr) console.error('lead_posts dedup lookup failed:', dupErr.message);
+            else if (dupRows && dupRows.length) dupOriginal = dupRows[0];
+          } catch (dupLookupErr) {
+            console.error('lead_posts dedup lookup threw:', dupLookupErr.message);
+          }
+        }
+
+        // FB-Lead-Form → WhatsApp signature: GHL auto-creates a second contact
+        // when the lead clicks the "Start WhatsApp chat" CTA on the post-submit
+        // page. The auto-created contact has a different phone (their WA account),
+        // no email, and a partial name — so phone/email dedup above misses it.
+        // Fuzzy-match instead: same name first-3-chars, within 5 min, original
+        // came in with Source=Facebook, incoming is non-Facebook social. Tight
+        // filters to keep false-positive rate low.
+        if (!dupOriginal && contactId && namePrefix3 && namePrefix3.length === 3 && !emailLower) {
+          const incomingSource = (source || '').toLowerCase();
+          const looksLikeWaSpawned = incomingSource && !incomingSource.includes('facebook') && !incomingSource.includes('vsl');
+          if (looksLikeWaSpawned) {
+            try {
+              const fuzzySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+              const { data: fuzzyRows, error: fuzzyErr } = await supabase
+                .from('lead_posts')
+                .select('contact_id, slack_message_ts, slack_channel_id, posted_at, source, full_name')
+                .neq('contact_id', contactId)
+                .gte('posted_at', fuzzySince)
+                .eq('name_prefix3', namePrefix3)
+                .order('posted_at', { ascending: false })
+                .limit(1);
+              if (fuzzyErr) console.error('lead_posts fuzzy dedup lookup failed:', fuzzyErr.message);
+              else if (fuzzyRows && fuzzyRows.length) {
+                const candidate = fuzzyRows[0];
+                const candSource = (candidate.source || '').toLowerCase();
+                if (candSource.includes('facebook')) {
+                  console.log(`GHL webhook: fuzzy FB→WA dup match — incoming ${contactId} ("${fullName}", ${source}) matches recent ${candidate.contact_id} ("${candidate.full_name}", ${candidate.source})`);
+                  dupOriginal = candidate;
+                }
+              }
+            } catch (fuzzyErrThrow) {
+              console.error('lead_posts fuzzy dedup lookup threw:', fuzzyErrThrow.message);
+            }
+          }
+        }
+
+        if (dupOriginal) {
+          console.log(`GHL webhook: contact ${contactId} matches recent lead_posts row (orig contact ${dupOriginal.contact_id}, ts ${dupOriginal.slack_message_ts}). Skipping top-level post.`);
+          const dupNote = [
+            `⚠️ GHL spawned a second contact for this lead — *${fullName || 'unknown'}*`,
+            source ? `Source on duplicate: ${source}` : null,
+            phone  ? `Phone: ${phone}` : null,
+            email  ? `Email: ${email}` : null,
+            `🔗 ${ghlLink}`,
+            `_Original contact above is the one to work; this duplicate is junk and can be ignored / merged in GHL._`,
+          ].filter(Boolean).join('\n');
+          try {
+            await slack.client.chat.postMessage({
+              channel: dupOriginal.slack_channel_id || LEAD_CHANNEL_ID,
+              thread_ts: dupOriginal.slack_message_ts,
+              text: dupNote,
+            });
+          } catch (dupPostErr) {
+            console.error('lead_posts dedup thread reply failed:', dupPostErr.message);
+          }
+          try {
+            await supabase.from('lead_posts').upsert({
+              contact_id: contactId,
+              slack_message_ts: dupOriginal.slack_message_ts,
+              slack_channel_id: dupOriginal.slack_channel_id || LEAD_CHANNEL_ID,
+              phone_last10: phoneLast10,
+              email_lower: emailLower,
+              source: source || null,
+              full_name: fullName || null,
+              name_prefix3: namePrefix3,
+            }, { onConflict: 'contact_id' });
+          } catch (lpErr) {
+            console.error('lead_posts dup-row upsert failed:', lpErr.message);
+          }
+          return;
+        }
+
         const setterSlackId = resolveSetterSlackId(resolvedAssignedTo);
         const contextLine = leadContext ? `\n- Context: ${leadContext}` : '';
         const actionGuidance = leadContext
@@ -5857,6 +5962,11 @@ async function handleGHLWebhook(req, res) {
               contact_id: contactId,
               slack_message_ts: leadPost.ts,
               slack_channel_id: LEAD_CHANNEL_ID,
+              phone_last10: phoneLast10,
+              email_lower: emailLower,
+              source: source || null,
+              full_name: fullName || null,
+              name_prefix3: namePrefix3,
             }, { onConflict: 'contact_id' });
           } catch (lpErr) {
             console.error('lead_posts insert failed:', lpErr.message);
