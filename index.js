@@ -6042,12 +6042,18 @@ async function handleGHLClaimWebhook(req, res) {
       res.end(JSON.stringify({ received: true }));
       try {
         const payload = JSON.parse(body);
+        // Log full payload for debugging — strip later once stable.
+        console.log('ghl-claim webhook RAW payload:', JSON.stringify(payload).slice(0, 1500));
         const cd = payload.customData || payload.custom_data || {};
-        const contactId  = cd.contact_id || cd.contactId  || payload.contact_id  || payload.contactId  || payload.contact?.id || '';
-        const assignedTo = cd.assigned_to || cd.assignedTo || payload.assigned_to || payload.assignedTo || payload.contact?.assignedTo || '';
+        // Strip whitespace from keys (GHL Custom Data sometimes ships keys with trailing spaces — see existing /webhook/ghl-lead workflow)
+        const cdNorm = {};
+        for (const [k, v] of Object.entries(cd)) cdNorm[String(k).trim()] = v;
+        const contactId  = cdNorm.contact_id || cdNorm.contactId  || payload.contact_id  || payload.contactId  || payload.contact?.id || '';
+        const assignedTo = cdNorm.assigned_to || cdNorm.assignedTo || cdNorm.assigned_user || cdNorm.user_id || payload.assigned_to || payload.assignedTo || payload.contact?.assignedTo || '';
         const locationId = payload.location_id || payload.locationId || process.env.GHL_LOCATION_ID || '';
+        console.log(`ghl-claim parsed: contactId=${contactId} assignedTo=${assignedTo} cdKeys=${Object.keys(cd).join('|')}`);
         if (!contactId) { console.warn('ghl-claim webhook: no contact_id in payload'); return; }
-        if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (likely an unassign event)`); return; }
+        if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (likely an unassign event OR GHL token resolved to empty — check workflow Custom Data 'assignedTo' value)`); return; }
 
         const claimCorr = newCorrelationId();
         console.log(`ghl-claim webhook: contact=${contactId} assignedTo=${assignedTo}`);
