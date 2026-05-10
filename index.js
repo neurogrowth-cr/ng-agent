@@ -5762,6 +5762,17 @@ const SLACK_TO_GHL_USER = {
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
 };
 
+// Fallback: GHL ships payload.user.email reliably even when customData.assignedTo
+// is empty/broken. Used by /webhook/ghl-claim when the GHL token doesn't resolve.
+const EMAIL_TO_GHL_USER_ID = {
+  'joseph.neurogrowth@gmail.com': 'cUTTPGov7ZTLvyjKHdX8',
+  'oscar.neurogrowth@gmail.com':  'ZcmdIz2EEraPd80W2zop',
+  'william.neurogrowth@gmail.com': 'N8mvtuHbbbY7QppqNMr7',
+  'jonathan.neurogrowth@gmail.com': 'gqYMYkpDDlTdxvBkfl2C',
+  'jose.neurogrowth@gmail.com': 'izLTA0jy5OrKyMvyltjV',
+  'ronny.duarte@neurogrowth.io': 'zoGW530iDnPOFqQNfssc',
+};
+
 const LEAD_CHANNEL_ID = 'C0AJANQBYUE'; // #ng-sales-goats
 const LEAD_CLAIM_EMOJIS = new Set(['raised_hand', 'hand', 'white_check_mark', 'heavy_check_mark']);
 const LEAD_CLAIMED_EMOJI = 'white_check_mark';
@@ -6049,11 +6060,21 @@ async function handleGHLClaimWebhook(req, res) {
         const cdNorm = {};
         for (const [k, v] of Object.entries(cd)) cdNorm[String(k).trim()] = v;
         const contactId  = cdNorm.contact_id || cdNorm.contactId  || payload.contact_id  || payload.contactId  || payload.contact?.id || '';
-        const assignedTo = cdNorm.assigned_to || cdNorm.assignedTo || cdNorm.assigned_user || cdNorm.user_id || payload.assigned_to || payload.assignedTo || payload.contact?.assignedTo || '';
+        let assignedTo = cdNorm.assigned_to || cdNorm.assignedTo || cdNorm.assigned_user || cdNorm.user_id || payload.assigned_to || payload.assignedTo || payload.contact?.assignedTo || '';
+        let assignedToSource = assignedTo ? 'customData' : '';
+        // Fallback: GHL token sometimes ships empty even on legitimate assigns. The top-level user.email
+        // arrives reliably, so resolve setter id via EMAIL_TO_GHL_USER_ID. Only known active setters resolve.
+        if (!assignedTo) {
+          const userEmail = String(payload.user?.email || '').toLowerCase().trim();
+          if (userEmail && EMAIL_TO_GHL_USER_ID[userEmail]) {
+            assignedTo = EMAIL_TO_GHL_USER_ID[userEmail];
+            assignedToSource = `email:${userEmail}`;
+          }
+        }
         const locationId = payload.location_id || payload.locationId || process.env.GHL_LOCATION_ID || '';
-        console.log(`ghl-claim parsed: contactId=${contactId} assignedTo=${assignedTo} cdKeys=${Object.keys(cd).join('|')}`);
+        console.log(`ghl-claim parsed: contactId=${contactId} assignedTo=${assignedTo} source=${assignedToSource} cdKeys=${Object.keys(cd).join('|')}`);
         if (!contactId) { console.warn('ghl-claim webhook: no contact_id in payload'); return; }
-        if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (likely an unassign event OR GHL token resolved to empty — check workflow Custom Data 'assignedTo' value)`); return; }
+        if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (unassign event, or GHL token + user.email both empty/unmapped — user.email='${payload.user?.email || ''}')`); return; }
 
         const claimCorr = newCorrelationId();
         console.log(`ghl-claim webhook: contact=${contactId} assignedTo=${assignedTo}`);
@@ -6476,7 +6497,7 @@ async function runStalledProspectFollowups(correlationId) {
             },
           });
           approvalDrafts.push({ ...r, message: draftText });
-          logActivity({ event_type: 'stalled_followup_draft_posted', event_source: 'cron', action: 'outbound', user_id: RON_SLACK_ID, output: { contact_id: r.contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
+          logActivity({ event_type: 'stalled_followup_draft_posted', event_source: 'cron', action: 'outbound', actor_user_id: RON_SLACK_ID, output: { contact_id: r.contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
         } catch (err) {
           console.error(`stalled approval-draft post failed for ${r.contactId}: ${err.message}`);
           liveSkips.post_failed = (liveSkips.post_failed || 0) + 1;
@@ -6527,7 +6548,7 @@ async function runStalledProspectFollowups(correlationId) {
       }
 
       liveSent.push({ ...r, message: draftText });
-      logActivity({ event_type: 'stalled_followup_sent', event_source: 'cron', action: 'outbound', user_id: r.setterSlackId, output: { contact_id: r.contactId, message: draftText.slice(0, 500) }, correlation_id: correlationId });
+      logActivity({ event_type: 'stalled_followup_sent', event_source: 'cron', action: 'outbound', actor_user_id: r.setterSlackId, output: { contact_id: r.contactId, message: draftText.slice(0, 500) }, correlation_id: correlationId });
     }
 
     // DM the setter what was actually sent on their behalf (live only).
@@ -6699,7 +6720,7 @@ async function runRecoverableLeadsCampaign(contactIds, ronSlackId, correlationId
         },
       });
       summary.posted += 1;
-      logActivity({ event_type: 'campaign_draft_posted', event_source: 'slack', action: 'outbound', user_id: ronSlackId, output: { contact_id: contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
+      logActivity({ event_type: 'campaign_draft_posted', event_source: 'slack', action: 'outbound', actor_user_id: ronSlackId, output: { contact_id: contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
     } catch (err) {
       console.error(`campaign post failed for ${contactId}: ${err.message}`);
     }
@@ -7266,7 +7287,7 @@ slack.event('reaction_added', async ({ event }) => {
 
       logActivity({
         event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
-        user_id: event.user, channel_id: channel,
+        actor_user_id: event.user, channel_id: channel,
         output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_in_setter_pipelines: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail, opps_skipped_non_setter: skippedNonSetterOpps },
         correlation_id: claimCorr,
       });
