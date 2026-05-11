@@ -4728,7 +4728,6 @@ slack.event('message', async ({ event }) => {
     await slack.client.chat.postMessage({
       channel: event.channel,
       thread_ts: event.ts,
-      reply_broadcast: true,
       text: replyText,
     });
 
