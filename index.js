@@ -1073,10 +1073,12 @@ function registerDynamicCron(task) {
         ? `\n\nRECENT CLIENT UPDATES FROM TEAM (last 7 days — apply where relevant):\n${recentClientCtx.map(r => `• ${(r.key.split(':')[1] || r.key).replace(/-/g, ' ')}: ${r.value}`).join('\n')}`
         : '';
       // Task-specific pre-computed data blocks (iClosed-first, etc).
-      // For Weekly Closer Comparison, inject actual iClosed appointment + outcome
-      // stats so the model isn't relying on self-reported EOD numbers as primary truth.
+      // For the Weekly Sales Pod Leaderboard (task name: "Weekly Closer Comparison"),
+      // inject both closer and setter stats so the report renders TOP CLOSERS + TOP SETTERS
+      // without relying on self-reported EOD as primary truth.
       let taskDataBlock = '';
-      let weeklyCloserStats = null; // also used downstream for dynamic header validation
+      let weeklyCloserStats = null; // used downstream for dynamic header validation
+      let weeklySetterStats = null;
       if (task.name === 'Weekly Closer Comparison') {
         try {
           const now = new Date();
@@ -1084,10 +1086,12 @@ function registerDynamicCron(task) {
           const weekEnd   = now;
           const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
           weeklyCloserStats = await getCloserWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
-          const block = formatCloserWeeklyStatsBlock(weeklyCloserStats, weekStart.toISOString(), weekEnd.toISOString());
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; cite EOD only when a closer has source=eod-fallback):\n${block}`;
+          weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
+          const closerBlock = formatCloserWeeklyStatsBlock(weeklyCloserStats, weekStart.toISOString(), weekEnd.toISOString());
+          const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source for the leaderboard; cite EOD only when a closer has source=eod-fallback):\n\n${closerBlock}\n\n${setterBlock}`;
         } catch (statsErr) {
-          console.error('getCloserWeeklyStats failed:', statsErr.message);
+          console.error('Weekly pod stats failed:', statsErr.message);
           taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute iClosed stats (${statsErr.message}). Fall back to your usual data tools.`;
         }
       }
@@ -1174,20 +1178,23 @@ function registerDynamicCron(task) {
         const upper = t.toUpperCase();
         const len = t.trim().length;
 
-        // Weekly Closer Comparison: require only closers with iClosed/EOD
-        // activity this week (resolved at runtime via weeklyCloserStats).
+        // Weekly Sales Pod Leaderboard (task name kept as "Weekly Closer Comparison"):
+        // require only people with activity this week — resolved at runtime from
+        // both weeklyCloserStats and weeklySetterStats.
         let headers = TASK_HEADERS[taskName];
         if (taskName === 'Weekly Closer Comparison') {
-          if (weeklyCloserStats && Object.keys(weeklyCloserStats).length) {
-            headers = Object.keys(weeklyCloserStats)
-              .filter(name => {
-                const s = weeklyCloserStats[name];
-                return (s.calls_booked || 0) > 0 || (s.sold || 0) > 0 || (s.eod_days || 0) > 0;
-              })
-              .map(n => n.toUpperCase());
-          } else {
-            headers = []; // no activity computed — fall through to length-only check
-          }
+          const closerHeaders = (weeklyCloserStats ? Object.keys(weeklyCloserStats) : [])
+            .filter(name => {
+              const s = weeklyCloserStats[name];
+              return (s.calls_booked || 0) > 0 || (s.sold || 0) > 0 || (s.eod_days || 0) > 0;
+            });
+          const setterHeaders = (weeklySetterStats ? Object.keys(weeklySetterStats) : [])
+            .filter(name => {
+              const s = weeklySetterStats[name];
+              return (s.calls_booked || 0) > 0 || (s.qualified_leads || 0) > 0 || (s.new_conversations || 0) > 0 || (s.eod_days || 0) > 0;
+            });
+          const combined = Array.from(new Set([...closerHeaders, ...setterHeaders])).map(n => n.toUpperCase());
+          headers = combined.length ? combined : [];
         }
 
         if (headers === undefined) {
@@ -2804,17 +2811,98 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   if (!names.length) {
     return `No closer activity (iClosed or EOD) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
-  const lines = [`CLOSER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(iClosed actuals are primary truth; EOD shown only when iClosed has no rows for that closer.)`);
-  for (const name of names) {
+  // Rank closers by revenue desc (with sold count + close rate as visible secondaries).
+  const ranked = names.map(name => {
     const s = stats[name];
     const showRate = s.calls_booked > 0 ? Math.round((s.attended / s.calls_booked) * 100) : 0;
     const closeRate = s.attended > 0 ? Math.round((s.sold / s.attended) * 100) : 0;
+    return { name, s, showRate, closeRate };
+  }).sort((a, b) => (b.s.revenue || 0) - (a.s.revenue || 0) || (b.s.sold || 0) - (a.s.sold || 0));
+
+  const lines = [`CLOSER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
+  lines.push(`(iClosed actuals are primary truth; EOD shown only when iClosed has no rows for that closer. Ranked by revenue, then sold count.)`);
+  ranked.forEach(({ name, s, showRate, closeRate }, idx) => {
     lines.push(``);
-    lines.push(`${name.toUpperCase()} (source: ${s.source}${s.source === 'iclosed' ? '' : ` — ${s.eod_days} EOD day(s)`})`);
+    lines.push(`#${idx + 1} ${name.toUpperCase()} (source: ${s.source}${s.source === 'iclosed' ? '' : ` — ${s.eod_days} EOD day(s)`})`);
     lines.push(`  Calls booked: ${s.calls_booked} | Attended: ${s.attended} | No-shows: ${s.no_shows} (show rate: ${showRate}%)`);
     lines.push(`  Sold: ${s.sold} | Revenue: $${s.revenue.toLocaleString()} (close rate on shows: ${closeRate}%)`);
+  });
+  return lines.join('\n');
+}
+
+// ─── SETTER WEEKLY STATS (iClosed-first calls booked, EOD for soft metrics) ──
+// Used by the Weekly Sales Pod Leaderboard. iClosed appointments are the truth
+// source for calls booked + attended + no-shows attributed to each setter.
+// revops_setter_eod_daily supplies the soft metrics that iClosed doesn't track:
+// new_conversations and qualified_leads.
+async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
+  const result = {}; // { setterName: { calls_booked, attended, no_shows, new_conversations, qualified_leads, eod_days } }
+
+  // 1. iClosed appointments — calls booked attributed to each setter
+  const { data: appts, error: apptErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, setter_id, scheduled_start, attended, no_show_reason')
+    .gte('scheduled_start', weekStartIso)
+    .lte('scheduled_start', weekEndIso);
+  if (apptErr) throw apptErr;
+
+  for (const a of (appts || [])) {
+    if (!a.setter_id) continue; // skip rows with no setter attribution
+    const name = resolveSalesMember(a.setter_id);
+    if (!result[name]) result[name] = { calls_booked: 0, attended: 0, no_shows: 0, new_conversations: 0, qualified_leads: 0, eod_days: 0 };
+    result[name].calls_booked += 1;
+    if (a.attended === true) result[name].attended += 1;
+    if (a.attended === false) result[name].no_shows += 1;
   }
+
+  // 2. Setter EOD — soft metrics iClosed doesn't have (new convos, qualified leads)
+  const weekStartDate = weekStartIso.slice(0, 10);
+  const weekEndDate   = weekEndIso.slice(0, 10);
+  const { data: eodRows } = await portalSupabase
+    .from('revops_setter_eod_daily')
+    .select('setter_id, report_date, new_conversations, qualified_leads, scheduled_calls, calls_show, calls_no_show')
+    .gte('report_date', weekStartDate)
+    .lte('report_date', weekEndDate);
+
+  for (const r of (eodRows || [])) {
+    if (!r.setter_id) continue;
+    const name = resolveSalesMember(r.setter_id);
+    if (!result[name]) result[name] = { calls_booked: 0, attended: 0, no_shows: 0, new_conversations: 0, qualified_leads: 0, eod_days: 0 };
+    result[name].new_conversations += (r.new_conversations || 0);
+    result[name].qualified_leads   += (r.qualified_leads   || 0);
+    result[name].eod_days += 1;
+    // If a setter only has EOD data (no iClosed bookings attributed), fold EOD scheduled_calls in as a fallback
+    if (result[name].calls_booked === 0) {
+      result[name].calls_booked += (r.scheduled_calls || 0);
+      result[name].attended     += (r.calls_show     || 0);
+      result[name].no_shows     += (r.calls_no_show  || 0);
+    }
+  }
+
+  return result;
+}
+
+function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
+  const names = Object.keys(stats);
+  if (!names.length) {
+    return `No setter activity (iClosed or EOD) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
+  }
+  // Rank setters by qualified leads, then calls booked. Both are activity metrics; quality first.
+  const ranked = names.map(name => {
+    const s = stats[name];
+    const showRate = s.calls_booked > 0 ? Math.round((s.attended / s.calls_booked) * 100) : 0;
+    const qualRate = s.new_conversations > 0 ? Math.round((s.qualified_leads / s.new_conversations) * 100) : 0;
+    return { name, s, showRate, qualRate };
+  }).sort((a, b) => (b.s.qualified_leads || 0) - (a.s.qualified_leads || 0) || (b.s.calls_booked || 0) - (a.s.calls_booked || 0));
+
+  const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
+  lines.push(`(iClosed = truth source for calls booked/attended/no-shows; EOD = new conversations + qualified leads. Ranked by qualified leads, then calls booked.)`);
+  ranked.forEach(({ name, s, showRate, qualRate }, idx) => {
+    lines.push(``);
+    lines.push(`#${idx + 1} ${name.toUpperCase()} (${s.eod_days} EOD day(s) submitted)`);
+    lines.push(`  New conversations: ${s.new_conversations} | Qualified leads: ${s.qualified_leads} (qualification rate: ${qualRate}%)`);
+    lines.push(`  Calls booked: ${s.calls_booked} | Attended: ${s.attended} | No-shows: ${s.no_shows} (show rate: ${showRate}%)`);
+  });
   return lines.join('\n');
 }
 
