@@ -4932,9 +4932,12 @@ slack.event('message', async ({ event }) => {
     }
 
     const setterInfo = await resolveSetterForContact(prospectEmail, prospectName);
+    const setterSlackId = setterInfo.setter ? resolveSetterSlackId(setterInfo.setter) : null;
+    const setterTag = setterSlackId ? `<@${setterSlackId}>` : setterInfo.setter;
+
     let replyText;
-    if (setterInfo.source === 'appointment-setting' && setterInfo.setter) {
-      replyText = `👤 Setter: ${setterInfo.setter}`;
+    if (setterInfo.source === 'appointment-setting' && setterTag) {
+      replyText = `👤 Setter: ${setterTag}`;
     } else if (setterInfo.source === 'appointment-setting') {
       replyText = `👤 Setter: appointment-setting pipeline (setter unmapped — check GHL).`;
     } else {
@@ -4947,8 +4950,37 @@ slack.event('message', async ({ event }) => {
       text: replyText,
     });
 
+    // DM the setter with booking details so they don't miss it. Only fires when
+    // we successfully resolved a Slack ID (otherwise we have no one to DM).
+    if (setterSlackId) {
+      try {
+        const dateMatch = flatText.match(/Date:\s*([^\n]+)/i);
+        const timeMatch = flatText.match(/Time:\s*([^\n]+)/i);
+        const hostMatch = flatText.match(/Host:\s*([^\n(]+?)(?=\s*[(\n]|$)/i);
+        const permalinkRes = await slack.client.chat.getPermalink({ channel: event.channel, message_ts: event.ts }).catch(() => null);
+        const permalink = permalinkRes && permalinkRes.permalink ? permalinkRes.permalink : null;
+
+        const prospectLabel = prospectName
+          ? `${prospectName}${prospectEmail ? ` (${prospectEmail})` : ''}`
+          : (prospectEmail || 'a prospect');
+
+        const dmLines = [
+          `🎯 *Your lead booked a strategy call*`,
+          `*Prospect:* ${prospectLabel}`,
+        ];
+        if (dateMatch) dmLines.push(`*Date:* ${dateMatch[1].trim()}`);
+        if (timeMatch) dmLines.push(`*Time:* ${timeMatch[1].trim()}`);
+        if (hostMatch) dmLines.push(`*Closer:* ${hostMatch[1].trim()}`);
+        if (permalink) dmLines.push(`<${permalink}|View in #ng-sales-goats>`);
+
+        await slack.client.chat.postMessage({ channel: setterSlackId, text: dmLines.join('\n') });
+      } catch (dmErr) {
+        console.error('iClosed relay DM error:', dmErr.message);
+      }
+    }
+
     await upsertKnowledge('intel', dedupKey, `Setter reveal posted for iClosed booking ${prospectEmail || prospectName}: ${replyText}`, 'iclosed-relay');
-    console.log(`iClosed relay: posted setter reveal for ${prospectEmail || prospectName} → ${replyText}`);
+    console.log(`iClosed relay: posted setter reveal for ${prospectEmail || prospectName} → ${replyText}${setterSlackId ? ' (+ DM)' : ''}`);
   } catch (err) {
     console.error('iClosed relay error:', err.message);
   }
