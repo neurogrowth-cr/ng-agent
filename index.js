@@ -1072,9 +1072,29 @@ function registerDynamicCron(task) {
       const clientCtxBlock = recentClientCtx?.length
         ? `\n\nRECENT CLIENT UPDATES FROM TEAM (last 7 days — apply where relevant):\n${recentClientCtx.map(r => `• ${(r.key.split(':')[1] || r.key).replace(/-/g, ' ')}: ${r.value}`).join('\n')}`
         : '';
+      // Task-specific pre-computed data blocks (iClosed-first, etc).
+      // For Weekly Closer Comparison, inject actual iClosed appointment + outcome
+      // stats so the model isn't relying on self-reported EOD numbers as primary truth.
+      let taskDataBlock = '';
+      let weeklyCloserStats = null; // also used downstream for dynamic header validation
+      if (task.name === 'Weekly Closer Comparison') {
+        try {
+          const now = new Date();
+          // Last 7 days, ending now
+          const weekEnd   = now;
+          const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          weeklyCloserStats = await getCloserWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
+          const block = formatCloserWeeklyStatsBlock(weeklyCloserStats, weekStart.toISOString(), weekEnd.toISOString());
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; cite EOD only when a closer has source=eod-fallback):\n${block}`;
+        } catch (statsErr) {
+          console.error('getCloserWeeklyStats failed:', statsErr.message);
+          taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute iClosed stats (${statsErr.message}). Fall back to your usual data tools.`;
+        }
+      }
+
       const enrichedPrompt = liveContext
-        ? `${task.prompt}${lessonContext}${clientCtxBlock}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
-        : `${task.prompt}${lessonContext}${clientCtxBlock}`;
+        ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}`;
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
@@ -1137,7 +1157,11 @@ function registerDynamicCron(task) {
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
         'Monthly Business Review':    ['WINS THIS MONTH', 'GAPS & MISSES', 'KEEP DOING', 'STOP DOING', 'WATCH LIST', 'ONE PRIORITY FOR NEXT MONTH'],
-        'Weekly Closer Comparison':   ['JOSE CARRANZA', 'JONATHAN MADRIZ'],
+        // Weekly Closer Comparison headers are resolved dynamically from the
+        // precomputed weeklyCloserStats below — only closers with activity that
+        // week are required to appear. Static list left empty so we don't fall
+        // through to a wrong fallback.
+        'Weekly Closer Comparison':   [],
         'Sales Call Prep Reminder':         [], // short task, skip header check
         'Blocked Client Report — MWF':      [], // short report, no fixed headers
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
@@ -1149,7 +1173,23 @@ function registerDynamicCron(task) {
         const t = text || '';
         const upper = t.toUpperCase();
         const len = t.trim().length;
-        const headers = TASK_HEADERS[taskName];
+
+        // Weekly Closer Comparison: require only closers with iClosed/EOD
+        // activity this week (resolved at runtime via weeklyCloserStats).
+        let headers = TASK_HEADERS[taskName];
+        if (taskName === 'Weekly Closer Comparison') {
+          if (weeklyCloserStats && Object.keys(weeklyCloserStats).length) {
+            headers = Object.keys(weeklyCloserStats)
+              .filter(name => {
+                const s = weeklyCloserStats[name];
+                return (s.calls_booked || 0) > 0 || (s.sold || 0) > 0 || (s.eod_days || 0) > 0;
+              })
+              .map(n => n.toUpperCase());
+          } else {
+            headers = []; // no activity computed — fall through to length-only check
+          }
+        }
+
         if (headers === undefined) {
           return { ok: len >= 300, reason: len >= 300 ? null : `length ${len} < 300 (unknown task — length-only check)`, found: [], missing: [], len };
         }
@@ -2554,7 +2594,9 @@ async function getSalesIntelligence(query) {
           const time    = formatICTime(a.scheduled_start, { hour: '2-digit', minute: '2-digit' });
           const outcome = outcomeMap[a.id];
           const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
-          let setterLabel = 'VSL self-booking';
+          // VSL funnel is paused — do not attribute calls to 'VSL self-booking'
+          // when no setter-pipeline opportunity is found. Use 'setter unknown' instead.
+          let setterLabel = 'setter unknown';
           try {
             const info = await resolveSetterForContact(a.prospect?.email, a.prospect?.full_name);
             if (info.source === 'appointment-setting') {
@@ -2688,6 +2730,92 @@ async function getSalesIntelligence(query) {
   } catch (err) {
     return `Sales intelligence error: ${err.message}`;
   }
+}
+
+// ─── CLOSER WEEKLY STATS (iClosed-first, EOD fallback) ───────────────────────
+// Used by the "Weekly Closer Comparison" scheduled task. iClosed appointment +
+// outcome data is the primary truth source; self-reported EOD numbers are only
+// included when a closer has no iClosed rows for the week.
+async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
+  const result = {}; // { closerName: { source, calls_booked, attended, no_shows, sold, revenue, eod_days } }
+
+  // 1. Primary: iClosed appointments in range
+  const { data: appts, error: apptErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type')
+    .gte('scheduled_start', weekStartIso)
+    .lte('scheduled_start', weekEndIso);
+  if (apptErr) throw apptErr;
+
+  const apptIds = (appts || []).map(a => a.id);
+  let outcomesById = {};
+  if (apptIds.length) {
+    const { data: outcomes } = await portalSupabase
+      .from('revops_sales_outcomes')
+      .select('appointment_id, outcome, closed_revenue, lost_reason')
+      .in('appointment_id', apptIds);
+    outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
+  }
+
+  for (const a of (appts || [])) {
+    const name = resolveSalesMember(a.closer_id);
+    if (!result[name]) result[name] = { source: 'iclosed', calls_booked: 0, attended: 0, no_shows: 0, sold: 0, revenue: 0, eod_days: 0 };
+    result[name].calls_booked += 1;
+    if (a.attended === true) result[name].attended += 1;
+    if (a.attended === false) result[name].no_shows += 1;
+    const o = outcomesById[a.id];
+    if (o) {
+      const outcomeLower = (o.outcome || '').toLowerCase();
+      if (outcomeLower.includes('sold') || outcomeLower.includes('won') || outcomeLower.includes('close')) {
+        result[name].sold += 1;
+      }
+      result[name].revenue += Number(o.closed_revenue || 0);
+    }
+  }
+
+  // 2. Fallback: pull EOD rows for the same range, mark as eod-fallback for closers without iClosed activity
+  const weekStartDate = weekStartIso.slice(0, 10);
+  const weekEndDate   = weekEndIso.slice(0, 10);
+  const { data: eodRows } = await portalSupabase
+    .from('revops_closer_eod_daily')
+    .select('closer_id, report_date, scheduled_calls, canceled_calls, no_shows, qualified_calls, bookings, installment_closes, full_closes')
+    .gte('report_date', weekStartDate)
+    .lte('report_date', weekEndDate);
+
+  for (const r of (eodRows || [])) {
+    const name = resolveSalesMember(r.closer_id);
+    if (!result[name]) {
+      result[name] = { source: 'eod-fallback', calls_booked: 0, attended: 0, no_shows: 0, sold: 0, revenue: 0, eod_days: 0 };
+    }
+    // Only fold EOD numbers in when iClosed has no data for this closer
+    if (result[name].source === 'eod-fallback') {
+      result[name].calls_booked += (r.scheduled_calls || 0);
+      result[name].no_shows     += (r.no_shows || 0);
+      result[name].sold         += (r.full_closes || 0) + (r.installment_closes || 0);
+    }
+    result[name].eod_days += 1;
+  }
+
+  return result;
+}
+
+function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
+  const names = Object.keys(stats);
+  if (!names.length) {
+    return `No closer activity (iClosed or EOD) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
+  }
+  const lines = [`CLOSER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
+  lines.push(`(iClosed actuals are primary truth; EOD shown only when iClosed has no rows for that closer.)`);
+  for (const name of names) {
+    const s = stats[name];
+    const showRate = s.calls_booked > 0 ? Math.round((s.attended / s.calls_booked) * 100) : 0;
+    const closeRate = s.attended > 0 ? Math.round((s.sold / s.attended) * 100) : 0;
+    lines.push(``);
+    lines.push(`${name.toUpperCase()} (source: ${s.source}${s.source === 'iclosed' ? '' : ` — ${s.eod_days} EOD day(s)`})`);
+    lines.push(`  Calls booked: ${s.calls_booked} | Attended: ${s.attended} | No-shows: ${s.no_shows} (show rate: ${showRate}%)`);
+    lines.push(`  Sold: ${s.sold} | Revenue: $${s.revenue.toLocaleString()} (close rate on shows: ${closeRate}%)`);
+  }
+  return lines.join('\n');
 }
 
 // ─── GHL CONVERSATIONS ────────────────────────────────────────────────────────
@@ -4911,23 +5039,65 @@ async function fetchGHLConvoForContact(contactId) {
   // Get conversations for this contact
   const convoRes  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&contactId=${contactId}&limit=1`, { headers });
   const convoData = await convoRes.json();
-  const convoId   = convoData.conversations?.[0]?.id;
+  const convoCount = (convoData.conversations || []).length;
+  const convoId    = convoData.conversations?.[0]?.id;
+  console.log(`[GHL] fetchConvo contactId=${contactId} status=${convoRes.status} conversations=${convoCount} convoId=${convoId || 'none'}`);
   if (!convoId) return null;
   // Get recent messages
   const msgRes  = await fetch(`https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=12`, { headers });
   const msgData = await msgRes.json();
-  return msgData.messages || [];
+  const messages = msgData.messages || msgData.messages?.messages || [];
+  const msgCount = Array.isArray(messages) ? messages.length : 0;
+  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${msgCount}`);
+  return Array.isArray(messages) ? messages : [];
 }
 
 async function searchGHLContact(email, name) {
   const locationId = process.env.GHL_LOCATION_ID;
   const apiKey     = process.env.GHL_API_KEY;
   const headers    = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
-  // Try by email first, fall back to name
+
+  // 1. Exact email match (preferred — most reliable)
+  if (email) {
+    try {
+      const exactRes  = await fetch(`https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${locationId}&email=${encodeURIComponent(email)}`, { headers });
+      if (exactRes.ok) {
+        const exactData = await exactRes.json();
+        const contact = exactData.contact || exactData.contacts?.[0];
+        if (contact) {
+          console.log(`[GHL] searchContact strategy=email-exact email=${email} -> ${contact.id}`);
+          return contact;
+        }
+        console.log(`[GHL] searchContact strategy=email-exact email=${email} -> no match`);
+      } else {
+        console.log(`[GHL] searchContact email-exact failed status=${exactRes.status}`);
+      }
+    } catch (e) {
+      console.log(`[GHL] searchContact email-exact threw: ${e.message}`);
+    }
+  }
+
+  // 2. Fuzzy query fallback (email-or-name)
   const query = email || name;
-  const res  = await fetch(`https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&query=${encodeURIComponent(query)}&limit=1`, { headers });
+  if (!query) {
+    console.log('[GHL] searchContact called with no email or name');
+    return null;
+  }
+  const res  = await fetch(`https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&query=${encodeURIComponent(query)}&limit=5`, { headers });
   const data = await res.json();
-  return data.contacts?.[0] || null;
+  const contacts = data.contacts || [];
+  console.log(`[GHL] searchContact strategy=fuzzy query="${query}" status=${res.status} returned=${contacts.length}`);
+
+  // Prefer email match within fuzzy results before falling to first
+  if (email) {
+    const emailLower = email.toLowerCase();
+    const emailMatch = contacts.find(c => (c.email || '').toLowerCase() === emailLower);
+    if (emailMatch) {
+      console.log(`[GHL] searchContact fuzzy result matched email -> ${emailMatch.id}`);
+      return emailMatch;
+    }
+  }
+  return contacts[0] || null;
 }
 
 // Determine whether a booked call came from the Appointment Setting Pipeline
@@ -5020,7 +5190,8 @@ async function runSalesCallPrep(_correlationId) {
           ? `👤 Booked by: ${setterInfo.setter}`
           : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
       } else {
-        sourceLine = `📲 Source: VSL self-booking (no setter)`;
+        // VSL funnel is paused — don't attribute to VSL when no setter opp is found
+        sourceLine = `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
       }
 
       try {
@@ -5044,7 +5215,8 @@ async function runSalesCallPrep(_correlationId) {
       }
 
       if (setterInfo.source === 'vsl' && convoSection === 'GHL conversation not found for this prospect.') {
-        convoSection = 'VSL direct booking — prospect self-scheduled via the sales page. No setter contact, no GHL conversation.';
+        // VSL is paused — these are likely iClosed self-bookings without a GHL contact record yet
+        convoSection = 'No GHL contact / conversation found for this prospect (likely iClosed-only booking).';
       }
 
       // Build the brief
