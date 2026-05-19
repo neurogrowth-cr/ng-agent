@@ -6259,32 +6259,51 @@ function resolveSetterSlackId(assignedUser) {
   return null;
 }
 
-// Phone normalization for our two markets. Costa Rica national numbers are
-// 8 digits; US/Canada (NANP) are 10. That length gap makes country inference
-// reliable without a heavy lib. Leads often arrive with no country code (GHL
-// then defaults them to the location country, +506, so US numbers show a CR
-// flag) or with a wrong +506 glued onto a 10-digit US number — both fixed here.
-function normalizePhone(raw) {
+// Phone normalization for our three markets: CR (8-digit national), US/CA
+// (10-digit NANP), and MX (10-digit, post-2019 IFT unification). CR is
+// unambiguous on length. US vs MX collide at 10 digits, so when no country
+// code is present we require a country hint (GHL contact's `country` field)
+// to classify confidently — without a hint we display raw and refuse to
+// write back to GHL, since auto-tagging an MX lead as +1 (or vice versa)
+// would corrupt the CRM record.
+function normalizePhone(raw, countryHint) {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, '');
   if (!digits) return null;
+  const hint = (countryHint || '').toString().trim().toUpperCase();
 
-  // Strip a leading country code so we can judge by national length.
+  // If an explicit country code is present, trust it (this is the only way to
+  // safely disambiguate a bare 10-digit US vs MX number).
+  let cc = null;
   let national = digits;
-  if (digits.length === 11 && digits.startsWith('1')) national = digits.slice(1);
-  else if (digits.length === 9 && digits.startsWith('1')) national = digits.slice(1);
-  else if (digits.length >= 11 && digits.startsWith('506')) national = digits.slice(3);
+  if (digits.length === 11 && digits.startsWith('1'))        { cc = '1';   national = digits.slice(1); }
+  else if (digits.length === 12 && digits.startsWith('52'))  { cc = '52';  national = digits.slice(2); }
+  else if (digits.length === 13 && digits.startsWith('521')) { cc = '52';  national = digits.slice(3); }
+  else if (digits.length >= 11  && digits.startsWith('506')) { cc = '506'; national = digits.slice(3); }
 
-  let cc;
-  if (national.length === 10) cc = '1';        // US / Canada
-  else if (national.length === 8) cc = '506';  // Costa Rica
-  else return { e164: null, display: String(raw).trim(), confident: false };
+  if (cc) {
+    const ok = (cc === '506' && national.length === 8) || ((cc === '1' || cc === '52') && national.length === 10);
+    if (!ok) return { e164: null, display: String(raw).trim(), confident: false };
+    return { e164: `+${cc}${national}`, display: formatPhoneDisplay(cc, national), confident: true };
+  }
 
-  return { e164: `+${cc}${national}`, display: formatPhoneDisplay(cc, national), confident: true };
+  // No prefix — judge by length, falling back to the country hint when 10
+  // digits are ambiguous between US/CA and MX.
+  if (national.length === 8) {
+    return { e164: `+506${national}`, display: formatPhoneDisplay('506', national), confident: true };
+  }
+  if (national.length === 10) {
+    if (hint === 'US' || hint === 'CA') cc = '1';
+    else if (hint === 'MX')             cc = '52';
+    else return { e164: null, display: String(raw).trim(), confident: false };
+    return { e164: `+${cc}${national}`, display: formatPhoneDisplay(cc, national), confident: true };
+  }
+  return { e164: null, display: String(raw).trim(), confident: false };
 }
 
 function formatPhoneDisplay(cc, national) {
   if (cc === '1')   return `+1 (${national.slice(0, 3)}) ${national.slice(3, 6)}-${national.slice(6)}`;
+  if (cc === '52')  return `+52 ${national.slice(0, 3)} ${national.slice(3, 6)} ${national.slice(6)}`;
   if (cc === '506') return `+506 ${national.slice(0, 4)} ${national.slice(4)}`;
   return `+${cc}${national}`;
 }
@@ -6321,7 +6340,8 @@ async function handleGHLWebhook(req, res) {
         const fullName   = cd.fullName || payload.fullName || payload.full_name || `${payload.first_name || ct.firstName || ''} ${payload.last_name || ct.lastName || ''}`.trim() || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
-        const phoneInfo  = normalizePhone(phone);
+        const phoneCountry = cd.country  || ct.country         || payload.country || '';
+        const phoneInfo  = normalizePhone(phone, phoneCountry);
         const phoneDisplay = phoneInfo ? phoneInfo.display : phone;
         const contactAttr = (payload.contact && payload.contact.attributionSource) || {};
         const attrSource  = payload.attributionSource || {};
