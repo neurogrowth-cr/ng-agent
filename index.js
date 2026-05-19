@@ -849,6 +849,7 @@ function inferReportId(messageText, fallbackChannel) {
   if (t.includes('eod pulse') || t.includes('end of day pulse'))         return 'fulfillment-eod';
   if (t.includes('week in review') || t.includes('friday delivery'))     return 'friday-delivery-wrap';
   if (t.includes('anomaly') || t.includes('drifted') || t.includes('σ')) return 'anomaly-alert';
+  if (t.includes('still missing an iclosed outcome') || t.includes('outcome not logged')) return 'unlogged-outcome-reminder';
   return fallbackChannel || 'general-report';
 }
 
@@ -5759,29 +5760,6 @@ async function runSalesStandup(_correlationId) {
       .lte('scheduled_start', todayEndISO)
       .order('scheduled_start', { ascending: true });
 
-    // Yesterday's attended with no outcome logged
-    const ystStart = new Date(now - 24 * 60 * 60 * 1000); ystStart.setHours(0, 0, 0, 0);
-    const ystEnd   = new Date(now - 24 * 60 * 60 * 1000); ystEnd.setHours(23, 59, 59, 999);
-    const { data: ystAttended } = await portalSupabase
-      .from('revops_appointments')
-      .select('id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
-      .eq('attended', true)
-      .gte('scheduled_start', ystStart.toISOString())
-      .lte('scheduled_start', ystEnd.toISOString());
-
-    let unloggedByCloser = {};
-    if (ystAttended && ystAttended.length) {
-      const ystIds = ystAttended.map(a => a.id);
-      const { data: ystOutcomes } = await portalSupabase
-        .from('revops_sales_outcomes')
-        .select('appointment_id')
-        .in('appointment_id', ystIds);
-      const loggedSet = new Set((ystOutcomes || []).map(o => o.appointment_id));
-      ystAttended.filter(a => !loggedSet.has(a.id)).forEach(a => {
-        (unloggedByCloser[a.closer_id] = unloggedByCloser[a.closer_id] || []).push(a);
-      });
-    }
-
     // Yesterday's closer EOD stats
     const { data: closerEOD } = await portalSupabase
       .from('revops_closer_eod_daily')
@@ -5808,7 +5786,6 @@ async function runSalesStandup(_correlationId) {
         const closeRatePct  = heldCalls > 0 ? Math.round((closes / heldCalls) * 100) : 0;
 
         const myTodayCalls = (todayCalls || []).filter(a => a.closer_id === closer.email);
-        const myUnlogged   = unloggedByCloser[closer.email] || [];
 
         const lines = [`${closerLessonNote}Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
 
@@ -5827,17 +5804,6 @@ async function runSalesStandup(_correlationId) {
           lines.push('');
         }
 
-        // Outcomes not logged
-        if (myUnlogged.length) {
-          lines.push(`⚠️ Outcome not logged (${myUnlogged.length} calls):`);
-          myUnlogged.forEach(a => {
-            const pName  = a.prospect?.full_name || 'Unknown';
-            const dStr   = formatICTime(a.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-            lines.push(`• ${pName} — ${dStr} — please log in iClosed`);
-          });
-          lines.push('');
-        }
-
         lines.push('See something off? Thread on this message and tag @Max with the correction.');
         await slack.client.chat.postMessage({ channel: closer.slackId, text: lines.join('\n') });
         console.log(`Sales standup DM sent to closer ${closer.name}`);
@@ -5850,6 +5816,144 @@ async function runSalesStandup(_correlationId) {
   } catch (err) {
     console.error('Sales standup error:', err.message);
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Sales standup cron failed: ${err.message}` });
+  }
+}
+
+// ─── UNLOGGED ICLOSED OUTCOME REMINDERS ──────────────────────────────────────
+// Fires 4 PM CR every day. DMs the owning closer for any attended call >24h old
+// that still has no iClosed outcome. Re-nudges daily (de-duped via agent_knowledge)
+// and escalates to Ron once a call has been unlogged 3+ days despite reminders.
+async function runUnloggedOutcomeReminders(_correlationId) {
+  console.log('Running unlogged-outcome reminders...');
+  try {
+    const now    = Date.now();
+    const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
+    const cutoff = new Date(now - 24 * 60 * 60 * 1000).toISOString();      // >24h old
+
+    // Past calls 24h–14d ago. `attended` is almost always null so it is NOT a
+    // gate; we exclude cancelled calls (qualification_snapshot) and require an
+    // iclosed_call_id (needed to match outcomes). NOTE: revops_sales_outcomes
+    // is unusable here — the dash.neurogrowth.io ingestion never populates it
+    // (0 rows / 156 appts). The raw iclosed_webhook_deliveries "Outcome added"
+    // feed is the source of truth for "did the closer log an outcome".
+    const { data: pastCalls } = await portalSupabase
+      .from('revops_appointments')
+      .select('id, closer_id, scheduled_start, iclosed_call_id, qualification_snapshot, prospect:prospect_id(full_name)')
+      .lte('scheduled_start', cutoff)
+      .gte('scheduled_start', since);
+
+    const dueCalls = (pastCalls || []).filter(
+      a => a.iclosed_call_id && a.qualification_snapshot?.iclosed?.cancelled !== true
+    );
+
+    if (!dueCalls.length) {
+      console.log('Unlogged-outcome reminders: no due calls in window.');
+      return;
+    }
+
+    // Calls that already have an iClosed outcome logged — derived from the raw
+    // "Outcome added" webhook deliveries (payload.callPreviewId === iclosed_call_id).
+    // 30-day lookback covers the 14-day call window plus late logging.
+    const whSince = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: outcomeEvents } = await portalSupabase
+      .from('iclosed_webhook_deliveries')
+      .select('payload')
+      .eq('normalized_event_type', 'Outcome added')
+      .gte('created_at', whSince)
+      .limit(2000);
+    const loggedCallIds = new Set();
+    (outcomeEvents || []).forEach(r => {
+      const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
+      if (p && p.callPreviewId) loggedCallIds.add(p.callPreviewId);
+    });
+    const unlogged = dueCalls.filter(a => !loggedCallIds.has(a.iclosed_call_id));
+
+    if (!unlogged.length) {
+      console.log('Unlogged-outcome reminders: all attended calls logged.');
+      return;
+    }
+
+    // De-dup + escalation state per appointment ───────────────────────────────
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const unloggedByCloser = {};
+    const escalations = []; // { appt, closerName, count } where 3+ days unlogged
+
+    for (const a of unlogged) {
+      const dedupKey = `outcome-reminder:${a.id}`;
+      let firstReminded = todayISO;
+      let count = 1;
+      const { data: existing } = await supabase
+        .from('agent_knowledge')
+        .select('value')
+        .eq('key', dedupKey)
+        .limit(1);
+      if (existing && existing.length && existing[0].value) {
+        const [prevDate, prevCount] = String(existing[0].value).split('|');
+        if (prevDate) firstReminded = prevDate;
+        count = (parseInt(prevCount, 10) || 0) + 1;
+      }
+      await upsertKnowledge('process', dedupKey, `${firstReminded}|${count}`, 'outcome-reminder');
+
+      const daysSinceFirst = Math.floor((now - new Date(firstReminded).getTime()) / 86400000);
+      const entry = { appt: a, count, daysSinceFirst };
+      (unloggedByCloser[a.closer_id] = unloggedByCloser[a.closer_id] || []).push(entry);
+      if (daysSinceFirst >= 3) {
+        escalations.push({ appt: a, closerName: resolveSalesMember(a.closer_id), count });
+      }
+    }
+
+    // Feedback-loop lessons ───────────────────────────────────────────────────
+    const lessons = await getReportLessons('unlogged-outcome-reminder');
+    const lessonNote = lessons.length
+      ? `[Corrections applied from feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`
+      : '';
+
+    // DM each closer their list ───────────────────────────────────────────────
+    for (const [closerEmail, entries] of Object.entries(unloggedByCloser)) {
+      const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
+      if (!slackId) {
+        console.warn(`Unlogged-outcome reminders: no Slack ID for closer ${closerEmail}`);
+        continue;
+      }
+      const closerName = resolveSalesMember(closerEmail);
+      const firstName  = (typeof closerName === 'string' ? closerName : '').split(' ')[0] || 'there';
+      try {
+        const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an iClosed outcome:\n`];
+        lines.push(`⚠️ Outcome not logged (${entries.length}):`);
+        entries.forEach(({ appt, count }) => {
+          const pName = appt.prospect?.full_name || 'Unknown';
+          const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+          const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
+          const nudge = count > 1 ? ` · reminded ${count}×` : '';
+          lines.push(`• ${pName} — ${dStr} CR — held ${heldDays}d ago${nudge}`);
+        });
+        lines.push('');
+        lines.push('Please add the outcome in iClosed when you get a sec.');
+        lines.push('');
+        lines.push('See something off? Thread on this message and tag @Max with the correction.');
+        await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
+        console.log(`Unlogged-outcome reminder sent to ${closerName} (${entries.length} calls)`);
+      } catch (closerErr) {
+        console.error(`Unlogged-outcome reminder to ${closerName} failed:`, closerErr.message);
+      }
+    }
+
+    // Escalate 3+ day stragglers to Ron ───────────────────────────────────────
+    if (escalations.length) {
+      const eLines = ['🚨 Outcome-logging escalation — 3+ days unlogged despite reminders:\n'];
+      escalations.forEach(({ appt, closerName, count }) => {
+        const pName = appt.prospect?.full_name || 'Unknown';
+        const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric' });
+        eLines.push(`• ${pName} — ${dStr} — closer: ${closerName} — reminded ${count}×`);
+      });
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: eLines.join('\n') });
+      console.log(`Unlogged-outcome escalation sent to Ron (${escalations.length} calls)`);
+    }
+
+    console.log('Unlogged-outcome reminders complete.');
+  } catch (err) {
+    console.error('Unlogged-outcome reminders error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Unlogged-outcome reminder cron failed: ${err.message}` });
   }
 }
 
@@ -6005,6 +6109,11 @@ cron.schedule('0 9 * * 1-5', wrapCronJob('runSalesStandup', async (c) => { await
 
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
 cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
+
+// Unlogged iClosed outcome reminders — 4 PM CR every day (DMs closers, escalates to Ron after 3d).
+// "Logged?" is derived from raw iclosed_webhook_deliveries "Outcome added" events
+// (revops_sales_outcomes is permanently empty — separate dash.neurogrowth.io ingestion bug).
+cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stalled prospect follow-ups — 11 AM CR Mon–Fri. Dry-run DMs setters their stalled list;
 // live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
