@@ -1,5 +1,25 @@
 # Lessons
 
+## 2026-05-13 — Slack listeners on private channels need `message.groups`, not `message.channels`
+
+**Symptom.** The iClosed "Strategy call booked" relay (a `slack.event('message')` listener watching `#ng-sales-goats`) never fired once since it shipped — zero `iclosed-setter-reveal-*` rows in `agent_knowledge`, no threaded setter reveals, despite many qualifying iClosed posts.
+
+**Misleading signals that wasted time.**
+- Max clearly *posts* in `#ng-sales-goats` (lead alerts, reports) → assumed it could also receive messages there. It can't: `chat:write` lets a bot post to channels it isn't subscribed to receive from.
+- `reaction_added` events from that channel *were* being delivered → assumed message events would be too. Different event/scope path.
+- Slack app config showed `message.channels` subscribed + `channels:history` granted + bot was a channel member (`/invite` said "already in this channel"). All true, all irrelevant.
+
+**Root cause.** `#ng-sales-goats` is a **private** channel. Private-channel messages dispatch under `message.groups` (scope `groups:history`), **not** `message.channels` (scope `channels:history`). The app was only subscribed to `message.channels`, so every message in any private channel was silently never delivered.
+
+**How we proved it.** Added a temp trace logging *every* message event the listener received (channel + channel_type). Railway logs showed 100% `channel_type: "im"`, zero for the private channel — definitively "listener never invoked for that channel" vs. a downstream filter bug.
+
+**Fix.** Add the `message.groups` bot event in Slack app config. If `groups:history` is already an approved scope, no reinstall is needed (Socket Mode re-handshakes).
+
+**Takeaways.**
+- When a Slack listener targets a channel, check whether it's public or private and subscribe to the matching event (`message.channels` *and/or* `message.groups`). The public/private distinction is invisible in code.
+- "Bot posts there fine" and "bot gets reactions there" are NOT evidence the bot receives messages there.
+- To distinguish "listener never fires" from "listener fires but filters drop it," trace *before* the first early-return with the broadest possible scope, then narrow.
+
 ## 2026-05-08 — Duplicate "New Lead" Slack posts come from GHL, not our code
 
 **Symptom.** Two `🆕 *New Lead*` posts in `#ng-sales-goats` for what looked like the same person, seconds apart. Reported case: Roberto Javier Gomez Avalos / "Rob" at 09:29 CDMX.

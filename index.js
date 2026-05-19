@@ -4883,19 +4883,6 @@ slack.message(async ({ message, say }) => {
 // VSL self-bookings and other event types are ignored.
 slack.event('message', async ({ event }) => {
   try {
-    // TEMP diagnostic — fires for EVERY message event the listener receives, so
-    // we can distinguish between "listener never invoked" vs "channel filter
-    // mismatch". Remove once setter-reveal is verified working.
-    console.log('msg-event debug:', JSON.stringify({
-      channel: event && event.channel,
-      channel_type: event && event.channel_type,
-      ts: event && event.ts,
-      subtype: event && event.subtype,
-      bot_id: event && event.bot_id,
-      app_id: event && event.app_id,
-      lead_channel: LEAD_CHANNEL_ID,
-      n_attachments: (event && event.attachments || []).length,
-    }));
     if (!event || event.subtype && event.subtype !== 'bot_message') return;
     if (event.thread_ts) return; // only react to top-level posts
     if (event.channel !== LEAD_CHANNEL_ID) return;
