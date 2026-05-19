@@ -6259,6 +6259,36 @@ function resolveSetterSlackId(assignedUser) {
   return null;
 }
 
+// Phone normalization for our two markets. Costa Rica national numbers are
+// 8 digits; US/Canada (NANP) are 10. That length gap makes country inference
+// reliable without a heavy lib. Leads often arrive with no country code (GHL
+// then defaults them to the location country, +506, so US numbers show a CR
+// flag) or with a wrong +506 glued onto a 10-digit US number — both fixed here.
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const digits = String(raw).replace(/\D/g, '');
+  if (!digits) return null;
+
+  // Strip a leading country code so we can judge by national length.
+  let national = digits;
+  if (digits.length === 11 && digits.startsWith('1')) national = digits.slice(1);
+  else if (digits.length === 9 && digits.startsWith('1')) national = digits.slice(1);
+  else if (digits.length >= 11 && digits.startsWith('506')) national = digits.slice(3);
+
+  let cc;
+  if (national.length === 10) cc = '1';        // US / Canada
+  else if (national.length === 8) cc = '506';  // Costa Rica
+  else return { e164: null, display: String(raw).trim(), confident: false };
+
+  return { e164: `+${cc}${national}`, display: formatPhoneDisplay(cc, national), confident: true };
+}
+
+function formatPhoneDisplay(cc, national) {
+  if (cc === '1')   return `+1 (${national.slice(0, 3)}) ${national.slice(3, 6)}-${national.slice(6)}`;
+  if (cc === '506') return `+506 ${national.slice(0, 4)} ${national.slice(4)}`;
+  return `+${cc}${national}`;
+}
+
 async function handleGHLWebhook(req, res) {
   // Auth check — reject requests that don't include the correct secret header
   // Set GHL_WEBHOOK_SECRET in env vars and configure GHL to send it as x-ghl-secret
@@ -6291,6 +6321,8 @@ async function handleGHLWebhook(req, res) {
         const fullName   = cd.fullName || payload.fullName || payload.full_name || `${payload.first_name || ct.firstName || ''} ${payload.last_name || ct.lastName || ''}`.trim() || ct.name || payload.name || 'Unknown';
         const email      = cd.email      || payload.email      || ct.email    || '';
         const phone      = cd.phone      || payload.phone      || ct.phone    || '';
+        const phoneInfo  = normalizePhone(phone);
+        const phoneDisplay = phoneInfo ? phoneInfo.display : phone;
         const contactAttr = (payload.contact && payload.contact.attributionSource) || {};
         const attrSource  = payload.attributionSource || {};
         const sourceRaw   = cd.source || payload.source || payload.contact_source || ct.source || contactAttr.sessionSource || contactAttr.medium || attrSource.medium || payload.triggerData?.source || '';
@@ -6323,6 +6355,26 @@ async function handleGHLWebhook(req, res) {
         }
 
         console.log('GHL parsed:', { fullName, email, phone, source, assignedTo: resolvedAssignedTo, contactId });
+
+        // Write the corrected E.164 number back to GHL so the CRM stops
+        // mis-flagging country codes and the team no longer fixes it by hand.
+        // Conservative on purpose: only when we're confident about the country
+        // (8-digit CR / 10-digit US) AND the stored value actually differs.
+        if (contactId && phoneInfo?.confident && phoneInfo.e164
+            && phoneInfo.e164.replace(/\D/g, '') !== String(phone).replace(/\D/g, '')) {
+          try {
+            const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+            const putRes  = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+              method: 'PUT', headers: ghlAuth, body: JSON.stringify({ phone: phoneInfo.e164 }),
+            });
+            if (putRes.ok) {
+              console.log(`GHL phone normalized: "${phone}" → ${phoneInfo.e164} (contact ${contactId})`);
+              logActivity({ event_type: 'ghl_update', event_source: 'ghl', action: 'phone_normalized', correlation_id: newCorrelationId(), output: { contact_id: contactId, from: String(phone), to: phoneInfo.e164 } });
+            } else {
+              console.warn(`GHL phone PUT failed ${putRes.status}: ${(await putRes.text()).slice(0, 200)}`);
+            }
+          } catch (phoneErr) { console.error('GHL phone normalize error:', phoneErr.message); }
+        }
 
         const ghlLink      = contactId ? `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${contactId}` : 'https://app.gohighlevel.com';
 
@@ -6457,7 +6509,7 @@ async function handleGHLWebhook(req, res) {
         const channelNote = [
           `🆕 *New Lead* — ${fullName}`,
           email             ? `📧 ${email}`   : null,
-          phone             ? `📱 ${phone}`   : null,
+          phoneDisplay      ? `📱 ${phoneDisplay}` : null,
           source && source !== 'Unknown channel' ? `📌 Source: ${source}` : null,
           resolvedAssignedTo ? `👤 Assigned to: ${resolvedAssignedTo}` : null,
           leadContext        ? `📝 ${leadContext}` : null,
