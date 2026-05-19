@@ -2538,6 +2538,91 @@ async function getSalesIntelligence(query) {
     const weekStartStr  = toDateStr(weekStart);
     const monthStartStr = toDateStr(monthStart);
 
+    // ── LEADS TODAY (authoritative — lead_posts + setter_claims) ───────────
+    // Must run before the "today calls" branch ("leads today" also contains
+    // "today") and before the portalSupabase fetch / empty-data early return,
+    // because lead data lives in the primary `supabase` project, not the portal.
+    // Fixes the undercount where the report inferred owners from immutable
+    // #ng-sales-goats post text: ✋/✅ claims only write setter_claims, never
+    // edit the post, so setters who claimed by reaction were uncredited.
+    if (q.includes('lead') && (q.includes('today') || q.includes('hoy'))) {
+      // Costa Rica is UTC−6, no DST (same assumption as formatICTime).
+      const crDate = now.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+      const dayStartUtc = new Date(`${crDate}T06:00:00Z`);
+      const dayEndUtc   = new Date(dayStartUtc.getTime() + 24 * 60 * 60 * 1000);
+
+      const { data: leadRows, error: leadErr } = await supabase
+        .from('lead_posts')
+        .select('slack_message_ts, contact_id, full_name, source, posted_at')
+        .gte('posted_at', dayStartUtc.toISOString())
+        .lt('posted_at', dayEndUtc.toISOString())
+        .order('posted_at', { ascending: true });
+      if (leadErr) return `Leads-today error: ${leadErr.message}`;
+
+      // Dedupe to one logical lead per Slack post. The FB→WA dup path upserts
+      // a second contact_id row that shares the original's slack_message_ts;
+      // keep the earliest row per ts but track every contact_id in the group.
+      const byTs = new Map(); // ts → { source, contactIds:Set }
+      for (const r of (leadRows || [])) {
+        if (!r.slack_message_ts) continue;
+        let g = byTs.get(r.slack_message_ts);
+        if (!g) { g = { source: r.source || null, contactIds: new Set() }; byTs.set(r.slack_message_ts, g); }
+        if (r.contact_id) g.contactIds.add(r.contact_id);
+      }
+      const totalLeads = byTs.size;
+
+      // Resolve owner = whoever has claimed any contact_id in the lead group
+      // (claim may have happened any time, not just today).
+      const SETTER_BY_SLACK_ID = {
+        'U0A9J00EMGD': 'Joseph Salazar',
+        'U0B1S1UMH9P': 'Oscar M',
+        'U0B16P6DQ2F': 'William B',
+      };
+      const allContactIds = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
+      const claimByContact = new Map(); // contact_id → { name, claimed_at }
+      if (allContactIds.length) {
+        const { data: claimRows } = await supabase
+          .from('setter_claims')
+          .select('ghl_contact_id, claimed_by_setter_name, claimed_by_slack_user_id, claimed_at')
+          .in('ghl_contact_id', allContactIds)
+          .order('claimed_at', { ascending: true });
+        for (const c of (claimRows || [])) {
+          if (claimByContact.has(c.ghl_contact_id)) continue; // earliest claim wins
+          const name = c.claimed_by_setter_name
+            || SETTER_BY_SLACK_ID[c.claimed_by_slack_user_id]
+            || (c.claimed_by_slack_user_id ? `setter ${c.claimed_by_slack_user_id}` : null);
+          claimByContact.set(c.ghl_contact_id, { name, claimed_at: c.claimed_at });
+        }
+      }
+
+      const bySetter = {};
+      const bySource = {};
+      let unclaimed = 0;
+      for (const g of byTs.values()) {
+        const srcKey = g.source || 'Unknown';
+        bySource[srcKey] = (bySource[srcKey] || 0) + 1;
+        // Pick the earliest claim across all contact_ids in this lead group.
+        let owner = null, ownerAt = null;
+        for (const cid of g.contactIds) {
+          const cl = claimByContact.get(cid);
+          if (cl && cl.name && (!ownerAt || cl.claimed_at < ownerAt)) { owner = cl.name; ownerAt = cl.claimed_at; }
+        }
+        if (owner) bySetter[owner] = (bySetter[owner] || 0) + 1;
+        else unclaimed++;
+      }
+
+      const lines = ['LEADS_TODAY_DATA (authoritative — render verbatim, do NOT recount from Slack):'];
+      lines.push(`Total new leads today: ${totalLeads}`);
+      lines.push('By setter (owner = whoever has claimed the lead):');
+      const setterEntries = Object.entries(bySetter).sort((a, b) => b[1] - a[1]);
+      if (setterEntries.length) setterEntries.forEach(([n, c]) => lines.push(`  ${n}: ${c}`));
+      else lines.push('  (no leads claimed yet)');
+      lines.push(`Unclaimed (no setter claimed yet): ${unclaimed}`);
+      lines.push('Sources:');
+      Object.entries(bySource).sort((a, b) => b[1] - a[1]).forEach(([s, c]) => lines.push(`  ${s}: ${c}`));
+      return lines.join('\n');
+    }
+
     // ── Query EOD tables ───────────────────────────────────────────────────
     const { data: setterEOD } = await portalSupabase
       .from('revops_setter_eod_daily')
@@ -4084,7 +4169,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Debbanny is no longer active but historical rows resolve to her name), today\'s calls, prospect lookup by name, pipeline summary. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Debbanny is no longer active but historical rows resolve to her name), today\'s calls, prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
