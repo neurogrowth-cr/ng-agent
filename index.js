@@ -4315,7 +4315,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
             const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
               model: 'claude-sonnet-4-6',
-              max_tokens: 1024,
+              max_tokens: 4096,
               system: fullSystemPrompt,
               messages: currentMessages,
               tools: TOOLS,
