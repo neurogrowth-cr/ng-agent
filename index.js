@@ -2669,10 +2669,15 @@ async function getSalesIntelligence(query) {
 
     // ── TODAY'S CALLS ──────────────────────────────────────────────────────
     if (q.includes('today') || q.includes('hoy')) {
+      const partnerConsultingIds = await getPartnerConsultingCallIds();
       const todayCalls = appts.filter(a => {
         if (!a.scheduled_start) return false;
         const d = new Date(a.scheduled_start);
-        return d >= todayStart && d <= todayEnd;
+        if (d < todayStart || d > todayEnd) return false;
+        // Exclude Internal Partner Consulting 1:1 sessions (paid-client meetings,
+        // not sales pipeline). Sales reporting only covers flywheel strategy calls.
+        if (a.iclosed_call_id && partnerConsultingIds.has(a.iclosed_call_id)) return false;
+        return true;
       });
       const todayCloserRows = closerRows.filter(r => r.report_date === todayStr);
       const todaySetterRows = setterRows.filter(r => r.report_date === todayStr);
@@ -5330,6 +5335,35 @@ async function resolveSetterForContact(email, name) {
   }
 }
 
+// iClosed event_type slug `partner-consulting-session` = Internal Partner Consulting
+// 1:1 sessions with already-paid clients. These are NOT flywheel strategy calls and
+// must be excluded from sales rosters / call-prep / closer briefs (which target the
+// new-business funnel). Strategy calls use slugs `linkedin-flywheel*`. We filter
+// negatively (drop known partner-consulting) so appointments without a matched
+// webhook delivery still appear.
+async function getPartnerConsultingCallIds() {
+  try {
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const { data } = await portalSupabase
+      .from('iclosed_webhook_deliveries')
+      .select('payload')
+      .eq('normalized_event_type', 'Call booked')
+      .gte('created_at', since)
+      .limit(5000);
+    const ids = new Set();
+    (data || []).forEach(r => {
+      const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
+      const slug = p?.event_type?.slug;
+      const callId = p?.event?.callPreviewId;
+      if (callId && slug === 'partner-consulting-session') ids.add(callId);
+    });
+    return ids;
+  } catch (err) {
+    console.error('getPartnerConsultingCallIds error:', err.message);
+    return new Set();
+  }
+}
+
 async function runSalesCallPrep(_correlationId) {
   console.log('Running sales call prep...');
   try {
@@ -5341,7 +5375,7 @@ async function runSalesCallPrep(_correlationId) {
     const { data: upcoming, error } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at,
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id,
         prospect:prospect_id ( full_name, company, email, lead_source )
       `)
       .gte('scheduled_start', new Date(windowMin).toISOString())
@@ -5354,7 +5388,13 @@ async function runSalesCallPrep(_correlationId) {
       return;
     }
 
-    for (const appt of upcoming) {
+    // Skip Internal Partner Consulting 1:1s — paid-client meetings, not sales pipeline.
+    const partnerConsultingIds = await getPartnerConsultingCallIds();
+    const upcomingFiltered = upcoming.filter(
+      a => !a.iclosed_call_id || !partnerConsultingIds.has(a.iclosed_call_id)
+    );
+
+    for (const appt of upcomingFiltered) {
       // Dedup — skip if brief already sent for this appointment
       const prepKey = `call-prep-${appt.id}`;
       const { data: existing } = await supabase.from('agent_knowledge').select('id').eq('key', prepKey).limit(1);
@@ -5824,13 +5864,18 @@ async function runSalesStandup(_correlationId) {
     const todayStartISO = todayStart.toISOString();
     const todayEndISO   = todayEnd.toISOString();
 
-    // Today's appointments
-    const { data: todayCalls } = await portalSupabase
+    // Today's appointments — exclude Internal Partner Consulting 1:1s (paid clients,
+    // not sales pipeline). Closer brief is about today's strategy calls only.
+    const { data: todayCallsRaw } = await portalSupabase
       .from('revops_appointments')
-      .select('id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+      .select('id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
       .gte('scheduled_start', todayStartISO)
       .lte('scheduled_start', todayEndISO)
       .order('scheduled_start', { ascending: true });
+    const partnerConsultingIds = await getPartnerConsultingCallIds();
+    const todayCalls = (todayCallsRaw || []).filter(
+      a => !a.iclosed_call_id || !partnerConsultingIds.has(a.iclosed_call_id)
+    );
 
     // Yesterday's closer EOD stats
     const { data: closerEOD } = await portalSupabase
