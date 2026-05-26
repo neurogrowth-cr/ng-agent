@@ -3014,7 +3014,15 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
       'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
     };
-    const lines = convos.map(c => {
+    // Fetch the last few messages per conversation in parallel so the model has
+    // enough context to judge "positive booking-track" vs noise (single-emoji
+    // replies, auto-responses, opt-outs). Per-convo failures degrade silently to
+    // the summary line — never break the whole tool result on one bad fetch.
+    const TAIL_N = 5;
+    const tails = await Promise.all(convos.map(c =>
+      ghlGetConversationMessages(c.id).catch(() => [])
+    ));
+    const lines = convos.map((c, i) => {
       const lastDate  = new Date(c.lastMessageDate).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const age       = Math.floor((now - c.lastMessageDate) / oneDayMs);
       const unread    = c.unreadCount > 0 ? ` [UNREAD: ${c.unreadCount}]` : '';
@@ -3024,7 +3032,22 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       // Resolve assigned setter from GHL user ID
       const assignedId   = c.assignedTo || c.userId || '';
       const assignedName = GHL_USERS[assignedId] || GHL_USERS[assignedId.toLowerCase()] || (assignedId ? `user:${assignedId}` : 'unassigned');
-      return `${c.contactName || c.fullName || 'Unknown'} | setter: ${assignedName} | ${channel} | ${direction}${unread}${stale}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+      const header = `${c.contactName || c.fullName || 'Unknown'} | setter: ${assignedName} | ${channel} | ${direction}${unread}${stale}`;
+      // Last N messages (oldest first) — gives the judge enough context to tell
+      // a booking-track exchange from a single-emoji ack or an opt-out.
+      const tail = (tails[i] || []).slice(-TAIL_N);
+      if (!tail.length) {
+        return `${header}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+      }
+      const tailLines = tail.map(m => {
+        const dir  = m.direction === 'inbound' ? 'in ' : 'out';
+        const when = (m.dateAdded || m.createdAt)
+          ? new Date(m.dateAdded || m.createdAt).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+          : '?';
+        const body = String(m.body || m.message || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+        return `  [${dir} ${when}] "${body}"`;
+      });
+      return `${header}\nLast ${tail.length} messages (oldest first):\n${tailLines.join('\n')}`;
     });
     const unreadCount = convos.filter(c => c.unreadCount > 0).length;
     const staleCount  = convos.filter(c => (now - c.lastMessageDate) / oneDayMs >= 3).length;
