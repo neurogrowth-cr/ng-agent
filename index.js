@@ -5304,6 +5304,65 @@ const CLOSER_SLACK = {
   'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN',
 };
 
+// Pull the prospect's iClosed booking intake (questions_and_answers + event + booked-from)
+// from the raw webhook deliveries. Used as a fallback when no GHL contact exists
+// (public-scheduler self-bookings never sync to GHL).
+async function fetchIClosedIntakeForProspect(prospectId) {
+  if (!prospectId) return null;
+  try {
+    const { data, error } = await portalSupabase
+      .from('iclosed_webhook_deliveries')
+      .select('normalized_event_type, payload, created_at')
+      .eq('prospect_id', prospectId)
+      .order('created_at', { ascending: false })
+      .limit(10);
+    if (error || !data || !data.length) return null;
+
+    const norm  = (raw) => Array.isArray(raw) ? raw[0] : raw;
+    const hasQA = (p) => {
+      if (!p) return false;
+      if (Array.isArray(p.questions_and_answers) && p.questions_and_answers.length) return true;
+      if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object' && Object.keys(p.questionsAndAnswers).length) return true;
+      return false;
+    };
+    const booked   = data.find(r => r.normalized_event_type === 'Call booked' && hasQA(norm(r.payload)));
+    const richest  = data.find(r => hasQA(norm(r.payload)));
+    const pick     = booked || richest || data[0];
+    const p        = norm(pick.payload);
+    if (!p) return null;
+
+    const BOILERPLATE = new Set(['full name', 'phone number', 'email address', 'email', 'phone']);
+    const qa = [];
+    if (Array.isArray(p.questions_and_answers)) {
+      for (const r of p.questions_and_answers) {
+        const q = (r?.question || '').trim();
+        const a = (r?.answer   || '').trim();
+        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
+      }
+    } else if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object') {
+      for (const [k, v] of Object.entries(p.questionsAndAnswers)) {
+        if (/_question$|_response$/.test(k)) continue;
+        const q = k.trim();
+        const a = (typeof v === 'string' ? v : '').trim();
+        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
+      }
+    }
+
+    return {
+      eventName:  p.event_type?.name || p.event?.name || null,
+      bookedFrom: p.call_booked_from || null,
+      setterName: (p.event?.setter?.name || '').trim() || null,
+      qa,
+      timezone:   p.timeZone || p.invitee?.timezone || null,
+      country:    p.country  || null,
+      phone:      p.phoneNumber || p.invitee?.text_reminder_number || null,
+    };
+  } catch (err) {
+    console.error('fetchIClosedIntakeForProspect error:', err.message);
+    return null;
+  }
+}
+
 async function fetchGHLConvoForContact(contactId) {
   const locationId = process.env.GHL_LOCATION_ID;
   const apiKey     = process.env.GHL_API_KEY;
@@ -5420,7 +5479,7 @@ async function runSalesCallPrep(_correlationId) {
     const { data: upcomingRaw, error } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id,
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, prospect_id,
         prospect:prospect_id ( full_name, company, email, lead_source )
       `)
       .gte('scheduled_start', new Date(windowMin).toISOString())
@@ -5445,6 +5504,7 @@ async function runSalesCallPrep(_correlationId) {
       }
 
       const prospect    = appt.prospect || {};
+      const prospectId   = appt.prospect_id;
       const prospectName = prospect.full_name || 'Unknown prospect';
       const company     = prospect.company   || '';
       const email       = prospect.email     || '';
@@ -5458,14 +5518,11 @@ async function runSalesCallPrep(_correlationId) {
       let convoSection = 'GHL conversation not found for this prospect.';
       // Truth source: opportunity in the Appointment Setting Pipeline.
       const setterInfo = await resolveSetterForContact(email, prospectName);
-      let sourceLine;
+      let sourceLine = null;
       if (setterInfo.source === 'appointment-setting') {
         sourceLine = setterInfo.setter
           ? `👤 Booked by: ${setterInfo.setter}`
           : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
-      } else {
-        // VSL funnel is paused — don't attribute to VSL when no setter opp is found
-        sourceLine = `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
       }
 
       try {
@@ -5488,9 +5545,32 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      if (setterInfo.source === 'vsl' && convoSection === 'GHL conversation not found for this prospect.') {
-        // VSL is paused — these are likely iClosed self-bookings without a GHL contact record yet
-        convoSection = 'No GHL contact / conversation found for this prospect (likely iClosed-only booking).';
+      // iClosed self-booking fallback — public-scheduler bookings never create a GHL contact,
+      // so use the booking intake (event + Q&A) from iclosed_webhook_deliveries instead.
+      if (setterInfo.source === 'vsl') {
+        const intake = await fetchIClosedIntakeForProspect(prospectId);
+        const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
+        sourceLine = selfBooked
+          ? `🟢 Source: self-booked via iClosed (no setter)`
+          : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
+
+        if (convoSection === 'GHL conversation not found for this prospect.') {
+          if (intake) {
+            const lines = ['No GHL conversation (self-booked via iClosed — no setter contact).', '📋 iClosed intake:'];
+            if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
+            for (const { question, answer } of intake.qa) {
+              lines.push(`• ${question.replace(/[.?!:]+$/, '')}: "${answer}"`);
+            }
+            const meta = [];
+            if (intake.bookedFrom) meta.push(`Booked via: ${intake.bookedFrom.toLowerCase().replace(/_/g, ' ')}`);
+            if (intake.timezone)   meta.push(`Timezone: ${intake.timezone}`);
+            if (intake.phone)      meta.push(`Phone: ${intake.phone}`);
+            if (meta.length) lines.push(`• ${meta.join(' · ')}`);
+            convoSection = lines.join('\n');
+          } else {
+            convoSection = 'No GHL or iClosed context available for this prospect.';
+          }
+        }
       }
 
       // Build the brief
