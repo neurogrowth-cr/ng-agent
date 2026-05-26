@@ -2524,6 +2524,48 @@ function resolveSalesMember(id) {
   return SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()] || id;
 }
 
+// Sales reports must only count the 3 flywheel iClosed calendars:
+//   linkedin-flywheel, linkedin-flywheel-vsl, linkedin-flywheel-doc.
+// revops_appointments also contains partner-consulting-session calls (Ron's
+// paid-client 1:1s) — these must be excluded from every sales report.
+// Helper returns a Set of iclosed_call_id values to EXCLUDE. Negative filter
+// is intentional: appointments without a matched webhook still pass through,
+// so we never silently drop a real flywheel call.
+const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc']);
+let _nonFlywheelCache = { ids: null, fetchedAt: 0 };
+async function getNonFlywheelCallIds() {
+  if (_nonFlywheelCache.ids && (Date.now() - _nonFlywheelCache.fetchedAt) < 10 * 60 * 1000) {
+    return _nonFlywheelCache.ids;
+  }
+  const since = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await portalSupabase
+    .from('iclosed_webhook_deliveries')
+    .select('payload')
+    .eq('normalized_event_type', 'Call booked')
+    .gte('created_at', since)
+    .limit(5000);
+  if (error) {
+    console.error('getNonFlywheelCallIds error:', error.message);
+    return new Set();
+  }
+  const exclude = new Set();
+  for (const r of (data || [])) {
+    const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
+    const slug = p?.event_type?.slug;
+    const callId = p?.event?.callPreviewId;
+    if (!callId || !slug) continue;
+    if (!SALES_FLYWHEEL_SLUGS.has(slug)) exclude.add(callId);
+  }
+  _nonFlywheelCache = { ids: exclude, fetchedAt: Date.now() };
+  return exclude;
+}
+
+// Convenience: filter an array of revops_appointments rows in-place semantics.
+function filterFlywheelAppts(rows, excludeIds) {
+  if (!excludeIds || !excludeIds.size) return rows || [];
+  return (rows || []).filter(a => !a.iclosed_call_id || !excludeIds.has(a.iclosed_call_id));
+}
+
 async function getSalesIntelligence(query) {
   try {
     const q = (query || '').toLowerCase();
@@ -2637,7 +2679,7 @@ async function getSalesIntelligence(query) {
       .limit(100);
 
     // ── Query appointments for individual call lookups ─────────────────────
-    const { data: appointments } = await portalSupabase
+    const { data: appointmentsRaw } = await portalSupabase
       .from('revops_appointments')
       .select(`
         id, setter_id, closer_id, booked_at, scheduled_start,
@@ -2646,6 +2688,8 @@ async function getSalesIntelligence(query) {
       `)
       .order('scheduled_start', { ascending: false })
       .limit(200);
+    const excludeIds = await getNonFlywheelCallIds();
+    const appointments = filterFlywheelAppts(appointmentsRaw, excludeIds);
 
     // ── Query outcomes ─────────────────────────────────────────────────────
     const { data: outcomes } = await portalSupabase
@@ -2668,16 +2712,12 @@ async function getSalesIntelligence(query) {
       rows.filter(r => r[dateField] && r[dateField] >= fromStr);
 
     // ── TODAY'S CALLS ──────────────────────────────────────────────────────
+    // `appts` is already flywheel-only (filtered above via getNonFlywheelCallIds).
     if (q.includes('today') || q.includes('hoy')) {
-      const partnerConsultingIds = await getPartnerConsultingCallIds();
       const todayCalls = appts.filter(a => {
         if (!a.scheduled_start) return false;
         const d = new Date(a.scheduled_start);
-        if (d < todayStart || d > todayEnd) return false;
-        // Exclude Internal Partner Consulting 1:1 sessions (paid-client meetings,
-        // not sales pipeline). Sales reporting only covers flywheel strategy calls.
-        if (a.iclosed_call_id && partnerConsultingIds.has(a.iclosed_call_id)) return false;
-        return true;
+        return d >= todayStart && d <= todayEnd;
       });
       const todayCloserRows = closerRows.filter(r => r.report_date === todayStr);
       const todaySetterRows = setterRows.filter(r => r.report_date === todayStr);
@@ -2837,13 +2877,15 @@ async function getSalesIntelligence(query) {
 async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
   const result = {}; // { closerName: { source, calls_booked, attended, no_shows, sold, revenue, eod_days } }
 
-  // 1. Primary: iClosed appointments in range
-  const { data: appts, error: apptErr } = await portalSupabase
+  // 1. Primary: iClosed appointments in range (flywheel-only)
+  const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type')
+    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
+  const excludeIds = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(apptsRaw, excludeIds);
 
   const apptIds = (appts || []).map(a => a.id);
   let outcomesById = {};
@@ -2929,13 +2971,15 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
 async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
   const result = {}; // { setterName: { calls_booked, attended, no_shows, new_conversations, qualified_leads, eod_days } }
 
-  // 1. iClosed appointments — calls booked attributed to each setter
-  const { data: appts, error: apptErr } = await portalSupabase
+  // 1. iClosed appointments — calls booked attributed to each setter (flywheel-only)
+  const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, setter_id, scheduled_start, attended, no_show_reason')
+    .select('id, setter_id, scheduled_start, attended, no_show_reason, iclosed_call_id')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
+  const excludeIdsSet = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(apptsRaw, excludeIdsSet);
 
   for (const a of (appts || [])) {
     if (!a.setter_id) continue; // skip rows with no setter attribution
@@ -3019,7 +3063,15 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
       'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
     };
-    const lines = convos.map(c => {
+    // Fetch the last few messages per conversation in parallel so the model has
+    // enough context to judge "positive booking-track" vs noise (single-emoji
+    // replies, auto-responses, opt-outs). Per-convo failures degrade silently to
+    // the summary line — never break the whole tool result on one bad fetch.
+    const TAIL_N = 5;
+    const tails = await Promise.all(convos.map(c =>
+      ghlGetConversationMessages(c.id).catch(() => [])
+    ));
+    const lines = convos.map((c, i) => {
       const lastDate  = new Date(c.lastMessageDate).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const age       = Math.floor((now - c.lastMessageDate) / oneDayMs);
       const unread    = c.unreadCount > 0 ? ` [UNREAD: ${c.unreadCount}]` : '';
@@ -3029,7 +3081,22 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       // Resolve assigned setter from GHL user ID
       const assignedId   = c.assignedTo || c.userId || '';
       const assignedName = GHL_USERS[assignedId] || GHL_USERS[assignedId.toLowerCase()] || (assignedId ? `user:${assignedId}` : 'unassigned');
-      return `${c.contactName || c.fullName || 'Unknown'} | setter: ${assignedName} | ${channel} | ${direction}${unread}${stale}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+      const header = `${c.contactName || c.fullName || 'Unknown'} | setter: ${assignedName} | ${channel} | ${direction}${unread}${stale}`;
+      // Last N messages (oldest first) — gives the judge enough context to tell
+      // a booking-track exchange from a single-emoji ack or an opt-out.
+      const tail = (tails[i] || []).slice(-TAIL_N);
+      if (!tail.length) {
+        return `${header}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+      }
+      const tailLines = tail.map(m => {
+        const dir  = m.direction === 'inbound' ? 'in ' : 'out';
+        const when = (m.dateAdded || m.createdAt)
+          ? new Date(m.dateAdded || m.createdAt).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+          : '?';
+        const body = String(m.body || m.message || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+        return `  [${dir} ${when}] "${body}"`;
+      });
+      return `${header}\nLast ${tail.length} messages (oldest first):\n${tailLines.join('\n')}`;
     });
     const unreadCount = convos.filter(c => c.unreadCount > 0).length;
     const staleCount  = convos.filter(c => (now - c.lastMessageDate) / oneDayMs >= 3).length;
@@ -3200,13 +3267,15 @@ async function runMondayGapDetection(_correlationId) {
       const nowTs = Date.now();
       const salesGapLines = [];
 
-      // a. No-shows with no reschedule in last 7 days
+      // a. No-shows with no reschedule in last 7 days (flywheel-only)
       const sevenDaysAgo = new Date(nowTs - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const { data: noShows } = await portalSupabase
+      const excludeIds = await getNonFlywheelCallIds();
+      const { data: noShowsRaw } = await portalSupabase
         .from('revops_appointments')
-        .select('id, prospect_id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
         .eq('attended', false)
         .gte('scheduled_start', sevenDaysAgo);
+      const noShows = filterFlywheelAppts(noShowsRaw, excludeIds);
 
       if (noShows && noShows.length) {
         const noShowFlags = [];
@@ -3232,12 +3301,13 @@ async function runMondayGapDetection(_correlationId) {
       // b. Outcomes not logged (attended ≥48h ago, no outcome record)
       const fortyEightHAgo = new Date(nowTs - 48 * 60 * 60 * 1000).toISOString();
       const fourteenDaysAgo = new Date(nowTs - 14 * 24 * 60 * 60 * 1000).toISOString();
-      const { data: attended } = await portalSupabase
+      const { data: attendedRaw } = await portalSupabase
         .from('revops_appointments')
-        .select('id, prospect_id, closer_id, scheduled_start, prospect:prospect_id(full_name)')
+        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
         .eq('attended', true)
         .lte('scheduled_start', fortyEightHAgo)
         .gte('scheduled_start', fourteenDaysAgo);
+      const attended = filterFlywheelAppts(attendedRaw, excludeIds);
 
       if (attended && attended.length) {
         const attendedIds = attended.map(a => a.id);
@@ -3768,12 +3838,14 @@ async function _scrapeMetaCostPerBookingToday() {
   const spend = parseFloat(row.spend || 0);
   if (spend <= 0) return null;
   const todayStr = new Date().toISOString().slice(0, 10);
-  const { count, error } = await portalSupabase
+  const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id', { count: 'exact', head: true })
+    .select('id, iclosed_call_id')
     .gte('booked_at', `${todayStr}T00:00:00`)
     .lt('booked_at',  `${todayStr}T23:59:59`);
   if (error) throw new Error(error.message);
+  const excludeIds = await getNonFlywheelCallIds();
+  const count = filterFlywheelAppts(data, excludeIds).length;
   if (!count || count <= 0) return null;
   return +(spend / count).toFixed(2);
 }
@@ -3794,29 +3866,31 @@ async function _scrapeGhlNewContactsToday() {
   return (data.contacts || []).length;
 }
 
-// iClosed calls booked yesterday (both funnels via revops_appointments)
+// iClosed calls booked yesterday (flywheel-only)
 async function _scrapeIclosedCallsBookedYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id')
+    .select('id, iclosed_call_id')
     .gte('booked_at', `${yesterday}T00:00:00`)
     .lt('booked_at',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
-  return (data || []).length;
+  const excludeIds = await getNonFlywheelCallIds();
+  return filterFlywheelAppts(data, excludeIds).length;
 }
 
-// iClosed calls held yesterday (attended = true)
+// iClosed calls held yesterday (attended = true, flywheel-only)
 async function _scrapeIclosedCallsHeldYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id')
+    .select('id, iclosed_call_id')
     .eq('attended', true)
     .gte('scheduled_start', `${yesterday}T00:00:00`)
     .lt('scheduled_start',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
-  return (data || []).length;
+  const excludeIds = await getNonFlywheelCallIds();
+  return filterFlywheelAppts(data, excludeIds).length;
 }
 
 // iClosed sales yesterday (full_closes from closer EOD table — same source as close_rate)
@@ -5230,6 +5304,65 @@ const CLOSER_SLACK = {
   'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN',
 };
 
+// Pull the prospect's iClosed booking intake (questions_and_answers + event + booked-from)
+// from the raw webhook deliveries. Used as a fallback when no GHL contact exists
+// (public-scheduler self-bookings never sync to GHL).
+async function fetchIClosedIntakeForProspect(prospectId) {
+  if (!prospectId) return null;
+  try {
+    const { data, error } = await portalSupabase
+      .from('iclosed_webhook_deliveries')
+      .select('normalized_event_type, payload, created_at')
+      .eq('prospect_id', prospectId)
+      .order('created_at', { ascending: false })
+      .limit(10);
+    if (error || !data || !data.length) return null;
+
+    const norm  = (raw) => Array.isArray(raw) ? raw[0] : raw;
+    const hasQA = (p) => {
+      if (!p) return false;
+      if (Array.isArray(p.questions_and_answers) && p.questions_and_answers.length) return true;
+      if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object' && Object.keys(p.questionsAndAnswers).length) return true;
+      return false;
+    };
+    const booked   = data.find(r => r.normalized_event_type === 'Call booked' && hasQA(norm(r.payload)));
+    const richest  = data.find(r => hasQA(norm(r.payload)));
+    const pick     = booked || richest || data[0];
+    const p        = norm(pick.payload);
+    if (!p) return null;
+
+    const BOILERPLATE = new Set(['full name', 'phone number', 'email address', 'email', 'phone']);
+    const qa = [];
+    if (Array.isArray(p.questions_and_answers)) {
+      for (const r of p.questions_and_answers) {
+        const q = (r?.question || '').trim();
+        const a = (r?.answer   || '').trim();
+        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
+      }
+    } else if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object') {
+      for (const [k, v] of Object.entries(p.questionsAndAnswers)) {
+        if (/_question$|_response$/.test(k)) continue;
+        const q = k.trim();
+        const a = (typeof v === 'string' ? v : '').trim();
+        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
+      }
+    }
+
+    return {
+      eventName:  p.event_type?.name || p.event?.name || null,
+      bookedFrom: p.call_booked_from || null,
+      setterName: (p.event?.setter?.name || '').trim() || null,
+      qa,
+      timezone:   p.timeZone || p.invitee?.timezone || null,
+      country:    p.country  || null,
+      phone:      p.phoneNumber || p.invitee?.text_reminder_number || null,
+    };
+  } catch (err) {
+    console.error('fetchIClosedIntakeForProspect error:', err.message);
+    return null;
+  }
+}
+
 async function fetchGHLConvoForContact(contactId) {
   const locationId = process.env.GHL_LOCATION_ID;
   const apiKey     = process.env.GHL_API_KEY;
@@ -5335,35 +5468,6 @@ async function resolveSetterForContact(email, name) {
   }
 }
 
-// iClosed event_type slug `partner-consulting-session` = Internal Partner Consulting
-// 1:1 sessions with already-paid clients. These are NOT flywheel strategy calls and
-// must be excluded from sales rosters / call-prep / closer briefs (which target the
-// new-business funnel). Strategy calls use slugs `linkedin-flywheel*`. We filter
-// negatively (drop known partner-consulting) so appointments without a matched
-// webhook delivery still appear.
-async function getPartnerConsultingCallIds() {
-  try {
-    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-    const { data } = await portalSupabase
-      .from('iclosed_webhook_deliveries')
-      .select('payload')
-      .eq('normalized_event_type', 'Call booked')
-      .gte('created_at', since)
-      .limit(5000);
-    const ids = new Set();
-    (data || []).forEach(r => {
-      const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
-      const slug = p?.event_type?.slug;
-      const callId = p?.event?.callPreviewId;
-      if (callId && slug === 'partner-consulting-session') ids.add(callId);
-    });
-    return ids;
-  } catch (err) {
-    console.error('getPartnerConsultingCallIds error:', err.message);
-    return new Set();
-  }
-}
-
 async function runSalesCallPrep(_correlationId) {
   console.log('Running sales call prep...');
   try {
@@ -5371,11 +5475,11 @@ async function runSalesCallPrep(_correlationId) {
     const windowMin = now + (3.5 * 60 * 60 * 1000); // 3.5h from now
     const windowMax = now + (5   * 60 * 60 * 1000); // 5h from now
 
-    // Query upcoming appointments in the window
-    const { data: upcoming, error } = await portalSupabase
+    // Query upcoming appointments in the window (flywheel-only)
+    const { data: upcomingRaw, error } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id,
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, prospect_id,
         prospect:prospect_id ( full_name, company, email, lead_source )
       `)
       .gte('scheduled_start', new Date(windowMin).toISOString())
@@ -5383,18 +5487,14 @@ async function runSalesCallPrep(_correlationId) {
       .is('attended', null); // only upcoming (not yet attended/no-showed)
 
     if (error) throw error;
-    if (!upcoming || !upcoming.length) {
+    const excludeIds = await getNonFlywheelCallIds();
+    const upcoming = filterFlywheelAppts(upcomingRaw, excludeIds);
+    if (!upcoming.length) {
       console.log('Sales call prep: no calls in window.');
       return;
     }
 
-    // Skip Internal Partner Consulting 1:1s — paid-client meetings, not sales pipeline.
-    const partnerConsultingIds = await getPartnerConsultingCallIds();
-    const upcomingFiltered = upcoming.filter(
-      a => !a.iclosed_call_id || !partnerConsultingIds.has(a.iclosed_call_id)
-    );
-
-    for (const appt of upcomingFiltered) {
+    for (const appt of upcoming) {
       // Dedup — skip if brief already sent for this appointment
       const prepKey = `call-prep-${appt.id}`;
       const { data: existing } = await supabase.from('agent_knowledge').select('id').eq('key', prepKey).limit(1);
@@ -5404,6 +5504,7 @@ async function runSalesCallPrep(_correlationId) {
       }
 
       const prospect    = appt.prospect || {};
+      const prospectId   = appt.prospect_id;
       const prospectName = prospect.full_name || 'Unknown prospect';
       const company     = prospect.company   || '';
       const email       = prospect.email     || '';
@@ -5417,14 +5518,11 @@ async function runSalesCallPrep(_correlationId) {
       let convoSection = 'GHL conversation not found for this prospect.';
       // Truth source: opportunity in the Appointment Setting Pipeline.
       const setterInfo = await resolveSetterForContact(email, prospectName);
-      let sourceLine;
+      let sourceLine = null;
       if (setterInfo.source === 'appointment-setting') {
         sourceLine = setterInfo.setter
           ? `👤 Booked by: ${setterInfo.setter}`
           : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
-      } else {
-        // VSL funnel is paused — don't attribute to VSL when no setter opp is found
-        sourceLine = `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
       }
 
       try {
@@ -5447,9 +5545,32 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      if (setterInfo.source === 'vsl' && convoSection === 'GHL conversation not found for this prospect.') {
-        // VSL is paused — these are likely iClosed self-bookings without a GHL contact record yet
-        convoSection = 'No GHL contact / conversation found for this prospect (likely iClosed-only booking).';
+      // iClosed self-booking fallback — public-scheduler bookings never create a GHL contact,
+      // so use the booking intake (event + Q&A) from iclosed_webhook_deliveries instead.
+      if (setterInfo.source === 'vsl') {
+        const intake = await fetchIClosedIntakeForProspect(prospectId);
+        const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
+        sourceLine = selfBooked
+          ? `🟢 Source: self-booked via iClosed (no setter)`
+          : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
+
+        if (convoSection === 'GHL conversation not found for this prospect.') {
+          if (intake) {
+            const lines = ['No GHL conversation (self-booked via iClosed — no setter contact).', '📋 iClosed intake:'];
+            if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
+            for (const { question, answer } of intake.qa) {
+              lines.push(`• ${question.replace(/[.?!:]+$/, '')}: "${answer}"`);
+            }
+            const meta = [];
+            if (intake.bookedFrom) meta.push(`Booked via: ${intake.bookedFrom.toLowerCase().replace(/_/g, ' ')}`);
+            if (intake.timezone)   meta.push(`Timezone: ${intake.timezone}`);
+            if (intake.phone)      meta.push(`Phone: ${intake.phone}`);
+            if (meta.length) lines.push(`• ${meta.join(' · ')}`);
+            convoSection = lines.join('\n');
+          } else {
+            convoSection = 'No GHL or iClosed context available for this prospect.';
+          }
+        }
       }
 
       // Build the brief
@@ -5864,18 +5985,15 @@ async function runSalesStandup(_correlationId) {
     const todayStartISO = todayStart.toISOString();
     const todayEndISO   = todayEnd.toISOString();
 
-    // Today's appointments — exclude Internal Partner Consulting 1:1s (paid clients,
-    // not sales pipeline). Closer brief is about today's strategy calls only.
+    // Today's appointments (flywheel-only — excludes partner-consulting 1:1s)
     const { data: todayCallsRaw } = await portalSupabase
       .from('revops_appointments')
       .select('id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
       .gte('scheduled_start', todayStartISO)
       .lte('scheduled_start', todayEndISO)
       .order('scheduled_start', { ascending: true });
-    const partnerConsultingIds = await getPartnerConsultingCallIds();
-    const todayCalls = (todayCallsRaw || []).filter(
-      a => !a.iclosed_call_id || !partnerConsultingIds.has(a.iclosed_call_id)
-    );
+    const excludeIds = await getNonFlywheelCallIds();
+    const todayCalls = filterFlywheelAppts(todayCallsRaw, excludeIds);
 
     // Yesterday's closer EOD stats
     const { data: closerEOD } = await portalSupabase
@@ -5959,8 +6077,12 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       .lte('scheduled_start', cutoff)
       .gte('scheduled_start', since);
 
+    // Flywheel-only: exclude partner-consulting 1:1s before any dedup/state tracking.
+    const excludeIds = await getNonFlywheelCallIds();
     const dueCalls = (pastCalls || []).filter(
-      a => a.iclosed_call_id && a.qualification_snapshot?.iclosed?.cancelled !== true
+      a => a.iclosed_call_id
+        && a.qualification_snapshot?.iclosed?.cancelled !== true
+        && !excludeIds.has(a.iclosed_call_id)
     );
 
     if (!dueCalls.length) {
