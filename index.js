@@ -371,12 +371,13 @@ const pendingDrafts = {};
 // ─── EMAIL PROXY: feature flag ────────────────────────────────────────────────
 const EMAIL_PROXY_LIVE = String(process.env.EMAIL_PROXY_LIVE || '').toLowerCase() === 'true';
 
-// Setters who have earned Ron-approval bypass — Stage-1 "looks good" sends
-// directly without routing to Ron. Add Slack IDs here as setters prove out.
-// Oscar M (U0B1S1UMH9P) — promoted 2026-05-07 after his first clean send.
-const EMAIL_PROXY_AUTOSEND_SETTERS = new Set([
-  'U0B1S1UMH9P', // Oscar M
-]);
+// Roles that skip Ron's Stage-2 approval — setter/closer drafts go out
+// directly after Stage-1 "looks good". Ron still gets an audit-trail DM.
+const EMAIL_PROXY_AUTOSEND_ROLES = new Set(['setter', 'closer']);
+function isAutosendUser(slackId) {
+  const role = TEAM_MEMBERS[slackId]?.role;
+  return role ? EMAIL_PROXY_AUTOSEND_ROLES.has(role) : false;
+}
 
 // ─── SLACK CHANNEL LIST CACHE ─────────────────────────────────────────────────
 // conversations.list is rate-limited — cache for 10 minutes instead of calling per-request
@@ -467,7 +468,6 @@ const RON_ONLY_TOOLS = new Set([
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte NG' },
-  'U07SMMDMSLQ': { name: 'Tania',    role: 'client_success', displayName: 'Tania Araya NG' },
   'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' },
   'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
@@ -1094,6 +1094,36 @@ function registerDynamicCron(task) {
         } catch (statsErr) {
           console.error('Weekly pod stats failed:', statsErr.message);
           taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute iClosed stats (${statsErr.message}). Fall back to your usual data tools.`;
+        }
+      }
+
+      // Fulfillment EOD Pulse — inject filtered portal alerts (no aged blockers)
+      // plus a fulfillment-domain anomaly block so the BLOCKERS section can surface
+      // movement signals instead of repeating the same long-standing blocked clients.
+      if (task.name === 'Fulfillment EOD Pulse') {
+        try {
+          const dailyAlerts = await getPortalAlerts({ mode: 'daily' });
+          const fulfillmentMetrics = METRIC_REGISTRY.filter(m => m.domain === 'fulfillment');
+          const snapshots = await Promise.all(fulfillmentMetrics.map(m => detectAnomaly(m.name).catch(() => null)));
+          const triggered = snapshots.filter(s => s && s.triggered);
+          let anomalyBlock;
+          if (!triggered.length) {
+            anomalyBlock = 'No fulfillment anomalies triggered in the last 24h.';
+          } else {
+            const lines = await Promise.all(triggered.map(async s => {
+              const labelObj = METRIC_REGISTRY.find(m => m.name === s.metric);
+              const label = labelObj ? labelObj.label : s.metric;
+              const direction = s.z > 0 ? 'above' : 'below';
+              const narration = await narrateAnomaly(s);
+              const base = `• ${label} = ${s.value} (${Math.abs(s.z).toFixed(1)}σ ${direction} ${s.sampleSize}-sample mean ${s.mean.toFixed(2)})`;
+              return narration ? `${base} — ${narration}` : base;
+            }));
+            anomalyBlock = `PRECOMPUTED FULFILLMENT ANOMALIES (last 24h, ≥${ANOMALY_THRESHOLD_SIGMA}σ from baseline):\n${lines.join('\n')}`;
+          }
+          taskDataBlock = `\n\n---\nFRESH BLOCKERS ONLY (aged + fully blocked clients are deliberately hidden from the daily — they belong in the Friday Delivery Wrap-Up):\n${dailyAlerts}\n\n---\n${anomalyBlock}`;
+        } catch (fErr) {
+          console.error('Fulfillment EOD precompute failed:', fErr.message);
+          taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute fulfillment data block (${fErr.message}). Use your usual data tools.`;
         }
       }
 
@@ -2381,7 +2411,12 @@ async function updatePortalRecord(table, id, fields) {
 }
 
 // ─── PORTAL: ALERTS ───────────────────────────────────────────────────────────
-async function getPortalAlerts() {
+async function getPortalAlerts({ mode = 'full' } = {}) {
+  // mode: 'full'  → every blocked / at-risk / overdue client (used by weekly + ad-hoc tool calls)
+  //       'daily' → suppress long-standing fully-blocked noise so the daily EOD only shows fresh issues:
+  //                   • drop customer_status='blocked' (🔴 BLOCKED tier)
+  //                   • drop OVERDUE clients >30 days in with no activity completed in the last 14 days
+  //                   • drop Phase 0 OVERDUE >30 days (aged signups)
   try {
     const { data: dashboards, error } = await portalSupabase
       .from('client_dashboards')
@@ -2391,6 +2426,8 @@ async function getPortalAlerts() {
       .order('created_at', { ascending: true });
     if (error) throw error;
     if (!dashboards || !dashboards.length) return '✅ No blocked or at-risk clients. All clients on track.';
+    const dailyMode = mode === 'daily';
+    const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
 
     // Fetch templates upfront so we can resolve activity titles and find activation call
     const { data: templates } = await portalSupabase
@@ -2436,8 +2473,13 @@ async function getPortalAlerts() {
       const blockedDetails = blockedActs.map(a => templateMap[a.template_id] || 'Unknown').join(', ');
 
       if (dash.customer_status === 'blocked') {
+        if (dailyMode) continue; // long-standing blocked clients move to weekly wrap-up
         alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
       } else if (daysSince >= 14) {
+        if (dailyMode && daysSince > 30) {
+          const recentActivity = allActs.some(a => a.completed_at && (now - new Date(a.completed_at).getTime()) <= fourteenDaysMs);
+          if (!recentActivity) continue; // aged + dormant — suppress from daily
+        }
         alerts.push(`🔴 OVERDUE — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince} (past 14-day window)`);
       } else if (daysSince >= 7) {
         alerts.push(`🟡 AT RISK — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}`);
@@ -2465,6 +2507,7 @@ async function getPortalAlerts() {
       if (r.phase0_step === '5_ready_for_handoff') {
         phase0Alerts.push(`🟢 PHASE 0 HANDOFF READY — ${name}${co} | ${stepStr} | Day ${days} — move to Phase 1`);
       } else if (days >= 14) {
+        if (dailyMode && days > 30) continue; // aged Phase 0 stalls move to weekly wrap-up
         phase0Alerts.push(`🔴 PHASE 0 OVERDUE — ${name}${co} | ${stepStr} | Day ${days} (past 14-day threshold)`);
       } else if (days >= 7) {
         phase0Alerts.push(`🟡 PHASE 0 AT RISK — ${name}${co} | ${stepStr} | Day ${days}`);
@@ -3578,7 +3621,7 @@ async function runProactiveDMs(_correlationId) {
     if (blocked.length > 0) {
       const names = blocked.map(d => `${d.client_name}`).join(', ');
       const msg = `These clients are currently blocked: ${names}. If the block is on the client side — missing onboarding form, unresponsive, contract issue — this needs a proactive outreach before it becomes a bigger problem. Can you check what's needed and follow up?`;
-      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+      for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
@@ -3607,7 +3650,7 @@ async function runProactiveDMs(_correlationId) {
       const urgentCount = stuckPhase0.filter(r => r.days_in_phase0 >= 14).length;
       const urgentNote  = urgentCount > 0 ? ` ${urgentCount} of them are past 14 days — that's critical.` : '';
       const msg = `Phase 0 alert — ${stuckPhase0.length} client${stuckPhase0.length > 1 ? 's' : ''} stuck in pre-portal onboarding for 7+ days.${urgentNote}\n\n${lines}\n\nCan you reach out to each one and unblock whatever step they're on?`;
-      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+      for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to Tania: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
@@ -3636,7 +3679,7 @@ async function runProactiveDMs(_correlationId) {
     if (hitting20InStabilization.length > 0) {
       const names = hitting20InStabilization.map(d => d.client_name).join(', ');
       const msg = `Day 20 in stabilization today for: ${names}. This is the checkpoint — time to reach out to the client, schedule the 1:1 progress check, and confirm how the campaign is performing. Can you get that call on the calendar and flag anything that needs Ron's attention?`;
-      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+      for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to Tania: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
@@ -3645,7 +3688,7 @@ async function runProactiveDMs(_correlationId) {
     if (approaching20InStabilization.length > 0) {
       const names = approaching20InStabilization.map(d => d.client_name).join(', ');
       const msg = `Heads up — these clients hit Day 20 in stabilization in 2 days: ${names}. Start preparing the 1:1 progress check outreach so it's ready to go on Day 20.`;
-      for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+      for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to Tania: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
@@ -4335,7 +4378,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
       const tInitial = Date.now();
       let response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
-        max_tokens: 2048,
+        max_tokens: 4096,
         system: fullSystemPrompt,
         messages,
         tools: TOOLS,
@@ -4555,7 +4598,7 @@ async function promoteDraftToRon(setterSlackId, say) {
   // Ron gets the audit-trail confirmation (or technical error) via the
   // say-wrapper below so he has visibility into autosent emails without
   // having to approve each one.
-  if (EMAIL_PROXY_AUTOSEND_SETTERS.has(setterSlackId)) {
+  if (isAutosendUser(setterSlackId)) {
     await say(`Listo, enviando ahora.`);
     const syntheticPending = {
       kind: 'email',
@@ -5862,7 +5905,7 @@ async function runFulfillmentStandup(_correlationId) {
 
     taniaLines.push(`Anything you need from me to move any of these forward? I can draft client emails, schedule 1:1 reminders, or pull activity details on any client.`);
 
-    for (const id of (slackIdsByRole('client_success').length ? slackIdsByRole('client_success') : ['U07SMMDMSLQ'])) {
+    for (const id of slackIdsByRole('client_success')) {
       await slack.client.chat.postMessage({ channel: id, text: taniaLines.join('\n') });
     }
     await saveStandupSnapshot('tania', { phase0Clients: p0Names, slaWatch: slaNames, phase3StabClients: p3StabNames, blocked: blockedNames });
