@@ -112,12 +112,10 @@ Core promise: 10-30 qualified LinkedIn calls per month with decision-makers. ICP
 THE TEAM
 
 Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring.
-Tania (U07SMMDMSLQ) — Client Success Operations Manager. Client health, AR, contracts, case studies.
 Josue Duran (U08ABBFNGUW) — Technical Operations Manager (full-time fulfillment). Activation calls, campaign ops, client launch sequencing.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
 Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
-Joseph Salazar (U0A9J00EMGD) — Appointment Setter. Books discovery calls.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999) — High-Ticket Closers. They close deals after setting.
@@ -131,10 +129,10 @@ Task Execution: When Ron assigns a task, confirm you understood it, execute with
 Communication Drafting: Draft all routine outgoing messages. Ron reviews client-facing or sales-critical content before it goes out. Write in professional, confident, direct tone for external; efficient and direct for internal.
 
 Standup Accountability (Scheduled Jobs):
-- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Tania, Josue, Valeria, Felipe.
+- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Josue, Valeria, Felipe.
 - EOD check (weekdays 5:00 PM Costa Rica): Cross-reference open items against reported completions. Flag anything unresolved.
 - Weekly summary (Fridays 4:00 PM Costa Rica): Digest for Ron covering sales closures, delivery status, blockers, Monday priorities.
-- Sales call prep (evening before any sales call on calendar): Alert Ron to review prospect brief. If no brief exists, alert Tania.
+- Sales call prep (evening before any sales call on calendar): Alert Ron to review prospect brief. If no brief exists, alert Ron directly.
 
 ---
 
@@ -211,7 +209,7 @@ CRITICAL BEHAVIOR RULES:
    WRONG — "I can see Andres Ch M in GHL. Let me open that conversation." [silence]
    WRONG — "Nothing in sales intelligence yet. Let me check knowledge." [silence]
    WRONG — "Let me pull more history to find him." [silence after 5 minutes]
-   RIGHT — Call every relevant tool, compile the result, return a single complete answer: "Andres Chavez — assigned to Joseph Salazar. Last message April 9, no outbound response sent."
+   RIGHT — Call every relevant tool, compile the result, return a single complete answer: "Andres Chavez — assigned to Oscar M. Last message April 9, no outbound response sent."
 
    If ALL sources return nothing, say so immediately in one message: "Andres Chavez not found in GHL, sales intelligence, or knowledge base. He may not have been logged yet."
 
@@ -245,7 +243,7 @@ When reading, summarizing, or posting to #ng-sales-goats, you only surface and a
 - Prospect quality and pipeline health (how qualified is the book, what are conversion rates)
 - Objection patterns (what objections are showing up repeatedly, how they are being handled)
 - No-show and follow-up status (who ghosted, who needs re-engagement, FU sequence stage)
-- EOD reports from Joseph, Oscar, William, and Jose (calls booked, pipeline updates, actions needed)
+- EOD reports from Oscar, William, and Jose (calls booked, pipeline updates, actions needed)
 - Sales performance signals (close rate trends, setter-to-closer handoff quality)
 - Lead source quality (where are booked calls coming from, which sources convert)
 
@@ -472,7 +470,6 @@ const TEAM_MEMBERS = {
   'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
   'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe Herrera NG' },
-  'U0A9J00EMGD': { name: 'Joseph',   role: 'setter',         displayName: 'Joseph Salazar NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
@@ -552,20 +549,20 @@ function buildRoleSystemPrompt(userId) {
   if (userId === RON_SLACK_ID) return SYSTEM_PROMPT;
 
   const roleContext = {
-    client_success: `You are speaking with Tania, the Client Success Operations Manager at NeuroGrowth. She is the operational backbone of the business — hybrid Chief of Staff and Client Success role reporting to Ron.
+    client_success: `You are speaking with the Client Success Operations Manager at NeuroGrowth. They are the operational backbone of the business — hybrid Chief of Staff and Client Success role reporting to Ron.
 
-CROSS-ROLE CONTEXT: Fulfillment and sales are not siloed from Tania. When she asks about a client, surface both sides — delivery status AND sales history (what was promised on the close call, renewal timing, setter notes). When she asks about a prospect or renewal, pull delivery reputation (on-time launch, blockers, satisfaction signals) since that shapes retention and case-study potential.
+CROSS-ROLE CONTEXT: Fulfillment and sales are not siloed from client success. When they ask about a client, surface both sides — delivery status AND sales history (what was promised on the close call, renewal timing, setter notes). When they ask about a prospect or renewal, pull delivery reputation (on-time launch, blockers, satisfaction signals) since that shapes retention and case-study potential.
 
-PORTAL FOCUS: Lead with her book of business first, then expand. She can ask about any client, prospect, or deal — answer freely. Prioritize client health, onboarding phase, AR status, renewal signals, and any sale-to-delivery handoff gaps.
+PORTAL FOCUS: Lead with their book of business first, then expand. They can ask about any client, prospect, or deal — answer freely. Prioritize client health, onboarding phase, AR status, renewal signals, and any sale-to-delivery handoff gaps.
 
-Her 3 pillars:
+Their 3 pillars:
 - Executive Ops (30%): Draft and manage all contracts and SLAs, maintain contract repo with renewal dates, prepare pre-meeting research packages for Ron, own OKR tracking and sprint completion monitoring, produce weekly 5-min ops summary for Ron.
 - Client Success (50%): Primary contact for all non-strategic client comms — respond within 2 hours. Bi-weekly client check-in calls (Ron handles monthly strategic sessions). Track client health scores (target >80/100 average). Monitor early warning signals (reduced responsiveness, declining campaign metrics). Identify upsell and expansion opportunities. Execute case study and testimonial SOP. Coordinate quarterly business reviews with performance data.
 - Project and Team Coordination (20%): Own project tracking, coordinate with David on infrastructure, facilitate comms between SDR team and technical team, track action items across team members.
 
 Key KPIs: 100% client retention, >80 health score average, <2hr response time, 90%+ feedback actioned within 1 week, 1 case study per quarter, CEO operational time <20%.
 
-When Tania asks about a client, give her full health context: engagement level, last interaction, open action items, any risk signals. Help her draft client comms, check-in messages, expansion proposals, escalation summaries, and case study outreach. She cannot access Ron's Gmail, calendar, or GHL.`,
+When they ask about a client, give them full health context: engagement level, last interaction, open action items, any risk signals. Help them draft client comms, check-in messages, expansion proposals, escalation summaries, and case study outreach. They cannot access Ron's Gmail, calendar, or GHL.`,
 
     tech_ops: `You are speaking with Josue, the Technical Operations Manager at NeuroGrowth. He reports to Ron (CEO) and is the single point of accountability for technical campaign excellence across all clients.
 
@@ -579,7 +576,7 @@ His role is split:
 
 Key performance targets: 95%+ on-time launch rate within 14-day guarantee, 90%+ SLA compliance across DFY portfolio, keep CEO time on campaign ops under 5 hours/week.
 
-After Day 14, Tania becomes primary client contact for satisfaction/admin — Josue remains owner of technical campaign performance.
+After Day 14, client success becomes primary client contact for satisfaction/admin — Josue remains owner of technical campaign performance.
 
 When Josue asks about a client, pull from knowledge base and fulfillment channel to give him full context: current status, last action taken, what's blocking them, and what the next step is. Be direct and operational — tell him exactly what to do, not a summary. Help him draft channel updates, client comms, campaign fix plans, and escalation messages. He cannot access Ron's email, calendar, or GHL.`,
 
@@ -636,21 +633,21 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Joseph, Oscar, and William and close them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Oscar and William and close them into paying clients.
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
-- Take discovery and closing calls with prospects set by Joseph
+- Take discovery and closing calls with prospects set by the setters
 - Nurture pipeline: follow up with no-shows and maybes, handle objections, re-engage cold leads
 - Collect payments from new clients
 - Add new clients into the NeuroGrowth system (Neurogrowth portal and GHL)
 - File an EOD report every day: calls taken, deals closed, pipeline updates, follow-ups needed
 
 Key context:
-- Prospects arrive pre-qualified by Joseph with niche, service, price point, and ICP already gathered
+- Prospects arrive pre-qualified by the setters with niche, service, price point, and ICP already gathered
 - He works the post-call nurture sequence for no-shows and undecided prospects
 - Payment collection and client data entry into GHL is his responsibility on close
-- Works with Tania on handoff once a client pays
+- Works with client success on handoff once a client pays
 
 When Jose asks about a prospect or pipeline, pull from GHL conversations and knowledge base. Help him draft follow-up messages, re-engagement scripts, and closing sequences. Help him prep his EOD report. He cannot access Ron's Gmail or calendar.`,
 
@@ -663,7 +660,7 @@ PORTAL FOCUS: Lead with portfolio health — phase transitions, launch risk, SLA
 Their role:
 - Oversight of the 14-day launch cycle and DFY portfolio (works alongside Josue on technical campaign excellence)
 - Owns operational gap detection and escalation: when something is slipping, they're the one who notices and routes it
-- Coordinates between fulfillment (Valeria), campaigns (Felipe), client success (Tania), and tech lead (David)
+- Coordinates between fulfillment (Valeria), campaigns (Felipe), client success, and tech lead (David)
 - Surfaces operational issues to Ron with recommended actions, not raw status
 
 When they ask about ops health, pull fulfillment channel activity, recent gap detection alerts, SLA status across active clients, and any cross-team dependencies that are blocking. Help them draft escalation summaries for Ron, ops channel updates, and coordination messages between teams. They can use GHL, Drive, Notion, and calendar; they cannot send email on Ron's behalf.`,
@@ -2530,7 +2527,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
 // setter_id / closer_id mapping — update when David confirms the ID format.
 const SALES_TEAM_MAP = {
   // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
-  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
   '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero', // historical — no longer active
@@ -2541,8 +2538,8 @@ const SALES_TEAM_MAP = {
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
 
   // ── SETTERS — iClosed EOD email IDs ─────────────────────────────────────
-  'joseph.neurogrowth@gmail.com':   'Joseph Salazar',
-  'Salazcamjos@gmail.com':          'Joseph Salazar',
+  'joseph.neurogrowth@gmail.com':   'Joseph Salazar', // historical — no longer active
+  'Salazcamjos@gmail.com':          'Joseph Salazar', // historical — no longer active
   'oscar.neurogrowth@gmail.com':    'Oscar M',
   'william.neurogrowth@gmail.com':  'William B',
   'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
@@ -2659,7 +2656,6 @@ async function getSalesIntelligence(query) {
       // Resolve owner = whoever has claimed any contact_id in the lead group
       // (claim may have happened any time, not just today).
       const SETTER_BY_SLACK_ID = {
-        'U0A9J00EMGD': 'Joseph Salazar',
         'U0B1S1UMH9P': 'Oscar M',
         'U0B16P6DQ2F': 'William B',
       };
@@ -3302,7 +3298,7 @@ async function runMondayGapDetection(_correlationId) {
       const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email;
       const co   = r.company ? ` (${r.company})` : '';
       const label = r.days_in_phase0 >= 14 ? '🔴 PHASE 0 OVERDUE' : '🟡 PHASE 0 STALE';
-      gaps.push(`${label} — ${name}${co} | ${stepLabels[r.phase0_step] || r.phase0_step} | Day ${r.days_in_phase0} (Tania to unblock)`);
+      gaps.push(`${label} — ${name}${co} | ${stepLabels[r.phase0_step] || r.phase0_step} | Day ${r.days_in_phase0} (fulfillment to unblock)`);
     }
 
     // ── Sales gap detection ────────────────────────────────────────────────────
@@ -3617,17 +3613,17 @@ async function runProactiveDMs(_correlationId) {
       console.log(`Proactive DM sent to campaigns role: ${stalledPhase2.length} client(s) stalled in Phase 2`);
     }
 
-    // ── DM Tania: blocked clients ──
+    // ── DM client success: blocked clients ──
     if (blocked.length > 0) {
       const names = blocked.map(d => `${d.client_name}`).join(', ');
       const msg = `These clients are currently blocked: ${names}. If the block is on the client side — missing onboarding form, unresponsive, contract issue — this needs a proactive outreach before it becomes a bigger problem. Can you check what's needed and follow up?`;
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Tania: ${blocked.length} blocked client(s)`);
+      console.log(`Proactive DM sent to client_success: ${blocked.length} blocked client(s)`);
     }
 
-    // ── DM Tania: Phase 0 clients stuck ≥7 days in same step ──────────────────
+    // ── DM client success: Phase 0 clients stuck ≥7 days in same step ─────────
     const { data: stuckPhase0 } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
@@ -3653,10 +3649,10 @@ async function runProactiveDMs(_correlationId) {
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Tania: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
+      console.log(`Proactive DM sent to client_success: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
     }
 
-    // ── DM Tania: clients hitting Day 20 in Phase 3 (stabilization) ──
+    // ── DM client success: clients hitting Day 20 in Phase 3 (stabilization) ──
     // Uses stabilization_started_at as the Day 1 anchor.
     // Day 20 = time to reach out, schedule the 1:1 progress check, coordinate with client.
     const { data: phase3Clients } = await portalSupabase
@@ -3682,7 +3678,7 @@ async function runProactiveDMs(_correlationId) {
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Tania: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
+      console.log(`Proactive DM sent to client_success: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
     }
 
     if (approaching20InStabilization.length > 0) {
@@ -3691,7 +3687,7 @@ async function runProactiveDMs(_correlationId) {
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Tania: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
+      console.log(`Proactive DM sent to client_success: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
     }
 
     console.log('Proactive team DMs complete.');
@@ -4291,7 +4287,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Joseph, Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Debbanny is no longer active but historical rows resolve to her name), today\'s calls, prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Joseph bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Joseph and Debbanny are no longer active but historical rows resolve to their names), today\'s calls, prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
@@ -5829,9 +5825,9 @@ async function runFulfillmentStandup(_correlationId) {
     await saveStandupSnapshot('felipe', { phase2Clients: phase2.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP2, phase3Clients: phase3.map(d => ({ name: d.client_name })) });
     console.log('Standup DM sent to Felipe');
 
-    // ── DM Tania — Phase 0 owner, SLA enforcer, Phase 3 client success ─────────
+    // ── DM client success — Phase 0 owner, SLA enforcer, Phase 3 client success
     const taniaSnap = await getYesterdayStandupSnapshot('tania');
-    const taniaLines = [`Good morning Tania! Here's your ${today} client success brief:\n`];
+    const taniaLines = [`Here's your ${today} client success brief:\n`];
 
     const { data: phase0All } = await portalSupabase
       .from('v_phase0_fulfillment')
@@ -5906,10 +5902,12 @@ async function runFulfillmentStandup(_correlationId) {
     taniaLines.push(`Anything you need from me to move any of these forward? I can draft client emails, schedule 1:1 reminders, or pull activity details on any client.`);
 
     for (const id of slackIdsByRole('client_success')) {
-      await slack.client.chat.postMessage({ channel: id, text: taniaLines.join('\n') });
+      const firstName = getMemberContext(id).name;
+      const personalized = [`Good morning ${firstName}! ${taniaLines[0]}`, ...taniaLines.slice(1)].join('\n');
+      await slack.client.chat.postMessage({ channel: id, text: personalized });
     }
     await saveStandupSnapshot('tania', { phase0Clients: p0Names, slaWatch: slaNames, phase3StabClients: p3StabNames, blocked: blockedNames });
-    console.log('Standup DM sent to Tania');
+    console.log('Standup DM sent to client_success');
 
     console.log('Fulfillment standup DMs complete.');
   } catch (err) {
@@ -5954,7 +5952,6 @@ async function runSalesStandup(_correlationId) {
 
     // ── DM each setter ─────────────────────────────────────────────────────
     const setters = [
-      { slackId: 'U0A9J00EMGD', name: 'Joseph' },
       { slackId: 'U0B1S1UMH9P', name: 'Oscar' },
       { slackId: 'U0B16P6DQ2F', name: 'William' },
     ];
@@ -6368,7 +6365,7 @@ cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => {
 // cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 // cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 
-// Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, Tania based on client status)
+// Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, client_success based on client status)
 // runProactiveDMs merged into runFulfillmentStandup (9 AM) — stalled flags now inline per role
 // cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
 
@@ -7563,9 +7560,9 @@ async function runSetterLeaderboard(correlationId) {
   // Canonical roster of active setters. EOD table keys by email; setter_claims keys by Slack ID;
   // GHL keys by user ID. Walking this list lets us join all three cleanly.
   // Closers (Jonathan, Jose) excluded — they don't submit setter EOD reports.
-  // Debbanny excluded — rolled off 2026-05-03; historical rows still resolve via display maps.
+  // Debbanny (rolled off 2026-05-03) and Joseph (rolled off 2026-05-30) excluded;
+  // historical rows still resolve via display maps.
   const ACTIVE_SETTERS = [
-    { name: 'Joseph Salazar', email: 'joseph.neurogrowth@gmail.com',  slackId: 'U0A9J00EMGD' },
     { name: 'Oscar M',        email: 'oscar.neurogrowth@gmail.com',   slackId: 'U0B1S1UMH9P' },
     { name: 'William B',      email: 'william.neurogrowth@gmail.com', slackId: 'U0B16P6DQ2F' },
   ];
@@ -8089,7 +8086,7 @@ slack.event('member_joined_channel', async ({ event }) => {
     const member = getMemberContext(event.user);
     const roleIntros = {
       ceo:            `You are greeting Ron, the CEO and Founder of NeuroGrowth. This is your home base. Give him a sharp 2-line welcome that shows you're ready to work — mention you can pull emails, calendar, GHL, Slack channels, Drive, and Notion on demand.`,
-      client_success: `You are greeting Tania, the Client Success Operations Manager. Welcome her and let her know you can help with: client health checks, drafting client comms, checking fulfillment channel activity, contract reminders, and searching the knowledge base. Keep it to 3-4 lines max.`,
+      client_success: `You are greeting ${member.displayName}, the Client Success Operations Manager. Welcome them and let them know you can help with: client health checks, drafting client comms, checking fulfillment channel activity, contract reminders, and searching the knowledge base. Keep it to 3-4 lines max.`,
       tech_ops:       `You are greeting Josue, the Technical Operations Manager. Welcome him and let him know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and his daily briefing every morning at 8:30 AM. Keep it to 3-4 lines max.`,
       tech_lead:      `You are greeting David, the Lead Technology and Automation specialist. Welcome him and let him know you can help with: systems channel activity, Make.com issue tracking, process documentation, and Notion. Keep it to 3-4 lines max.`,
       fulfillment:    `You are greeting Valeria, the Fulfillment Operations specialist. Welcome her and let her know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
