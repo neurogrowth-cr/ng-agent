@@ -171,11 +171,15 @@ These were called out in the spec but explicitly de-scoped or never targeted for
 | 9:00 AM | Mon–Fri | Fulfillment Standup (`runFulfillmentStandup`) — personalized daily brief DMs to Josue, Valeria, Felipe, Tania |
 | 2:00 PM | Monday | Gap Detection — blocked/overdue/stale clients + Phase 0 gaps; Ron approves before posting to ops channel |
 | 3:00 PM + 8:00 PM | Daily | Proactive Alerts — unresolved `alert` knowledge entries >24h |
-| 6:00 PM | Mon–Fri | Fulfillment EOD Pulse → `#ng-fullfillment-ops` |
+| 6:00 PM | Mon, Wed | Fulfillment EOD Pulse → `#ng-fullfillment-ops` (was Mon–Fri; slimmed 2026-06-17) |
 | 10:30 PM | Friday | Weekly Portal Trends + Friday Delivery Wrap-Up |
 | 9:00 AM | Daily | Phase 3 Day 20 Check-in Alert |
 
 **Dynamic crons** stored in `scheduled_tasks` — validated section headers, reject + notify Ron if malformed.
+
+**Deactivated 2026-06-17** (cadence slim-down, `active=false` in `scheduled_tasks`, easily restorable):
+- `Blocked Client Report — MWF` (was Mon/Wed/Fri 8 AM) — note: Friday Wrap-Up still points aged >14d-no-activity blocks here, so those no longer surface anywhere until/unless the Friday prompt's block-filtering rule is relaxed.
+- `Phase 0 Aging Alert` (was Mon/Wed/Fri 8 AM) — Phase 0 aging now surfaces only in EOD (Mon/Wed) + Friday Wrap-Up.
 
 ## Standup DM contents (9 AM)
 
