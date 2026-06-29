@@ -7887,10 +7887,72 @@ healthServer.listen(process.env.PORT || 3000, () => {
   console.log(`Health check server listening on port ${process.env.PORT || 3000}`);
 });
 
+// ─── SOCKET HEALTH ──────────────────────────────────────────────────────────
+// Max receives every inbound Slack event (iClosed setter relay, reaction-based
+// lead claiming, @mentions, DMs) over a single Socket Mode WebSocket. Crons post
+// outbound via the bot token and keep working even when the socket is dead, so a
+// silent socket failure looks like "Max half-works" — exactly what happened when
+// inbound went dark from Jun 26 while reports kept posting. These guards make a
+// socket failure loud instead of silent.
+const SOCKET_ALERT_CHANNEL = process.env.SOCKET_ALERT_CHANNEL || OPS_CHANNEL;
+
+async function alertSocketHealth(text) {
+  try {
+    await slack.client.chat.postMessage({ channel: SOCKET_ALERT_CHANNEL, text });
+  } catch (e) {
+    console.error('alertSocketHealth: failed to post alert:', e.message);
+  }
+}
+
+// Watchdog: if the socket drops and does not recover within the grace window,
+// post one alert. Debounced — at most one alert per outage; cleared on reconnect.
+function attachSocketWatchdog() {
+  const client = slack.receiver && slack.receiver.client;
+  if (!client || typeof client.on !== 'function') {
+    console.error('Socket watchdog: SocketMode client unavailable — watchdog not attached.');
+    return;
+  }
+  const GRACE_MS = 90 * 1000;
+  let downTimer = null;
+  let alerted = false;
+
+  client.on('disconnected', () => {
+    console.error('[socket] disconnected — starting watchdog grace timer.');
+    if (downTimer) return;
+    downTimer = setTimeout(() => {
+      alerted = true;
+      console.error('[socket] still down after grace window — alerting ops.');
+      alertSocketHealth('🚨 Max Socket Mode has been disconnected for 90s+ — inbound Slack events (iClosed setter reveal, reaction lead-claiming, @mentions, DMs) are NOT being processed. Crons still post. Check Railway logs / SLACK_APP_TOKEN.');
+    }, GRACE_MS);
+  });
+
+  const onUp = (state) => {
+    if (downTimer) { clearTimeout(downTimer); downTimer = null; }
+    if (alerted) {
+      alerted = false;
+      console.log(`[socket] reconnected (${state}) — inbound events flowing again.`);
+      alertSocketHealth('✅ Max Socket Mode reconnected — inbound Slack events are flowing again.');
+    }
+  };
+  client.on('authenticated', () => onUp('authenticated'));
+  client.on('connected', () => onUp('connected'));
+}
+
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
-  await slack.start();
+  try {
+    await slack.start();
+  } catch (err) {
+    // Socket Mode could not be established (revoked/rotated SLACK_APP_TOKEN,
+    // Socket Mode toggled off on the app, or Slack-side failure). Running on
+    // without the socket means inbound events are silently dead, so fail loud
+    // and exit — Railway's ON_FAILURE policy restarts and retries.
+    console.error('FATAL: slack.start() failed — Socket Mode could not connect:', err && err.message);
+    await alertSocketHealth(`🚨 Max failed to start Socket Mode: ${err && err.message ? err.message : 'unknown error'}. Inbound Slack events are down. Restarting…`);
+    process.exit(1);
+  }
   console.log('NeuroGrowth PM Agent is running.');
+  attachSocketWatchdog();
   await loadAndRegisterDynamicCrons();
   // Static infrastructure crons (not stored in DB)
   cron.schedule('0 7 15 * *', wrapCronJob('runPhase3Reconciliation', async (c) => { await runPhase3Reconciliation(c); }), { timezone: 'America/Costa_Rica' });
