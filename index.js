@@ -118,6 +118,7 @@ Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Pro
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
+Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999) — High-Ticket Closers. They close deals after setting.
 
 ---
@@ -243,7 +244,7 @@ When reading, summarizing, or posting to #ng-sales-goats, you only surface and a
 - Prospect quality and pipeline health (how qualified is the book, what are conversion rates)
 - Objection patterns (what objections are showing up repeatedly, how they are being handled)
 - No-show and follow-up status (who ghosted, who needs re-engagement, FU sequence stage)
-- EOD reports from Oscar, William, and Jose (calls booked, pipeline updates, actions needed)
+- EOD reports from Oscar, William, Sebastian, and Jose (calls booked, pipeline updates, actions needed)
 - Sales performance signals (close rate trends, setter-to-closer handoff quality)
 - Lead source quality (where are booked calls coming from, which sources convert)
 
@@ -472,6 +473,7 @@ const TEAM_MEMBERS = {
   'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe Herrera NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
+  'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
   'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
@@ -633,7 +635,7 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Oscar and William and close them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Oscar, William, and Sebastian and close them into paying clients.
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
@@ -2530,6 +2532,7 @@ const SALES_TEAM_MAP = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
+  'wdjte1temxfr0lpi5rgv': 'Sebastian S',      'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero', // historical — no longer active
 
   // ── CLOSERS — iClosed identifies hosts by email address ─────────────────
@@ -2542,6 +2545,7 @@ const SALES_TEAM_MAP = {
   'Salazcamjos@gmail.com':          'Joseph Salazar', // historical — no longer active
   'oscar.neurogrowth@gmail.com':    'Oscar M',
   'william.neurogrowth@gmail.com':  'William B',
+  'sebastian.neurogrowth@gmail.com': 'Sebastian S',
   'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
 
   // ── FALLBACK — GHL user IDs for closers if iClosed uses those instead ───
@@ -2658,6 +2662,7 @@ async function getSalesIntelligence(query) {
       const SETTER_BY_SLACK_ID = {
         'U0B1S1UMH9P': 'Oscar M',
         'U0B16P6DQ2F': 'William B',
+        'U0BFA4SRVQC': 'Sebastian S',
       };
       const allContactIds = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
       const claimByContact = new Map(); // contact_id → { name, claimed_at }
@@ -3281,6 +3286,7 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
       'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
       'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+      'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
       '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
       'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
@@ -3571,6 +3577,7 @@ async function runMondayGapDetection(_correlationId) {
             'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
             'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
             'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+            'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
             '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
           };
           const staleLines = staleInbound.map(c => {
@@ -6137,6 +6144,7 @@ async function runSalesStandup(_correlationId) {
     const setters = [
       { slackId: 'U0B1S1UMH9P', name: 'Oscar' },
       { slackId: 'U0B16P6DQ2F', name: 'William' },
+      { slackId: 'U0BFA4SRVQC', name: 'Sebastian' },
     ];
 
     // Fetch yesterday's setter EOD aggregate (team total)
@@ -6595,6 +6603,7 @@ const GHL_USER_NAMES = {
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
   'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+  'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — no longer active
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
@@ -6605,12 +6614,14 @@ const GHL_TO_SLACK = {
   'joseph': 'U0A9J00EMGD', 'joseph salazar': 'U0A9J00EMGD',
   'oscar': 'U0B1S1UMH9P', 'oscar m': 'U0B1S1UMH9P', 'oscar neurogrowth': 'U0B1S1UMH9P',
   'william': 'U0B16P6DQ2F', 'william b': 'U0B16P6DQ2F', 'william neurogrowth': 'U0B16P6DQ2F',
+  'sebastian': 'U0BFA4SRVQC', 'sebastian s': 'U0BFA4SRVQC', 'sebastian serrano': 'U0BFA4SRVQC', 'sebastian neurogrowth': 'U0BFA4SRVQC',
   'debbanny': 'U0AR16QVDB3', 'debanny': 'U0AR16QVDB3', 'debbanny neurogrowth': 'U0AR16QVDB3', 'debbanny romero': 'U0AR16QVDB3', // historical
   'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
   'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD', '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',
   'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P', 'n8mvtuhbbby7qppqnmr7': 'U0B16P6DQ2F',
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
+  'wdjte1temxfr0lpi5rgv': 'U0BFA4SRVQC',
 };
 
 // Reverse map for lead-claim flow: Slack user → GHL user ID (used by reaction_added handler)
@@ -6619,6 +6630,7 @@ const SLACK_TO_GHL_USER = {
   'U0A9J00EMGD': 'cUTTPGov7ZTLvyjKHdX8', // Joseph Salazar
   'U0B1S1UMH9P': 'ZcmdIz2EEraPd80W2zop', // Oscar M
   'U0B16P6DQ2F': 'N8mvtuHbbbY7QppqNMr7', // William B
+  'U0BFA4SRVQC': 'Wdjte1temxfR0lpi5RGV', // Sebastian Serrano
   'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
   'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyltjV', // Jose Carranza
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
@@ -6630,6 +6642,7 @@ const EMAIL_TO_GHL_USER_ID = {
   'joseph.neurogrowth@gmail.com': 'cUTTPGov7ZTLvyjKHdX8',
   'oscar.neurogrowth@gmail.com':  'ZcmdIz2EEraPd80W2zop',
   'william.neurogrowth@gmail.com': 'N8mvtuHbbbY7QppqNMr7',
+  'sebastian.neurogrowth@gmail.com': 'Wdjte1temxfR0lpi5RGV',
   'jonathan.neurogrowth@gmail.com': 'gqYMYkpDDlTdxvBkfl2C',
   'jose.neurogrowth@gmail.com': 'izLTA0jy5OrKyMvyltjV',
   'ronny.duarte@neurogrowth.io': 'zoGW530iDnPOFqQNfssc',
@@ -7313,6 +7326,7 @@ async function runStalledProspectFollowups(correlationId) {
     'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
     'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
     'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+    'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
     'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
     'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
   };
