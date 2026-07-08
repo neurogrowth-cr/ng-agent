@@ -30,8 +30,9 @@ const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/calendar.events',
-  'https://www.googleapis.com/auth/drive.readonly',          // ← NEW: read Drive files
-  'https://www.googleapis.com/auth/drive.metadata.readonly', // ← NEW: search Drive
+  'https://www.googleapis.com/auth/drive.readonly',          // read Drive files (MAX)
+  'https://www.googleapis.com/auth/drive.metadata.readonly', // search Drive (MAX)
+  'https://www.googleapis.com/auth/drive.file',              // ← NEW: create/upload the files REVI makes (write)
 ];
 
 const REDIRECT_URI = 'http://localhost:3000/callback';
