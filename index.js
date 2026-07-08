@@ -1097,8 +1097,9 @@ function registerDynamicCron(task) {
       }
 
       // Fulfillment EOD Pulse — inject filtered portal alerts (no aged blockers)
-      // plus a fulfillment-domain anomaly block so the BLOCKERS section can surface
-      // movement signals instead of repeating the same long-standing blocked clients.
+      // plus a fulfillment-domain anomaly block. Blockers and anomalies render as
+      // separate report sections (BLOCKERS vs ANOMALIES) — see the Supabase-stored
+      // task prompt for the section split.
       if (task.name === 'Fulfillment EOD Pulse') {
         try {
           const dailyAlerts = await getPortalAlerts({ mode: 'daily' });
@@ -1187,7 +1188,7 @@ function registerDynamicCron(task) {
       // task, we check for its headers. Unknown tasks fall back to length check.
       const TASK_HEADERS = {
         'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
-        'Fulfillment EOD Pulse':      ['WINS TODAY', 'BLOCKERS', 'TOMORROW'],
+        'Fulfillment EOD Pulse':      ['WINS TODAY', 'BLOCKERS', 'ANOMALIES', 'TOMORROW'],
         'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
         'Monthly Business Review':    ['WINS THIS MONTH', 'GAPS & MISSES', 'KEEP DOING', 'STOP DOING', 'WATCH LIST', 'ONE PRIORITY FOR NEXT MONTH'],
