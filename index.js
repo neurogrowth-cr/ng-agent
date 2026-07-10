@@ -5754,15 +5754,31 @@ async function runSalesCallPrep(_correlationId) {
       const callTime    = formatICTime(appt.scheduled_start, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const hoursOut    = Math.round((new Date(appt.scheduled_start).getTime() - now) / (1000 * 60 * 60) * 10) / 10;
 
-      // GHL conversation lookup + setter resolution
-      let convoSection = 'GHL conversation not found for this prospect.';
+      // GHL conversation lookup + setter resolution.
+      // convoSection stays null until something real is found — no placeholder
+      // text lives here, so a brief with nothing to show simply omits the
+      // section (see brief assembly below) instead of printing a dead line.
+      let convoSection = null;
       // Truth source: opportunity in the Appointment Setting Pipeline.
       const setterInfo = await resolveSetterForContact(email, prospectName);
       let sourceLine = null;
+      let intake = null; // lazy — fetched at most once, reused by both the vsl sourceLine check and the fallback below
+
       if (setterInfo.source === 'appointment-setting') {
         sourceLine = setterInfo.setter
           ? `👤 Booked by: ${setterInfo.setter}`
           : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
+      } else {
+        // vsl — self-booked vs setter-unknown is decided by the iClosed booking
+        // payload (call_booked_from / event.setter), NOT by whether a GHL
+        // contact exists — most self-booked leads still get a GHL contact via
+        // the ad pipeline, so using contact presence here would mislabel them
+        // (the exact bug fixed 2026-05-08/13/26 — do not reintroduce).
+        intake = await fetchIClosedIntakeForProspect(prospectId);
+        const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
+        sourceLine = selfBooked
+          ? `🟢 Source: self-booked via iClosed (no setter)`
+          : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
       }
 
       try {
@@ -5785,47 +5801,41 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      // iClosed self-booking fallback — public-scheduler bookings never create a GHL contact,
-      // so use the booking intake (event + Q&A) from iclosed_webhook_deliveries instead.
-      if (setterInfo.source === 'vsl') {
-        const intake = await fetchIClosedIntakeForProspect(prospectId);
-        const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
-        sourceLine = selfBooked
-          ? `🟢 Source: self-booked via iClosed (no setter)`
-          : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
-
-        if (convoSection === 'GHL conversation not found for this prospect.') {
-          if (intake) {
-            const lines = ['No GHL conversation (self-booked via iClosed — no setter contact).', '📋 iClosed intake:'];
-            if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
-            for (const { question, answer } of intake.qa) {
-              lines.push(`• ${question.replace(/[.?!:]+$/, '')}: "${answer}"`);
-            }
-            const meta = [];
-            if (intake.bookedFrom) meta.push(`Booked via: ${intake.bookedFrom.toLowerCase().replace(/_/g, ' ')}`);
-            if (intake.timezone)   meta.push(`Timezone: ${intake.timezone}`);
-            if (intake.phone)      meta.push(`Phone: ${intake.phone}`);
-            if (meta.length) lines.push(`• ${meta.join(' · ')}`);
-            convoSection = lines.join('\n');
-          } else {
-            convoSection = 'No GHL or iClosed context available for this prospect.';
+      // No GHL conversation found — whether self-booked or setter-booked, fall
+      // back to the iClosed booking intake (event + the prospect's own Q&A
+      // answers) from iclosed_webhook_deliveries. If that's empty too, the
+      // section is simply left out of the brief (no dead "not found" line).
+      if (!convoSection) {
+        if (!intake) intake = await fetchIClosedIntakeForProspect(prospectId);
+        if (intake && (intake.eventName || intake.qa.length)) {
+          const lines = ['📋 No GHL message history — here\'s what they shared when booking:'];
+          if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
+          for (const { question, answer } of intake.qa) {
+            lines.push(`• ${question.replace(/[.?!:]+$/, '')}: "${answer}"`);
           }
+          const meta = [];
+          if (intake.bookedFrom) meta.push(`Booked via: ${intake.bookedFrom.toLowerCase().replace(/_/g, ' ')}`);
+          if (intake.timezone)   meta.push(`Timezone: ${intake.timezone}`);
+          if (intake.phone)      meta.push(`Phone: ${intake.phone}`);
+          if (meta.length) lines.push(`• ${meta.join(' · ')}`);
+          convoSection = lines.join('\n');
         }
       }
 
-      // Build the brief
-      const brief = [
+      // Build the brief — GHL section only appears when there's real content.
+      const briefLines = [
         `📞 *CALL PREP — ${prospectName}* | in ${hoursOut}h (${callTime} CR)`,
         company     ? `🏢 Company: ${company}` : '',
         email       ? `📧 Email: ${email}` : '',
         leadSource  ? `🔗 Lead source: ${leadSource}` : '',
         sourceLine,
         ``,
-        `*GHL CONVERSATION HISTORY:*`,
-        convoSection,
-        ``,
-        `Good luck on the call ${closerName.split(' ')[0]}. Let me know if you need anything before you jump on.`,
-      ].filter(l => l !== null && l !== undefined).join('\n');
+      ];
+      if (convoSection) {
+        briefLines.push(`*GHL CONVERSATION HISTORY:*`, convoSection, ``);
+      }
+      briefLines.push(`Good luck on the call ${closerName.split(' ')[0]}. Let me know if you need anything before you jump on.`);
+      const brief = briefLines.filter(l => l !== null && l !== undefined).join('\n');
 
       if (!closerSlack) {
         // Closer not mapped — send to Ron
