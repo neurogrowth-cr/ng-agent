@@ -2617,15 +2617,23 @@ async function getSalesIntelligence(query) {
   try {
     const q = (query || '').toLowerCase();
     const now = new Date();
-    const todayStart = new Date(now); todayStart.setHours(0,0,0,0);
-    const todayEnd   = new Date(now); todayEnd.setHours(23,59,59,999);
-    const weekStart  = new Date(now); weekStart.setDate(now.getDate() - now.getDay()); weekStart.setHours(0,0,0,0);
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    // Costa Rica is UTC−6, no DST. All day/week/month boundaries below must
+    // anchor to the CR calendar date, not the server's (UTC) local date —
+    // otherwise "today" drifts up to 6 hours and calls near CR midnight land
+    // on the wrong day. Same fix already applied to LEADS TODAY below; this
+    // mirrors it for TODAY'S CALLS / week / month.
+    const toDateStr = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const todayStr   = toDateStr(now);
+    const todayStart = new Date(`${todayStr}T06:00:00Z`); // CR midnight, as a UTC instant
+    const todayEnd   = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000 - 1);
 
-    const toDateStr = (d) => d.toISOString().split('T')[0];
-    const todayStr      = toDateStr(now);
-    const weekStartStr  = toDateStr(weekStart);
-    const monthStartStr = toDateStr(monthStart);
+    const crDow      = new Date(`${todayStr}T00:00:00Z`).getUTCDay(); // 0=Sun..6=Sat for the CR calendar date
+    const weekStart  = new Date(todayStart.getTime() - crDow * 24 * 60 * 60 * 1000);
+    const weekStartStr = toDateStr(weekStart);
+
+    const [crYear, crMonth] = todayStr.split('-').map(Number);
+    const monthStartStr = `${crYear}-${String(crMonth).padStart(2, '0')}-01`;
+    const monthStart    = new Date(`${monthStartStr}T06:00:00Z`);
 
     // ── LEADS TODAY (authoritative — lead_posts + setter_claims) ───────────
     // Must run before the "today calls" branch ("leads today" also contains
