@@ -115,6 +115,7 @@ Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, p
 Josue Duran (U08ABBFNGUW) — Technical Operations Manager (full-time fulfillment). Activation calls, campaign ops, client launch sequencing.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
 Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
+Gerald Arias (U0BAAC0KS82) — Fulfillment Operations.
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
@@ -474,6 +475,7 @@ const TEAM_MEMBERS = {
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
+  'U0BAAC0KS82': { name: 'Gerald',   role: 'fulfillment',    displayName: 'Gerald Arias NG' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
   'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
@@ -590,18 +592,18 @@ PORTAL FOCUS: Lead with system health, Make.com scenario activity, portal data i
 
 He cannot access Ron's email or calendar.`,
 
-    fulfillment: `You are speaking with Valeria, the Fulfillment Operations specialist at NeuroGrowth. Her primary role is creating client delivery documents — she runs the LinkedIn Flywheel Delivery System (Project 1 and Project 2 pipeline).
+    fulfillment: `You are speaking with ${member.displayName}, a Fulfillment Operations specialist at NeuroGrowth. Their primary role is creating client delivery documents — they run the LinkedIn Flywheel Delivery System (Project 1 and Project 2 pipeline).
 
 How the delivery system works:
 - Project 1 (Profile Optimization and Client Intelligence): Takes onboarding form + activation call + LinkedIn PDF as inputs. Runs language gate and activation gate quality checks, then runs 14-step market analysis. Produces 3 docs: Doc 1 (Voice + Calendar) goes to client via WhatsApp, Doc 2 (LinkedIn guide) goes to fulfillment team, Doc 3 (Intelligence bundle) hands off to Project 2.
 - Project 2 (Campaign Factory): Takes the intelligence bundle, runs bundle detection and pre-gen summary confirmation, builds 3 sequences (A, B, C — 5 messages each) + voice notes + Sales Navigator D1-D12 + Prosp.ai config. Produces File 1 (internal campaign bible for fulfillment, 7 sections D1-D12) and File 2 (founder-facing campaign overview, plain language).
 - Delivery: Doc 1 and File 2 go to founder. Doc 2 and File 1 go to fulfillment team (Felipe).
 
-Client onboarding checklist phases she owns or coordinates:
+Client onboarding checklist phases fulfillment owns or coordinates:
 - Phase 1: Voice Profile and Content Calendar setup, Video General Overview, Voice Profile Prompt
 - Phase 2: Campaign Validation (with Felipe), content calendar and profile steps
 
-Help Valeria with delivery doc status, client setup coordination, and fulfillment channel activity. She cannot access Ron's Gmail, calendar, or GHL.`,
+Help ${member.name} with delivery doc status, client setup coordination, and fulfillment channel activity. They cannot access Ron's Gmail, calendar, or GHL.`,
 
     campaigns: `You are speaking with Felipe, the Technical Campaign Specialist at NeuroGrowth. He executes the LinkedIn growth system deliverables that Valeria's docs produce. He works alongside Valeria on fulfillment.
 
@@ -5935,9 +5937,9 @@ async function runFulfillmentStandup(_correlationId) {
     await saveStandupSnapshot('josue', { blocked: blockedNames, hitting14: hitting14Names, hitting7: hitting7Names, phase0Needing: needsCallNames, phase0Handoff: handoffNames, counts: { phase1: phase1.length, phase2: phase2.length, phase3: phase3.length, blocked: blocked.length, phase0: (phase0||[]).length } });
     console.log('Standup DM sent to tech_ops role');
 
-    // ── DM Valeria — delivery docs, Phase 1 ───────────────────────────────────
+    // ── DM fulfillment role — delivery docs, Phase 1 ──────────────────────────
     const valeriaSnap = await getYesterdayStandupSnapshot('valeria');
-    const valeriaLines = [`Good morning Valeria! Here's your ${today} delivery brief:\n`];
+    const valeriaLines = [];
 
     const phase1Names   = phase1.map(d => d.client_name);
     const stalledP1     = phase1.filter(d => (getDayCount(d) || 0) >= 4).map(d => d.client_name);
@@ -5966,10 +5968,12 @@ async function runFulfillmentStandup(_correlationId) {
     valeriaLines.push(`Any docs blocked or waiting on client input? Let Josue know so he can follow up.`);
 
     for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
-      await slack.client.chat.postMessage({ channel: id, text: valeriaLines.join('\n') });
+      const recipientName = getMemberContext(id).name;
+      const greeting = `Good morning ${recipientName}! Here's your ${today} delivery brief:\n`;
+      await slack.client.chat.postMessage({ channel: id, text: [greeting, ...valeriaLines].join('\n') });
     }
     await saveStandupSnapshot('valeria', { phase1Clients: phase1.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP1, blocked: vBlockedNames });
-    console.log('Standup DM sent to Valeria');
+    console.log('Standup DM sent to fulfillment role');
 
     // ── DM Felipe — campaigns, Phase 2 ───────────────────────────────────────
     const felipeSnap = await getYesterdayStandupSnapshot('felipe');
@@ -8237,7 +8241,7 @@ slack.event('member_joined_channel', async ({ event }) => {
       client_success: `You are greeting ${member.displayName}, the Client Success Operations Manager. Welcome them and let them know you can help with: client health checks, drafting client comms, checking fulfillment channel activity, contract reminders, and searching the knowledge base. Keep it to 3-4 lines max.`,
       tech_ops:       `You are greeting Josue, the Technical Operations Manager. Welcome him and let him know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and his daily briefing every morning at 8:30 AM. Keep it to 3-4 lines max.`,
       tech_lead:      `You are greeting David, the Lead Technology and Automation specialist. Welcome him and let him know you can help with: systems channel activity, Make.com issue tracking, process documentation, and Notion. Keep it to 3-4 lines max.`,
-      fulfillment:    `You are greeting Valeria, the Fulfillment Operations specialist. Welcome her and let her know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
+      fulfillment:    `You are greeting ${member.displayName}, a Fulfillment Operations specialist. Welcome them and let them know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
       campaigns:      `You are greeting Felipe, the Technical Campaign Specialist. Welcome him and let him know you can help with: campaign status per client, Prosp config questions, fulfillment channel updates, and content pipeline tracking. Keep it to 3-4 lines max.`,
       setter:         `You are greeting ${member.displayName}, an Appointment Setter at NeuroGrowth. Welcome them and let them know you can help with: GHL prospect lookups, drafting follow-up messages in Spanish, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`,
       closer:         `You are greeting Jose, the High-Ticket Closer. Welcome him and let him know you can help with: GHL pipeline status, prospect follow-up drafts, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`,
