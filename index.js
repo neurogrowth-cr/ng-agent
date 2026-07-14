@@ -6443,6 +6443,165 @@ async function runUnloggedOutcomeReminders(_correlationId) {
   }
 }
 
+// ─── STALE UNCLAIMED LEADS ────────────────────────────────────────────────────
+// A lead posted to #ng-sales-goats with no time-based fallback if nobody reacts
+// sat unclaimed for 11 days before anyone noticed (2026-07-02 → 2026-07-13,
+// Adrian RM / excelenciaenbombas@hotmail.com). These two jobs close that gap:
+// a 2h in-thread nag, and a daily digest to Ron of everything still open.
+
+// Shared query: leads posted since `sinceMs` with no matching setter_claims row.
+// Mirrors the leads-today report's join pattern (two queries + diff in JS —
+// supabase-js has no LEFT JOIN, and nothing else in this file uses raw SQL for it).
+async function getUnclaimedLeads(sinceMs) {
+  const { data: leadRows, error: leadErr } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts, slack_channel_id, contact_id, full_name, source, posted_at')
+    .gte('posted_at', new Date(sinceMs).toISOString())
+    .order('posted_at', { ascending: true });
+  if (leadErr) { console.error('getUnclaimedLeads: lead_posts query failed:', leadErr.message); return []; }
+
+  // Group by slack_message_ts, not contact_id — the FB→WhatsApp dup-skip path
+  // in handleGHLWebhook gives a duplicate contact its own lead_posts row that
+  // reuses the ORIGINAL lead's slack_message_ts. Without grouping, a dup's
+  // contact_id (which never appears in setter_claims) would false-positive an
+  // already-claimed lead as unclaimed.
+  const byTs = new Map(); // ts → { slackChannelId, fullName, source, postedAt (earliest), contactIds:Set }
+  for (const r of (leadRows || [])) {
+    if (!r.slack_message_ts) continue;
+    let g = byTs.get(r.slack_message_ts);
+    if (!g) {
+      g = { slackChannelId: r.slack_channel_id, fullName: r.full_name, source: r.source, postedAt: r.posted_at, contactIds: new Set() };
+      byTs.set(r.slack_message_ts, g);
+    }
+    if (r.contact_id) g.contactIds.add(r.contact_id);
+  }
+
+  const allContactIds = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
+  const claimedContactIds = new Set();
+  if (allContactIds.length) {
+    const { data: claimRows, error: claimErr } = await supabase
+      .from('setter_claims')
+      .select('ghl_contact_id')
+      .in('ghl_contact_id', allContactIds);
+    if (claimErr) { console.error('getUnclaimedLeads: setter_claims query failed:', claimErr.message); return []; }
+    for (const c of (claimRows || [])) claimedContactIds.add(c.ghl_contact_id);
+  }
+
+  const unclaimed = [];
+  for (const [ts, g] of byTs.entries()) {
+    const isClaimed = [...g.contactIds].some(cid => claimedContactIds.has(cid));
+    if (isClaimed) continue;
+    unclaimed.push({
+      slackMessageTs: ts,
+      slackChannelId: g.slackChannelId,
+      contactId: [...g.contactIds][0] || null,
+      fullName: g.fullName,
+      source: g.source,
+      postedAt: g.postedAt,
+    });
+  }
+  unclaimed.sort((a, b) => new Date(a.postedAt) - new Date(b.postedAt));
+  return unclaimed;
+}
+
+// Resolves the @setters Slack user group to its mention string at runtime
+// rather than hardcoding a subteam ID that could go stale if the group is
+// ever recreated. Cached after first successful lookup. Falls back to
+// <!channel> (and logs loudly) if the group can't be found, so the nag never
+// silently fails to notify anyone.
+let _cachedSetterMention = null;
+async function resolveSetterUsergroupMention() {
+  if (_cachedSetterMention) return _cachedSetterMention;
+  try {
+    const res = await slack.client.usergroups.list();
+    const group = (res.usergroups || []).find(g => g.handle === 'setters');
+    if (group) {
+      _cachedSetterMention = `<!subteam^${group.id}|@setters>`;
+      return _cachedSetterMention;
+    }
+    console.warn('resolveSetterUsergroupMention: no usergroup with handle "setters" found — falling back to <!channel>.');
+  } catch (err) {
+    console.error('resolveSetterUsergroupMention: usergroups.list failed:', err.message, '— falling back to <!channel>.');
+  }
+  return '<!channel>';
+}
+
+// Nag check — every 30 min, 7 AM–9 PM CR (see cron registration below). Posts
+// ONE threaded reminder per lead, the first time it crosses 2h unclaimed.
+// Never repeats for the same lead (agent_knowledge dedupe).
+async function runStaleLeadNagCheck(_correlationId) {
+  console.log('Running stale-lead nag check...');
+  try {
+    const leads = await getUnclaimedLeads(Date.now() - 24 * 60 * 60 * 1000);
+    const staleLeads = leads.filter(l => Date.now() - new Date(l.postedAt).getTime() >= 2 * 60 * 60 * 1000);
+    if (!staleLeads.length) { console.log('Stale-lead nag check: nothing past the 2h threshold.'); return; }
+
+    const mention = await resolveSetterUsergroupMention();
+
+    for (const lead of staleLeads) {
+      if (!lead.contactId) continue;
+      const dedupKey = `stale-lead-nag:${lead.contactId}`;
+      const { data: existing } = await supabase
+        .from('agent_knowledge')
+        .select('value')
+        .eq('key', dedupKey)
+        .limit(1);
+      if (existing && existing.length) continue; // already nagged — one-shot, never repeats
+
+      try {
+        await slack.client.chat.postMessage({
+          channel: lead.slackChannelId,
+          thread_ts: lead.slackMessageTs,
+          text: `${mention} this lead has been unclaimed for 2+ hours — ${lead.fullName || 'Unknown'}. React ✅ to claim.`,
+        });
+        await upsertKnowledge('process', dedupKey, new Date().toISOString(), 'stale-lead-nag');
+        console.log(`Stale-lead nag posted for contact ${lead.contactId} (${lead.fullName}).`);
+      } catch (postErr) {
+        // Don't write the dedupe key if the post failed — better to retry
+        // next tick than silently suppress a lead that was never actually nagged.
+        console.error(`Stale-lead nag: post failed for contact ${lead.contactId}:`, postErr.message);
+      }
+    }
+    console.log('Stale-lead nag check complete.');
+  } catch (err) {
+    console.error('Stale-lead nag check error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Stale-lead nag check cron failed: ${err.message}` });
+  }
+}
+
+// Daily sweep — 6 PM CR every day. ONE DM to Ron listing every lead still
+// unclaimed at sweep time. Leads persist on this list every day until claimed
+// (no "seen it once" suppression) — that persistence is the actual fix for
+// the 11-day blind spot this feature exists to close.
+async function runStaleLeadDailySweep(_correlationId) {
+  console.log('Running stale-lead daily sweep...');
+  try {
+    const leads = await getUnclaimedLeads(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    if (!leads.length) { console.log('Stale-lead daily sweep: nothing unclaimed.'); return; }
+
+    const formatElapsed = (postedAt) => {
+      const ms = Date.now() - new Date(postedAt).getTime();
+      const hours = Math.floor(ms / (60 * 60 * 1000));
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.floor(hours / 24);
+      return `${days}d ${hours % 24}h ago`;
+    };
+
+    const lines = [
+      `UNCLAIMED LEADS — END OF DAY SWEEP`,
+      '',
+      `${leads.length} lead(s) still unclaimed as of 6 PM CR:`,
+      '',
+      ...leads.map(l => `• ${l.fullName || 'Unknown'} — posted ${formatElapsed(l.postedAt)} (${l.source || 'Unknown source'})`),
+    ];
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
+    console.log(`Stale-lead daily sweep sent to Ron (${leads.length} unclaimed).`);
+  } catch (err) {
+    console.error('Stale-lead daily sweep error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Stale-lead daily sweep cron failed: ${err.message}` });
+  }
+}
+
 // ─── WEEKLY SALES & MARKETING RECAP ──────────────────────────────────────────
 // Fires Friday 5 PM CR. DMs Ron only with 7-day sales + marketing summary.
 async function runWeeklySalesMarketingRecap(_correlationId) {
@@ -6600,6 +6759,16 @@ cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { awa
 // "Logged?" is read directly from revops_sales_outcomes (by appointment_id) —
 // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19).
 cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
+
+// Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
+// the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours.
+// One-shot per lead via agent_knowledge dedupe (stale-lead-nag:<contact_id>) — never repeats.
+cron.schedule('*/30 7-20 * * *', wrapCronJob('runStaleLeadNagCheck', async (c) => { await runStaleLeadNagCheck(c); }), { timezone: 'America/Costa_Rica' });
+
+// Stale-lead daily sweep — 6:00 PM CR every day (no weekend exclusion — leads
+// can go unclaimed on weekends too). DMs Ron ONE summary of every lead still
+// unclaimed at sweep time; repeat appearances are intentional, not deduped.
+cron.schedule('0 18 * * *', wrapCronJob('runStaleLeadDailySweep', async (c) => { await runStaleLeadDailySweep(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stalled prospect follow-ups — 11 AM CR Mon–Fri. Dry-run DMs setters their stalled list;
 // live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
