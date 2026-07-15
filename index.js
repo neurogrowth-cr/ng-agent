@@ -6458,7 +6458,13 @@ async function getUnclaimedLeads(sinceMs) {
     .select('slack_message_ts, slack_channel_id, contact_id, full_name, source, posted_at')
     .gte('posted_at', new Date(sinceMs).toISOString())
     .order('posted_at', { ascending: true });
-  if (leadErr) { console.error('getUnclaimedLeads: lead_posts query failed:', leadErr.message); return []; }
+  // Throw rather than swallow-and-return-[] — both callers treat an empty
+  // result as "genuinely nothing unclaimed" (nag check: nothing to nag;
+  // sweep: no DM to Ron). A swallowed query error would look identical to
+  // "all clear" and silently mask exactly the kind of failure this feature
+  // exists to catch. Let the caller's own try/catch (which already DMs Ron
+  // on any thrown error) handle it instead.
+  if (leadErr) throw new Error(`getUnclaimedLeads: lead_posts query failed: ${leadErr.message}`);
 
   // Group by slack_message_ts, not contact_id — the FB→WhatsApp dup-skip path
   // in handleGHLWebhook gives a duplicate contact its own lead_posts row that
@@ -6483,7 +6489,7 @@ async function getUnclaimedLeads(sinceMs) {
       .from('setter_claims')
       .select('ghl_contact_id')
       .in('ghl_contact_id', allContactIds);
-    if (claimErr) { console.error('getUnclaimedLeads: setter_claims query failed:', claimErr.message); return []; }
+    if (claimErr) throw new Error(`getUnclaimedLeads: setter_claims query failed: ${claimErr.message}`);
     for (const c of (claimRows || [])) claimedContactIds.add(c.ghl_contact_id);
   }
 
