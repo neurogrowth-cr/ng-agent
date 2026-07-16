@@ -6483,12 +6483,20 @@ async function getUnclaimedLeads(sinceMs) {
   }
 
   const allContactIds = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
+  // Chunk the .in() lookup — the daily sweep's 30-day window can pull 700+
+  // distinct contact IDs (confirmed live 2026-07-15: 705 over 30 days), and
+  // cramming all of them into one filter produces a URL long enough to fail
+  // at the fetch/network layer (raw "TypeError: fetch failed", not a normal
+  // Postgrest error) before Supabase ever sees the request. 200/chunk keeps
+  // each request comfortably short regardless of how much lead volume grows.
+  const CLAIM_LOOKUP_CHUNK_SIZE = 200;
   const claimedContactIds = new Set();
-  if (allContactIds.length) {
+  for (let i = 0; i < allContactIds.length; i += CLAIM_LOOKUP_CHUNK_SIZE) {
+    const chunk = allContactIds.slice(i, i + CLAIM_LOOKUP_CHUNK_SIZE);
     const { data: claimRows, error: claimErr } = await supabase
       .from('setter_claims')
       .select('ghl_contact_id')
-      .in('ghl_contact_id', allContactIds);
+      .in('ghl_contact_id', chunk);
     if (claimErr) throw new Error(`getUnclaimedLeads: setter_claims query failed: ${claimErr.message}`);
     for (const c of (claimRows || [])) claimedContactIds.add(c.ghl_contact_id);
   }
