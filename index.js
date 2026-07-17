@@ -6541,8 +6541,12 @@ async function resolveSetterUsergroupMention() {
 }
 
 // Nag check — every 30 min, 7 AM–9 PM CR (see cron registration below). Posts
-// ONE threaded reminder per lead, the first time it crosses 2h unclaimed.
-// Never repeats for the same lead (agent_knowledge dedupe).
+// a threaded reminder the first time a lead crosses 2h unclaimed, then keeps
+// re-nagging the SAME thread every additional hour it stays unclaimed (2026-07-16:
+// changed from one-shot per Ron — a single nag wasn't enough pressure, wanted
+// escalating hourly pings on the lead's own thread, not just the once-daily
+// Ron digest). agent_knowledge tracks last-nagged-at per lead, not just
+// ever-nagged, so the gate is "≥1h since last nag" rather than "never nagged."
 async function runStaleLeadNagCheck(_correlationId) {
   console.log('Running stale-lead nag check...');
   try {
@@ -6560,16 +6564,18 @@ async function runStaleLeadNagCheck(_correlationId) {
         .select('value')
         .eq('key', dedupKey)
         .limit(1);
-      if (existing && existing.length) continue; // already nagged — one-shot, never repeats
+      const lastNaggedAt = existing && existing.length ? new Date(existing[0].value).getTime() : null;
+      if (lastNaggedAt && Date.now() - lastNaggedAt < 60 * 60 * 1000) continue; // nagged within the last hour — wait for the next hourly window
 
+      const hoursUnclaimed = Math.floor((Date.now() - new Date(lead.postedAt).getTime()) / (60 * 60 * 1000));
       try {
         await slack.client.chat.postMessage({
           channel: lead.slackChannelId,
           thread_ts: lead.slackMessageTs,
-          text: `${mention} this lead has been unclaimed for 2+ hours — ${lead.fullName || 'Unknown'}. React ✅ to claim.`,
+          text: `${mention} this lead has been unclaimed for ${hoursUnclaimed}+ hours — ${lead.fullName || 'Unknown'}. React ✅ to claim.`,
         });
         await upsertKnowledge('process', dedupKey, new Date().toISOString(), 'stale-lead-nag');
-        console.log(`Stale-lead nag posted for contact ${lead.contactId} (${lead.fullName}).`);
+        console.log(`Stale-lead nag posted for contact ${lead.contactId} (${lead.fullName}), ${hoursUnclaimed}h unclaimed.`);
       } catch (postErr) {
         // Don't write the dedupe key if the post failed — better to retry
         // next tick than silently suppress a lead that was never actually nagged.
@@ -6775,8 +6781,9 @@ cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { awa
 cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
-// the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours.
-// One-shot per lead via agent_knowledge dedupe (stale-lead-nag:<contact_id>) — never repeats.
+// the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours,
+// then re-nags the SAME thread every additional hour until claimed (agent_knowledge
+// dedupe key stale-lead-nag:<contact_id> gates on "≥1h since last nag", not one-shot).
 cron.schedule('*/30 7-20 * * *', wrapCronJob('runStaleLeadNagCheck', async (c) => { await runStaleLeadNagCheck(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead daily sweep — 6:00 PM CR every day (no weekend exclusion — leads
