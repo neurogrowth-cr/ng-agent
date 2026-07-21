@@ -3715,6 +3715,7 @@ async function runNightlyLearning(correlationId) {
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
     let saved = 0;
+    const savedEntries = [];
     for (const line of lines) {
       const parts = line.split('|').map(p => p.trim());
       if (parts.length >= 3) {
@@ -3729,11 +3730,40 @@ async function runNightlyLearning(correlationId) {
             : key;
           await upsertKnowledge(category, normalizedKey, value, 'nightly-learning');
           saved++;
+          savedEntries.push({ category, key, value });
         }
       }
     }
+
+    // Sneak-peek executive summary appended to the confirmation post — the team
+    // sees WHAT Max learned, not just a count. Non-fatal: on any error the post
+    // falls back to the plain confirmation line.
+    let learnedBlock = '';
+    if (savedEntries.length) {
+      try {
+        // Cap per-entry, never tail-truncate the list — every saved entry from
+        // every source (Slack, Gmail, Calendar, Portal, REVI) must reach the
+        // summarizer, or low-priority-sorted categories would silently drop.
+        const order = { alert: 0, decision: 1, client: 2, team: 3, intel: 4, process: 5 };
+        const entryList = savedEntries
+          .sort((a, b) => (order[a.category] ?? 9) - (order[b.category] ?? 9))
+          .map(e => `[${e.category}] ${e.key}: ${String(e.value).slice(0, 300)}`)
+          .join('\n')
+          .slice(0, 24000);
+        const tSum = Date.now();
+        const sumRes = await anthropic.messages.create({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 350,
+          messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
+        });
+        logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId);
+        const sumText = sumRes.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+        if (sumText) learnedBlock = `\n\n*What I learned tonight:*\n${sumText}`;
+      } catch (sumErr) { console.error('Nightly learning summary generation failed:', sumErr.message); }
+    }
+
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI | Knowledge entries saved: ${saved}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI | Knowledge entries saved: ${saved}${learnedBlock}`);
   } catch (err) {
     console.error('Nightly learning error:', err.message);
     try {
