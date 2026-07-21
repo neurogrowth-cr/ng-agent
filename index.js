@@ -21,6 +21,14 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
+// REVI (the sales-coaching agent) lives in the `revi` schema of this SAME
+// Supabase project. Read-only by convention — every revi.* query in this file
+// must go through the REVI DATA ACCESS section so schema changes break loudly
+// in exactly one place. Grep ng-revi before renaming anything it reads.
+const reviSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+  auth: { persistSession: false },
+  db: { schema: 'revi' },
+});
 
 const { Pool } = require('pg');
 const portalPg = process.env.PORTAL_READONLY_DATABASE_URL
@@ -463,6 +471,8 @@ const RON_ONLY_TOOLS = new Set([
   'get_calendar_events',
   'create_calendar_event',
   'add_calendar_attendees',
+  // REVI coaching teardowns + leadership initiatives are Ron-only material.
+  'get_revi_intelligence',
 ]);
 
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
@@ -4254,6 +4264,235 @@ async function _scrapeDay7AtRiskCount() {
   return count;
 }
 
+// ─── REVI DATA ACCESS ─────────────────────────────────────────────────────────
+// ALL reads of the `revi` schema (REVI, the sales-coaching + initiative-tracking
+// agent) live in this section. REVI owns that schema and may migrate it —
+// explicit column lists here mean a rename breaks in one findable place, and
+// every caller treats failures as non-fatal (surfaces degrade to pre-REVI
+// output). Never select transcript_full (token bomb). teardown_text is Ron-only
+// coaching material — never route it to a closer-facing surface; closer-facing
+// surfaces use closer_draft_text (the coaching REVI already sent them).
+
+async function reviFindCallsByProspect(emailOrName, limit = 3) {
+  if (!emailOrName) return [];
+  let q = reviSupabase
+    .from('closer_call_scores')
+    .select('id, prospect_name, prospect_email, call_date, duration_min, overall_score, deal_outcome, prospect_signals, coaching_doc_url, closer:closer_id ( full_name )')
+    .order('call_date', { ascending: false })
+    .limit(limit);
+  q = emailOrName.includes('@')
+    ? q.ilike('prospect_email', emailOrName)
+    : q.ilike('prospect_name', `%${emailOrName}%`);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+// Per-closer scoring + coaching summary. closerName null = all active closers.
+// forCloserEyes=true swaps Ron-only teardown_text for the closer-safe draft.
+async function reviGetCoachingSummary(closerName = null, days = 14, forCloserEyes = false) {
+  const sinceISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data: closers, error: cErr } = await reviSupabase
+    .from('revi_closers')
+    .select('id, full_name, is_active');
+  if (cErr) throw cErr;
+  const wanted = closerName
+    ? (closers || []).filter(c => (c.full_name || '').toLowerCase().includes(closerName.toLowerCase()))
+    : (closers || []).filter(c => c.is_active);
+
+  const out = [];
+  for (const c of wanted) {
+    const { data: calls, error: sErr } = await reviSupabase
+      .from('closer_call_scores')
+      .select('overall_score, deal_outcome, call_date')
+      .eq('closer_id', c.id)
+      .gte('call_date', sinceISO);
+    if (sErr) throw sErr;
+    const { data: runs } = await reviSupabase
+      .from('coaching_runs')
+      .select('run_date, teardown_text, closer_draft_text, status')
+      .eq('closer_id', c.id)
+      .order('run_date', { ascending: false })
+      .limit(1);
+    const scores = (calls || []).map(x => Number(x.overall_score)).filter(Number.isFinite);
+    const latest = runs && runs[0];
+    const focusText = latest ? (forCloserEyes ? latest.closer_draft_text : latest.teardown_text) : null;
+    out.push({
+      closer: c.full_name,
+      is_active: c.is_active,
+      calls_scored: (calls || []).length,
+      avg_score: scores.length ? +(scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1) : null,
+      outcomes: (calls || []).reduce((m, x) => { const k = x.deal_outcome || 'pending'; m[k] = (m[k] || 0) + 1; return m; }, {}),
+      latest_coaching_date: latest ? latest.run_date : null,
+      latest_coaching_focus: focusText ? String(focusText).slice(0, 600) : null,
+    });
+  }
+  return out;
+}
+
+async function reviGetRecentDeals(days = 30) {
+  const sinceISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data: won, error: wErr } = await reviSupabase
+    .from('won_deals')
+    .select('prospect_name, prospect_email, call_date, marketing_tags, case_study_eligible')
+    .gte('call_date', sinceISO)
+    .order('call_date', { ascending: false })
+    .limit(20);
+  if (wErr) throw wErr;
+  const { data: lost, error: lErr } = await reviSupabase
+    .from('lost_deals')
+    .select('prospect_name, prospect_email, call_date, primary_loss_reason, failure_pattern_tags, bottom_three_criteria')
+    .gte('call_date', sinceISO)
+    .order('call_date', { ascending: false })
+    .limit(20);
+  if (lErr) throw lErr;
+  return { won: won || [], lost: lost || [] };
+}
+
+async function reviGetOpenInitiatives() {
+  const { data: inits, error } = await reviSupabase
+    .from('initiatives')
+    .select('title, description, owner_name, meeting_source, needle_mover, next_step, due_hint, last_movement_at, last_mentioned_at')
+    .eq('status', 'open')
+    .order('last_movement_at', { ascending: false });
+  if (error) throw error;
+  const { data: meetings } = await reviSupabase
+    .from('leadership_meetings')
+    .select('meeting_kind, title, meeting_date, counts, digest_text')
+    .order('meeting_date', { ascending: false })
+    .limit(2);
+  const dayMs = 24 * 60 * 60 * 1000;
+  return {
+    open_initiatives: (inits || []).map(i => ({
+      ...i,
+      description: String(i.description || '').slice(0, 300),
+      days_since_movement: i.last_movement_at ? Math.floor((Date.now() - new Date(i.last_movement_at).getTime()) / dayMs) : null,
+    })),
+    recent_meetings: (meetings || []).map(m => ({
+      kind: m.meeting_kind,
+      title: m.title,
+      date: m.meeting_date,
+      counts: m.counts,
+      digest: String(m.digest_text || '').slice(0, 1200),
+    })),
+  };
+}
+
+// Backend for the get_revi_intelligence tool (Ron-only — teardowns and
+// initiative data are leadership material). Returns JSON-stringifiable data;
+// errors come back as strings so Q&A degrades instead of crashing the turn.
+async function queryReviIntelligence(topic, query = null, days = null) {
+  try {
+    if (topic === 'prospect') {
+      if (!query) return 'topic=prospect requires query (prospect email or name).';
+      const calls = await reviFindCallsByProspect(query, 5);
+      return calls.length ? calls : `REVI has no scored calls matching "${query}".`;
+    }
+    if (topic === 'coaching')    return await reviGetCoachingSummary(query || null, days || 14, false);
+    if (topic === 'scoreboard')  return await reviGetCoachingSummary(null, days || 7, false);
+    if (topic === 'deals')       return await reviGetRecentDeals(days || 30);
+    if (topic === 'initiatives') return await reviGetOpenInitiatives();
+    return `Unknown topic "${topic}". Use coaching, initiatives, deals, prospect, or scoreboard.`;
+  } catch (err) {
+    console.error(`queryReviIntelligence(${topic}) failed:`, err.message);
+    return `REVI data unavailable right now (${err.message}). REVI's schema may be mid-migration — the rest of Max still works.`;
+  }
+}
+
+// ── REVI cross-checks cron ───────────────────────────────────────────────────
+// C3 heartbeat: REVI scores calls from Fathom recordings. If sales calls were
+// held (metric_observations, iclosed_calls_held_yest) but REVI hasn't scored
+// anything in 2+ business days, its ingestion is silently dead (exactly the
+// 2026-07-16 Fathom team-sharing incident). Alert-only — silent when healthy.
+// C1 coverage + C2 outcome reconciliation land with the GHL migration.
+function _businessDaysBetween(fromMs, toMs) {
+  let count = 0;
+  const d = new Date(fromMs);
+  d.setUTCHours(12, 0, 0, 0); // noon anchor — immune to DST/offset drift
+  while (true) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    if (d.getTime() >= toMs) break; // never count a day past the end bound
+    const dow = new Date(d.getTime() - 6 * 60 * 60 * 1000).getUTCDay(); // CR = UTC-6
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
+// THE swap point for the iClosed→GHL migration: sales calls that took place in
+// [sinceISO, now). Today that truth lives in portal revops_appointments
+// (flywheel-only); post-cutover this ONE function re-points at the GHL-native
+// appointment source and the cross-checks never change.
+// NOTE: deliberately NOT metric_observations/iclosed_calls_held_yest — that
+// metric has logged zeros for months (audit INS-09) and would silence the check.
+async function _countSalesCallsSince(sinceISO) {
+  const { data: appts, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, iclosed_call_id, scheduled_start')
+    .gte('scheduled_start', sinceISO)
+    .lt('scheduled_start', new Date().toISOString());
+  if (error) throw error;
+  const excludeIds = await getNonFlywheelCallIds();
+  return filterFlywheelAppts(appts || [], excludeIds).length;
+}
+
+async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
+  const alerts = [];
+
+  // Check 1 — scoring freshness vs. calls actually held.
+  const { data: lastScoredRows, error: lsErr } = await reviSupabase
+    .from('closer_call_scores')
+    .select('created_at')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (lsErr) throw lsErr;
+  const lastScoredAt = lastScoredRows && lastScoredRows[0] ? new Date(lastScoredRows[0].created_at).getTime() : 0;
+  const quietBizDays = _businessDaysBetween(lastScoredAt, Date.now());
+
+  if (quietBizDays >= 2) {
+    const sinceISO = new Date(lastScoredAt || Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const heldSince = await _countSalesCallsSince(sinceISO);
+    if (heldSince > 0) {
+      alerts.push(
+        `🔇 *REVI appears stalled.* ${heldSince} sales call(s) held since ${sinceISO.slice(0, 10)}, ` +
+        `but REVI hasn't scored anything in ${quietBizDays} business days ` +
+        `(last scored call: ${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}).\n` +
+        `Check: Fathom API key / team sharing (broke silently on Jul 16), the ng-sales-REVI Railway service, and REVI's poll logs.`
+      );
+    }
+  }
+
+  // Check 2 — coaching runs stuck in draft >24h (REVI scored but never delivered).
+  const dayAgoISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { data: stuck } = await reviSupabase
+    .from('coaching_runs')
+    .select('run_date, status, created_at')
+    .eq('status', 'draft')
+    .lt('created_at', dayAgoISO);
+  if (stuck && stuck.length) {
+    alerts.push(
+      `📄 *REVI has ${stuck.length} coaching run(s) stuck in draft >24h* ` +
+      `(run dates: ${[...new Set(stuck.map(s => s.run_date))].join(', ')}). ` +
+      `Scoring worked but delivery didn't — check REVI's Slack send + Drive upload.`
+    );
+  }
+
+  if (!alerts.length) { console.log('REVI cross-checks: healthy, staying silent.'); return { alerts: [] }; }
+  if (dryRun) { console.log('REVI cross-checks dry-run alerts:\n' + alerts.join('\n\n')); return { alerts }; }
+
+  // Dedup: one alert per distinct condition (stall keyed on last-scored date,
+  // stuck drafts keyed on their run dates) — not one per day the condition persists.
+  const stuckDates = (stuck || []).map(s => s.run_date).sort().join(',');
+  const dedupKey = `revi-health:${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}:${stuckDates || 'none'}`;
+  const { data: already } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
+  if (already && already.length) { console.log(`REVI cross-checks: alert already sent for ${dedupKey}.`); return { alerts, deduped: true }; }
+
+  const message = `*REVI HEALTH CHECK*\n\n${alerts.join('\n\n')}`;
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
+  await upsertKnowledge('alert', dedupKey, message, 'revi-cross-check');
+  console.log(`REVI cross-checks: ${alerts.length} alert(s) DMed to Ron.`);
+  return { alerts };
+}
+
 // ── Metric registry — single source of truth for what gets scraped ──────────
 const METRIC_REGISTRY = [
   // Marketing — per-funnel CPL signals (blended CPL is meaningless across two funnels)
@@ -4500,6 +4739,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
+          { name: 'get_revi_intelligence', description: "Query REVI (the sales-call coaching + leadership-initiative agent) data. Topics: 'coaching' = per-closer scores, outcomes, and latest coaching focus (query = optional closer name); 'initiatives' = open leadership initiatives from Win Da Week / Management Sync / Product Sync meetings, with owners, next steps, and days stalled; 'deals' = recent won/lost deals with loss reasons and pattern tags; 'prospect' = REVI's scored calls + buying signals for one prospect (query = email or name, required); 'scoreboard' = all-closer comparison. Use for any question about call coaching, closer performance quality, why deals are lost, or what initiatives are open/stalled.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'coaching | initiatives | deals | prospect | scoreboard' }, query: { type: 'string', description: 'Prospect email/name (topic=prospect) or closer name (topic=coaching). Optional otherwise.' }, days: { type: 'number', description: 'Lookback window in days. Defaults: coaching 14, deals 30, scoreboard 7.' } }, required: ['topic'] } },
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
@@ -4566,6 +4806,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
             (out.errors.length ? `\n\nErrors: ${out.errors.map(e => e.metric + ': ' + e.error).join('; ')}` : '');
         }
         else if (toolUse.name === 'query_metric_history')   result = await queryMetricHistory(toolUse.input.metric, Math.min(toolUse.input.days || 30, 90));
+        else if (toolUse.name === 'get_revi_intelligence')  result = await queryReviIntelligence(toolUse.input.topic, toolUse.input.query || null, toolUse.input.days);
         else if (toolUse.name === 'draft_outbound_email')   result = await draftOutboundEmail(toolUse.input, userId);
         else if (toolUse.name === 'draft_reply_email')      result = await draftReplyEmail(toolUse.input, userId);
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
@@ -5822,6 +6063,39 @@ async function runSalesCallPrep(_correlationId) {
         }
       }
 
+      // REVI intel — prior scored calls for this prospect (repeat prospects) plus
+      // the closer's own current coaching focus. Cross-schema read of REVI's data;
+      // non-fatal by design: the brief must still send if revi.* is unreachable.
+      // Closer-facing surface → closer_draft_text only, never Ron-only teardowns.
+      let reviSection = null;
+      try {
+        const reviLines = [];
+        const priorCalls = email ? await reviFindCallsByProspect(email, 3) : [];
+        for (const pc of priorCalls) {
+          const when = pc.call_date ? formatICTime(pc.call_date, { month: 'short', day: 'numeric' }) : '';
+          const sig = pc.prospect_signals || {};
+          const bits = [`${when} with ${pc.closer && pc.closer.full_name ? pc.closer.full_name.split(' ')[0] : 'us'}`];
+          if (pc.overall_score != null)       bits.push(`scored ${pc.overall_score}`);
+          if (pc.deal_outcome && pc.deal_outcome !== 'pending') bits.push(`outcome: ${pc.deal_outcome}`);
+          if (sig.buying_signal_strength)     bits.push(`buying signal ${sig.buying_signal_strength}`);
+          if (sig.objection_type)             bits.push(`objection: ${sig.objection_type}`);
+          if (sig.stated_timeline)            bits.push(`timeline: ${sig.stated_timeline}`);
+          if (sig.decision_maker_status)      bits.push(`DM status: ${sig.decision_maker_status}`);
+          reviLines.push(`• Prior call ${bits.join(' · ')}${pc.coaching_doc_url ? `\n  ${pc.coaching_doc_url}` : ''}`);
+        }
+        if (closerSlack) {
+          // First-name match — Max's display names and REVI's full_name differ in
+          // suffixes; closers are first-name-unique (Jose, Jonathan).
+          const [coachSum] = await reviGetCoachingSummary((closerName || '').split(' ')[0], 14, true);
+          if (coachSum && coachSum.latest_coaching_focus) {
+            reviLines.push(`🎯 Your current coaching focus (${coachSum.latest_coaching_date}): ${coachSum.latest_coaching_focus.slice(0, 250)}`);
+          }
+        }
+        if (reviLines.length) reviSection = reviLines.join('\n');
+      } catch (reviErr) {
+        console.error(`REVI intel lookup failed for ${prospectName}:`, reviErr.message);
+      }
+
       // Build the brief — GHL section only appears when there's real content.
       const briefLines = [
         `📞 *CALL PREP — ${prospectName}* | in ${hoursOut}h (${callTime} CR)`,
@@ -5833,6 +6107,9 @@ async function runSalesCallPrep(_correlationId) {
       ];
       if (convoSection) {
         briefLines.push(`*GHL CONVERSATION HISTORY:*`, convoSection, ``);
+      }
+      if (reviSection) {
+        briefLines.push(`*REVI INTEL:*`, reviSection, ``);
       }
       briefLines.push(`Good luck on the call ${closerName.split(' ')[0]}. Let me know if you need anything before you jump on.`);
       const brief = briefLines.filter(l => l !== null && l !== undefined).join('\n');
@@ -6765,6 +7042,10 @@ cron.schedule('0 6 * * *',   async () => {
     catch (_) {}
   }
 }, { timezone: 'America/Costa_Rica' });
+
+// REVI cross-checks — 6:30 AM CR Tue–Sat (each run covers the prior business day).
+// Heartbeat on REVI's ingestion + delivery; alert-only, silent when healthy.
+cron.schedule('30 6 * * 2-6', wrapCronJob('runReviCrossChecks', async (c) => { await runReviCrossChecks(c); }), { timezone: 'America/Costa_Rica' });
 
 // Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
 cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
