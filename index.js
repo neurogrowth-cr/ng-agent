@@ -1139,6 +1139,20 @@ function registerDynamicCron(task) {
         }
       }
 
+      // Sales tasks get REVI coaching context appended so scheduled reports can
+      // explain the numbers (call quality, objections, initiative movement) —
+      // not just state them. Non-fatal; report runs REVI-blind on error.
+      if (task.name === 'Sales EOD Report' || task.name === 'Weekly Closer Comparison') {
+        try {
+          const reviCtx = await reviBuildDailyDigest(task.name === 'Weekly Closer Comparison' ? 7 * 24 : 26);
+          if (reviCtx) {
+            taskDataBlock += `\n\n---\nREVI COACHING CONTEXT (read-only intelligence from the sales-coach agent — weave in ONLY where it explains the sales numbers, e.g. a low show/close rate alongside weak buying signals or a recurring objection. Do not turn this report into a coaching report, and do not rank closers by coaching score):\n${reviCtx}`;
+          }
+        } catch (reviErr) {
+          console.error(`REVI context injection failed for "${task.name}":`, reviErr.message);
+        }
+      }
+
       const enrichedPrompt = liveContext
         ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
         : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}`;
@@ -3683,9 +3697,18 @@ async function runNightlyLearning(correlationId) {
         digest += `\n\n=== PORTAL ===\n${portalSummary}`;
       }
     } catch (portalErr) { console.error('Portal snapshot error in nightly learning:', portalErr.message); }
+
+    // REVI digest — sales-call quality + leadership initiative movement from the
+    // sibling coaching agent's schema. Non-fatal: nightly learning proceeds
+    // REVI-blind if the revi schema is unreachable.
+    try {
+      const reviDigest = await reviBuildDailyDigest(26);
+      if (reviDigest) digest += `\n\n=== REVI (sales coaching + leadership initiatives) ===\n${reviDigest}`;
+    } catch (reviErr) { console.error('Nightly learning — REVI digest error:', reviErr.message); }
+
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n\n${digest}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
@@ -3710,7 +3733,7 @@ async function runNightlyLearning(correlationId) {
       }
     }
     console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar | Knowledge entries saved: ${saved}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI | Knowledge entries saved: ${saved}`);
   } catch (err) {
     console.error('Nightly learning error:', err.message);
     try {
@@ -4376,6 +4399,65 @@ async function reviGetOpenInitiatives() {
       digest: String(m.digest_text || '').slice(0, 1200),
     })),
   };
+}
+
+// Compact plain-text digest of REVI activity in the last `hours` — feeds Max's
+// AUTONOMOUS surfaces: nightly learning (distills patterns into agent_knowledge)
+// and sales scheduled-task context. Objective data only (scores, outcomes,
+// signals, initiative movements) — deliberately NO teardown text, because
+// nightly insights land in shared-visibility knowledge the whole team can search.
+async function reviBuildDailyDigest(hours = 26) {
+  const sinceISO = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const lines = [];
+
+  const { data: calls } = await reviSupabase
+    .from('closer_call_scores')
+    .select('prospect_name, call_date, overall_score, deal_outcome, prospect_signals, closer:closer_id ( full_name )')
+    .gte('created_at', sinceISO)
+    .order('call_date', { ascending: false })
+    .limit(20);
+  if (calls && calls.length) {
+    lines.push(`Calls scored by REVI (${calls.length}):`);
+    for (const c of calls) {
+      const sig = c.prospect_signals || {};
+      const bits = [
+        `${c.closer && c.closer.full_name ? c.closer.full_name.split(' ')[0] : '?'} × ${c.prospect_name || 'unknown prospect'}`,
+        c.overall_score != null ? `score ${c.overall_score}/100` : null,
+        c.deal_outcome && c.deal_outcome !== 'pending' ? `outcome: ${c.deal_outcome}` : null,
+        sig.buying_signal_strength ? `buying signal ${sig.buying_signal_strength}` : null,
+        sig.objection_type ? `objection: ${String(sig.objection_type).slice(0, 180)}` : null,
+        sig.stated_timeline ? `timeline: ${String(sig.stated_timeline).slice(0, 180)}` : null,
+      ].filter(Boolean);
+      lines.push(`• ${bits.join(' · ')}`);
+    }
+  }
+
+  const { data: moves } = await reviSupabase
+    .from('initiative_updates')
+    .select('movement, next_step, initiative:initiative_id ( title, owner_name )')
+    .gte('created_at', sinceISO)
+    .limit(15);
+  if (moves && moves.length) {
+    lines.push(`Leadership initiative movements (${moves.length}):`);
+    for (const m of moves) {
+      const title = m.initiative ? m.initiative.title : 'unknown initiative';
+      const owner = m.initiative && m.initiative.owner_name ? ` (${m.initiative.owner_name})` : '';
+      lines.push(`• [${m.movement}] ${title}${owner}${m.next_step ? ` — next: ${String(m.next_step).slice(0, 120)}` : ''}`);
+    }
+  }
+
+  const { data: meetings } = await reviSupabase
+    .from('leadership_meetings')
+    .select('meeting_kind, title, counts')
+    .gte('created_at', sinceISO)
+    .limit(5);
+  if (meetings && meetings.length) {
+    for (const m of meetings) {
+      lines.push(`• Leadership meeting processed: ${m.title || m.meeting_kind} — movement counts ${JSON.stringify(m.counts || {})}`);
+    }
+  }
+
+  return lines.length ? lines.join('\n') : null;
 }
 
 // Backend for the get_revi_intelligence tool (Ron-only — teardowns and
