@@ -1051,7 +1051,12 @@ function registerDynamicCron(task) {
       try {
       console.log(`Running dynamic cron: ${task.name}`);
 
-      // Inject live email + calendar context into scheduled report prompts
+      // Inject live email + calendar context into scheduled report prompts.
+      // Ron's inbox is confidential (bank/billing notices land there) — email
+      // context is ONLY injected when the report is delivered to Ron directly,
+      // never into a prompt whose output posts to a team-visible channel.
+      const taskChannel = (task.channel || AGENT_CHANNEL).replace(/^#/, '');
+      const deliversToRonOnly = taskChannel === RON_SLACK_ID;
       let liveContext = '';
       try {
         const todayEvents = await getCalendarEvents(0, 1);
@@ -1062,14 +1067,15 @@ function registerDynamicCron(task) {
         if (tomorrowEvents && !tomorrowEvents.includes('error') && !tomorrowEvents.includes('No events')) {
           liveContext += `\n\nTOMORROW'S CALENDAR:\n${tomorrowEvents}`;
         }
-        const emails = await getRecentEmails();
-        if (emails && !emails.includes('error')) {
-          liveContext += `\n\nRECENT EMAILS (unread):\n${emails}`;
+        if (deliversToRonOnly) {
+          const emails = await getRecentEmails();
+          if (emails && !emails.includes('error')) {
+            liveContext += `\n\nRECENT EMAILS (unread):\n${emails}`;
+          }
         }
       } catch (e) { console.error('Live context fetch error for scheduled task:', e.message); }
 
       // Inject any lessons learned from team feedback on previous reports for this channel
-      const taskChannel = (task.channel || AGENT_CHANNEL).replace(/^#/, '');
       const taskLessons = await getReportLessons(taskChannel);
       const lessonContext = taskLessons.length
         ? `\n\nPREVIOUS FEEDBACK FROM TEAM (apply these corrections to this report):\n${taskLessons.map(l => `• ${l.value}`).join('\n')}`
@@ -1153,9 +1159,12 @@ function registerDynamicCron(task) {
         }
       }
 
+      // Team-visible reports must never surface company financials, whatever
+      // source they arrived from (Slack digests, knowledge base, live context).
+      const confidentialityRule = deliversToRonOnly ? '' : `\n\nCONFIDENTIALITY: This report posts to a team-visible channel. Never include company financial details — bank balances, payment failures or successes, billing/subscription status, invoices, card or account information. If such a signal appears anywhere in your context, omit it entirely; Ron is notified privately through a separate channel.`;
       const enrichedPrompt = liveContext
-        ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
-        : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}`;
+        ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}`;
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
@@ -3708,7 +3717,7 @@ async function runNightlyLearning(correlationId) {
 
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n\n${digest}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
@@ -3716,6 +3725,7 @@ async function runNightlyLearning(correlationId) {
     const lines = text.split('\n').filter(l => l.includes('|'));
     let saved = 0;
     const savedEntries = [];
+    const ronOnlyEntries = [];
     for (const line of lines) {
       const parts = line.split('|').map(p => p.trim());
       if (parts.length >= 3) {
@@ -3724,6 +3734,14 @@ async function runNightlyLearning(correlationId) {
         const category = rawCategory.toLowerCase().replace(/[^a-z]/g, '').trim();
         const VALID_CATEGORIES = new Set(['client','team','process','decision','alert','intel']);
         const value = valueParts.join('|').trim();
+        // Financial/billing intel is Ron-confidential: stored as private
+        // knowledge (only Ron's queries surface it), DM'd to Ron, and kept out
+        // of savedEntries so it never reaches the public team summary below.
+        if (category === 'confidential' && key && value) {
+          await upsertKnowledge('alert', `confidential:${key}`, value, 'nightly-learning', RON_SLACK_ID, 'private');
+          ronOnlyEntries.push({ key, value });
+          continue;
+        }
         if (category && VALID_CATEGORIES.has(category) && key && value) {
           const normalizedKey = category === 'client'
             ? `client:${key.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}:${new Date().toISOString().slice(0, 10)}`
@@ -3754,7 +3772,7 @@ async function runNightlyLearning(correlationId) {
         const sumRes = await anthropic.messages.create({
           model: 'claude-sonnet-4-6',
           max_tokens: 350,
-          messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
+          messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Never mention company financial, banking, or billing details (balances, payments, invoices, subscription status) — those are confidential to Ron and must not appear in this team-facing summary. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
         });
         logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId);
         const sumText = sumRes.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
@@ -3762,8 +3780,18 @@ async function runNightlyLearning(correlationId) {
       } catch (sumErr) { console.error('Nightly learning summary generation failed:', sumErr.message); }
     }
 
-    console.log(`Nightly learning complete. ${saved} knowledge entries saved.`);
+    console.log(`Nightly learning complete. ${saved} knowledge entries saved, ${ronOnlyEntries.length} confidential (Ron-only).`);
     await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI | Knowledge entries saved: ${saved}${learnedBlock}`);
+
+    // Confidential (financial/billing) findings go to Ron's DM only.
+    if (ronOnlyEntries.length) {
+      try {
+        await slack.client.chat.postMessage({
+          channel: RON_SLACK_ID,
+          text: `🔒 *Confidential — from tonight's learning (not shared with the team):*\n${ronOnlyEntries.map(e => `• *${e.key}:* ${e.value}`).join('\n')}`,
+        });
+      } catch (dmErr) { console.error('Failed to DM Ron confidential nightly entries:', dmErr.message); }
+    }
   } catch (err) {
     console.error('Nightly learning error:', err.message);
     try {

@@ -61,3 +61,15 @@ So GHL produces two contact records per real lead, each with its own contact_id,
 **Cases the fuzzy match still misses.** When the WA display name has a totally different first name from the form (e.g., form: "Warner Zuñiga", WA: "WZM" — initials only). Those will still produce two top-level Slack posts. Acceptable until the GHL-side fix lands.
 
 **Real fix (GHL side, not yet built).** Pre-fill the WhatsApp click-to-chat URL with `?text=…Ref: {{contact.id}}`, then add a GHL workflow on `Inbound Message` that parses the ID and merges/deletes the auto-created dup. See chat 2026-05-08 for full step-by-step. Until that lands, the safety net carries the load.
+
+---
+
+## 2026-07-22 — Financial signals leaked to a team channel (confidentiality boundary)
+
+**What happened.** An evening scheduled report posted to a team channel included the iClosed $360 payment failure AND the Tech-Stack account balance ($185.97). Source: `registerDynamicCron` injected Ron's unread Gmail (`getRecentEmails()`) into EVERY scheduled report prompt regardless of destination channel — a bank/billing notice in the inbox became team-visible output.
+
+**Rule.** Company financials (bank balances, payment failures, billing status, invoices, card/account info) are **Ron-only** until he says otherwise. Ron's Gmail is a confidential source: it must never feed a prompt whose output posts to a team-visible surface.
+
+**Fix shipped.** (1) Email context only injected when `task.channel === RON_SLACK_ID` (DM). (2) Team-channel report prompts carry an explicit CONFIDENTIALITY rule as defense-in-depth. (3) Nightly learning: new `confidential` extraction category → saved as `visibility='private'` knowledge under Ron's user_id, DM'd to Ron, excluded from the public "What I learned tonight" post (proactive-alerts cron only re-broadcasts `shared` alerts, so private entries can't resurface).
+
+**Pattern to remember.** Whenever wiring a new data source into Max, ask: *who can see the output surface this feeds?* A source's sensitivity must be ≤ the audience of every surface it reaches. Gmail/Calendar/GHL-financials → Ron-only surfaces. Slack channels/portal → team surfaces OK.
