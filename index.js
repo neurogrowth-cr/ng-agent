@@ -1252,7 +1252,8 @@ function registerDynamicCron(task) {
         'Blocked Client Report — MWF':      [], // short report, no fixed headers
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
         'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
-        'Daily iClosed Call Roster':        [], // short on quiet days
+        'Daily Sales Call Roster':          [], // short on quiet days
+        'Daily iClosed Call Roster':        [], // legacy name — renamed 2026-07-26
       };
 
       function validateFinalReport(text, taskName) {
@@ -3018,6 +3019,9 @@ function _newSetterSlot() {
   return {
     source: 'ghl', leads_claimed: 0,
     calls_booked: 0, attended: 0, no_shows: 0, pending: 0, aqc: 0,
+    claimed_booked: 0,   // this week's booked calls whose lead this setter had claimed
+    claim_mismatches: 0, // booked by this setter but claimed by someone else
+    mismatch_notes: [],
   };
 }
 
@@ -3027,7 +3031,7 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
   // 1. Flywheel appointments in range + their outcomes
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, scheduled_start, iclosed_call_id, setter_id, source')
+    .select('id, scheduled_start, iclosed_call_id, setter_id, source, prospect:prospect_id ( email )')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -3044,13 +3048,50 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
     outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
   }
 
-  // 2. Credit each appointment to its native setter_id (roster email → name).
+  // Cross-check source: who CLAIMED each prospect in #ng-sales-goats (✋ flow →
+  // setter_claims). 45-day lookback — claims usually precede bookings by days.
+  // Latest claim per prospect email wins.
+  const claimOwnerByEmail = {};
+  {
+    const { data: claimHist } = await supabase
+      .from('setter_claims')
+      .select('prospect_email, claimed_by_setter_name, claimed_at')
+      .not('prospect_email', 'is', null)
+      .gte('claimed_at', new Date(new Date(weekEndIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString())
+      .order('claimed_at', { ascending: true });
+    for (const c of (claimHist || [])) {
+      const k = (c.prospect_email || '').toLowerCase().trim();
+      if (k && c.claimed_by_setter_name) claimOwnerByEmail[k] = c.claimed_by_setter_name;
+    }
+  }
+
+  // 2. Credit each appointment to its native setter_id (roster email → name),
+  //    and cross-check against the claim owner: claimed→booked conversions and
+  //    booker≠claimer mismatches both surface on the leaderboard.
   for (const a of (appts || [])) {
-    if (!a.setter_id) continue; // self-booked / closer-booked — not a setter call
+    const prospectEmail = (a.prospect?.email || '').toLowerCase().trim();
+    const claimOwner = prospectEmail ? claimOwnerByEmail[prospectEmail] : null;
+
+    if (!a.setter_id) {
+      // Self-booked in GHL — but if a setter had claimed this lead, credit the
+      // claim→booking conversion so channel work still shows up.
+      if (claimOwner) {
+        if (!result[claimOwner]) result[claimOwner] = _newSetterSlot();
+        result[claimOwner].claimed_booked += 1;
+      }
+      continue;
+    }
     const name = resolveSalesMember(a.setter_id);
     if (!result[name]) result[name] = _newSetterSlot();
     const slot = result[name];
     slot.calls_booked += 1;
+    if (claimOwner) {
+      if (claimOwner === name) slot.claimed_booked += 1;
+      else {
+        slot.claim_mismatches += 1;
+        slot.mismatch_notes.push(`${prospectEmail} claimed by ${claimOwner}`);
+      }
+    }
     const c = classifyOutcome(outcomesById[a.id]);
     if (c.showed)            slot.attended += 1;
     if (c.noShow)            slot.no_shows += 1;
@@ -3091,7 +3132,7 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
   const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Leads claimed from setter_claims; calls booked/show rate/qualified attended calls from GHL-native setter attribution + outcomes; pending calls excluded from show rate. Self-booked calls carry no setter credit. Ranked by qualified attended calls.)`);
+  lines.push(`(Leads claimed from setter_claims — the ✋ flow in #ng-sales-goats; calls booked/show rate/qualified attended calls from GHL-native setter attribution + outcomes; pending calls excluded from show rate. Self-booked calls carry no setter credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by qualified attended calls.)`);
   ranked.forEach(({ name, s, showRate }, idx) => {
     const showRateStr = showRate === null ? '— (no outcomes logged yet)' : `${showRate}%`;
     const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
@@ -3099,6 +3140,7 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
     lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Show rate: ${showRateStr}`);
     lines.push(`  Qualified attended calls: ${s.aqc} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr}`);
+    lines.push(`  Cross-check: claimed→booked ${s.claimed_booked}${s.claim_mismatches ? ` | ⚠️ ${s.claim_mismatches} booked-by-them but claimed by someone else (${s.mismatch_notes.slice(0, 3).join('; ')})` : ''}`);
   });
   return lines.join('\n');
 }
@@ -4688,7 +4730,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
