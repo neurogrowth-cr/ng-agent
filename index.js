@@ -2608,13 +2608,13 @@ function resolveSalesMember(id) {
   return SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()] || id;
 }
 
-// Sales reports must only count the 3 flywheel iClosed calendars:
-//   linkedin-flywheel, linkedin-flywheel-vsl, linkedin-flywheel-doc.
-// revops_appointments also contains partner-consulting-session calls (Ron's
-// paid-client 1:1s) — these must be excluded from every sales report.
-// Helper returns a Set of iclosed_call_id values to EXCLUDE. Negative filter
-// is intentional: appointments without a matched webhook still pass through,
-// so we never silently drop a real flywheel call.
+// Sales reports must only count flywheel sales calls.
+// Legacy iClosed rows: exclude non-flywheel calendars (partner-consulting 1:1s)
+// via the frozen iclosed_webhook_deliveries slug scan below (decays naturally as
+// rows age past the 120d window). GHL rows (iclosed_call_id NULL) always pass —
+// they are sales-only BY CONSTRUCTION: dash's webhook ingestion is gated on the
+// GHL_SALES_CALENDAR_IDS allowlist. If a non-sales calendar ever joins GHL,
+// gate it in dash — do NOT add a second allowlist here (it would drift).
 const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc']);
 let _nonFlywheelCache = { ids: null, fetchedAt: 0 };
 async function getNonFlywheelCallIds() {
@@ -4046,7 +4046,7 @@ async function _scrapeGhlNewContactsToday() {
   return (data.contacts || []).length;
 }
 
-// iClosed calls booked yesterday (flywheel-only)
+// Calls booked yesterday (flywheel-only; booked_at populated by dash for GHL rows)
 async function _scrapeIclosedCallsBookedYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
@@ -4059,55 +4059,80 @@ async function _scrapeIclosedCallsBookedYesterday() {
   return filterFlywheelAppts(data, excludeIds).length;
 }
 
-// iClosed calls held yesterday (attended = true, flywheel-only)
+// Calls held yesterday (outcome-derived showed count, flywheel-only). The raw
+// `attended` boolean is unreliable (~22% logged) — use classifyOutcome, the same
+// truth the weekly stats use.
 async function _scrapeIclosedCallsHeldYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
     .select('id, iclosed_call_id')
-    .eq('attended', true)
     .gte('scheduled_start', `${yesterday}T00:00:00`)
     .lt('scheduled_start',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
-  return filterFlywheelAppts(data, excludeIds).length;
+  const appts = filterFlywheelAppts(data, excludeIds);
+  if (!appts.length) return 0;
+  const { data: outcomes } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('appointment_id, outcome')
+    .in('appointment_id', appts.map(a => a.id));
+  const outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
+  return appts.filter(a => classifyOutcome(outcomesById[a.id]).showed).length;
 }
 
-// iClosed sales yesterday (full_closes from closer EOD table — same source as close_rate)
+// Sales yesterday (won outcomes logged in GHL — EOD tables retired at cutover)
 async function _scrapeIclosedSalesYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
-    .from('revops_closer_eod_daily')
-    .select('full_closes')
-    .eq('report_date', yesterday);
+    .from('revops_sales_outcomes')
+    .select('id, outcome, created_at')
+    .eq('outcome', 'won')
+    .gte('created_at', `${yesterday}T00:00:00`)
+    .lt('created_at',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
-  if (!data || !data.length) return null;
-  return data.reduce((a, r) => a + (r.full_closes || 0), 0);
+  return (data || []).length;
 }
 
+// Close rate yesterday = won ÷ showed for calls scheduled yesterday (outcome-derived).
 async function _scrapeCloseRateYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
-    .from('revops_closer_eod_daily')
-    .select('full_closes, qualified_calls')
-    .eq('report_date', yesterday);
+    .from('revops_appointments')
+    .select('id, iclosed_call_id')
+    .gte('scheduled_start', `${yesterday}T00:00:00`)
+    .lt('scheduled_start',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
-  if (!data || !data.length) return null;
-  const closes = data.reduce((a, r) => a + (r.full_closes || 0), 0);
-  const qualified = data.reduce((a, r) => a + (r.qualified_calls || 0), 0);
-  if (qualified <= 0) return null;
-  return +(closes / qualified).toFixed(4);
+  const excludeIds = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(data, excludeIds);
+  if (!appts.length) return null;
+  const { data: outcomes } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('appointment_id, outcome')
+    .in('appointment_id', appts.map(a => a.id));
+  const outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
+  let showed = 0, won = 0;
+  for (const a of appts) {
+    const o = outcomesById[a.id];
+    if (classifyOutcome(o).showed) showed += 1;
+    if ((o?.outcome || '').toLowerCase() === 'won') won += 1;
+  }
+  if (showed <= 0) return null;
+  return +(won / showed).toFixed(4);
 }
 
+// Setter-booked calls yesterday (native setter_id — EOD tables retired at cutover)
 async function _scrapeSetterCallsBookedYesterday() {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await portalSupabase
-    .from('revops_setter_eod_daily')
-    .select('scheduled_calls')
-    .eq('report_date', yesterday);
+    .from('revops_appointments')
+    .select('id, iclosed_call_id, setter_id')
+    .not('setter_id', 'is', null)
+    .gte('booked_at', `${yesterday}T00:00:00`)
+    .lt('booked_at',  `${yesterday}T23:59:59`);
   if (error) throw new Error(error.message);
-  if (!data || !data.length) return null;
-  return data.reduce((a, r) => a + (r.scheduled_calls || 0), 0);
+  const excludeIds = await getNonFlywheelCallIds();
+  return filterFlywheelAppts(data, excludeIds).length;
 }
 
 async function _scrapePhase0ToPhase1Conv7d() {
@@ -4491,11 +4516,11 @@ const METRIC_REGISTRY = [
   // Lead volume — GHL is the universal truth-source (covers both VSL + Form funnels)
   { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'GHL new contacts (today)' },
   // Call pipeline — iClosed revops_appointments is the truth-source for booked/held
-  { name: 'iclosed_calls_booked_yest',    domain: 'sales',       scrape: _scrapeIclosedCallsBookedYesterday, label: 'iClosed calls booked (yesterday)' },
-  { name: 'iclosed_calls_held_yest',      domain: 'sales',       scrape: _scrapeIclosedCallsHeldYesterday,   label: 'iClosed calls held (yesterday)' },
-  { name: 'iclosed_sales_yest',           domain: 'sales',       scrape: _scrapeIclosedSalesYesterday,       label: 'iClosed sales / full closes (yesterday)' },
+  { name: 'iclosed_calls_booked_yest',    domain: 'sales',       scrape: _scrapeIclosedCallsBookedYesterday, label: 'Sales calls booked (yesterday)' },
+  { name: 'iclosed_calls_held_yest',      domain: 'sales',       scrape: _scrapeIclosedCallsHeldYesterday,   label: 'Sales calls held (yesterday)' },
+  { name: 'iclosed_sales_yest',           domain: 'sales',       scrape: _scrapeIclosedSalesYesterday,       label: 'Sales won (yesterday)' },
   { name: 'close_rate_yesterday',         domain: 'sales',       scrape: _scrapeCloseRateYesterday,          label: 'Close rate (yesterday)' },
-  { name: 'setter_calls_booked_yest',     domain: 'sales',       scrape: _scrapeSetterCallsBookedYesterday,  label: 'Setter calls booked EOD (yesterday)' },
+  { name: 'setter_calls_booked_yest',     domain: 'sales',       scrape: _scrapeSetterCallsBookedYesterday,  label: 'Setter-booked calls (yesterday)' },
   // Fulfillment
   { name: 'phase0_to_phase1_conv_7d',     domain: 'fulfillment', scrape: _scrapePhase0ToPhase1Conv7d,        label: 'Phase 0 → Phase 1 conversion (7d)' },
   { name: 'phase1_cycle_days_p50',        domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_1'), label: 'Phase 1 cycle days (p50)' },
