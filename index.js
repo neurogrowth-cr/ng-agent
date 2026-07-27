@@ -2559,34 +2559,38 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
   }
 }
 
-// ─── SALES INTELLIGENCE (iClosed + RevOps) ───────────────────────────────────
+// ─── SALES INTELLIGENCE (GHL + RevOps) ───────────────────────────────────────
 // Queries revops_* tables in the portal Supabase project.
-// Tables are populated by the iClosed webhook pipeline.
-// setter_id / closer_id mapping — update when David confirms the ID format.
+// Since the 2026-07-23 cutover, rows are populated by the GHL webhook pipeline
+// (source='ghl', ghl_appointment_id, setter_id/closer_id = roster emails);
+// iClosed rows (source='iclosed', iclosed_call_id) are frozen history.
 const SALES_TEAM_MAP = {
   // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',      'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
+  't28sdyo0eaunhjhl4jyu': 'Josue D',          'T28SDyO0EAUNHJHl4jyu': 'Josue D',
   '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero', // historical — no longer active
 
-  // ── CLOSERS — iClosed identifies hosts by email address ─────────────────
+  // ── CLOSERS — roster emails (GHL rows carry these in closer_id) ─────────
   'ronny.duarte@neurogrowth.io':  'Ron Duarte',
   'jose.neurogrowth@gmail.com':   'Jose Carranza',
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
 
-  // ── SETTERS — iClosed EOD email IDs ─────────────────────────────────────
+  // ── SETTERS — roster emails (GHL rows carry these in setter_id) ─────────
   'joseph.neurogrowth@gmail.com':   'Joseph Salazar', // historical — no longer active
   'Salazcamjos@gmail.com':          'Joseph Salazar', // historical — no longer active
   'oscar.neurogrowth@gmail.com':    'Oscar M',
   'william.neurogrowth@gmail.com':  'William B',
   'sebastian.neurogrowth@gmail.com': 'Sebastian S',
+  'josue.duran@neurogrowth.io':     'Josue D',
   'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
 
-  // ── FALLBACK — GHL user IDs for closers if iClosed uses those instead ───
+  // ── FALLBACK — raw GHL user IDs (unmapped rows surface these) ───────────
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-  'izlta0jy5orkymsyltjv': 'Jose Carranza',       'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+  'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
+  'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 // scheduled_start in revops_appointments is now true UTC (upstream sync fixed
 // in dash.neurogrowth.io PR #2 — normalizer prefers iClosed's
