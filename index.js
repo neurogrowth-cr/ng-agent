@@ -354,7 +354,7 @@ Otherwise the originator approves their own draft. Internal Slack messages, team
 
 When you escalate, tell the user clearly: "This one needs Ron's call — I'm routing it to him and I'll let you know when he signs off." Never make commitments on Ron's behalf. Never speak for Ron on pricing, scope, hiring, or client-facing promises.
 
-You have access to GHL, iClosed, Meta Ads, the portal, Supabase, Slack, Notion, and Google Drive/Docs/Sheets. You do NOT have access to Ron's Gmail or Google Calendar — if asked, explain that those are Ron-only and offer to help a different way.`;
+You have access to GHL (live sales source since the 2026-07-23 cutover; iClosed is frozen history), Meta Ads, the portal, Supabase, Slack, Notion, and Google Drive/Docs/Sheets. You do NOT have access to Ron's Gmail or Google Calendar — if asked, explain that those are Ron-only and offer to help a different way.`;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
 
@@ -2757,25 +2757,15 @@ async function getSalesIntelligence(query) {
       return lines.join('\n');
     }
 
-    // ── Query EOD tables ───────────────────────────────────────────────────
-    const { data: setterEOD } = await portalSupabase
-      .from('revops_setter_eod_daily')
-      .select('report_date, setter_id, new_conversations, follow_ups, qualified_leads, not_qualified_leads, scheduled_calls, calls_show, calls_no_show, notes')
-      .order('report_date', { ascending: false })
-      .limit(100);
-
-    const { data: closerEOD } = await portalSupabase
-      .from('revops_closer_eod_daily')
-      .select('report_date, closer_id, scheduled_calls, canceled_calls, no_shows, qualified_calls, bookings, installment_closes, full_closes, notes')
-      .order('report_date', { ascending: false })
-      .limit(100);
+    // EOD self-report tables retired at the GHL cutover (2026-07-23) — all
+    // performance sections now derive from appointments + outcomes.
 
     // ── Query appointments for individual call lookups ─────────────────────
     const { data: appointmentsRaw } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, setter_id, closer_id, booked_at, scheduled_start,
-        attended, no_show_reason, reschedule_count, meeting_type, iclosed_call_id,
+        id, setter_id, closer_id, booked_at, scheduled_start, source,
+        attended, no_show_reason, reschedule_count, meeting_type, iclosed_call_id, ghl_appointment_id,
         prospect:prospect_id ( full_name, company, email, lead_source, setter_owner_id, closer_owner_id, status )
       `)
       .order('scheduled_start', { ascending: false })
@@ -2792,16 +2782,11 @@ async function getSalesIntelligence(query) {
 
     const outcomeMap = {};
     (outcomes || []).forEach(o => { outcomeMap[o.appointment_id] = o; });
-    const appts      = appointments || [];
-    const setterRows = setterEOD || [];
-    const closerRows = closerEOD || [];
+    const appts = appointments || [];
 
-    if (!appts.length && !setterRows.length && !closerRows.length) {
-      return 'No sales data found yet. iClosed API integration is being set up — data will appear here once it starts syncing.';
+    if (!appts.length) {
+      return 'No sales appointments found. GHL webhook ingestion feeds revops_appointments — check dash /api/integrations/ghl/webhook deliveries if this persists.';
     }
-
-    const filterByDate = (rows, dateField, fromStr) =>
-      rows.filter(r => r[dateField] && r[dateField] >= fromStr);
 
     // ── TODAY'S CALLS ──────────────────────────────────────────────────────
     // `appts` is already flywheel-only (filtered above via getNonFlywheelCallIds).
@@ -2811,9 +2796,6 @@ async function getSalesIntelligence(query) {
         const d = new Date(a.scheduled_start);
         return d >= todayStart && d <= todayEnd;
       });
-      const todayCloserRows = closerRows.filter(r => r.report_date === todayStr);
-      const todaySetterRows = setterRows.filter(r => r.report_date === todayStr);
-
       const lines = [];
 
       if (todayCalls.length) {
@@ -2824,101 +2806,47 @@ async function getSalesIntelligence(query) {
           const time    = formatICTime(a.scheduled_start, { hour: '2-digit', minute: '2-digit' });
           const outcome = outcomeMap[a.id];
           const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
-          // VSL funnel is paused — do not attribute calls to 'VSL self-booking'
-          // when no setter-pipeline opportunity is found. Use 'setter unknown' instead.
-          let setterLabel = 'setter unknown';
-          try {
-            const info = await resolveSetterForContact(a.prospect?.email, a.prospect?.full_name);
-            if (info.source === 'appointment-setting') {
-              setterLabel = info.setter || 'appointment-setting pipeline (setter unmapped)';
-            }
-          } catch (_) {}
+          // Native setter attribution (GHL createdBy → setter_id). NULL on a GHL
+          // row = widget self-booked or closer-booked. Live GHL opp lookup only
+          // for legacy iClosed rows that never had a setter_id.
+          let setterLabel;
+          if (a.setter_id) {
+            setterLabel = resolveSalesMember(a.setter_id);
+          } else if (a.source === 'ghl') {
+            setterLabel = 'self-booked';
+          } else {
+            setterLabel = 'setter unknown';
+            try {
+              const info = await resolveSetterForContact(a.prospect?.email, a.prospect?.full_name);
+              if (info.source === 'appointment-setting') {
+                setterLabel = info.setter || 'appointment-setting pipeline (setter unmapped)';
+              }
+            } catch (_) {}
+          }
           lines.push(`  ${name} — ${time} CR — closer: ${closer} — setter: ${setterLabel} — ${status}`);
         }
       }
 
-      if (todayCloserRows.length) {
-        lines.push(`\nCloser activity today:`);
-        todayCloserRows.forEach(r => {
-          const name = resolveSalesMember(r.closer_id);
-          lines.push(`  ${name}: ${r.scheduled_calls} scheduled, ${r.canceled_calls} canceled, ${r.no_shows} no-shows, ${r.qualified_calls} qualified, ${r.full_closes} closes`);
-        });
-      }
-
-      if (todaySetterRows.length) {
-        lines.push(`\nSetter activity today:`);
-        todaySetterRows.forEach(r => {
-          const name = resolveSalesMember(r.setter_id);
-          lines.push(`  ${name}: ${r.new_conversations} new convos, ${r.qualified_leads} qualified, ${r.scheduled_calls} calls booked`);
-        });
-      }
-
-      if (!lines.length) return 'No call or EOD data found for today.';
+      if (!lines.length) return 'No calls scheduled today.';
       return lines.join('\n');
     }
 
-    // ── SETTER PERFORMANCE ─────────────────────────────────────────────────
-    if (q.includes('setter') || q.includes('joseph') || q.includes('oscar') || q.includes('william') || q.includes('debbanny') || q.includes('booked') || q.includes('conversations') || q.includes('qualified leads')) {
+    // ── SETTER PERFORMANCE (GHL-native; EOD retired at cutover) ────────────
+    if (q.includes('setter') || q.includes('joseph') || q.includes('oscar') || q.includes('william') || q.includes('sebastian') || q.includes('josue') || q.includes('debbanny') || q.includes('booked') || q.includes('conversations') || q.includes('qualified leads')) {
       const fromStr = q.includes('month') ? monthStartStr : weekStartStr;
       const period  = q.includes('month') ? 'this month' : 'this week';
-      const rows    = filterByDate(setterRows, 'report_date', fromStr);
-
-      if (!rows.length) return `No setter EOD data found for ${period}. Note: setter data comes from GHL EOD reports submitted daily.`;
-
-      const byPerson = {};
-      rows.forEach(r => {
-        const name = resolveSalesMember(r.setter_id);
-        if (!byPerson[name]) byPerson[name] = { new_conversations: 0, qualified_leads: 0, not_qualified: 0, scheduled_calls: 0, calls_show: 0, calls_no_show: 0, days: 0 };
-        byPerson[name].new_conversations += r.new_conversations || 0;
-        byPerson[name].qualified_leads   += r.qualified_leads   || 0;
-        byPerson[name].not_qualified     += r.not_qualified_leads || 0;
-        byPerson[name].scheduled_calls   += r.scheduled_calls   || 0;
-        byPerson[name].calls_show        += r.calls_show        || 0;
-        byPerson[name].calls_no_show     += r.calls_no_show     || 0;
-        byPerson[name].days++;
-      });
-
-      const lines = [`Setter performance ${period}:`];
-      Object.entries(byPerson).forEach(([name, s]) => {
-        lines.push(`\n${name} (${s.days} day(s) with EOD):`);
-        lines.push(`  New conversations: ${s.new_conversations}`);
-        lines.push(`  Qualified: ${s.qualified_leads} | Not qualified: ${s.not_qualified}`);
-        lines.push(`  Calls booked: ${s.scheduled_calls} | Show: ${s.calls_show} | No-show: ${s.calls_no_show}`);
-      });
-      return lines.join('\n');
+      const stats = await getSetterWeeklyStats(`${fromStr}T00:00:00.000Z`, now.toISOString());
+      const block = formatSetterWeeklyStatsBlock(stats, `${fromStr}T00:00:00.000Z`, now.toISOString());
+      return `Setter performance ${period} (GHL-native; EOD self-reports retired at cutover 2026-07-23):\n\n${block}`;
     }
 
-    // ── CLOSER PERFORMANCE ─────────────────────────────────────────────────
+    // ── CLOSER PERFORMANCE (GHL-native; EOD retired at cutover) ────────────
     if (q.includes('closer') || q.includes('jonathan') || q.includes('jose') || q.includes('close rate') || q.includes('closed') || q.includes('cancel') || q.includes('no-show') || q.includes('qualified calls')) {
       const fromStr = q.includes('month') ? monthStartStr : weekStartStr;
       const period  = q.includes('month') ? 'this month' : 'this week';
-      const rows    = filterByDate(closerRows, 'report_date', fromStr);
-
-      if (!rows.length) return `No closer EOD data found for ${period}.`;
-
-      const byPerson = {};
-      rows.forEach(r => {
-        const name = resolveSalesMember(r.closer_id);
-        if (!byPerson[name]) byPerson[name] = { scheduled: 0, canceled: 0, no_shows: 0, qualified: 0, bookings: 0, installment: 0, full: 0, days: 0 };
-        byPerson[name].scheduled   += r.scheduled_calls   || 0;
-        byPerson[name].canceled    += r.canceled_calls    || 0;
-        byPerson[name].no_shows    += r.no_shows          || 0;
-        byPerson[name].qualified   += r.qualified_calls   || 0;
-        byPerson[name].bookings    += r.bookings          || 0;
-        byPerson[name].installment += r.installment_closes || 0;
-        byPerson[name].full        += r.full_closes       || 0;
-        byPerson[name].days++;
-      });
-
-      const lines = [`Closer performance ${period}:`];
-      Object.entries(byPerson).forEach(([name, c]) => {
-        const closeRate = c.qualified > 0 ? Math.round((c.full + c.installment) / c.qualified * 100) : 0;
-        lines.push(`\n${name} (${c.days} day(s) with EOD):`);
-        lines.push(`  Scheduled: ${c.scheduled} | Canceled: ${c.canceled} | No-shows: ${c.no_shows}`);
-        lines.push(`  Qualified calls: ${c.qualified} | Bookings: ${c.bookings}`);
-        lines.push(`  Closes: ${c.full} full + ${c.installment} installment | Close rate: ${closeRate}%`);
-      });
-      return lines.join('\n');
+      const stats = await getCloserWeeklyStats(`${fromStr}T00:00:00.000Z`, now.toISOString());
+      const block = formatCloserWeeklyStatsBlock(stats, `${fromStr}T00:00:00.000Z`, now.toISOString());
+      return `Closer performance ${period} (GHL-native; EOD self-reports retired at cutover 2026-07-23):\n\n${block}`;
     }
 
     // ── PROSPECT LOOKUP ────────────────────────────────────────────────────
@@ -2931,7 +2859,7 @@ async function getSalesIntelligence(query) {
         `Prospect: ${matchedProspect.prospect?.full_name || 'Unknown'}`,
         `Company: ${matchedProspect.prospect?.company || 'N/A'}`,
         `Closer: ${closer}`,
-        `Setter: not available from iClosed — check GHL for setter assignment`,
+        matchedProspect.setter_id ? `Setter: ${resolveSalesMember(matchedProspect.setter_id)}` : (matchedProspect.source === 'ghl' ? 'Setter: self-booked (widget or closer-booked)' : 'Setter: not recorded (legacy iClosed row)'),
         `Scheduled: ${time} CR`,
         `Attended: ${matchedProspect.attended === true ? 'Yes' : matchedProspect.attended === false ? 'No — ' + (matchedProspect.no_show_reason || 'no reason given') : 'Not recorded'}`,
         matchedProspect.reschedule_count > 0 ? `Rescheduled: ${matchedProspect.reschedule_count}x` : '',
@@ -2942,18 +2870,17 @@ async function getSalesIntelligence(query) {
       return lines.join('\n');
     }
 
-    // ── DEFAULT: PIPELINE SUMMARY ──────────────────────────────────────────
+    // ── DEFAULT: PIPELINE SUMMARY (outcome-derived; EOD retired) ───────────
     const upcoming       = appts.filter(a => a.scheduled_start && new Date(a.scheduled_start) >= now).length;
     const thisWeekAppts  = appts.filter(a => a.scheduled_start && new Date(a.scheduled_start) >= weekStart).length;
-    const totalCloses    = closerRows.reduce((sum, r) => sum + (r.full_closes || 0) + (r.installment_closes || 0), 0);
-    const thisWeekCloses = filterByDate(closerRows, 'report_date', weekStartStr).reduce((sum, r) => sum + (r.full_closes || 0) + (r.installment_closes || 0), 0);
-    const thisWeekConvos = filterByDate(setterRows, 'report_date', weekStartStr).reduce((sum, r) => sum + (r.new_conversations || 0), 0);
+    const wonOutcomes    = (outcomes || []).filter(o => (o.outcome || '').toLowerCase() === 'won');
+    const thisWeekCloses = appts.filter(a => a.scheduled_start && new Date(a.scheduled_start) >= weekStart
+      && (outcomeMap[a.id]?.outcome || '').toLowerCase() === 'won').length;
 
     return [
       `Sales pipeline summary:`,
       `Appointments on record: ${appts.length} | Upcoming: ${upcoming} | This week: ${thisWeekAppts}`,
-      `New conversations this week (setters): ${thisWeekConvos}`,
-      `Closes this week: ${thisWeekCloses} | All time: ${totalCloses}`,
+      `Closes this week: ${thisWeekCloses} | Recent won outcomes on record: ${wonOutcomes.length}`,
       Object.keys(outcomeMap).length > 0 ? `Outcomes recorded: ${Object.keys(outcomeMap).length}` : 'No outcomes recorded yet',
     ].join('\n');
 
@@ -2964,7 +2891,7 @@ async function getSalesIntelligence(query) {
 
 // ─── OUTCOME-DERIVED ATTENDANCE TRUTH ────────────────────────────────────────
 // The revops_appointments.attended boolean is unreliable (logged on ~22% of
-// rows; even `won` calls show attended=false). The iClosed OUTCOME is the real
+// rows; even `won` calls show attended=false). The logged OUTCOME (GHL since\n// the 2026-07-23 cutover; iClosed for frozen history) is the real
 // signal of whether a call happened:
 //   no_show                              → did not attend
 //   won | lost | follow_up | disqualified → attended (the call took place)
@@ -4741,7 +4668,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query iClosed and RevOps sales data from Supabase. Use for: closer performance (Jonathan, Jose — scheduled calls, cancellations, no-shows, qualified calls, closes, close rate from revops_closer_eod_daily), setter performance (Oscar, William — new conversations, qualified leads, calls booked from revops_setter_eod_daily — NOTE: setter data comes from GHL EOD reports not iClosed; Joseph and Debbanny are no longer active but historical rows resolve to their names), today\'s calls, prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages. Setter assignment on individual calls is not available from iClosed — direct setter questions to GHL conversations.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
