@@ -860,7 +860,7 @@ function inferReportId(messageText, fallbackChannel) {
   if (t.includes('eod pulse') || t.includes('end of day pulse'))         return 'fulfillment-eod';
   if (t.includes('week in review') || t.includes('friday delivery'))     return 'friday-delivery-wrap';
   if (t.includes('anomaly') || t.includes('drifted') || t.includes('σ')) return 'anomaly-alert';
-  if (t.includes('still missing an iclosed outcome') || t.includes('outcome not logged')) return 'unlogged-outcome-reminder';
+  if (t.includes('still missing an iclosed outcome') || t.includes('still missing an outcome in ghl') || t.includes('outcome not logged')) return 'unlogged-outcome-reminder';
   return fallbackChannel || 'general-report';
 }
 
@@ -1107,7 +1107,7 @@ function registerDynamicCron(task) {
           weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
           const closerBlock = formatCloserWeeklyStatsBlock(weeklyCloserStats, weekStart.toISOString(), weekEnd.toISOString());
           const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source for the leaderboard; iClosed outcomes are truth for calls/show rate/qualified-attended-calls, leads claimed comes from setter_claims; cite EOD only when an entry is tagged source=eod-fallback / [calls from EOD self-report]):\n\n${closerBlock}\n\n${setterBlock}`;
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source for the leaderboard; GHL-native appointment + outcome data is truth for calls/show rate/qualified-attended-calls, setter credit comes from who booked the call in GHL, leads claimed comes from setter_claims; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${closerBlock}\n\n${setterBlock}`;
         } catch (statsErr) {
           console.error('Weekly pod stats failed:', statsErr.message);
           taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute iClosed stats (${statsErr.message}). Fall back to your usual data tools.`;
@@ -2984,14 +2984,13 @@ function classifyOutcome(outcomeRow) {
   return { showed: false, noShow: false, qualifiedAttended: false, pending: true };
 }
 
-// ─── CLOSER WEEKLY STATS (iClosed-first, EOD fallback) ───────────────────────
-// Used by the "Weekly Closer Comparison" scheduled task. iClosed appointment +
-// outcome data is the primary truth source; self-reported EOD numbers are only
-// included when a closer has no iClosed rows for the week.
+// ─── CLOSER WEEKLY STATS (GHL-native) ────────────────────────────────────────
+// Used by the "Weekly Closer Comparison" scheduled task. GHL appointment +
+// outcome rows in revops_* are the truth source (closer_id = roster email).
+// EOD self-reports were retired at the GHL cutover (2026-07-23).
 async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
-  const result = {}; // { closerName: { source, calls_booked, attended, no_shows, sold, revenue, eod_days } }
+  const result = {}; // { closerName: { source, calls_booked, attended, no_shows, pending, sold, revenue } }
 
-  // 1. Primary: iClosed appointments in range (flywheel-only)
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
     .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id')
@@ -3013,7 +3012,7 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
 
   for (const a of (appts || [])) {
     const name = resolveSalesMember(a.closer_id);
-    if (!result[name]) result[name] = { source: 'iclosed', calls_booked: 0, attended: 0, no_shows: 0, pending: 0, sold: 0, revenue: 0, eod_days: 0 };
+    if (!result[name]) result[name] = { source: 'ghl', calls_booked: 0, attended: 0, no_shows: 0, pending: 0, sold: 0, revenue: 0 };
     result[name].calls_booked += 1;
     const o = outcomesById[a.id];
     // Attendance is derived from the OUTCOME, not the broken attended boolean.
@@ -3028,36 +3027,13 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
     }
   }
 
-  // 2. Fallback: pull EOD rows for the same range, mark as eod-fallback for closers without iClosed activity
-  const weekStartDate = weekStartIso.slice(0, 10);
-  const weekEndDate   = weekEndIso.slice(0, 10);
-  const { data: eodRows } = await portalSupabase
-    .from('revops_closer_eod_daily')
-    .select('closer_id, report_date, scheduled_calls, canceled_calls, no_shows, qualified_calls, bookings, installment_closes, full_closes')
-    .gte('report_date', weekStartDate)
-    .lte('report_date', weekEndDate);
-
-  for (const r of (eodRows || [])) {
-    const name = resolveSalesMember(r.closer_id);
-    if (!result[name]) {
-      result[name] = { source: 'eod-fallback', calls_booked: 0, attended: 0, no_shows: 0, pending: 0, sold: 0, revenue: 0, eod_days: 0 };
-    }
-    // Only fold EOD numbers in when iClosed has no data for this closer
-    if (result[name].source === 'eod-fallback') {
-      result[name].calls_booked += (r.scheduled_calls || 0);
-      result[name].no_shows     += (r.no_shows || 0);
-      result[name].sold         += (r.full_closes || 0) + (r.installment_closes || 0);
-    }
-    result[name].eod_days += 1;
-  }
-
   return result;
 }
 
 function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   const names = Object.keys(stats);
   if (!names.length) {
-    return `No closer activity (iClosed or EOD) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
+    return `No closer activity (GHL appointments/outcomes) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
   // Rank closers by revenue desc (with sold count + close rate as visible secondaries).
   const ranked = names.map(name => {
@@ -3071,12 +3047,12 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   }).sort((a, b) => (b.s.revenue || 0) - (a.s.revenue || 0) || (b.s.sold || 0) - (a.s.sold || 0));
 
   const lines = [`CLOSER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(iClosed actuals are primary truth; show rate is outcome-derived — pending calls excluded. EOD shown only when iClosed has no rows for that closer. Ranked by revenue, then sold count.)`);
+  lines.push(`(GHL appointment + outcome actuals are truth; show rate is outcome-derived — pending calls excluded. Ranked by revenue, then sold count.)`);
   ranked.forEach(({ name, s, showRate, closeRate }, idx) => {
     const showRateStr = showRate === null ? '— (no outcomes logged yet)' : `${showRate}%`;
     const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
     lines.push(``);
-    lines.push(`#${idx + 1} ${name.toUpperCase()} (source: ${s.source}${s.source === 'iclosed' ? '' : ` — ${s.eod_days} EOD day(s)`})`);
+    lines.push(`#${idx + 1} ${name.toUpperCase()}`);
     lines.push(`  Calls booked: ${s.calls_booked} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr} (show rate: ${showRateStr})`);
     lines.push(`  Sold: ${s.sold} | Revenue: $${s.revenue.toLocaleString()} (close rate on shows: ${closeRate}%)`);
   });
@@ -3467,9 +3443,9 @@ async function runMondayGapDetection(_correlationId) {
             const pName = a.prospect?.full_name || 'Unknown';
             const dStr  = formatICTime(a.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             const closerName = resolveSalesMember(a.closer_id);
-            return `• ${pName} — ${dStr} — please log in iClosed`;
+            return `• ${pName} — ${dStr} — please log the outcome in GHL`;
           });
-          salesGapLines.push(`Outcomes not logged (held >48h, no iClosed entry):\n${unloggedLines.join('\n')}`);
+          salesGapLines.push(`Outcomes not logged (held >48h, no outcome in GHL):\n${unloggedLines.join('\n')}`);
         }
       }
 
@@ -6598,10 +6574,10 @@ async function runSalesStandup(_correlationId) {
   }
 }
 
-// ─── UNLOGGED ICLOSED OUTCOME REMINDERS ──────────────────────────────────────
-// Fires 4 PM CR every day. DMs the owning closer for any attended call >24h old
-// that still has no iClosed outcome. Re-nudges daily (de-duped via agent_knowledge)
-// and escalates to Ron once a call has been unlogged 3+ days despite reminders.
+// ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
+// Fires 4 PM CR every day. DMs the owning closer for any call >24h old that
+// still has no outcome logged in GHL. Re-nudges daily (de-duped via
+// agent_knowledge) and escalates to Ron once unlogged 3+ days despite reminders.
 async function runUnloggedOutcomeReminders(_correlationId) {
   console.log('Running unlogged-outcome reminders...');
   try {
@@ -6610,19 +6586,21 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     const cutoff = new Date(now - 24 * 60 * 60 * 1000).toISOString();      // >24h old
 
     // Past calls 24h–14d ago. `attended` is almost always null so it is NOT a
-    // gate; we exclude cancelled calls (qualification_snapshot) and require an
-    // iclosed_call_id (needed to match flywheel filtering).
+    // gate; we exclude cancelled calls (qualification_snapshot carries the flag
+    // under .iclosed for legacy rows and .ghl for GHL rows) and require a call
+    // identity (ghl_appointment_id for GHL rows, iclosed_call_id for legacy).
     const { data: pastCalls } = await portalSupabase
       .from('revops_appointments')
-      .select('id, closer_id, scheduled_start, iclosed_call_id, qualification_snapshot, prospect:prospect_id(full_name)')
+      .select('id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name)')
       .lte('scheduled_start', cutoff)
       .gte('scheduled_start', since);
 
     // Flywheel-only: exclude partner-consulting 1:1s before any dedup/state tracking.
     const excludeIds = await getNonFlywheelCallIds();
     const dueCalls = (pastCalls || []).filter(
-      a => a.iclosed_call_id
+      a => (a.iclosed_call_id || a.ghl_appointment_id)
         && a.qualification_snapshot?.iclosed?.cancelled !== true
+        && a.qualification_snapshot?.ghl?.cancelled !== true
         && !excludeIds.has(a.iclosed_call_id)
     );
 
@@ -6694,7 +6672,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       const closerName = resolveSalesMember(closerEmail);
       const firstName  = (typeof closerName === 'string' ? closerName : '').split(' ')[0] || 'there';
       try {
-        const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an iClosed outcome:\n`];
+        const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an outcome in GHL:\n`];
         lines.push(`⚠️ Outcome not logged (${entries.length}):`);
         entries.forEach(({ appt, count }) => {
           const pName = appt.prospect?.full_name || 'Unknown';
@@ -6704,7 +6682,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
           lines.push(`• ${pName} — ${dStr} CR — held ${heldDays}d ago${nudge}`);
         });
         lines.push('');
-        lines.push('Please add the outcome in iClosed when you get a sec.');
+        lines.push('Please set the outcome on the opportunity card in GHL when you get a sec.');
         lines.push('');
         lines.push('See something off? Thread on this message and tag @Max with the correction.');
         await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
@@ -7069,7 +7047,7 @@ cron.schedule('0 9 * * 1-5', wrapCronJob('runSalesStandup', async (c) => { await
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
 cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
 
-// Unlogged iClosed outcome reminders — 4 PM CR every day (DMs closers, escalates to Ron after 3d).
+// Unlogged GHL outcome reminders — 4 PM CR every day (DMs closers, escalates to Ron after 3d).
 // "Logged?" is read directly from revops_sales_outcomes (by appointment_id) —
 // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19).
 cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
