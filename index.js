@@ -3083,30 +3083,28 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   return lines.join('\n');
 }
 
-// ─── SETTER WEEKLY STATS (cross-platform: iClosed + setter_attributions) ─────
-// Used by the unified weekly LEADERBOARD. Setter identity is NOT in iClosed, so
-// calls are attributed via the ng-agent-owned setter_attributions map (keyed by
-// iclosed_call_id, populated by runSetterAttributionReconcile). Show rate and
-// qualified-attended-calls (AQC) are derived from the iClosed OUTCOME via
-// classifyOutcome — the same truth the closer stats use. Leads claimed comes
-// from setter_claims. revops_setter_eod_daily is a LAST-RESORT fallback only —
-// its calls/show numbers are folded in solely for setters who have zero
-// attributed iClosed calls that week (clearly flagged source='eod-fallback').
+// ─── SETTER WEEKLY STATS (GHL-native) ────────────────────────────────────────
+// Used by the unified weekly LEADERBOARD. Since the GHL cutover (2026-07-23),
+// revops_appointments.setter_id carries the booker natively (GHL createdBy →
+// roster email, mapped upstream in dash). Rows with setter_id NULL are widget
+// self-bookings or closer-booked calls — no setter credit by policy. Show rate
+// and qualified-attended-calls (AQC) derive from the OUTCOME via classifyOutcome
+// — the same truth the closer stats use. Leads claimed comes from setter_claims.
+// EOD self-reports were retired at the cutover (tables kept as frozen history).
 function _newSetterSlot() {
   return {
-    source: 'iclosed', leads_claimed: 0,
+    source: 'ghl', leads_claimed: 0,
     calls_booked: 0, attended: 0, no_shows: 0, pending: 0, aqc: 0,
-    new_conversations: 0, qualified_leads: 0, eod_days: 0,
   };
 }
 
 async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
   const result = {};
 
-  // 1. iClosed flywheel appointments in range + their outcomes
+  // 1. Flywheel appointments in range + their outcomes
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, scheduled_start, iclosed_call_id')
+    .select('id, scheduled_start, iclosed_call_id, setter_id, source')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -3123,20 +3121,10 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
     outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
   }
 
-  // 2. Setter attribution map (ng-agent project) keyed by iclosed_call_id
-  const callIds = (appts || []).map(a => a.iclosed_call_id).filter(Boolean);
-  let setterByCallId = {};
-  if (callIds.length) {
-    const { data: attrs } = await supabase
-      .from('setter_attributions')
-      .select('iclosed_call_id, setter_name')
-      .in('iclosed_call_id', callIds);
-    setterByCallId = Object.fromEntries((attrs || []).filter(a => a.setter_name).map(a => [a.iclosed_call_id, a.setter_name]));
-  }
-
+  // 2. Credit each appointment to its native setter_id (roster email → name).
   for (const a of (appts || [])) {
-    const name = setterByCallId[a.iclosed_call_id];
-    if (!name) continue; // unattributed / self-booked — not a setter call
+    if (!a.setter_id) continue; // self-booked / closer-booked — not a setter call
+    const name = resolveSalesMember(a.setter_id);
     if (!result[name]) result[name] = _newSetterSlot();
     const slot = result[name];
     slot.calls_booked += 1;
@@ -3160,40 +3148,13 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
     result[name].leads_claimed += 1;
   }
 
-  // 4. Setter EOD — soft metrics iClosed can't have (new convos, qualified leads),
-  //    plus LAST-RESORT call numbers only for setters with no attributed iClosed calls.
-  const weekStartDate = weekStartIso.slice(0, 10);
-  const weekEndDate   = weekEndIso.slice(0, 10);
-  const { data: eodRows } = await portalSupabase
-    .from('revops_setter_eod_daily')
-    .select('setter_id, report_date, new_conversations, qualified_leads, scheduled_calls, calls_show, calls_no_show')
-    .gte('report_date', weekStartDate)
-    .lte('report_date', weekEndDate);
-
-  for (const r of (eodRows || [])) {
-    if (!r.setter_id) continue;
-    const name = resolveSalesMember(r.setter_id);
-    if (!result[name]) result[name] = _newSetterSlot();
-    const slot = result[name];
-    slot.new_conversations += (r.new_conversations || 0);
-    slot.qualified_leads   += (r.qualified_leads   || 0);
-    slot.eod_days += 1;
-    // Fallback: only when iClosed attributed zero calls to this setter this week.
-    if (slot.calls_booked === 0) {
-      slot.source    = 'eod-fallback';
-      slot.calls_booked += (r.scheduled_calls || 0);
-      slot.attended     += (r.calls_show     || 0);
-      slot.no_shows     += (r.calls_no_show  || 0);
-    }
-  }
-
   return result;
 }
 
 function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   const names = Object.keys(stats);
   if (!names.length) {
-    return `No setter activity (iClosed, claims, or EOD) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
+    return `No setter activity (GHL bookings or lead claims) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
   // Rank by qualified attended calls (real call quality), then calls booked, then leads claimed.
   const ranked = names.map(name => {
@@ -3207,114 +3168,22 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
   const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Leads claimed from setter_claims; calls booked/show rate/qualified attended calls from iClosed outcomes attributed via setter_attributions; pending calls excluded from show rate. EOD shown only as fallback when iClosed attributed no calls. Ranked by qualified attended calls.)`);
+  lines.push(`(Leads claimed from setter_claims; calls booked/show rate/qualified attended calls from GHL-native setter attribution + outcomes; pending calls excluded from show rate. Self-booked calls carry no setter credit. Ranked by qualified attended calls.)`);
   ranked.forEach(({ name, s, showRate }, idx) => {
     const showRateStr = showRate === null ? '— (no outcomes logged yet)' : `${showRate}%`;
     const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
-    const srcStr = s.source === 'eod-fallback' ? ' [calls from EOD self-report — no iClosed attribution]' : '';
     lines.push(``);
-    lines.push(`#${idx + 1} ${name.toUpperCase()} (${s.eod_days} EOD day(s) submitted)${srcStr}`);
+    lines.push(`#${idx + 1} ${name.toUpperCase()}`);
     lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Show rate: ${showRateStr}`);
     lines.push(`  Qualified attended calls: ${s.aqc} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr}`);
-    lines.push(`  New conversations (EOD): ${s.new_conversations} | Qualified leads (EOD): ${s.qualified_leads}`);
   });
   return lines.join('\n');
 }
 
-// ─── SETTER ATTRIBUTION RECONCILER ───────────────────────────────────────────
-// iClosed never sends a setter, so we build the setter→call link ourselves and
-// store it in setter_attributions (keyed by iclosed_call_id). For each recent
-// flywheel appointment without a resolved attribution, resolve the setter via:
-//   1. claim email   — setter_claims.prospect_email = prospect.email (pure SQL, high confidence)
-//   2. GHL opp owner  — resolveSetterForContact() live lookup (medium confidence, throttled)
-//   3. unresolved     — self-booked / unclaimed (low confidence)
-// Re-runnable: already-resolved rows are skipped; 'unresolved' rows are retried
-// (a claim or assignment may have landed since the last pass).
-const ATTRIB_WINDOW_DAYS = 21;     // how far back to reconcile each run
-const ATTRIB_GHL_CALL_CAP = 40;    // max live GHL fallback lookups per run (rate-limit guard)
-
-async function runSetterAttributionReconcile(_correlationId) {
-  console.log('Running setter attribution reconcile...');
-  let resolved = { claim_email: 0, ghl_opp: 0, unresolved: 0 };
-  try {
-    const sinceIso = new Date(Date.now() - ATTRIB_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
-
-    // 1. Recent flywheel appointments with prospect contact info
-    const { data: apptsRaw, error: apptErr } = await portalSupabase
-      .from('revops_appointments')
-      .select('iclosed_call_id, scheduled_start, prospect:prospect_id ( full_name, email, iclosed_contact_id )')
-      .gte('scheduled_start', sinceIso);
-    if (apptErr) throw apptErr;
-    const excludeIds = await getNonFlywheelCallIds();
-    const appts = filterFlywheelAppts(apptsRaw, excludeIds).filter(a => a.iclosed_call_id);
-    if (!appts.length) { console.log('Attribution reconcile: no flywheel appts in window.'); return resolved; }
-
-    // 2. Existing attributions — skip ones already resolved (keep retrying 'unresolved')
-    const callIds = appts.map(a => a.iclosed_call_id);
-    const { data: existing } = await supabase
-      .from('setter_attributions')
-      .select('iclosed_call_id, resolved_via')
-      .in('iclosed_call_id', callIds);
-    const alreadyResolved = new Set((existing || []).filter(r => r.resolved_via && r.resolved_via !== 'unresolved').map(r => r.iclosed_call_id));
-    const todo = appts.filter(a => !alreadyResolved.has(a.iclosed_call_id));
-    if (!todo.length) { console.log('Attribution reconcile: all in-window appts already resolved.'); return resolved; }
-
-    // 3. Build claim-email → setter map (most recent claim wins) from setter_claims
-    const { data: claims } = await supabase
-      .from('setter_claims')
-      .select('prospect_email, claimed_by_setter_name, claimed_at')
-      .not('prospect_email', 'is', null)
-      .gte('claimed_at', new Date(Date.now() - (ATTRIB_WINDOW_DAYS + 14) * 24 * 60 * 60 * 1000).toISOString())
-      .order('claimed_at', { ascending: true });
-    const claimByEmail = {};
-    for (const c of (claims || [])) {
-      const k = (c.prospect_email || '').toLowerCase().trim();
-      if (k && c.claimed_by_setter_name) claimByEmail[k] = c.claimed_by_setter_name; // later claim overwrites
-    }
-
-    // 4. Resolve each appointment
-    let ghlCalls = 0;
-    const rows = [];
-    for (const a of todo) {
-      const email = (a.prospect?.email || '').toLowerCase().trim();
-      let setterName = null, via = 'unresolved', confidence = 'low';
-
-      if (email && claimByEmail[email]) {
-        setterName = claimByEmail[email]; via = 'claim_email'; confidence = 'high';
-      } else if (email && ghlCalls < ATTRIB_GHL_CALL_CAP) {
-        ghlCalls += 1;
-        try {
-          const r = await resolveSetterForContact(a.prospect?.email, a.prospect?.full_name);
-          if (r && r.setter) { setterName = r.setter; via = 'ghl_opp'; confidence = 'medium'; }
-        } catch (e) { console.warn('attribution GHL resolve failed:', e.message); }
-      }
-
-      resolved[via] += 1;
-      rows.push({
-        iclosed_call_id: a.iclosed_call_id,
-        prospect_email: a.prospect?.email || null,
-        ghl_contact_id: null,
-        setter_name: setterName,
-        resolved_via: via,
-        confidence,
-        resolved_at: new Date().toISOString(),
-      });
-    }
-
-    // 5. Upsert (idempotent on iclosed_call_id)
-    if (rows.length) {
-      const { error: upErr } = await supabase
-        .from('setter_attributions')
-        .upsert(rows, { onConflict: 'iclosed_call_id' });
-      if (upErr) console.error('setter_attributions upsert failed:', upErr.message);
-    }
-    console.log(`Attribution reconcile: ${todo.length} appts processed — claim_email=${resolved.claim_email}, ghl_opp=${resolved.ghl_opp}, unresolved=${resolved.unresolved} (GHL calls: ${ghlCalls})`);
-    return resolved;
-  } catch (err) {
-    console.error('runSetterAttributionReconcile error:', err.message);
-    return resolved;
-  }
-}
+// ─── SETTER ATTRIBUTION RECONCILER — RETIRED 2026-07-26 ─────────────────────
+// GHL records the booker natively (createdBy.userId → revops_appointments.setter_id,
+// mapped upstream in dash), so the email-match reconciler and its 2h cron are gone.
+// The setter_attributions table (migration 011) remains as frozen iClosed-era history.
 
 // ─── GHL CONVERSATIONS ────────────────────────────────────────────────────────
 async function getGHLConversations(limit = 20, unreadOnly = false) {
@@ -7220,10 +7089,8 @@ cron.schedule('0 18 * * *', wrapCronJob('runStaleLeadDailySweep', async (c) => {
 // live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
 cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
 
-// Setter attribution reconcile — every 2h. iClosed never sends a setter, so we
-// build the setter→call link from setter_claims (email match) + GHL opp owners
-// and store it in setter_attributions for the unified weekly LEADERBOARD to JOIN.
-cron.schedule('0 */2 * * *', wrapCronJob('runSetterAttributionReconcile', async (c) => { await runSetterAttributionReconcile(c); }), { timezone: 'America/Costa_Rica' });
+// Setter attribution reconcile cron RETIRED 2026-07-26 — GHL records the booker
+// natively in revops_appointments.setter_id; the leaderboard reads it directly.
 
 // NOTE: the standalone Wed+Sat "SETTER LEADERBOARD" post (runSetterLeaderboard, EOD-only,
 // MTD) was retired 2026-06-02 — its content is now part of the single unified weekly
