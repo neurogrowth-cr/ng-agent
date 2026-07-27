@@ -5716,14 +5716,15 @@ slack.message(async ({ message, say }) => {
 // Runs hourly Mon–Fri. Queries revops_appointments for calls in the next 3.5–5h,
 // fetches GHL conversation history for the prospect, and DMs the assigned closer
 // with a prep brief. Deduplicates via agent_knowledge so each call gets one brief.
-// closer_id in revops_appointments is stored as email (iClosed API format)
+// closer_id in revops_appointments is stored as the roster email (GHL rows are
+// mapped upstream in dash via admin_users; legacy iClosed rows used the same emails).
 const CLOSER_SLACK = {
   'jonathan.madriz.neurogrowth@gmail.com': 'U0APYAE0999', // Jonathan
   'jose.neurogrowth@gmail.com':            'U0AMTEKDCPN', // Jose
   'ronny.duarte@neurogrowth.io':           'U05HXGX18H3', // Ron (when he's the closer)
-  // GHL user ID fallbacks (in case format changes)
+  // Raw GHL user ID fallbacks (unmapped rows)
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999',
-  'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyltjV': 'U0AMTEKDCPN',
+  'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyItjV': 'U0AMTEKDCPN',
 };
 
 // Pull the prospect's iClosed booking intake (questions_and_answers + event + booked-from)
@@ -5781,6 +5782,54 @@ async function fetchIClosedIntakeForProspect(prospectId) {
     };
   } catch (err) {
     console.error('fetchIClosedIntakeForProspect error:', err.message);
+    return null;
+  }
+}
+
+// Pull the prospect's GHL booking intake from ghl_webhook_deliveries. The
+// qualification answers arrive as ROOT-LEVEL payload keys named with the literal
+// Spanish questions (contain "¿" or end with "?"); the booking setter (when a
+// setter relayed the webhook) rides in payload.user.
+async function fetchGhlIntakeForProspect(prospectId) {
+  if (!prospectId) return null;
+  try {
+    const { data, error } = await portalSupabase
+      .from('ghl_webhook_deliveries')
+      .select('normalized_event_type, payload, created_at')
+      .eq('prospect_id', prospectId)
+      .eq('normalized_event_type', 'ghl.call_booked')
+      .order('created_at', { ascending: false })
+      .limit(5);
+    if (error || !data || !data.length) return null;
+
+    const isQuestionKey = (k) => k.includes('¿') || /\?\s*$/.test(k);
+    const extractQa = (p) => {
+      const qa = [];
+      for (const [k, v] of Object.entries(p || {})) {
+        if (!isQuestionKey(k)) continue;
+        const a = (typeof v === 'string' ? v : '').trim();
+        if (a) qa.push({ question: k.trim(), answer: a });
+      }
+      return qa;
+    };
+    // Prefer the delivery that actually carries Q&A (workflow config varied early on).
+    const withQa = data.find(r => extractQa(r.payload).length);
+    const pick = withQa || data[0];
+    const p = pick.payload || {};
+    const qa = extractQa(p);
+
+    const setterName = [p.user?.firstName, p.user?.lastName].filter(Boolean).join(' ').trim() || null;
+    return {
+      eventName:  null,
+      bookedFrom: null,
+      setterName,
+      qa,
+      timezone:   p['Invitee Timezone'] || p.timezone || null,
+      country:    p.country || null,
+      phone:      p.phone || null,
+    };
+  } catch (err) {
+    console.error('fetchGhlIntakeForProspect error:', err.message);
     return null;
   }
 }
@@ -5901,7 +5950,7 @@ async function runSalesCallPrep(_correlationId) {
     const { data: upcomingRaw, error } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, prospect_id,
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, ghl_appointment_id, source, prospect_id,
         prospect:prospect_id ( full_name, company, email, lead_source )
       `)
       .gte('scheduled_start', new Date(windowMin).toISOString())
@@ -5941,26 +5990,33 @@ async function runSalesCallPrep(_correlationId) {
       // text lives here, so a brief with nothing to show simply omits the
       // section (see brief assembly below) instead of printing a dead line.
       let convoSection = null;
-      // Truth source: opportunity in the Appointment Setting Pipeline.
-      const setterInfo = await resolveSetterForContact(email, prospectName);
       let sourceLine = null;
-      let intake = null; // lazy — fetched at most once, reused by both the vsl sourceLine check and the fallback below
+      let intake = null; // lazy — fetched at most once, reused by the fallback below
 
-      if (setterInfo.source === 'appointment-setting') {
-        sourceLine = setterInfo.setter
-          ? `👤 Booked by: ${setterInfo.setter}`
-          : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
+      // Native setter attribution first: GHL records who booked the appointment
+      // (createdBy → setter_id upstream in dash). NULL on a GHL row means widget
+      // self-booked or closer-booked. Legacy iClosed rows fall back to the live
+      // opportunity-owner lookup + iClosed booking payload heuristics.
+      if (appt.setter_id) {
+        sourceLine = `👤 Booked by: ${resolveSalesMember(appt.setter_id)}`;
+      } else if (appt.source === 'ghl') {
+        sourceLine = `🟢 Source: self-booked (widget or closer-booked, no setter)`;
       } else {
-        // vsl — self-booked vs setter-unknown is decided by the iClosed booking
-        // payload (call_booked_from / event.setter), NOT by whether a GHL
-        // contact exists — most self-booked leads still get a GHL contact via
-        // the ad pipeline, so using contact presence here would mislabel them
-        // (the exact bug fixed 2026-05-08/13/26 — do not reintroduce).
-        intake = await fetchIClosedIntakeForProspect(prospectId);
-        const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
-        sourceLine = selfBooked
-          ? `🟢 Source: self-booked via iClosed (no setter)`
-          : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
+        const setterInfo = await resolveSetterForContact(email, prospectName);
+        if (setterInfo.source === 'appointment-setting') {
+          sourceLine = setterInfo.setter
+            ? `👤 Booked by: ${setterInfo.setter}`
+            : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
+        } else {
+          // vsl — self-booked vs setter-unknown is decided by the iClosed booking
+          // payload (call_booked_from / event.setter), NOT by whether a GHL
+          // contact exists (bug fixed 2026-05-08/13/26 — do not reintroduce).
+          intake = await fetchIClosedIntakeForProspect(prospectId);
+          const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
+          sourceLine = selfBooked
+            ? `🟢 Source: self-booked via iClosed (no setter)`
+            : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
+        }
       }
 
       try {
@@ -5983,11 +6039,12 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      // No GHL conversation found — whether self-booked or setter-booked, fall
-      // back to the iClosed booking intake (event + the prospect's own Q&A
-      // answers) from iclosed_webhook_deliveries. If that's empty too, the
+      // No GHL conversation found — fall back to the booking intake (the
+      // prospect's own Q&A answers): ghl_webhook_deliveries for GHL rows,
+      // iclosed_webhook_deliveries for legacy rows. If that's empty too, the
       // section is simply left out of the brief (no dead "not found" line).
       if (!convoSection) {
+        if (!intake && appt.source === 'ghl') intake = await fetchGhlIntakeForProspect(prospectId);
         if (!intake) intake = await fetchIClosedIntakeForProspect(prospectId);
         if (intake && (intake.eventName || intake.qa.length)) {
           const lines = ['📋 No GHL message history — here\'s what they shared when booking:'];
