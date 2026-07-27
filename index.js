@@ -1097,6 +1097,8 @@ function registerDynamicCron(task) {
       let taskDataBlock = '';
       let weeklyCloserStats = null; // used downstream for dynamic header validation
       let weeklySetterStats = null;
+      // Closer leaderboard (Mondays) — closers only since 2026-07-26; setters
+      // moved to their own "Setter Leaderboard" task (Tue + Sat).
       if (task.name === 'Weekly Closer Comparison') {
         try {
           const now = new Date();
@@ -1104,13 +1106,26 @@ function registerDynamicCron(task) {
           const weekEnd   = now;
           const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
           weeklyCloserStats = await getCloserWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
-          weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
           const closerBlock = formatCloserWeeklyStatsBlock(weeklyCloserStats, weekStart.toISOString(), weekEnd.toISOString());
-          const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source for the leaderboard; GHL-native appointment + outcome data is truth for calls/show rate/qualified-attended-calls, setter credit comes from who booked the call in GHL, leads claimed comes from setter_claims; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${closerBlock}\n\n${setterBlock}`;
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native appointment + outcome data is truth for calls/show rate/sold/revenue; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${closerBlock}`;
         } catch (statsErr) {
-          console.error('Weekly pod stats failed:', statsErr.message);
-          taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute iClosed stats (${statsErr.message}). Fall back to your usual data tools.`;
+          console.error('Weekly closer stats failed:', statsErr.message);
+          taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute closer stats (${statsErr.message}). Fall back to your usual data tools.`;
+        }
+      }
+
+      // Setter leaderboard (Tue + Sat) — rolling last 7 days, setters only.
+      if (task.name === 'Setter Leaderboard') {
+        try {
+          const now = new Date();
+          const weekEnd   = now;
+          const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
+          const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls, leads claimed comes from setter_claims; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}`;
+        } catch (statsErr) {
+          console.error('Setter leaderboard stats failed:', statsErr.message);
+          taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute setter stats (${statsErr.message}). Fall back to your usual data tools.`;
         }
       }
 
@@ -1232,6 +1247,7 @@ function registerDynamicCron(task) {
         // week are required to appear. Static list left empty so we don't fall
         // through to a wrong fallback.
         'Weekly Closer Comparison':   [],
+        'Setter Leaderboard':         [],
         'Sales Call Prep Reminder':         [], // short task, skip header check
         'Blocked Client Report — MWF':      [], // short report, no fixed headers
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
@@ -1252,15 +1268,19 @@ function registerDynamicCron(task) {
           const closerHeaders = (weeklyCloserStats ? Object.keys(weeklyCloserStats) : [])
             .filter(name => {
               const s = weeklyCloserStats[name];
-              return (s.calls_booked || 0) > 0 || (s.sold || 0) > 0 || (s.eod_days || 0) > 0;
-            });
+              return (s.calls_booked || 0) > 0 || (s.sold || 0) > 0;
+            })
+            .map(n => n.toUpperCase());
+          headers = closerHeaders.length ? closerHeaders : [];
+        }
+        if (taskName === 'Setter Leaderboard') {
           const setterHeaders = (weeklySetterStats ? Object.keys(weeklySetterStats) : [])
             .filter(name => {
               const s = weeklySetterStats[name];
-              return (s.calls_booked || 0) > 0 || (s.leads_claimed || 0) > 0 || (s.aqc || 0) > 0 || (s.qualified_leads || 0) > 0 || (s.new_conversations || 0) > 0 || (s.eod_days || 0) > 0;
-            });
-          const combined = Array.from(new Set([...closerHeaders, ...setterHeaders])).map(n => n.toUpperCase());
-          headers = combined.length ? combined : [];
+              return (s.calls_booked || 0) > 0 || (s.leads_claimed || 0) > 0 || (s.aqc || 0) > 0;
+            })
+            .map(n => n.toUpperCase());
+          headers = setterHeaders.length ? setterHeaders : [];
         }
 
         if (headers === undefined) {
