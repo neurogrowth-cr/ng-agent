@@ -2636,7 +2636,7 @@ function resolveSalesMember(id) {
 // they are sales-only BY CONSTRUCTION: dash's webhook ingestion is gated on the
 // GHL_SALES_CALENDAR_IDS allowlist. If a non-sales calendar ever joins GHL,
 // gate it in dash — do NOT add a second allowlist here (it would drift).
-const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc']);
+const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc', 'estrategia-linkedin-flywheel-selfserving-ron']);
 let _nonFlywheelCache = { ids: null, fetchedAt: 0 };
 async function getNonFlywheelCallIds() {
   if (_nonFlywheelCache.ids && (Date.now() - _nonFlywheelCache.fetchedAt) < 10 * 60 * 1000) {
