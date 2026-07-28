@@ -73,3 +73,26 @@ So GHL produces two contact records per real lead, each with its own contact_id,
 **Fix shipped.** (1) Email context only injected when `task.channel === RON_SLACK_ID` (DM). (2) Team-channel report prompts carry an explicit CONFIDENTIALITY rule as defense-in-depth. (3) Nightly learning: new `confidential` extraction category → saved as `visibility='private'` knowledge under Ron's user_id, DM'd to Ron, excluded from the public "What I learned tonight" post (proactive-alerts cron only re-broadcasts `shared` alerts, so private entries can't resurface).
 
 **Pattern to remember.** Whenever wiring a new data source into Max, ask: *who can see the output surface this feeds?* A source's sensitivity must be ≤ the audience of every surface it reaches. Gmail/Calendar/GHL-financials → Ron-only surfaces. Slack channels/portal → team surfaces OK.
+
+## 2026-07-28 — A filter that hides data is invisible; verify allowlists against raw counts, not code review
+
+**Symptom.** The Jul 27 Weekly Closer Leaderboard reported Ron at "$0 closed, 0 sold" for a week in which he had closed a $3,500 deal that was correctly logged in `revops_sales_outcomes` the same day.
+
+**Root cause — three independent allowlists, each silently dropping rows at a different layer.**
+1. `SALES_FLYWHEEL_SLUGS` (ng-agent) omitted Ron's personal iClosed event slug → `getNonFlywheelCallIds()` classified his calls as partner-consulting and excluded them from every sales report. Also hid a $3,895 win from June.
+2. dash's GHL sales-calendar allowlist omitted the "Intro" calendar → those bookings never reached `revops_appointments`.
+3. The GHL workflow trigger itself filtered to one calendar → GHL never *sent* the webhook at all.
+
+**Why it stayed hidden for weeks.** Every one of these fails *closed and silently*. An excluded call looks exactly like a call that never happened — there is no error, no log line, no gap in a sequence. Reports rendered confidently with missing rows.
+
+**How we proved each one.** Never by reading the code — always by counting raw rows:
+- Ran the leaderboard's exact query against Supabase and diffed the result against the Slack post.
+- Counted webhook deliveries by calendar id: **0 for Intro vs 19 for the main calendar** — that single count proved the gap was upstream in GHL, not in dash, and saved fixing the wrong layer.
+- Cross-checked "pending" calls against Fathom recordings: 12 of 14 had recordings, proving `pending` meant "outcome not logged", not "call didn't happen".
+
+**Takeaways.**
+- **An allowlist is a silent data filter. Any time one exists, get a raw count of what it excludes** — `count(*) where <excluded>` — and confirm every exclusion is intentional by name. Don't trust that the list looks reasonable.
+- **When data is missing across a multi-hop pipeline, count at each hop before editing any hop.** The delivery-count check located the true failure point in one query; without it, the dash fix alone would have shipped and changed nothing.
+- **Distinguish "no signal" from "negative signal" in every metric.** `pending` (no outcome row) is not `no_show`. Anything derived from a missing row needs an independent source of truth — Fathom recordings are the reliable one for "did this call happen".
+- GHL specifics worth remembering: its "In calendar" trigger filter is **single-select** — cover N calendars with N duplicate trigger cards (they OR together into the same action). Its public API is **list-only for workflows** (`GET /workflows/{id}` → 404), and the builder SPA won't render in an automated browser tab, so every workflow edit is manual UI work.
+- Vercel blocks deploys whose GitHub commit author has no linked Vercel account, even when that person's *email* is already on the team — it matches on GitHub login. Fix once via Account → Authentication → Login Connections rather than redeploying by hand each time.
