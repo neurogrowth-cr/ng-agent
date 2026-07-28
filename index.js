@@ -3180,32 +3180,39 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   if (!names.length) {
     return `No setter activity (GHL bookings or lead claims) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
-  // Rank by qualified attended calls (real call quality), then calls booked, then leads claimed.
+  // Ranked by the setter-CONTROLLED outcome first: calls booked. Converted calls
+  // (AQC) and claims break ties — quality still matters, but a setter is never
+  // out-ranked on a number that depends on the closer logging an outcome.
   const ranked = names.map(name => {
     const s = stats[name];
     const decided = (s.attended || 0) + (s.no_shows || 0);
     const showRate = decided > 0 ? Math.round((s.attended / decided) * 100) : null;
-    return { name, s, showRate };
+    const claimToBook = s.leads_claimed > 0 ? Math.round((s.claimed_booked / s.leads_claimed) * 100) : null;
+    return { name, s, showRate, claimToBook, decided };
   }).sort((a, b) =>
-    (b.s.aqc || 0) - (a.s.aqc || 0) ||
     (b.s.calls_booked || 0) - (a.s.calls_booked || 0) ||
+    (b.s.aqc || 0) - (a.s.aqc || 0) ||
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
   const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Leads claimed from setter_claims — the ✋ flow in #ng-sales-goats; calls booked/show rate from GHL-native setter attribution + outcomes. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it stays at 0 until outcomes are logged. When a setter's calls are all pending, lead with claims/bookings and say outcomes are pending — never front a zero. Self-booked calls carry no setter credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by converted calls, then bookings.)`);
-  ranked.forEach(({ name, s, showRate }, idx) => {
+  lines.push(`(Ordered by what the setter CONTROLS: leads claimed → calls booked → claim→book rate, then the shared/downstream numbers. Claims come from setter_claims — the ✋ flow in #ng-sales-goats; bookings + outcomes are GHL-native. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Self-booked calls carry no booking credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by calls booked.)`);
+  ranked.forEach(({ name, s, showRate, claimToBook, decided }, idx) => {
     const showRateStr = showRate === null ? 'pending' : `${showRate}%`;
-    const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
-    const decided = (s.attended || 0) + (s.no_shows || 0);
     lines.push(``);
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
+    // 1. OWNED — fully setter-controlled.
+    const c2bStr = claimToBook === null ? '' : ` (${claimToBook}% of claims)`;
+    lines.push(`  OWNED — Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Claimed→booked: ${s.claimed_booked}${c2bStr}`);
+    // 2. SHARED — setter influences via lead quality + confirmation work.
     if (decided === 0) {
-      lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Outcomes: pending on ${s.pending || 0} call(s)`);
+      lines.push(`  SHARED — Show rate: pending (${s.pending || 0} call(s) awaiting a logged outcome)`);
     } else {
-      lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Show rate: ${showRateStr}`);
-      lines.push(`  Converted calls (AQC — showed & not disqualified): ${s.aqc} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr}`);
+      lines.push(`  SHARED — Show rate: ${showRateStr} | Attended: ${s.attended} | No-shows: ${s.no_shows}${s.pending ? ` | Pending: ${s.pending}` : ''}`);
+      lines.push(`  DOWNSTREAM — Converted calls (AQC, closer-logged): ${s.aqc}`);
     }
-    lines.push(`  Cross-check: claimed→booked ${s.claimed_booked}${s.claim_mismatches ? ` | ⚠️ ${s.claim_mismatches} booked-by-them but claimed by someone else (${s.mismatch_notes.slice(0, 3).join('; ')})` : ''}`);
+    if (s.claim_mismatches) {
+      lines.push(`  ⚠️ Attribution: ${s.claim_mismatches} call(s) they booked were claimed by someone else (${s.mismatch_notes.slice(0, 3).join('; ')})`);
+    }
   });
   return lines.join('\n');
 }
