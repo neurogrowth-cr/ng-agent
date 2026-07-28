@@ -3195,14 +3195,19 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
   const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Ordered by what the setter CONTROLS: leads claimed → calls booked → claim→book rate, then the shared/downstream numbers. Claims come from setter_claims — the ✋ flow in #ng-sales-goats; bookings + outcomes are GHL-native. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Self-booked calls carry no booking credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by calls booked.)`);
+  lines.push(`(Ordered by what the setter CONTROLS: leads claimed → claims-that-became-calls → calls they booked, then the shared/downstream numbers. Claims come from setter_claims — the ✋ flow in #ng-sales-goats; bookings + outcomes are GHL-native. "Claims → calls" = calls from leads THEY claimed regardless of who clicked book (widget self-bookings and pre-cutover iClosed calls count); "Booked by them" = GHL booking attribution. The first can exceed the second — that is the funnel working, not an error. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Ranked by calls booked.)`);
   ranked.forEach(({ name, s, showRate, claimToBook, decided }, idx) => {
     const showRateStr = showRate === null ? 'pending' : `${showRate}%`;
     lines.push(``);
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
-    // 1. OWNED — fully setter-controlled.
-    const c2bStr = claimToBook === null ? '' : ` (${claimToBook}% of claims)`;
-    lines.push(`  OWNED — Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Claimed→booked: ${s.claimed_booked}${c2bStr}`);
+    // 1. OWNED — fully setter-controlled. Two distinct numbers, labelled so they
+    // can never read as contradictory: "claims → calls" counts every call that
+    // came from a lead THEY claimed (whoever finally clicked book — widget
+    // self-bookings and legacy iClosed-era calls included), while "booked by
+    // them" is GHL booking attribution. claims→calls can exceed booked-by-them;
+    // that is the funnel working, not a data error.
+    const c2bStr = claimToBook === null ? '' : ` (${claimToBook}%)`;
+    lines.push(`  OWNED — Leads claimed: ${s.leads_claimed} | Claims → calls: ${s.claimed_booked}${c2bStr} | Booked by them: ${s.calls_booked}`);
     // 2. SHARED — setter influences via lead quality + confirmation work.
     if (decided === 0) {
       lines.push(`  SHARED — Show rate: pending (${s.pending || 0} call(s) awaiting a logged outcome)`);
