@@ -1115,6 +1115,10 @@ function registerDynamicCron(task) {
       }
 
       // Setter leaderboard (Tue + Sat) — rolling last 7 days, setters only.
+      // Meshed intel: GHL bookings/outcomes (truth) + setter_claims (#ng-sales-goats
+      // ✋ flow) + REVI call scores (lead quality of what each setter feeds closers)
+      // + GHL conversation hygiene. Each enrichment is non-fatal — the leaderboard
+      // must still post if REVI or the GHL API is unreachable.
       if (task.name === 'Setter Leaderboard') {
         try {
           const now = new Date();
@@ -1122,7 +1126,63 @@ function registerDynamicCron(task) {
           const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
           weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
           const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls, leads claimed comes from setter_claims; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}`;
+
+          // REVI lead quality — scored calls among this week's setter-booked appts.
+          let reviBlock = '';
+          try {
+            const { data: wkAppts } = await portalSupabase
+              .from('revops_appointments')
+              .select('setter_id, prospect:prospect_id ( email )')
+              .not('setter_id', 'is', null)
+              .gte('scheduled_start', weekStart.toISOString())
+              .lte('scheduled_start', weekEnd.toISOString())
+              .limit(25);
+            const bySetter = {};
+            for (const a of (wkAppts || [])) {
+              const email = a.prospect?.email;
+              if (!email) continue;
+              const scored = await reviFindCallsByProspect(email, 1);
+              const sc = scored[0];
+              if (!sc || sc.overall_score == null) continue;
+              const name = resolveSalesMember(a.setter_id);
+              if (!bySetter[name]) bySetter[name] = { scores: [], signals: [] };
+              bySetter[name].scores.push(sc.overall_score);
+              const sig = sc.prospect_signals || {};
+              if (sig.buying_signal_strength) bySetter[name].signals.push(sig.buying_signal_strength);
+            }
+            const reviLines = Object.entries(bySetter).map(([name, d]) => {
+              const avg = Math.round(d.scores.reduce((a, b) => a + b, 0) / d.scores.length);
+              const sigStr = d.signals.length ? ` | buying signals: ${d.signals.join(', ')}` : '';
+              return `  ${name}: ${d.scores.length} scored call(s), avg call score ${avg}${sigStr}`;
+            });
+            if (reviLines.length) reviBlock = `\n\nREVI LEAD QUALITY (call scores for prospects each setter booked — proxy for lead quality fed to closers):\n${reviLines.join('\n')}`;
+          } catch (reviErr) {
+            console.warn('Setter leaderboard REVI enrichment failed:', reviErr.message);
+          }
+
+          // GHL conversation hygiene — unread / stale (3d+) convos per assigned setter.
+          let hygieneBlock = '';
+          try {
+            const locationId = process.env.GHL_LOCATION_ID;
+            const apiKey     = process.env.GHL_API_KEY;
+            const res  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&limit=100`, { headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28' } });
+            const data = await res.json();
+            const dayMs = 24 * 60 * 60 * 1000;
+            const agg = {};
+            for (const c of (data.conversations || [])) {
+              const assigned = resolveSalesMember(c.assignedTo || c.userId || '');
+              if (!weeklySetterStats[assigned]) continue; // only setters on this leaderboard
+              if (!agg[assigned]) agg[assigned] = { unread: 0, stale: 0 };
+              if (c.unreadCount > 0) agg[assigned].unread += 1;
+              if ((Date.now() - c.lastMessageDate) / dayMs >= 3) agg[assigned].stale += 1;
+            }
+            const hygLines = Object.entries(agg).map(([name, d]) => `  ${name}: ${d.unread} unread convo(s), ${d.stale} stale (3d+ no touch)`);
+            if (hygLines.length) hygieneBlock = `\n\nGHL FOLLOW-UP HYGIENE (assigned conversations, latest 100):\n${hygLines.join('\n')}`;
+          } catch (hygErr) {
+            console.warn('Setter leaderboard hygiene enrichment failed:', hygErr.message);
+          }
+
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls; leads claimed + claimed→booked cross-check come from setter_claims, the ✋ flow in #ng-sales-goats; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}${reviBlock}${hygieneBlock}`;
         } catch (statsErr) {
           console.error('Setter leaderboard stats failed:', statsErr.message);
           taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute setter stats (${statsErr.message}). Fall back to your usual data tools.`;
