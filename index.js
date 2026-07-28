@@ -3192,14 +3192,19 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
   const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Leads claimed from setter_claims — the ✋ flow in #ng-sales-goats; calls booked/show rate/qualified attended calls from GHL-native setter attribution + outcomes; pending calls excluded from show rate. Self-booked calls carry no setter credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by qualified attended calls.)`);
+  lines.push(`(Leads claimed from setter_claims — the ✋ flow in #ng-sales-goats; calls booked/show rate from GHL-native setter attribution + outcomes. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it stays at 0 until outcomes are logged. When a setter's calls are all pending, lead with claims/bookings and say outcomes are pending — never front a zero. Self-booked calls carry no setter credit, but a self-booked call whose lead a setter claimed still counts in claimed→booked. Ranked by converted calls, then bookings.)`);
   ranked.forEach(({ name, s, showRate }, idx) => {
-    const showRateStr = showRate === null ? '— (no outcomes logged yet)' : `${showRate}%`;
+    const showRateStr = showRate === null ? 'pending' : `${showRate}%`;
     const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
+    const decided = (s.attended || 0) + (s.no_shows || 0);
     lines.push(``);
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
-    lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Show rate: ${showRateStr}`);
-    lines.push(`  Qualified attended calls: ${s.aqc} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr}`);
+    if (decided === 0) {
+      lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Outcomes: pending on ${s.pending || 0} call(s)`);
+    } else {
+      lines.push(`  Leads claimed: ${s.leads_claimed} | Calls booked: ${s.calls_booked} | Show rate: ${showRateStr}`);
+      lines.push(`  Converted calls (AQC — showed & not disqualified): ${s.aqc} | Attended: ${s.attended} | No-shows: ${s.no_shows}${pendingStr}`);
+    }
     lines.push(`  Cross-check: claimed→booked ${s.claimed_booked}${s.claim_mismatches ? ` | ⚠️ ${s.claim_mismatches} booked-by-them but claimed by someone else (${s.mismatch_notes.slice(0, 3).join('; ')})` : ''}`);
   });
   return lines.join('\n');
