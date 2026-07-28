@@ -7202,6 +7202,13 @@ cron.schedule('0 18 * * *', wrapCronJob('runStaleLeadDailySweep', async (c) => {
 // live auto-send activates only when STALLED_FOLLOWUPS_LIVE='true' (deferred until dry-run validated).
 cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
 
+// Auto strike mover — every 2h, 7 AM–9 PM CR. Advances setter pipeline cards on
+// real human WhatsApp follow-ups so nobody has to drag them. Every 2h (not
+// hourly) because a full sweep costs ~1 API call per candidate card and the 20h
+// debounce means a card can only move once a day anyway. Defaults to DRY RUN —
+// set STRIKE_MOVER_MODE=live on Railway to arm it.
+cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }), { timezone: 'America/Costa_Rica' });
+
 // Setter attribution reconcile cron RETIRED 2026-07-26 — GHL records the booker
 // natively in revops_appointments.setter_id; the leaderboard reads it directly.
 
@@ -8163,6 +8170,236 @@ async function runStalledProspectFollowups(correlationId) {
   } catch (err) { console.error('stalled summary DM to Ron failed:', err.message); }
 
   console.log(`runStalledProspectFollowups done — ${totalSendable}/${totalCandidates} eligible, skipped ${totalSkipped}, sent ${liveSent.length}, drafts-posted ${approvalDrafts.length} (mode=${mode})`);
+}
+
+// ─── AUTO STRIKE MOVER (pipeline cards move themselves on setter follow-ups) ──
+// Setters spend real time dragging cards through New Lead → Initial Contact →
+// Strike 1/2/3, and mostly don't (hence 1,028 parked in Initial Contact). This
+// moves the card for them, so the board becomes a live activity tracker and
+// setters only converse.
+//
+// WHY THIS LIVES IN MAX AND NOT MAKE: GHL's conversation index
+// (conversations/search) does NOT track WhatsApp messages sent from the shared
+// WhatsApp Business phone — those arrive with userId '' and an unformatted
+// number, and lastMessageDate/lastManualMessageDate never move for them
+// (verified 2026-07-28: a thread with five setter messages still reported an
+// inbound from an hour earlier as its last message). Phone-origin is the
+// MAJORITY of real setter follow-ups, so no event-style poll built on that index
+// can be trusted. The only reliable source is per-conversation /messages, which
+// means sweeping candidate cards — prohibitive on Make's per-operation billing,
+// free here.
+//
+// RULES (Appointment Setting Pipeline only):
+//   New Lead → Initial Contact   on the first HUMAN outbound WhatsApp.
+//   IC → S1 → S2 → S3            one stage per chase. A chase means the lead has
+//                                been silent 24h+; an engaged conversation never
+//                                marches toward Strike 3.
+//   Watermark   the triggering message must be NEWER than the card's last stage
+//               change, so one message can never be counted twice and a setter's
+//               own manual drag is never re-counted.
+//   Debounce    at most one advance per card per 20h.
+//   Never past Strike 3, never backward, never touches Call Booked+ stages.
+//   Lost stays manual. Automated sends (source 'workflow') never count — only
+//   source 'app', which is the reliable human/automation discriminator (userId
+//   is frequently empty on genuine human sends and cannot be used for this).
+const STRIKE_PIPELINE_ID = process.env.STRIKE_MOVER_PIPELINE_ID || 'KH1IQuaN8aNB1lfRpvP4';
+const STRIKE_STAGE = {
+  NEW_LEAD:        '93de6a09-78a4-4253-bea4-c1528ed6f2b3',
+  INITIAL_CONTACT: '4b936528-794e-40ab-812d-144b9d5e8128',
+  STRIKE_1:        '92245916-0622-4f46-aabc-6091b8af5fc0',
+  STRIKE_2:        '6274c958-8252-4698-acc6-c6818d43a99f',
+  STRIKE_3:        'e639662d-6b1b-42b5-a89d-7ebd70ca97e3',
+};
+const STRIKE_STAGE_NAME = {
+  [STRIKE_STAGE.NEW_LEAD]:        'New Lead',
+  [STRIKE_STAGE.INITIAL_CONTACT]: 'Initial Contact',
+  [STRIKE_STAGE.STRIKE_1]:        'Strike 1',
+  [STRIKE_STAGE.STRIKE_2]:        'Strike 2',
+  [STRIKE_STAGE.STRIKE_3]:        'Strike 3',
+};
+const STRIKE_NEXT_STAGE = {
+  [STRIKE_STAGE.INITIAL_CONTACT]: STRIKE_STAGE.STRIKE_1,
+  [STRIKE_STAGE.STRIKE_1]:        STRIKE_STAGE.STRIKE_2,
+  [STRIKE_STAGE.STRIKE_2]:        STRIKE_STAGE.STRIKE_3,
+};
+const STRIKE_SCOPE_STAGES = [
+  STRIKE_STAGE.NEW_LEAD, STRIKE_STAGE.INITIAL_CONTACT, STRIKE_STAGE.STRIKE_1, STRIKE_STAGE.STRIKE_2,
+];
+const STRIKE_DEBOUNCE_MS     = 20 * 60 * 60 * 1000; // one advance per card per 20h
+const STRIKE_LEAD_SILENCE_MS = 24 * 60 * 60 * 1000; // lead quiet this long ⇒ outreach is a chase
+
+// contactId → conversationId. Saves one API call per card on every sweep after
+// the first. A stale entry self-heals: a failed messages fetch drops the card for
+// that run and the id is re-resolved next sweep.
+const _strikeConvoCache = new Map();
+
+async function ghlFetchJson(url) {
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  });
+  if (!res.ok) throw new Error(`GHL ${res.status} on ${url.split('?')[0].split('/').slice(-2).join('/')}`);
+  return res.json();
+}
+
+// Pages a whole stage. Uses the meta.startAfter/startAfterId cursor rather than
+// meta.nextPageUrl so the location/pipeline filters can't drift between pages.
+async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40 } = {}) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const out = [];
+  let startAfter = null, startAfterId = null;
+  for (let page = 0; page < maxPages; page++) {
+    let url = `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}`
+            + `&pipeline_id=${STRIKE_PIPELINE_ID}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
+    if (startAfter && startAfterId) url += `&startAfter=${startAfter}&startAfterId=${startAfterId}`;
+    const data  = await ghlFetchJson(url);
+    const batch = data.opportunities || [];
+    out.push(...batch);
+    if (batch.length < limit) break;
+    startAfter   = data.meta?.startAfter;
+    startAfterId = data.meta?.startAfterId;
+    if (!startAfter || !startAfterId) break;
+  }
+  return out;
+}
+
+async function ghlFindConversationId(contactId) {
+  if (_strikeConvoCache.has(contactId)) return _strikeConvoCache.get(contactId);
+  const locationId = process.env.GHL_LOCATION_ID;
+  const data = await ghlFetchJson(
+    `https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&contactId=${contactId}&limit=1`,
+  );
+  const id = (data.conversations || [])[0]?.id || null;
+  if (id) _strikeConvoCache.set(contactId, id);
+  return id;
+}
+
+async function ghlMoveOpportunityStage(oppId, stageId) {
+  const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+      'Version': '2021-07-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ pipelineId: STRIKE_PIPELINE_ID, pipelineStageId: stageId }),
+  });
+  if (!res.ok) throw new Error(`opp PUT ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+  return true;
+}
+
+// Pure decision function — all the semantics live here and it does no I/O, so the
+// rules can be reasoned about (and tested) without touching GHL.
+// `messages` must be oldest-first (ghlGetConversationMessages normalizes to that).
+function evaluateStrikeMove(opp, messages, now = Date.now()) {
+  const stage = opp.pipelineStageId;
+  if (opp.status !== 'open')                 return { skip: 'not_open' };
+  if (opp.pipelineId !== STRIKE_PIPELINE_ID) return { skip: 'wrong_pipeline' };
+  if (!STRIKE_SCOPE_STAGES.includes(stage))  return { skip: 'stage_out_of_scope' };
+
+  // Activity entries (TYPE_ACTIVITY_OPPORTUNITY — "Opportunity updated" etc.)
+  // interleave with real messages; without this filter the mover reads its own
+  // stage-change activity as the newest message in the thread.
+  const wa = (messages || []).filter(m => m.messageType === 'TYPE_WHATSAPP');
+  if (!wa.length) return { skip: 'no_whatsapp' };
+
+  const newest = wa[wa.length - 1];
+  if (String(newest.direction || '').toLowerCase() !== 'outbound') return { skip: 'lead_spoke_last' };
+  if (String(newest.source    || '').toLowerCase() !== 'app')      return { skip: 'automated_send' };
+
+  const touchTs = Date.parse(newest.dateAdded || newest.createdAt || 0) || 0;
+  const stageTs = Date.parse(opp.lastStageChangeAt || opp.createdAt || 0) || 0;
+  if (!touchTs)             return { skip: 'no_touch_timestamp' };
+  if (!(touchTs > stageTs)) return { skip: 'already_counted' };
+
+  if (stage === STRIKE_STAGE.NEW_LEAD) {
+    return { move: STRIKE_STAGE.INITIAL_CONTACT, reason: 'first human touch' };
+  }
+
+  if (now - stageTs < STRIKE_DEBOUNCE_MS) return { skip: 'debounced' };
+
+  // Lead silence, not "was the previous message outbound" — setters routinely
+  // double-text within one live conversation, and the naive check reads that as
+  // a chase and marches an engaged lead toward Strike 3.
+  const lastInbound   = [...wa].reverse().find(m => String(m.direction || '').toLowerCase() === 'inbound');
+  const lastInboundTs = lastInbound ? (Date.parse(lastInbound.dateAdded || lastInbound.createdAt || 0) || 0) : 0;
+  if (lastInboundTs && now - lastInboundTs < STRIKE_LEAD_SILENCE_MS) return { skip: 'lead_engaged' };
+
+  const next = STRIKE_NEXT_STAGE[stage];
+  if (!next) return { skip: 'no_next_stage' };
+  return { move: next, reason: lastInboundTs ? 'chase — lead silent 24h+' : 'chase — lead never replied' };
+}
+
+// Sweep — see cron registration below. Mode is STRIKE_MOVER_MODE:
+// 'dry_run' (default — reports what it WOULD do, writes nothing) | 'live'.
+async function runAutoStrikeMover(correlationId) {
+  const mode       = (process.env.STRIKE_MOVER_MODE || '').toLowerCase() === 'live' ? 'live' : 'dry_run';
+  const isLive     = mode === 'live';
+  const throttleMs = parseInt(process.env.STRIKE_MOVER_THROTTLE_MS || '120', 10);
+  // Stampede guard: the first live sweep over a 1,000+ card backlog could advance
+  // a lot of cards at once. Capped per run; the rest are picked up next sweep.
+  const maxMoves   = parseInt(process.env.STRIKE_MOVER_MAX_MOVES || '100', 10);
+  console.log(`runAutoStrikeMover starting (mode=${mode.toUpperCase()})`);
+
+  const cards = [];
+  for (const stageId of STRIKE_SCOPE_STAGES) cards.push(...await ghlSearchOppsByStage(stageId));
+
+  const skipCounts = {};
+  const bump = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
+  const moves = [], failures = [];
+  let capped = 0;
+
+  for (const opp of cards) {
+    try {
+      if (!opp.contactId) { bump('no_contact'); continue; }
+      const convoId = await ghlFindConversationId(opp.contactId);
+      if (!convoId) { bump('no_conversation'); continue; }
+      const messages = await ghlGetConversationMessages(convoId);
+      const verdict  = evaluateStrikeMove(opp, messages);
+      if (verdict.skip) { bump(verdict.skip); continue; }
+
+      if (moves.length >= maxMoves) { capped++; continue; }
+      if (isLive) await ghlMoveOpportunityStage(opp.id, verdict.move);
+      moves.push({
+        name:   opp.contact?.name || opp.name || opp.id,
+        from:   STRIKE_STAGE_NAME[opp.pipelineStageId] || opp.pipelineStageId,
+        to:     STRIKE_STAGE_NAME[verdict.move] || verdict.move,
+        reason: verdict.reason,
+      });
+    } catch (err) {
+      // A stale cached conversation id is the likeliest cause — drop it so the
+      // next sweep re-resolves instead of failing this card forever.
+      _strikeConvoCache.delete(opp.contactId);
+      failures.push(`${opp.contact?.name || opp.id}: ${err.message}`);
+    }
+    if (throttleMs > 0) await new Promise(r => setTimeout(r, throttleMs));
+  }
+
+  const skipBreakdown = Object.entries(skipCounts).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+  const verb = isLive ? 'Moved' : 'Would move';
+  const lines = [
+    `AUTO STRIKE MOVER — ${isLive ? 'LIVE' : 'DRY RUN'}`,
+    '',
+    `Cards scanned: ${cards.length} | ${verb}: ${moves.length}${capped ? ` (+${capped} over the ${maxMoves}/run cap, next sweep)` : ''}`,
+    '',
+    `Skips: ${skipBreakdown}`,
+  ];
+  if (moves.length) {
+    lines.push('');
+    lines.push(...moves.slice(0, 25).map(m => `• ${m.name}: ${m.from} → ${m.to} (${m.reason})`));
+    if (moves.length > 25) lines.push(`• …and ${moves.length - 25} more.`);
+  }
+  if (failures.length) {
+    lines.push('');
+    lines.push(`${failures.length} failure(s): ${failures.slice(0, 3).join(' | ')}`);
+  }
+  if (!isLive) lines.push('', `Set STRIKE_MOVER_MODE=live on Railway to let these moves actually happen.`);
+
+  try {
+    await postToSlack(AGENT_CHANNEL, lines.join('\n'));
+  } catch (err) { console.error('strike mover summary post failed:', err.message); }
+
+  console.log(`runAutoStrikeMover done — scanned ${cards.length}, ${verb.toLowerCase()} ${moves.length}, failures ${failures.length} (mode=${mode})`);
 }
 
 // ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─
