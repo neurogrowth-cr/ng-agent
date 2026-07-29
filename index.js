@@ -7259,35 +7259,41 @@ if (EMAIL_PROXY_LIVE) {
 }
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
+// ROSTER 2026-07-29 (Ron): active setters are Sebastian, Oscar and William only.
+// Joseph and Debbanny have rolled off.
+//
+// Deliberate split — departed staff stay in the NAME maps but are removed from the
+// ACTION maps. Name resolution is retrospective: leaderboards and weekly reports
+// resolve setter_id on historical rows, and dropping a departed setter's name there
+// would silently relabel their past calls "Unknown" rather than removing them.
+// The action maps below decide who gets DM'd, nudged and can claim leads — that is
+// where a stale entry does damage.
 const GHL_USER_NAMES = {
-  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — rolled off 2026-07
   'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
-  '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — no longer active
+  '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — rolled off 2026-05-03
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
   'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
   'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 
+// ACTION map — routes DMs and nudges. Departed setters MUST NOT appear here.
 const GHL_TO_SLACK = {
-  'joseph': 'U0A9J00EMGD', 'joseph salazar': 'U0A9J00EMGD',
   'oscar': 'U0B1S1UMH9P', 'oscar m': 'U0B1S1UMH9P', 'oscar neurogrowth': 'U0B1S1UMH9P',
   'william': 'U0B16P6DQ2F', 'william b': 'U0B16P6DQ2F', 'william neurogrowth': 'U0B16P6DQ2F',
   'sebastian': 'U0BFA4SRVQC', 'sebastian s': 'U0BFA4SRVQC', 'sebastian serrano': 'U0BFA4SRVQC', 'sebastian neurogrowth': 'U0BFA4SRVQC',
-  'debbanny': 'U0AR16QVDB3', 'debanny': 'U0AR16QVDB3', 'debbanny neurogrowth': 'U0AR16QVDB3', 'debbanny romero': 'U0AR16QVDB3', // historical
   'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
-  'cuttpcov7ztlvyjkhdx8': 'U0A9J00EMGD', '5orsahkh2joujb5fczrp': 'U0AR16QVDB3',
   'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P', 'n8mvtuhbbby7qppqnmr7': 'U0B16P6DQ2F',
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
   'wdjte1temxfr0lpi5rgv': 'U0BFA4SRVQC',
 };
 
-// Reverse map for lead-claim flow: Slack user → GHL user ID (used by reaction_added handler)
-// Active setters only — Debbanny was removed when she rolled off 2026-05-03.
+// ACTION map — lead-claim flow: Slack user → GHL user ID (reaction_added handler).
+// Active staff only: Debbanny rolled off 2026-05-03, Joseph 2026-07.
 const SLACK_TO_GHL_USER = {
-  'U0A9J00EMGD': 'cUTTPGov7ZTLvyjKHdX8', // Joseph Salazar
   'U0B1S1UMH9P': 'ZcmdIz2EEraPd80W2zop', // Oscar M
   'U0B16P6DQ2F': 'N8mvtuHbbbY7QppqNMr7', // William B
   'U0BFA4SRVQC': 'Wdjte1temxfR0lpi5RGV', // Sebastian Serrano
@@ -7296,10 +7302,10 @@ const SLACK_TO_GHL_USER = {
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
 };
 
-// Fallback: GHL ships payload.user.email reliably even when customData.assignedTo
-// is empty/broken. Used by /webhook/ghl-claim when the GHL token doesn't resolve.
+// ACTION map — fallback: GHL ships payload.user.email reliably even when
+// customData.assignedTo is empty/broken. Used by /webhook/ghl-claim when the GHL
+// token doesn't resolve. Active staff only.
 const EMAIL_TO_GHL_USER_ID = {
-  'joseph.neurogrowth@gmail.com': 'cUTTPGov7ZTLvyjKHdX8',
   'oscar.neurogrowth@gmail.com':  'ZcmdIz2EEraPd80W2zop',
   'william.neurogrowth@gmail.com': 'N8mvtuHbbbY7QppqNMr7',
   'sebastian.neurogrowth@gmail.com': 'Wdjte1temxfR0lpi5RGV',
@@ -7828,46 +7834,72 @@ async function ghlGetContact(contactId) {
   return data.contact || data || null;
 }
 
-async function hasFutureBooking(contact) {
-  // iClosed booking lookup via revops_iclosed_bookings — match on email or phone
+// Booking gate for stalled-prospect nudges — reads GHL directly.
+//
+// Replaces two lookups against `revops_iclosed_bookings` — a table that DOES NOT
+// EXIST in the portal database (verified 2026-07-29: `relation does not exist`).
+// Every call threw, the bare `catch` returned null, and both gates therefore read as
+// "no booking" for every prospect ever checked. Failing open in the dangerous
+// direction: a prospect who had already booked a call, or already sat through one,
+// was still eligible to be surfaced as a stalled lead and chased.
+//
+// GHL is now the booking source of truth, and this is keyed on contactId rather than
+// fuzzy email/phone matching, so it can't mis-join on a shared or missing email.
+// One fetch per candidate, shared by both gates.
+async function ghlGetContactAppointments(contactId) {
   try {
-    const email = (contact.email || '').toLowerCase();
-    const phone = (contact.phone || '').replace(/\D/g, '');
-    const orFilters = [];
-    if (email) orFilters.push(`email.eq.${email}`);
-    if (phone) orFilters.push(`phone.like.%${phone.slice(-9)}%`);
-    if (!orFilters.length) return null;
-    const { data, error } = await supabase
-      .from('revops_iclosed_bookings')
-      .select('event_at, event_status')
-      .or(orFilters.join(','))
-      .gte('event_at', new Date().toISOString())
-      .order('event_at', { ascending: true })
-      .limit(1);
-    if (error || !data || !data.length) return null;
-    return data[0];
-  } catch (_) { return null; }
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/appointments`, {
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.events || []).filter(e => !e.deleted);
+  } catch (_) { return []; }
 }
 
-async function hasAttendedCall(contact) {
-  try {
-    const email = (contact.email || '').toLowerCase();
-    const phone = (contact.phone || '').replace(/\D/g, '');
-    const orFilters = [];
-    if (email) orFilters.push(`email.eq.${email}`);
-    if (phone) orFilters.push(`phone.like.%${phone.slice(-9)}%`);
-    if (!orFilters.length) return null;
-    const { data, error } = await supabase
-      .from('revops_iclosed_bookings')
-      .select('event_at, event_status')
-      .or(orFilters.join(','))
-      .in('event_status', ['Showed', 'Qualified', 'Disqualified'])
-      .order('event_at', { ascending: false })
-      .limit(1);
-    if (error || !data || !data.length) return null;
-    return data[0];
-  } catch (_) { return null; }
+// GHL returns startTime as "YYYY-MM-DD HH:mm:ss" in UTC with no offset; normalize so
+// Date.parse doesn't fall back to the host's local zone.
+function parseGhlApptTime(s) {
+  const t = Date.parse(String(s || '').replace(' ', 'T') + 'Z');
+  return Number.isNaN(t) ? 0 : t;
 }
+
+const APPT_DEAD_STATUSES = new Set(['cancelled', 'canceled', 'noshow', 'no-show', 'invalid']);
+
+// Upcoming live appointment ⇒ they are booked, do not nudge.
+function findFutureBooking(appointments, now = Date.now()) {
+  const upcoming = appointments
+    .filter(a => !APPT_DEAD_STATUSES.has(String(a.appointmentStatus || '').toLowerCase()))
+    .map(a => ({ event_at: a.startTime, event_status: a.appointmentStatus, ts: parseGhlApptTime(a.startTime) }))
+    .filter(a => a.ts > now)
+    .sort((a, b) => a.ts - b.ts);
+  return upcoming[0] || null;
+}
+
+// Already sat through a call ⇒ a different motion than a stalled-prospect chase.
+function findAttendedCall(appointments) {
+  const attended = appointments
+    .filter(a => String(a.appointmentStatus || '').toLowerCase() === 'showed')
+    .map(a => ({ event_at: a.startTime, event_status: a.appointmentStatus, ts: parseGhlApptTime(a.startTime) }))
+    .sort((a, b) => b.ts - a.ts);
+  return attended[0] || null;
+}
+
+// A call that has already happened but is STILL marked 'confirmed' — i.e. the closer
+// hasn't logged showed/no-show yet. Outcome logging routinely lags by days, so this
+// state is common and ambiguous: the prospect may well have attended. Hold the nudge
+// rather than chase someone who just sat through a call. Bounded to a week so a
+// permanently unlogged appointment can't mute a prospect forever.
+function findAppointmentPendingOutcome(appointments, now = Date.now(), windowDays = 7) {
+  const cutoff = now - windowDays * 24 * 60 * 60 * 1000;
+  const pending = appointments
+    .filter(a => String(a.appointmentStatus || '').toLowerCase() === 'confirmed')
+    .map(a => ({ event_at: a.startTime, event_status: a.appointmentStatus, ts: parseGhlApptTime(a.startTime) }))
+    .filter(a => a.ts && a.ts <= now && a.ts >= cutoff)
+    .sort((a, b) => b.ts - a.ts);
+  return pending[0] || null;
+}
+
 
 // Returns true if a setter has DM'd Max `pause <contactId>` for this contact.
 // Pause entries live in agent_knowledge under category=setter_pref, key=pause:<contactId>.
@@ -7937,11 +7969,18 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
 
   if (await isStalledFollowupPaused(convo.contactId)) return { skip: 'setter_paused', setterSlackId };
 
-  const futureBooking = await hasFutureBooking(contact);
+  // One GHL fetch, both booking gates (see ghlGetContactAppointments — the old
+  // revops_iclosed_bookings lookups went dead at the GHL cutover and were failing open).
+  const appointments = await ghlGetContactAppointments(convo.contactId);
+
+  const futureBooking = findFutureBooking(appointments);
   if (futureBooking) return { skip: `already_booked:${futureBooking.event_at}`, setterSlackId };
 
-  const attended = await hasAttendedCall(contact);
+  const attended = findAttendedCall(appointments);
   if (attended) return { skip: `already_attended:${attended.event_status}`, setterSlackId };
+
+  const pendingOutcome = findAppointmentPendingOutcome(appointments);
+  if (pendingOutcome) return { skip: `appointment_pending_outcome:${pendingOutcome.event_at}`, setterSlackId };
 
   return {
     skip: null,
@@ -7982,13 +8021,14 @@ async function runStalledProspectFollowups(correlationId) {
     return businessDaysBetween(c.lastMessageDate, now) >= 2;
   });
 
+  // Nudge targets = ACTIVE SETTERS ONLY (Ron 2026-07-29: Sebastian, Oscar, William).
+  // Closers are intentionally absent: a conversation assigned to a closer is not a
+  // setter's stalled prospect, and Joseph/Debbanny have rolled off — a nudge naming
+  // them would either DM a departed teammate or silently reach nobody.
   const ghlUserNames = {
-    'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
     'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
     'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
     'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
-    'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-    'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
   };
 
   const skipCounts = {};
