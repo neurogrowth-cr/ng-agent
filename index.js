@@ -6720,24 +6720,59 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
     const cutoff = new Date(now - 24 * 60 * 60 * 1000).toISOString();      // >24h old
 
-    // Past calls 24h–14d ago. `attended` is almost always null so it is NOT a
-    // gate; we exclude cancelled calls (qualification_snapshot carries the flag
-    // under .iclosed for legacy rows and .ghl for GHL rows) and require a call
-    // identity (ghl_appointment_id for GHL rows, iclosed_call_id for legacy).
+    // Only nag on calls a closer can actually resolve. Outcomes are logged on the
+    // GHL opportunity card, and the webhook attaches them to the prospect's LATEST
+    // appointment — so two classes of row are permanently unfixable and must never
+    // be nagged (chasing impossible items is how a reminder system gets ignored):
+    //   1. Pre-cutover calls (before GHL went live) — pre-migration history.
+    //      Self-expiring: they fall out of the 14d window on their own.
+    //   2. Orphaned rows — the prospect rebooked, so any outcome the closer logs
+    //      lands on the newer appointment, never on this one.
+    // NOTE: iClosed-BOOKED calls scheduled after the cutover ARE fulfillable —
+    // the prospect has a live GHL opp card, so source is irrelevant here.
+    const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
+    const floorIso = since > GHL_CUTOVER_ISO ? since : GHL_CUTOVER_ISO;
+
+    // Past calls 24h–14d ago (never before the cutover). `attended` is almost
+    // always null so it is NOT a gate; we exclude cancelled calls
+    // (qualification_snapshot carries the flag under .iclosed for legacy rows and
+    // .ghl for GHL rows) and require a call identity.
     const { data: pastCalls } = await portalSupabase
       .from('revops_appointments')
-      .select('id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name)')
+      .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name)')
       .lte('scheduled_start', cutoff)
-      .gte('scheduled_start', since);
+      .gte('scheduled_start', floorIso);
+
+    // Orphan detection: any later appointment for the same prospect means an
+    // outcome logged now attaches there, not here.
+    const prospectIds = [...new Set((pastCalls || []).map(a => a.prospect_id).filter(Boolean))];
+    let latestStartByProspect = {};
+    if (prospectIds.length) {
+      const { data: allAppts } = await portalSupabase
+        .from('revops_appointments')
+        .select('prospect_id, scheduled_start')
+        .in('prospect_id', prospectIds);
+      for (const r of (allAppts || [])) {
+        const cur = latestStartByProspect[r.prospect_id];
+        if (!cur || String(r.scheduled_start) > cur) latestStartByProspect[r.prospect_id] = String(r.scheduled_start);
+      }
+    }
 
     // Flywheel-only: exclude partner-consulting 1:1s before any dedup/state tracking.
     const excludeIds = await getNonFlywheelCallIds();
-    const dueCalls = (pastCalls || []).filter(
-      a => (a.iclosed_call_id || a.ghl_appointment_id)
-        && a.qualification_snapshot?.iclosed?.cancelled !== true
-        && a.qualification_snapshot?.ghl?.cancelled !== true
-        && !excludeIds.has(a.iclosed_call_id)
-    );
+    let orphanSkipped = 0;
+    const dueCalls = (pastCalls || []).filter((a) => {
+      if (!(a.iclosed_call_id || a.ghl_appointment_id)) return false;
+      if (a.qualification_snapshot?.iclosed?.cancelled === true) return false;
+      if (a.qualification_snapshot?.ghl?.cancelled === true) return false;
+      if (excludeIds.has(a.iclosed_call_id)) return false;
+      const latest = a.prospect_id ? latestStartByProspect[a.prospect_id] : null;
+      if (latest && latest > String(a.scheduled_start)) { orphanSkipped += 1; return false; }
+      return true;
+    });
+    if (orphanSkipped) {
+      console.log(`Unlogged-outcome reminders: skipped ${orphanSkipped} orphaned call(s) — prospect rebooked, outcome would attach to the newer appointment.`);
+    }
 
     if (!dueCalls.length) {
       console.log('Unlogged-outcome reminders: no due calls in window.');
