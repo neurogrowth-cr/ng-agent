@@ -7885,6 +7885,88 @@ function findAttendedCall(appointments) {
   return attended[0] || null;
 }
 
+// ── STAGE + CLIENT GUARDRAILS ───────────────────────────────────────────────────
+// The nudge is built on conversations, which say nothing about where a prospect
+// actually sits in the pipeline. Without these gates, someone who booked a call — or
+// who already became a paying CLIENT — is exactly as eligible for a "you went quiet"
+// chase as a cold lead.
+const APPT_PIPELINE_STAGE_LABELS = {
+  '93de6a09-78a4-4253-bea4-c1528ed6f2b3': 'New Lead',
+  '4b936528-794e-40ab-812d-144b9d5e8128': 'Initial Contact',
+  '92245916-0622-4f46-aabc-6091b8af5fc0': 'Strike 1',
+  '6274c958-8252-4698-acc6-c6818d43a99f': 'Strike 2',
+  'e639662d-6b1b-42b5-a89d-7ebd70ca97e3': 'Strike 3',
+  'dc1fba03-abeb-4b47-9d29-6c308002b6c1': 'Call Booked',
+  '6432cf1d-a07f-4276-8b85-77de2e57a512': 'No show / Rescheduling',
+  '63d30181-4ec0-4daa-8832-a8eebe1afbeb': 'Open Deal',
+  'a6c8ecb1-a9b5-46a5-8683-f6a9720cfcc9': 'Closed',
+  '49cd4227-204c-4052-af94-78b961e96fab': 'No Fit',
+  '8eff3fbb-3cc0-474f-bbe7-df4704e0a668': 'Lost',
+};
+
+// ALLOW-LIST by design. Every closer stage (Call Booked, No show / Rescheduling,
+// Open Deal, Closed, No Fit, Lost) is excluded by omission, so a stage added to the
+// pipeline later is excluded until somebody deliberately opts it in — the safe
+// default for a gate whose job is to prevent unwanted outreach.
+// New Lead is excluded too: a card still sitting there has never been worked, which
+// is runStaleLeadNagCheck's job (claim the lead), not re-engagement.
+const NUDGEABLE_STAGE_IDS = new Set([
+  '4b936528-794e-40ab-812d-144b9d5e8128', // Initial Contact
+  '92245916-0622-4f46-aabc-6091b8af5fc0', // Strike 1
+  '6274c958-8252-4698-acc6-c6818d43a99f', // Strike 2
+  'e639662d-6b1b-42b5-a89d-7ebd70ca97e3', // Strike 3
+]);
+
+// Note this only inspects the Appointment Setting pipeline. A VSL self-booked
+// opportunity lives in pipeline 7KU0NBdMhhVifszmT9jo and would not appear here — the
+// appointment gates above are what catch those, since they read bookings directly
+// from GHL regardless of which pipeline the card sits in.
+async function findNudgeableOpp(contactId) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  try {
+    const data = await ghlFetchJson(
+      `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}`
+      + `&pipeline_id=${STRIKE_PIPELINE_ID}&contact_id=${contactId}&status=open&limit=5`,
+    );
+    const opps = data.opportunities || [];
+    if (!opps.length) return { opp: null, reason: 'no_open_setter_opp' };
+    const match = opps.find(o => NUDGEABLE_STAGE_IDS.has(o.pipelineStageId));
+    if (match) return { opp: match, reason: null };
+    const label = APPT_PIPELINE_STAGE_LABELS[opps[0].pipelineStageId] || opps[0].pipelineStageId;
+    return { opp: null, reason: `stage_not_nudgeable:${label}` };
+  } catch (err) {
+    // FAIL CLOSED. This gate exists to keep clients and booked prospects out of the
+    // chase list; an unverifiable stage must never become an implicit "go ahead".
+    return { opp: null, reason: `opp_lookup_failed:${err.message}` };
+  }
+}
+
+// Paying clients must never be chased as leads. Stage alone cannot guarantee that: a
+// client's old setter card may still sit in a strike stage because nobody moved it,
+// and duplicate contacts can hold a stray open opp. Portal `client_dashboards` is the
+// billing-side source of truth.
+//
+// Returns null when it cannot be read, and callers treat null as "cannot verify" and
+// hold EVERY nudge for that run. Sending nothing for one cycle costs a day; messaging
+// a paying client as if they were a cold lead costs trust.
+async function loadActiveClientEmails() {
+  try {
+    const { data, error } = await portalSupabase
+      .from('client_dashboards')
+      .select('email')
+      .eq('is_active', true);
+    if (error) throw new Error(error.message);
+    const set = new Set((data || []).map(r => String(r.email || '').toLowerCase().trim()).filter(Boolean));
+    // Zero rows means the query "worked" but told us nothing useful — treat as
+    // unverifiable rather than as "there are no clients".
+    if (!set.size) throw new Error('client_dashboards returned zero emails');
+    return set;
+  } catch (err) {
+    console.error('loadActiveClientEmails failed — holding all stalled nudges this run:', err.message);
+    return null;
+  }
+}
+
 // A call that has already happened but is STILL marked 'confirmed' — i.e. the closer
 // hasn't logged showed/no-show yet. Outcome logging routinely lags by days, so this
 // state is common and ambiguous: the prospect may well have attended. Hold the nudge
@@ -7930,7 +8012,7 @@ async function getStalledFollowupHistory(contactId) {
   } catch (_) { return { lifetime: 0, lastSentMs: null }; }
 }
 
-async function evaluateStalledCandidate(convo, ghlUserNames) {
+async function evaluateStalledCandidate(convo, ghlUserNames, clientEmails) {
   const reasons = [];
   const setterGhlId = (convo.assignedTo || '').toString();
   const setterName  = ghlUserNames[setterGhlId] || ghlUserNames[setterGhlId.toLowerCase()] || null;
@@ -7966,8 +8048,16 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
 
   const tags = (contact.tags || []).map(t => String(t).toLowerCase());
   for (const t of tags) if (DNC_TAGS.has(t)) return { skip: `dnc_tag:${t}`, setterSlackId };
+  // Won deals carry this tag from the Opportunity Won workflow — never chase them.
+  if (tags.includes('won-deal')) return { skip: 'won_deal_tag', setterSlackId };
 
   if (await isStalledFollowupPaused(convo.contactId)) return { skip: 'setter_paused', setterSlackId };
+
+  // Client gate — see loadActiveClientEmails. null means "could not verify", and the
+  // safe answer to that is silence.
+  if (!clientEmails) return { skip: 'client_check_unavailable', setterSlackId };
+  const contactEmail = String(contact.email || '').toLowerCase().trim();
+  if (contactEmail && clientEmails.has(contactEmail)) return { skip: 'is_client', setterSlackId };
 
   // One GHL fetch, both booking gates (see ghlGetContactAppointments — the old
   // revops_iclosed_bookings lookups went dead at the GHL cutover and were failing open).
@@ -7982,6 +8072,11 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
   const pendingOutcome = findAppointmentPendingOutcome(appointments);
   if (pendingOutcome) return { skip: `appointment_pending_outcome:${pendingOutcome.event_at}`, setterSlackId };
 
+  // Stage gate last — it is the most expensive check, so let the cheap disqualifiers
+  // run first. Only Initial Contact and the strikes may be nudged.
+  const { opp, reason: stageReason } = await findNudgeableOpp(convo.contactId);
+  if (!opp) return { skip: stageReason, setterSlackId };
+
   return {
     skip: null,
     setterSlackId,
@@ -7991,6 +8086,7 @@ async function evaluateStalledCandidate(convo, ghlUserNames) {
     ageDays: Math.floor((Date.now() - convo.lastMessageDate) / (24 * 60 * 60 * 1000)),
     contactId: convo.contactId,
     conversationId: convo.id,
+    stage: APPT_PIPELINE_STAGE_LABELS[opp.pipelineStageId] || opp.pipelineStageId,
   };
 }
 
@@ -8031,10 +8127,16 @@ async function runStalledProspectFollowups(correlationId) {
     'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   };
 
+  // Loaded once per run rather than per candidate. If this comes back null the
+  // client gate can't be evaluated and every candidate is held — see
+  // loadActiveClientEmails.
+  const clientEmails = await loadActiveClientEmails();
+  if (!clientEmails) console.warn('stalled-cron: client list unavailable — every candidate will be held this run.');
+
   const skipCounts = {};
   const claimable = [];
   for (const c of candidates) {
-    const result = await evaluateStalledCandidate(c, ghlUserNames);
+    const result = await evaluateStalledCandidate(c, ghlUserNames, clientEmails);
     if (result.skip) {
       skipCounts[result.skip.split(':')[0]] = (skipCounts[result.skip.split(':')[0]] || 0) + 1;
       console.log(`stalled-skip ${c.contactId}: ${result.skip}`);
@@ -8115,22 +8217,25 @@ async function runStalledProspectFollowups(correlationId) {
       }
 
       if (isApproval) {
-        // Post draft to Ron's DM with campaign_draft metadata. The existing
-        // reaction handler will handle ✅ → send + audit row, ❌ → skip.
+        // Post the draft to the ASSIGNED SETTER's DM (Ron 2026-07-29 — he does not
+        // want to be the approver: "I want the DMs to the setters"). The setter owns
+        // the conversation, so they are the right person to judge the draft, and it
+        // keeps Ron out of a per-message loop. Ron still receives the run summary.
+        // Approval remains human: nothing reaches the prospect without a ✅.
         const ghlLink = `https://app.gohighlevel.com/v2/location/${locationId}/contacts/detail/${r.contactId}`;
         const postText = [
-          `📤 *${r.contactName}* — ${r.ageDays}d stale | WhatsApp | setter: ${r.setterName}`,
-          `_Last (prospect):_ "${r.lastBody}"`,
+          `📤 *${r.contactName}* — ${r.ageDays}d sin respuesta | ${r.stage} | WhatsApp`,
+          `_Último mensaje (prospecto):_ "${r.lastBody}"`,
           ``,
-          `*Draft:*`,
+          `*Borrador:*`,
           `> ${draftText}`,
           ``,
-          `✅ to send · ❌ to skip · ✏️ revise (DM: \`revise ${r.contactId}: <new text>\`)`,
+          `✅ para enviar · ❌ para descartar · ✏️ editar (DM: \`revise ${r.contactId}: <nuevo texto>\`)`,
           `🔗 ${ghlLink}`,
         ].join('\n');
         try {
           await slack.client.chat.postMessage({
-            channel: RON_SLACK_ID,
+            channel: r.setterSlackId,
             text: postText,
             metadata: {
               event_type: 'campaign_draft',
@@ -8146,7 +8251,7 @@ async function runStalledProspectFollowups(correlationId) {
             },
           });
           approvalDrafts.push({ ...r, message: draftText });
-          logActivity({ event_type: 'stalled_followup_draft_posted', event_source: 'cron', action: 'outbound', actor_user_id: RON_SLACK_ID, output: { contact_id: r.contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
+          logActivity({ event_type: 'stalled_followup_draft_posted', event_source: 'cron', action: 'outbound', actor_user_id: r.setterSlackId, channel_id: r.setterSlackId, output: { contact_id: r.contactId, draft_text: draftText.slice(0, 500) }, correlation_id: correlationId });
         } catch (err) {
           console.error(`stalled approval-draft post failed for ${r.contactId}: ${err.message}`);
           liveSkips.post_failed = (liveSkips.post_failed || 0) + 1;
@@ -8231,7 +8336,9 @@ async function runStalledProspectFollowups(correlationId) {
   const modeLabel = mode.toUpperCase().replace('_', '-');
   let actionLine;
   if (isLive)          actionLine = `Sent: ${liveSent.length}${liveSkipBreakdown ? ` | Live-skip: ${liveSkipBreakdown}` : ''}`;
-  else if (isApproval) actionLine = `Drafts posted for approval: ${approvalDrafts.length}${liveSkipBreakdown ? ` | Skip: ${liveSkipBreakdown}` : ''}\n_React ✅ on each draft DM to send · ❌ to skip · DM \`revise <contact_id>: <new text>\` to edit before sending._`;
+  else if (isApproval) actionLine = `Drafts sent to setters for approval: ${approvalDrafts.length}${liveSkipBreakdown ? ` | Skip: ${liveSkipBreakdown}` : ''}`
+    + (approvalDrafts.length ? `\n${approvalDrafts.map(d => `• ${d.setterName} → ${d.contactName} (${d.stage}, ${d.ageDays}d)`).join('\n')}` : '')
+    + `\n_Each setter approves their own draft in DM (✅ send · ❌ skip · \`revise <contact_id>: <text>\`). Nothing reaches a prospect without a ✅._`;
   else                 actionLine = totalSendable > 0 ? `Setter DMs sent: ${Object.keys(bySetter).length}` : '_(no setter DMs sent — no eligible prospects today)_';
   const summary = [
     `📊 *Stalled prospect ${mode.replace('_', '-')} summary* (${modeLabel})`,
@@ -8917,16 +9024,33 @@ slack.event('reaction_added', async ({ event }) => {
     // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
     const baseEmoji = String(event.reaction || '').split('::')[0];
 
-    // Route 1: campaign-draft DM (Ron approves/skips a generated re-engagement message)
+    // Route 1: campaign-draft DM — Ron OR the assigned setter approves/skips a
+    // generated re-engagement message. Stalled-cron drafts now land in the setter's
+    // own DM (they own the conversation), so gating on Ron alone would leave those
+    // reactions silently inert. Ownership is re-checked against the draft metadata
+    // below; a DM channel is private to its member, so a setter can only ever react
+    // to their own drafts.
     const isCampaignChannel = event.item.channel && event.item.channel.startsWith('D');
     const isCampaignEmoji   = CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji);
-    if (isCampaignChannel && isCampaignEmoji && event.user === RON_SLACK_ID) {
+    const isKnownApprover   = event.user === RON_SLACK_ID || !!SLACK_TO_GHL_USER[event.user];
+    if (isCampaignChannel && isCampaignEmoji && isKnownApprover) {
       try {
         const dmHistory = await slack.client.conversations.history({
           channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
         });
         const dmMsg = dmHistory.messages && dmHistory.messages[0];
         const dmMeta = dmMsg?.metadata?.event_type === 'campaign_draft' ? dmMsg.metadata.event_payload : null;
+        // Ownership: Ron may approve anything; a setter may approve only a draft
+        // addressed to them. Drafts with no setter_slack_id (Ron's manual `campaign:`
+        // flow) stay Ron-only.
+        const ownsDraft = dmMeta && (
+          event.user === RON_SLACK_ID ||
+          (dmMeta.setter_slack_id && event.user === dmMeta.setter_slack_id)
+        );
+        if (dmMeta && !ownsDraft) {
+          console.log(`campaign-draft ${dmMeta.contact_id}: reaction from ${event.user} is not the assigned approver, ignoring`);
+          return;
+        }
         if (dmMeta) {
           // Already actioned? Look for an existing Max-applied ✅ or ❌ on this message
           const existing = (dmMsg.reactions || []).find(r => (CAMPAIGN_APPROVE_EMOJIS.has(r.name) || CAMPAIGN_SKIP_EMOJIS.has(r.name)) && r.users?.includes(process.env.SLACK_BOT_USER_ID));

@@ -68,6 +68,30 @@ check('no appointments leaves all gates open',
   [g.findFutureBooking([], NOW), g.findAttendedCall([]), g.findAppointmentPendingOutcome([], NOW)],
   [null, null, null]);
 
+// ── Stage allow-list ─────────────────────────────────────────────────────────
+// The nudge reads conversations, which say nothing about pipeline position. This
+// allow-list is what keeps a booked prospect — or a paying client whose old setter
+// card never moved — out of the chase list. Locked down here so widening it has to
+// be deliberate.
+const stageBlock = SRC.slice(
+  SRC.indexOf('const APPT_PIPELINE_STAGE_LABELS'),
+  SRC.indexOf('async function findNudgeableOpp'),
+);
+const s = new Function(`${stageBlock}; return { APPT_PIPELINE_STAGE_LABELS, NUDGEABLE_STAGE_IDS };`)();
+const stageId = (name) => Object.keys(s.APPT_PIPELINE_STAGE_LABELS)
+  .find(k => s.APPT_PIPELINE_STAGE_LABELS[k] === name);
+
+for (const name of ['Initial Contact', 'Strike 1', 'Strike 2', 'Strike 3']) {
+  check(`nudgeable: ${name}`, s.NUDGEABLE_STAGE_IDS.has(stageId(name)), true);
+}
+// New Lead is the stale-lead nag's territory (nobody has worked it yet), not
+// re-engagement. Everything from Call Booked onward is a closer stage.
+for (const name of ['New Lead', 'Call Booked', 'No show / Rescheduling', 'Open Deal', 'Closed', 'No Fit', 'Lost']) {
+  check(`NOT nudgeable: ${name}`, s.NUDGEABLE_STAGE_IDS.has(stageId(name)), false);
+}
+check('allow-list holds exactly four stages', s.NUDGEABLE_STAGE_IDS.size, 4);
+check('every pipeline stage has a readable label', Object.keys(s.APPT_PIPELINE_STAGE_LABELS).length, 11);
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);
