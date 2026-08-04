@@ -2167,8 +2167,10 @@ async function getMetaAdsSummary(datePreset = 'last_7d') {
     const cpm      = parseFloat(d.cpm   || 0).toFixed(2);
     // Form funnel CPL (lead action = Form campaigns only; VSL funnel not counted here)
     const formCpl  = parseInt(leads) > 0 ? (parseFloat(spend) / parseInt(leads)).toFixed(2) : 'N/A';
-    // CAC = spend / Meta Purchase events (fired via CAPI when a won outcome is logged;
-    // re-homed off the dead iClosed pixel 2026-08-03 — see the won-outcome DB trigger + Make)
+    // CAC = spend / Meta Purchase events. Fired via CAPI by Make scenario 5148801
+    // '[PROD] GHL Opp Won → CAPI Purchase' (GHL Opp-Won workflow trigger) — the
+    // replacement for the iClosed-fired pixel, live since the 2026-07-23 cutover
+    // (verified end-to-end 2026-08-03: 3 purchase events in Meta, last 14d)
     const cac      = parseInt(purchases) > 0 ? (parseFloat(spend) / parseInt(purchases)).toFixed(2) : 'N/A';
     return [
       `Meta Ads — ${datePreset.replace(/_/g,' ')}:`,
@@ -4074,8 +4076,9 @@ async function _scrapeMetaFormCplToday() {
   return +(totalSpend / totalLeads).toFixed(2);
 }
 
-// CAC — spend / Meta `purchase` actions (fired via CAPI on won outcomes since 2026-08-03;
-// the original iClosed-fired pixel died at the 2026-07-23 cutover)
+// CAC — spend / Meta `purchase` actions. Fired via CAPI by Make scenario 5148801
+// (GHL Opp Won → Purchase) since the 2026-07-23 cutover; the original
+// iClosed-fired pixel died with iClosed.
 async function _scrapeMetaCacToday() {
   const row = await _metaAccountInsights('today');
   if (!row) return null;
