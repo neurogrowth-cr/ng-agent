@@ -1090,7 +1090,7 @@ function registerDynamicCron(task) {
       const clientCtxBlock = recentClientCtx?.length
         ? `\n\nRECENT CLIENT UPDATES FROM TEAM (last 7 days — apply where relevant):\n${recentClientCtx.map(r => `• ${(r.key.split(':')[1] || r.key).replace(/-/g, ' ')}: ${r.value}`).join('\n')}`
         : '';
-      // Task-specific pre-computed data blocks (iClosed-first, etc).
+      // Task-specific pre-computed data blocks (GHL-first, etc).
       // For the Weekly Sales Pod Leaderboard (task name: "Weekly Closer Comparison"),
       // inject both closer and setter stats so the report renders TOP CLOSERS + TOP SETTERS
       // without relying on self-reported EOD as primary truth.
@@ -1313,7 +1313,6 @@ function registerDynamicCron(task) {
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
         'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
         'Daily Sales Call Roster':          [], // short on quiet days
-        'Daily iClosed Call Roster':        [], // legacy name — renamed 2026-07-26
       };
 
       function validateFinalReport(text, taskName) {
@@ -2168,14 +2167,15 @@ async function getMetaAdsSummary(datePreset = 'last_7d') {
     const cpm      = parseFloat(d.cpm   || 0).toFixed(2);
     // Form funnel CPL (lead action = Form campaigns only; VSL funnel not counted here)
     const formCpl  = parseInt(leads) > 0 ? (parseFloat(spend) / parseInt(leads)).toFixed(2) : 'N/A';
-    // CAC = spend / iClosed sales (purchase pixel fires when closer marks outcome = sale)
+    // CAC = spend / Meta Purchase events (fired via CAPI when a won outcome is logged;
+    // re-homed off the dead iClosed pixel 2026-08-03 — see the won-outcome DB trigger + Make)
     const cac      = parseInt(purchases) > 0 ? (parseFloat(spend) / parseInt(purchases)).toFixed(2) : 'N/A';
     return [
       `Meta Ads — ${datePreset.replace(/_/g,' ')}:`,
       `Spend: $${spend} | Impressions: ${parseInt(d.impressions||0).toLocaleString()} | Reach: ${parseInt(d.reach||0).toLocaleString()}`,
       `Clicks: ${parseInt(d.clicks||0).toLocaleString()} | CTR: ${ctr}% | CPC: $${cpc} | CPM: $${cpm}`,
       leads !== '0'     ? `Form leads: ${leads} | Form CPL: $${formCpl}` : 'Form leads: 0 (no lead pixel fires — VSL funnel not counted)',
-      purchases !== '0' ? `iClosed sales (purchase pixel): ${purchases} | CAC: $${cac}` : 'iClosed sales (purchase pixel): 0',
+      purchases !== '0' ? `Sales (Meta Purchase events): ${purchases} | CAC: $${cac}` : 'Sales (Meta Purchase events): 0',
     ].join('\n');
   } catch (err) { return `Meta Ads summary error: ${err.message}`; }
 }
@@ -2708,9 +2708,14 @@ function isUnresolvedSalesId(name) {
 // GHL_SALES_CALENDAR_IDS allowlist. If a non-sales calendar ever joins GHL,
 // gate it in dash — do NOT add a second allowlist here (it would drift).
 const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc', 'estrategia-linkedin-flywheel-selfserving-ron']);
+// Permanent boot-time memo (was a 10-min TTL): iclosed_webhook_deliveries is
+// frozen since the 2026-07-23 cutover, so the answer can never change within a
+// process lifetime. The 120d window empties ~2026-11-20, after which this
+// returns an empty set forever and the function + iclosed_call_id filtering
+// can be deleted outright.
 let _nonFlywheelCache = { ids: null, fetchedAt: 0 };
 async function getNonFlywheelCallIds() {
-  if (_nonFlywheelCache.ids && (Date.now() - _nonFlywheelCache.fetchedAt) < 10 * 60 * 1000) {
+  if (_nonFlywheelCache.ids) {
     return _nonFlywheelCache.ids;
   }
   const since = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000).toISOString();
@@ -3469,17 +3474,28 @@ async function runMondayGapDetection(_correlationId) {
       const nowTs = Date.now();
       const salesGapLines = [];
 
-      // a. No-shows with no reschedule in last 7 days (flywheel-only)
+      // a. No-shows with no reschedule in last 7 days (flywheel-only).
+      // Keyed on the logged OUTCOME (classifyOutcome — same truth as every
+      // other surface), NOT on attended=false, which GHL also sets on
+      // CANCELLED calls and would nag closers about cancellations. The 7d
+      // window is inherently post-cutover, so no explicit floor needed.
       const sevenDaysAgo = new Date(nowTs - 7 * 24 * 60 * 60 * 1000).toISOString();
       const excludeIds = await getNonFlywheelCallIds();
-      const { data: noShowsRaw } = await portalSupabase
+      const { data: recentApptsRaw } = await portalSupabase
         .from('revops_appointments')
         .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, prospect:prospect_id(full_name)')
-        .eq('attended', false)
-        .gte('scheduled_start', sevenDaysAgo);
-      const noShows = filterFlywheelAppts(noShowsRaw, excludeIds);
+        .gte('scheduled_start', sevenDaysAgo)
+        .lte('scheduled_start', new Date(nowTs).toISOString());
+      const recentAppts = filterFlywheelAppts(recentApptsRaw, excludeIds);
 
-      if (noShows && noShows.length) {
+      if (recentAppts && recentAppts.length) {
+        const { data: recentOutcomes } = await portalSupabase
+          .from('revops_sales_outcomes')
+          .select('appointment_id, outcome')
+          .in('appointment_id', recentAppts.map(a => a.id));
+        const outcomeByAppt = Object.fromEntries((recentOutcomes || []).map(o => [o.appointment_id, o]));
+        const noShows = recentAppts.filter(a => classifyOutcome(outcomeByAppt[a.id]).noShow);
+
         const noShowFlags = [];
         for (const appt of noShows) {
           const { data: future } = await portalSupabase
@@ -3500,35 +3516,11 @@ async function runMondayGapDetection(_correlationId) {
         }
       }
 
-      // b. Outcomes not logged (attended ≥48h ago, no outcome record)
-      const fortyEightHAgo = new Date(nowTs - 48 * 60 * 60 * 1000).toISOString();
-      const fourteenDaysAgo = new Date(nowTs - 14 * 24 * 60 * 60 * 1000).toISOString();
-      const { data: attendedRaw } = await portalSupabase
-        .from('revops_appointments')
-        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, prospect:prospect_id(full_name)')
-        .eq('attended', true)
-        .lte('scheduled_start', fortyEightHAgo)
-        .gte('scheduled_start', fourteenDaysAgo);
-      const attended = filterFlywheelAppts(attendedRaw, excludeIds);
-
-      if (attended && attended.length) {
-        const attendedIds = attended.map(a => a.id);
-        const { data: outcomes } = await portalSupabase
-          .from('revops_sales_outcomes')
-          .select('appointment_id')
-          .in('appointment_id', attendedIds);
-        const loggedSet = new Set((outcomes || []).map(o => o.appointment_id));
-        const unlogged = attended.filter(a => !loggedSet.has(a.id));
-        if (unlogged.length) {
-          const unloggedLines = unlogged.map(a => {
-            const pName = a.prospect?.full_name || 'Unknown';
-            const dStr  = formatICTime(a.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-            const closerName = resolveSalesMember(a.closer_id);
-            return `• ${pName} — ${dStr} — please log the outcome in GHL`;
-          });
-          salesGapLines.push(`Outcomes not logged (held >48h, no outcome in GHL):\n${unloggedLines.join('\n')}`);
-        }
-      }
+      // (The former "Outcomes not logged" section was deleted 2026-08-03: it
+      // duplicated the daily 4 PM runUnloggedOutcomeReminders — which owns
+      // that surface with per-call nudge counts, orphan-skip, and cancelled
+      // exclusion — and, keyed on the once-dead attended boolean, it went from
+      // silently empty to noisy-and-wrong when GHL started populating attended.)
 
       // c. Stale inbound leads >72h with no setter response
       const ghlRaw = await getGHLConversations(100);
@@ -4082,7 +4074,8 @@ async function _scrapeMetaFormCplToday() {
   return +(totalSpend / totalLeads).toFixed(2);
 }
 
-// CAC (iClosed sales, attributed via Meta `purchase` pixel fired on sale outcome)
+// CAC — spend / Meta `purchase` actions (fired via CAPI on won outcomes since 2026-08-03;
+// the original iClosed-fired pixel died at the 2026-07-23 cutover)
 async function _scrapeMetaCacToday() {
   const row = await _metaAccountInsights('today');
   if (!row) return null;
@@ -4526,10 +4519,10 @@ function _businessDaysBetween(fromMs, toMs) {
   return count;
 }
 
-// THE swap point for the iClosed→GHL migration: sales calls that took place in
-// [sinceISO, now). Today that truth lives in portal revops_appointments
-// (flywheel-only); post-cutover this ONE function re-points at the GHL-native
-// appointment source and the cross-checks never change.
+// Sales calls that took place in [sinceISO, now), flywheel-only. Reads portal
+// revops_appointments — GHL-native since the 2026-07-23 cutover (this function
+// was the designated migration swap point; the swap already happened upstream
+// in dash, so no code change was needed).
 // NOTE: deliberately NOT metric_observations/iclosed_calls_held_yest — that
 // metric has logged zeros for months (audit INS-09) and would silence the check.
 async function _countSalesCallsSince(sinceISO) {
@@ -4605,11 +4598,13 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
 const METRIC_REGISTRY = [
   // Marketing — per-funnel CPL signals (blended CPL is meaningless across two funnels)
   { name: 'meta_form_cpl_today',          domain: 'marketing',   scrape: _scrapeMetaFormCplToday,          label: 'Meta Form CPL (today)' },
-  { name: 'meta_cac_today',               domain: 'marketing',   scrape: _scrapeMetaCacToday,               label: 'Meta CAC via iClosed purchase pixel (today)' },
+  { name: 'meta_cac_today',               domain: 'marketing',   scrape: _scrapeMetaCacToday,               label: 'Meta CAC via Meta Purchase events (today)' },
   { name: 'meta_cost_per_booking_today',  domain: 'marketing',   scrape: _scrapeMetaCostPerBookingToday,    label: 'Meta cost-per-booking (today)' },
   // Lead volume — GHL is the universal truth-source (covers both VSL + Form funnels)
   { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'GHL new contacts (today)' },
-  // Call pipeline — iClosed revops_appointments is the truth-source for booked/held
+  // Call pipeline — revops_appointments (GHL-native since 2026-07-23) is the truth-source.
+  // NOTE: the iclosed_* metric KEYS are historical and frozen ON PURPOSE — they are
+  // primary keys in metric_observations with baseline history. Rename = severed baselines.
   { name: 'iclosed_calls_booked_yest',    domain: 'sales',       scrape: _scrapeIclosedCallsBookedYesterday, label: 'Sales calls booked (yesterday)' },
   { name: 'iclosed_calls_held_yest',      domain: 'sales',       scrape: _scrapeIclosedCallsHeldYesterday,   label: 'Sales calls held (yesterday)' },
   { name: 'iclosed_sales_yest',           domain: 'sales',       scrape: _scrapeIclosedSalesYesterday,       label: 'Sales won (yesterday)' },
@@ -5630,102 +5625,10 @@ slack.message(async ({ message, say }) => {
   } catch (err) { console.error('Claude API error (DM):', err); await say('Got turned around for a second — go ahead and ask again.'); }
 });
 
-// iClosed booking relay — when iClosed posts a "Strategy call booked" notification
-// for an Appointment Setting Pipeline call, post a threaded reply revealing the
-// setter (and broadcast it back to the channel via reply_broadcast: true).
-// VSL self-bookings and other event types are ignored.
-slack.event('message', async ({ event }) => {
-  try {
-    if (!event || event.subtype && event.subtype !== 'bot_message') return;
-    if (event.thread_ts) return; // only react to top-level posts
-    if (event.channel !== LEAD_CHANNEL_ID) return;
-
-    const isFromBot = !!(event.bot_id || event.app_id || (event.subtype === 'bot_message'));
-    if (!isFromBot) return;
-
-    // Bolt sometimes hides the rendered text inside attachments/blocks
-    const flatText = [
-      event.text || '',
-      ...(event.attachments || []).flatMap(a => [a.text || '', a.pretext || '', a.fallback || '', ...(a.fields || []).map(f => `${f.title || ''} ${f.value || ''}`)]),
-      ...(event.blocks || []).flatMap(b => (b.elements || []).flatMap(el => (el.elements || []).map(e => e.text || '')))
-    ].join('\n');
-
-    if (!/Strategy call booked/i.test(flatText)) return;
-    if (!/Event:\s*LinkedIn Flywheel\s*-\s*Appointment/i.test(flatText)) return;
-
-    // Dedup
-    const dedupKey = `iclosed-setter-reveal-${event.ts}`;
-    const { data: prior } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
-    if (prior && prior.length) return;
-
-    // Extract prospect email — first email that isn't a known closer/setter email.
-    const emails = (flatText.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || []);
-    const prospectEmail = emails.find(e => !SALES_TEAM_MAP[e] && !SALES_TEAM_MAP[e.toLowerCase()]) || null;
-
-    // Best-effort prospect name — first line, or text before "(email)"
-    let prospectName = '';
-    const nameMatch = flatText.match(/^([^\n<]+?)\s*[<(]/);
-    if (nameMatch) prospectName = nameMatch[1].trim();
-
-    if (!prospectEmail && !prospectName) {
-      console.log(`iClosed relay: could not extract prospect identity from ts=${event.ts} — skipping.`);
-      return;
-    }
-
-    const setterInfo = await resolveSetterForContact(prospectEmail, prospectName);
-    const setterSlackId = setterInfo.setter ? resolveSetterSlackId(setterInfo.setter) : null;
-    const setterTag = setterSlackId ? `<@${setterSlackId}>` : setterInfo.setter;
-
-    let replyText;
-    if (setterInfo.source === 'appointment-setting' && setterTag) {
-      replyText = `👤 Setter: ${setterTag}`;
-    } else if (setterInfo.source === 'appointment-setting') {
-      replyText = `👤 Setter: appointment-setting pipeline (setter unmapped — check GHL).`;
-    } else {
-      replyText = `👤 Setter: not found in Appointment Setting Pipeline (check GHL).`;
-    }
-
-    await slack.client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: replyText,
-    });
-
-    // DM the setter with booking details so they don't miss it. Only fires when
-    // we successfully resolved a Slack ID (otherwise we have no one to DM).
-    if (setterSlackId) {
-      try {
-        const dateMatch = flatText.match(/Date:\s*([^\n]+)/i);
-        const timeMatch = flatText.match(/Time:\s*([^\n]+)/i);
-        const hostMatch = flatText.match(/Host:\s*([^\n(]+?)(?=\s*[(\n]|$)/i);
-        const permalinkRes = await slack.client.chat.getPermalink({ channel: event.channel, message_ts: event.ts }).catch(() => null);
-        const permalink = permalinkRes && permalinkRes.permalink ? permalinkRes.permalink : null;
-
-        const prospectLabel = prospectName
-          ? `${prospectName}${prospectEmail ? ` (${prospectEmail})` : ''}`
-          : (prospectEmail || 'a prospect');
-
-        const dmLines = [
-          `🎯 *Your lead booked a strategy call*`,
-          `*Prospect:* ${prospectLabel}`,
-        ];
-        if (dateMatch) dmLines.push(`*Date:* ${dateMatch[1].trim()}`);
-        if (timeMatch) dmLines.push(`*Time:* ${timeMatch[1].trim()}`);
-        if (hostMatch) dmLines.push(`*Closer:* ${hostMatch[1].trim()}`);
-        if (permalink) dmLines.push(`<${permalink}|View in #ng-sales-goats>`);
-
-        await slack.client.chat.postMessage({ channel: setterSlackId, text: dmLines.join('\n') });
-      } catch (dmErr) {
-        console.error('iClosed relay DM error:', dmErr.message);
-      }
-    }
-
-    await upsertKnowledge('intel', dedupKey, `Setter reveal posted for iClosed booking ${prospectEmail || prospectName}: ${replyText}`, 'iclosed-relay');
-    console.log(`iClosed relay: posted setter reveal for ${prospectEmail || prospectName} → ${replyText}${setterSlackId ? ' (+ DM)' : ''}`);
-  } catch (err) {
-    console.error('iClosed relay error:', err.message);
-  }
-});
+// (The iClosed booking relay that lived here — threaded setter reveals on
+// iClosed's "Strategy call booked" posts — was deleted 2026-08-03. iClosed
+// was decommissioned 2026-07-23; booked alerts now come from Make scenario
+// 5148796 with different text, so the handler could never match again.)
 
 // @mention handler
 slack.event('app_mention', async ({ event, say }) => {
@@ -5895,64 +5798,8 @@ const CLOSER_SLACK = {
   'zogw530idnpofqqnfssc': 'U05HXGX18H3', 'zoGW530iDnPOFqQNfssc': 'U05HXGX18H3', // Ron
 };
 
-// Pull the prospect's iClosed booking intake (questions_and_answers + event + booked-from)
-// from the raw webhook deliveries. Used as a fallback when no GHL contact exists
-// (public-scheduler self-bookings never sync to GHL).
-async function fetchIClosedIntakeForProspect(prospectId) {
-  if (!prospectId) return null;
-  try {
-    const { data, error } = await portalSupabase
-      .from('iclosed_webhook_deliveries')
-      .select('normalized_event_type, payload, created_at')
-      .eq('prospect_id', prospectId)
-      .order('created_at', { ascending: false })
-      .limit(10);
-    if (error || !data || !data.length) return null;
-
-    const norm  = (raw) => Array.isArray(raw) ? raw[0] : raw;
-    const hasQA = (p) => {
-      if (!p) return false;
-      if (Array.isArray(p.questions_and_answers) && p.questions_and_answers.length) return true;
-      if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object' && Object.keys(p.questionsAndAnswers).length) return true;
-      return false;
-    };
-    const booked   = data.find(r => r.normalized_event_type === 'Call booked' && hasQA(norm(r.payload)));
-    const richest  = data.find(r => hasQA(norm(r.payload)));
-    const pick     = booked || richest || data[0];
-    const p        = norm(pick.payload);
-    if (!p) return null;
-
-    const BOILERPLATE = new Set(['full name', 'phone number', 'email address', 'email', 'phone']);
-    const qa = [];
-    if (Array.isArray(p.questions_and_answers)) {
-      for (const r of p.questions_and_answers) {
-        const q = (r?.question || '').trim();
-        const a = (r?.answer   || '').trim();
-        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
-      }
-    } else if (p.questionsAndAnswers && typeof p.questionsAndAnswers === 'object') {
-      for (const [k, v] of Object.entries(p.questionsAndAnswers)) {
-        if (/_question$|_response$/.test(k)) continue;
-        const q = k.trim();
-        const a = (typeof v === 'string' ? v : '').trim();
-        if (q && a && !BOILERPLATE.has(q.toLowerCase())) qa.push({ question: q, answer: a });
-      }
-    }
-
-    return {
-      eventName:  p.event_type?.name || p.event?.name || null,
-      bookedFrom: p.call_booked_from || null,
-      setterName: (p.event?.setter?.name || '').trim() || null,
-      qa,
-      timezone:   p.timeZone || p.invitee?.timezone || null,
-      country:    p.country  || null,
-      phone:      p.phoneNumber || p.invitee?.text_reminder_number || null,
-    };
-  } catch (err) {
-    console.error('fetchIClosedIntakeForProspect error:', err.message);
-    return null;
-  }
-}
+// (fetchIClosedIntakeForProspect deleted 2026-08-03 — orphaned once call prep
+// went GHL-native; iclosed_webhook_deliveries is frozen history.)
 
 // Pull the prospect's GHL booking intake from ghl_webhook_deliveries. The
 // qualification answers arrive as ROOT-LEVEL payload keys named with the literal
@@ -6118,7 +5965,7 @@ async function runSalesCallPrep(_correlationId) {
     const { data: upcomingRaw, error } = await portalSupabase
       .from('revops_appointments')
       .select(`
-        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, ghl_appointment_id, source, prospect_id,
+        id, closer_id, setter_id, scheduled_start, meeting_type, booked_at, iclosed_call_id, ghl_appointment_id, source, prospect_id, qualification_snapshot,
         prospect:prospect_id ( full_name, company, email, lead_source )
       `)
       .gte('scheduled_start', new Date(windowMin).toISOString())
@@ -6161,30 +6008,16 @@ async function runSalesCallPrep(_correlationId) {
       let sourceLine = null;
       let intake = null; // lazy — fetched at most once, reused by the fallback below
 
-      // Native setter attribution first: GHL records who booked the appointment
-      // (createdBy → setter_id upstream in dash). NULL on a GHL row means widget
-      // self-booked or closer-booked. Legacy iClosed rows fall back to the live
-      // opportunity-owner lookup + iClosed booking payload heuristics.
+      // Native setter attribution: GHL records who booked the appointment
+      // (createdBy → setter_id upstream in dash). NULL means widget self-booked
+      // or closer-booked, by design. (The legacy iClosed opportunity-owner +
+      // booking-payload heuristics that lived here were deleted 2026-08-03 —
+      // every upcoming appointment is GHL-sourced since the 2026-07-23 cutover,
+      // so the legacy arm could never fire again.)
       if (appt.setter_id) {
         sourceLine = `👤 Booked by: ${resolveSalesMember(appt.setter_id)}`;
-      } else if (appt.source === 'ghl') {
-        sourceLine = `🟢 Source: self-booked (widget or closer-booked, no setter)`;
       } else {
-        const setterInfo = await resolveSetterForContact(email, prospectName);
-        if (setterInfo.source === 'appointment-setting') {
-          sourceLine = setterInfo.setter
-            ? `👤 Booked by: ${setterInfo.setter}`
-            : `👤 Booked by: appointment-setting pipeline (setter unmapped)`;
-        } else {
-          // vsl — self-booked vs setter-unknown is decided by the iClosed booking
-          // payload (call_booked_from / event.setter), NOT by whether a GHL
-          // contact exists (bug fixed 2026-05-08/13/26 — do not reintroduce).
-          intake = await fetchIClosedIntakeForProspect(prospectId);
-          const selfBooked = !intake || intake.bookedFrom === 'PUBLIC_SCHEDULER' || !intake.setterName;
-          sourceLine = selfBooked
-            ? `🟢 Source: self-booked via iClosed (no setter)`
-            : `❓ Source: setter unknown (no appointment-setting pipeline opportunity)`;
-        }
+        sourceLine = `🟢 Source: self-booked (widget or closer-booked, no setter)`;
       }
 
       try {
@@ -6208,12 +6041,13 @@ async function runSalesCallPrep(_correlationId) {
       }
 
       // No GHL conversation found — fall back to the booking intake (the
-      // prospect's own Q&A answers): ghl_webhook_deliveries for GHL rows,
-      // iclosed_webhook_deliveries for legacy rows. If that's empty too, the
-      // section is simply left out of the brief (no dead "not found" line).
+      // prospect's own Q&A answers) from ghl_webhook_deliveries. If that's
+      // empty too, the section is simply left out of the brief. (The iClosed
+      // intake fallback was deleted 2026-08-03 — the frozen
+      // iclosed_webhook_deliveries table can never hold intake for an
+      // upcoming call, so it was a guaranteed-null query per brief.)
       if (!convoSection) {
-        if (!intake && appt.source === 'ghl') intake = await fetchGhlIntakeForProspect(prospectId);
-        if (!intake) intake = await fetchIClosedIntakeForProspect(prospectId);
+        if (!intake) intake = await fetchGhlIntakeForProspect(prospectId);
         if (intake && (intake.eventName || intake.qa.length)) {
           const lines = ['📋 No GHL message history — here\'s what they shared when booking:'];
           if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
@@ -6262,12 +6096,21 @@ async function runSalesCallPrep(_correlationId) {
         console.error(`REVI intel lookup failed for ${prospectName}:`, reviErr.message);
       }
 
+      // Lead quality score — parsed by dash from the GHL booking survey
+      // (qualification_snapshot.parsed, 0-100, threshold 50). Only rendered
+      // when present; thin bookings without a survey simply omit the line.
+      const leadScore = appt.qualification_snapshot?.parsed?.lead_quality_score;
+      const leadScoreLine = (leadScore !== null && leadScore !== undefined)
+        ? `🎯 Lead quality score: ${leadScore}/100`
+        : '';
+
       // Build the brief — GHL section only appears when there's real content.
       const briefLines = [
         `📞 *CALL PREP — ${prospectName}* | in ${hoursOut}h (${callTime} CR)`,
         company     ? `🏢 Company: ${company}` : '',
         email       ? `📧 Email: ${email}` : '',
         leadSource  ? `🔗 Lead source: ${leadSource}` : '',
+        leadScoreLine,
         sourceLine,
         ``,
       ];
@@ -6832,7 +6675,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       return;
     }
 
-    // Calls that already have an iClosed outcome logged. revops_sales_outcomes is
+    // Calls that already have an outcome logged. revops_sales_outcomes is
     // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19),
     // so we read it directly by appointment_id instead of scanning raw webhook
     // deliveries. Verified equivalent to the old webhook scan (0 mismatches over
@@ -7303,7 +7146,7 @@ cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => {
 // NOTE: the standalone Wed+Sat "SETTER LEADERBOARD" post (runSetterLeaderboard, EOD-only,
 // MTD) was retired 2026-06-02 — its content is now part of the single unified weekly
 // LEADERBOARD ("Weekly Closer Comparison" scheduled task), which renders both setters and
-// closers from the shared iClosed-first stat source so the numbers can never diverge.
+// closers from the shared GHL-first stat source so the numbers can never diverge.
 
 // Email proxy reply poller — top of every hour, 8am–8pm CR Mon–Fri.
 // Polls Gmail for new replies on active email_threads rows and DMs the setter.
@@ -8835,8 +8678,9 @@ async function sendCampaignMessage({ contactId, contactName, draftText, approver
 // was removed. It pulled setter calls/show-rate/qualified from EOD self-report
 // only, which silently diverged from the weekly pod. Setters now appear in the
 // single unified weekly LEADERBOARD ("Weekly Closer Comparison" task) alongside
-// closers, from the shared iClosed-first stat source (getSetterWeeklyStats):
-// calls attributed via setter_attributions, show rate + AQC outcome-derived.
+// closers, from the shared GHL-first stat source (getSetterWeeklyStats):
+// calls attributed via native revops_appointments.setter_id (setter_attributions is frozen
+// iClosed-era history), show rate + AQC outcome-derived.
 
 // ─── INNER CIRCLE HUDDLE EVENT LOOKUP (CACHED) ───────────────────────────────
 async function getInnerCircleHuddleEvent() {
@@ -8992,7 +8836,7 @@ healthServer.listen(process.env.PORT || 3000, () => {
 });
 
 // ─── SOCKET HEALTH ──────────────────────────────────────────────────────────
-// Max receives every inbound Slack event (iClosed setter relay, reaction-based
+// Max receives every inbound Slack event (reaction-based
 // lead claiming, @mentions, DMs) over a single Socket Mode WebSocket. Crons post
 // outbound via the bot token and keep working even when the socket is dead, so a
 // silent socket failure looks like "Max half-works" — exactly what happened when
@@ -9026,7 +8870,7 @@ function attachSocketWatchdog() {
     downTimer = setTimeout(() => {
       alerted = true;
       console.error('[socket] still down after grace window — alerting ops.');
-      alertSocketHealth('🚨 Max Socket Mode has been disconnected for 90s+ — inbound Slack events (iClosed setter reveal, reaction lead-claiming, @mentions, DMs) are NOT being processed. Crons still post. Check Railway logs / SLACK_APP_TOKEN.');
+      alertSocketHealth('🚨 Max Socket Mode has been disconnected for 90s+ — inbound Slack events (reaction lead-claiming, @mentions, DMs) are NOT being processed. Crons still post. Check Railway logs / SLACK_APP_TOKEN.');
     }, GRACE_MS);
   });
 
