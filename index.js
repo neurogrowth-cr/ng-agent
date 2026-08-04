@@ -4791,7 +4791,11 @@ async function transcribeAudio(fileBuffer, filename) {
 }
 
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
-async function callClaude(messages, retries = 3, userId = null, correlationId = null) {
+// opts.systemAppend — extra text appended to the system prompt for this call only.
+// opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
+//                     calls it, callClaude returns { structured: <tool input> } instead
+//                     of text. Used by /agent/consult for schema-constrained verdicts.
+async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
   const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -4813,7 +4817,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
 - Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
 - For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
 - Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
-      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + emailProxyGuidance;
+      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + emailProxyGuidance + (opts.systemAppend || '');
 
       const TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
@@ -4857,6 +4861,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
       ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'));
+      if (opts.finalTool) TOOLS.push(opts.finalTool);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
       async function dispatchTool(toolUse) {
@@ -4944,6 +4949,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         if (response.stop_reason !== 'tool_use') break;
 
         const toolUses = response.content.filter(b => b.type === 'tool_use');
+
+        // finalTool short-circuit: the structured submission IS the answer — return its input
+        if (opts.finalTool) {
+          const fin = toolUses.find(t => t.name === opts.finalTool.name);
+          if (fin) return { structured: fin.input };
+        }
+
         const toolResults = await Promise.all(toolUses.map(async (toolUse) => {
           const tTool = Date.now();
           let errored = false;
@@ -5006,6 +5018,34 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
 
         if (!nextResponse) break;
         response = nextResponse;
+      }
+
+      // finalTool never fired (model ended in text or exhausted rounds) — force the submission.
+      // If the last response still has pending tool_use blocks (round cap hit), drop that turn:
+      // appending it without tool_results would be an invalid message chain.
+      if (opts.finalTool) {
+        const forceMsgs = [...currentMessages];
+        if (response.stop_reason !== 'tool_use') forceMsgs.push({ role: 'assistant', content: response.content });
+        const nudge = `Submit your final answer now by calling ${opts.finalTool.name}.`;
+        const lastMsg = forceMsgs[forceMsgs.length - 1];
+        if (lastMsg && lastMsg.role === 'user') {
+          const blocks = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: String(lastMsg.content) }];
+          forceMsgs[forceMsgs.length - 1] = { role: 'user', content: [...blocks, { type: 'text', text: nudge }] };
+        } else {
+          forceMsgs.push({ role: 'user', content: nudge });
+        }
+        const tForce = Date.now();
+        const forced = await anthropic.messages.create({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 4096,
+          system: fullSystemPrompt,
+          messages: forceMsgs,
+          tools: TOOLS,
+          tool_choice: { type: 'tool', name: opts.finalTool.name },
+        });
+        logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id);
+        const fin = forced.content.find(b => b.type === 'tool_use' && b.name === opts.finalTool.name);
+        if (fin) return { structured: fin.input };
       }
 
       const responseText = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -8826,6 +8866,96 @@ async function handleSupabaseWebhook(req, res) {
   }
 }
 
+// ─── AGENT CONSULT (cross-agent API: REVI asks Max to verify initiatives) ────
+const SUBMIT_VERDICTS_TOOL = {
+  name: 'submit_verdicts',
+  description: 'Submit final per-initiative verification verdicts. This ends the consult — call it exactly once, covering every initiative id from the request.',
+  input_schema: {
+    type: 'object',
+    required: ['verdicts'],
+    properties: {
+      verdicts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['id', 'status', 'confidence'],
+          properties: {
+            id:         { type: 'string', description: 'The initiative id exactly as given in the request.' },
+            status:     { type: 'string', enum: ['confirmed_done', 'progress_found', 'no_evidence', 'unknown'] },
+            evidence:   { type: 'string', description: 'One plain-text sentence citing concrete evidence. NO Slack formatting, no asterisks, no emoji.' },
+            source:     { type: 'string', description: 'Where the evidence came from, e.g. "slack #ng-fullfillment-ops", "portal db", "ghl", "calendar", "knowledge base".' },
+            confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          },
+        },
+      },
+    },
+  },
+};
+
+const CONSULT_SYSTEM_APPEND = `
+
+AGENT CONSULT MODE: You are answering an API request from REVI (the sales-call coaching and leadership-initiative agent), not a Slack user. Rules for this request only:
+- Do NOT use get_revi_intelligence — REVI's own data is exactly what you are being asked to independently verify. Use Slack channels, the portal database, GHL, Calendar, and the knowledge base instead.
+- Evidence must be plain text: no Slack formatting, no backtick headers, no ALL CAPS names, no emoji.
+- Do not draft channel posts, DMs, or emails. Do not save knowledge. Read-only investigation.
+- Only report evidence you actually found via tools this request. If you find nothing, say no_evidence — never guess.`;
+
+async function handleAgentConsult(req, res) {
+  const secret = process.env.AGENT_CONSULT_SECRET;
+  const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  if (!secret) return json(503, { ok: false, error: 'consult disabled' });
+  if (req.headers['x-agent-secret'] !== secret) {
+    console.warn('Agent consult rejected — invalid or missing secret');
+    return json(401, { ok: false, error: 'Unauthorized' });
+  }
+  let body = '';
+  let tooLarge = false;
+  req.on('data', chunk => {
+    body += chunk.toString();
+    if (body.length > 100_000 && !tooLarge) { tooLarge = true; json(413, { ok: false, error: 'payload too large' }); req.destroy(); }
+  });
+  req.on('end', async () => {
+    if (tooLarge) return;
+    let payload;
+    try { payload = JSON.parse(body); } catch { return json(400, { ok: false, error: 'invalid JSON' }); }
+    const correlationId = newCorrelationId();
+    try {
+      if (payload.purpose === 'initiative_check' && Array.isArray(payload.initiatives) && payload.initiatives.length) {
+        const items = payload.initiatives.slice(0, 15);
+        const lines = items.map((i, n) =>
+          `${n + 1}. id: ${i.id}\n   title: ${i.title}\n   owner: ${i.owner_name || 'unowned'}\n   committed next step: ${i.next_step || '(none)'}\n   last movement: ${i.last_movement_at || 'unknown'} (${i.days_stalled != null ? i.days_stalled + ' days stalled' : 'age unknown'})\n   context: ${i.description || '(none)'}`
+        ).join('\n');
+        const msg = `REVI initiative verification request. The following leadership initiatives show NO movement in meetings for 10+ days. For each one, investigate whether real-world progress or completion actually happened outside of meetings — check the relevant Slack channels, the portal database, GHL, Calendar, and your knowledge base. Batch your lookups efficiently. Then call submit_verdicts exactly once, covering every id below.\n\n${lines}`;
+        console.log(`Agent consult [${correlationId}]: initiative_check for ${items.length} initiative(s)`);
+        const result = await callClaude([{ role: 'user', content: msg }], 3, null, correlationId, {
+          systemAppend: CONSULT_SYSTEM_APPEND,
+          finalTool: SUBMIT_VERDICTS_TOOL,
+        });
+        const requestedIds = new Set(items.map(i => String(i.id)));
+        const raw = (result && result.structured && Array.isArray(result.structured.verdicts)) ? result.structured.verdicts : [];
+        const verdicts = raw.filter(v => v && requestedIds.has(String(v.id)));
+        const answeredIds = new Set(verdicts.map(v => String(v.id)));
+        for (const id of requestedIds) {
+          if (!answeredIds.has(id)) verdicts.push({ id, status: 'unknown', evidence: '', source: '', confidence: 'low' });
+        }
+        console.log(`Agent consult [${correlationId}]: returning ${verdicts.length} verdict(s)`);
+        return json(200, { ok: true, checked_at: new Date().toISOString(), verdicts });
+      }
+      if (payload.purpose === 'question' && typeof payload.question === 'string' && payload.question.trim()) {
+        console.log(`Agent consult [${correlationId}]: question`);
+        const answer = await callClaude([{ role: 'user', content: payload.question.slice(0, 4000) }], 3, null, correlationId, {
+          systemAppend: CONSULT_SYSTEM_APPEND,
+        });
+        return json(200, { ok: true, answer: (typeof answer === 'string' ? answer : '').slice(0, 4000) });
+      }
+      return json(400, { ok: false, error: 'unknown purpose — expected initiative_check or question' });
+    } catch (err) {
+      console.error(`Agent consult error [${correlationId}]:`, err.message);
+      return json(500, { ok: false, error: 'internal error' });
+    }
+  });
+}
+
 // ─── HEALTH CHECK SERVER ──────────────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
@@ -8837,6 +8967,8 @@ const healthServer = http.createServer((req, res) => {
     handleGHLClaimWebhook(req, res);
   } else if (req.url === '/webhook/supabase' && req.method === 'POST') {
     handleSupabaseWebhook(req, res);
+  } else if (req.url === '/agent/consult' && req.method === 'POST') {
+    handleAgentConsult(req, res);
   } else {
     res.writeHead(404); res.end('Not found');
   }
