@@ -2686,7 +2686,18 @@ function formatICTime(scheduledStart, opts = { hour: '2-digit', minute: '2-digit
 
 function resolveSalesMember(id) {
   if (!id) return 'Unknown';
-  return SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()] || id;
+  const resolved = SALES_TEAM_MAP[id] || SALES_TEAM_MAP[id.toLowerCase()];
+  if (resolved) return resolved;
+  // Unmapped id (new hire's GHL user id, or a roster gap) — loud, so it gets
+  // added to SALES_TEAM_MAP instead of surfacing as a garbage leaderboard name.
+  console.warn(`resolveSalesMember: unmapped sales id "${id}" — add to SALES_TEAM_MAP`);
+  return id;
+}
+
+// True when a stats-map key is an unresolved raw id (GHL user id), not a person.
+// Used by leaderboard formatters to drop garbage rows instead of rendering them.
+function isUnresolvedSalesId(name) {
+  return !!name && name !== 'Unknown' && !name.includes('@') && !name.includes(' ') && /^[A-Za-z0-9]{18,}$/.test(name);
 }
 
 // Sales reports must only count flywheel sales calls.
@@ -3039,7 +3050,9 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
 }
 
 function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
-  const names = Object.keys(stats);
+  const dropped = Object.keys(stats).filter(isUnresolvedSalesId);
+  if (dropped.length) console.warn(`Closer stats: dropping unresolved id row(s) from leaderboard: ${dropped.join(', ')}`);
+  const names = Object.keys(stats).filter(n => !isUnresolvedSalesId(n));
   if (!names.length) {
     return `No closer activity (GHL appointments/outcomes) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
@@ -3169,7 +3182,9 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
 }
 
 function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
-  const names = Object.keys(stats);
+  const dropped = Object.keys(stats).filter(isUnresolvedSalesId);
+  if (dropped.length) console.warn(`Setter stats: dropping unresolved id row(s) from leaderboard: ${dropped.join(', ')}`);
+  const names = Object.keys(stats).filter(n => !isUnresolvedSalesId(n));
   if (!names.length) {
     return `No setter activity (GHL bookings or lead claims) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
@@ -5851,6 +5866,7 @@ const CLOSER_SLACK = {
   // Raw GHL user ID fallbacks (unmapped rows)
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999',
   'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyItjV': 'U0AMTEKDCPN',
+  'zogw530idnpofqqnfssc': 'U05HXGX18H3', 'zoGW530iDnPOFqQNfssc': 'U05HXGX18H3', // Ron
 };
 
 // Pull the prospect's iClosed booking intake (questions_and_answers + event + booked-from)
@@ -6538,8 +6554,6 @@ async function runSalesStandup(_correlationId) {
   try {
     const now      = Date.now();
     const today    = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
-    const yesterday = new Date(now - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-
     // ── Fetch GHL conversations for setter brief filtering ─────────────────
     let ghlConvos = [];
     try {
@@ -6571,23 +6585,27 @@ async function runSalesStandup(_correlationId) {
       { slackId: 'U0BFA4SRVQC', name: 'Sebastian' },
     ];
 
-    // Fetch yesterday's setter EOD aggregate (team total)
-    const { data: setterEOD } = await portalSupabase
-      .from('revops_setter_eod_daily')
-      .select('scheduled_calls, new_conversations, qualified_leads')
-      .eq('report_date', yesterday);
+    // Yesterday + 7-day setter stats, outcome-derived from GHL-native
+    // appointments and setter_claims. The EOD self-report tables this used to
+    // read were retired at the 2026-07-23 cutover (frozen history, 0 new rows)
+    // and were rendering "0" for every number here. Non-fatal: if the stats
+    // lookup fails, the DM sends without the stats block.
+    const crDateStr = d => d.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const yStr      = crDateStr(new Date(now - 24 * 60 * 60 * 1000));
+    const yStartIso = `${yStr}T06:00:00.000Z`; // CR midnight (UTC-6)
+    const yEndIso   = new Date(Date.parse(yStartIso) + 24 * 60 * 60 * 1000).toISOString();
 
-    const totalScheduled  = (setterEOD || []).reduce((s, r) => s + (r.scheduled_calls      || 0), 0);
-    const totalConvos     = (setterEOD || []).reduce((s, r) => s + (r.new_conversations    || 0), 0);
-    const totalQualified  = (setterEOD || []).reduce((s, r) => s + (r.qualified_leads      || 0), 0);
-
-    // Weekly total: last 7 rows for scheduled_calls (team aggregate)
-    const { data: weeklyEOD } = await portalSupabase
-      .from('revops_setter_eod_daily')
-      .select('scheduled_calls')
-      .order('report_date', { ascending: false })
-      .limit(7);
-    const weeklyScheduled = (weeklyEOD || []).reduce((s, r) => s + (r.scheduled_calls || 0), 0);
+    let setterYesterday = null, setterWeek = null;
+    try {
+      setterYesterday = await getSetterWeeklyStats(yStartIso, yEndIso);
+      setterWeek      = await getSetterWeeklyStats(new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString(), new Date(now).toISOString());
+    } catch (statsErr) {
+      console.error('Sales standup — setter stats failed:', statsErr.message);
+    }
+    const sumField = (stats, f) => stats ? Object.values(stats).reduce((s, r) => s + (r[f] || 0), 0) : 0;
+    const totalScheduled = sumField(setterYesterday, 'calls_booked');
+    const totalClaimed   = sumField(setterYesterday, 'leads_claimed');
+    const weeklyScheduled = sumField(setterWeek, 'calls_booked');
 
     const setterLessons = await getReportLessons('sales-standup-setter');
     const setterLessonNote = setterLessons.length
@@ -6598,10 +6616,12 @@ async function runSalesStandup(_correlationId) {
       try {
         const lines = [`${setterLessonNote}Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
 
-        // Yesterday stats
-        lines.push(`📊 Yesterday: ${totalScheduled} calls booked | ${totalConvos} new convos | ${totalQualified} leads qualified`);
-        lines.push(`📈 This week: ${weeklyScheduled} calls booked total`);
-        lines.push('');
+        // Yesterday stats — omitted entirely when the stats lookup failed
+        if (setterYesterday) {
+          lines.push(`📊 Yesterday (team): ${totalScheduled} calls booked | ${totalClaimed} leads claimed`);
+          lines.push(`📈 Last 7 days: ${weeklyScheduled} calls booked total`);
+          lines.push('');
+        }
 
         // Needs follow-up
         if (needsFollowUp.length) {
@@ -6650,13 +6670,15 @@ async function runSalesStandup(_correlationId) {
     const excludeIds = await getNonFlywheelCallIds();
     const todayCalls = filterFlywheelAppts(todayCallsRaw, excludeIds);
 
-    // Yesterday's closer EOD stats
-    const { data: closerEOD } = await portalSupabase
-      .from('revops_closer_eod_daily')
-      .select('closer_id, full_closes, qualified_calls, no_shows')
-      .eq('report_date', yesterday);
-    const closerEODMap = {};
-    (closerEOD || []).forEach(r => { closerEODMap[r.closer_id] = r; });
+    // Yesterday's closer stats — outcome-derived (same truth as the weekly
+    // leaderboard). The retired closer EOD table this used to read had 0 new
+    // rows since the cutover, so every closer got "0 calls | 0 closes" daily.
+    let closerYesterday = null;
+    try {
+      closerYesterday = await getCloserWeeklyStats(yStartIso, yEndIso);
+    } catch (statsErr) {
+      console.error('Sales standup — closer stats failed:', statsErr.message);
+    }
 
     const closers = Object.entries(CLOSER_SLACK)
       .filter(([email, slackId]) => slackId && email.includes('@') && slackId !== RON_SLACK_ID)
@@ -6669,19 +6691,24 @@ async function runSalesStandup(_correlationId) {
 
     for (const closer of closers) {
       try {
-        const eod           = closerEODMap[closer.email] || {};
-        const heldCalls     = eod.qualified_calls || 0;
-        const closes        = eod.full_closes     || 0;
-        const noShows       = eod.no_shows        || 0;
+        const cs            = closerYesterday ? (closerYesterday[closer.name] || null) : null;
+        const heldCalls     = cs ? cs.attended : 0;
+        const closes        = cs ? cs.sold     : 0;
+        const noShows       = cs ? cs.no_shows : 0;
+        const pendingCt     = cs ? cs.pending  : 0;
         const closeRatePct  = heldCalls > 0 ? Math.round((closes / heldCalls) * 100) : 0;
 
         const myTodayCalls = (todayCalls || []).filter(a => a.closer_id === closer.email);
 
         const lines = [`${closerLessonNote}Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
 
-        // Yesterday stats
-        lines.push(`📊 Yesterday: ${heldCalls} calls held | ${closes} closes | ${closeRatePct}% close rate | ${noShows} no-shows`);
-        lines.push('');
+        // Yesterday stats — omitted when the stats lookup failed; "awaiting
+        // outcome" keeps a 0-held day with pending calls from reading as dead.
+        if (closerYesterday) {
+          const pendingStr = pendingCt ? ` | ${pendingCt} awaiting outcome` : '';
+          lines.push(`📊 Yesterday: ${heldCalls} calls held | ${closes} closes | ${closeRatePct}% close rate | ${noShows} no-shows${pendingStr}`);
+          lines.push('');
+        }
 
         // Today on deck
         if (myTodayCalls.length) {
