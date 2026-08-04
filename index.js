@@ -1037,6 +1037,16 @@ function requiresApproval(channel) {
   return APPROVAL_REQUIRED_CHANNELS.some(c => c.replace('#', '') === ch);
 }
 
+// APPROVAL_NEEDED|<channelName>|<escalate>|<originUserId>|<reason>|<message...>
+// draft_channel_post returns this sentinel as its tool result; scheduled reports
+// post directly, so any reply still carrying it must be reduced to its message —
+// every callClaude reply in the cron handler (first attempt AND re-prompt) goes
+// through this before validation, or the sentinel posts verbatim to the channel.
+function stripApprovalSentinel(text) {
+  if (!text || !text.startsWith('APPROVAL_NEEDED|')) return text;
+  return text.split('|').slice(5).join('|').trim();
+}
+
 function registerDynamicCron(task) {
   try {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
@@ -1281,11 +1291,7 @@ function registerDynamicCron(task) {
 
       if (!reply || !reply.trim()) return;
 
-      // Strip APPROVAL_NEEDED sentinel if Claude used draft_channel_post tool
-      if (reply.startsWith('APPROVAL_NEEDED|')) {
-        const parts = reply.split('|');
-        reply = parts.slice(5).join('|').trim();
-      }
+      reply = stripApprovalSentinel(reply);
 
       // ── STRUCTURAL WHITELIST GUARD ───────────────────────────────────────────
       // Rejects any reply that doesn't contain the expected section headers.
@@ -1313,6 +1319,7 @@ function registerDynamicCron(task) {
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
         'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
         'Daily Sales Call Roster':          [], // short on quiet days
+        'Daily Closer Attendance & Outcome Reminder': [], // short nightly nudge — no fixed headers
       };
 
       function validateFinalReport(text, taskName) {
@@ -1366,11 +1373,11 @@ function registerDynamicCron(task) {
       if (!firstCheck.ok) {
         console.log(`Cron "${task.name}": output failed structural validation — ${firstCheck.reason}. Re-prompting...`);
         try {
-          const finalReply = await callClaude([
+          const finalReply = stripApprovalSentinel(await callClaude([
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
             { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
-          ], 3, null, correlation_id);
+          ], 3, null, correlation_id));
           const secondCheck = validateFinalReport(finalReply, task.name);
           if (finalReply && secondCheck.ok) {
             reply = finalReply;
