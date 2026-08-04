@@ -2737,9 +2737,17 @@ async function getNonFlywheelCallIds() {
 }
 
 // Convenience: filter an array of revops_appointments rows in-place semantics.
+// Drops (1) legacy iClosed rows on non-flywheel calendars, and (2) synthetic
+// pre-book disqualification rows (ghl_appointment_id = 'opp:{opportunityId}')
+// that dash creates for outcome-only opportunities — not real calls, so they
+// must never enter booked/held/show-rate denominators. Rows whose select
+// omitted ghl_appointment_id pass through (degrade open, never over-filter).
 function filterFlywheelAppts(rows, excludeIds) {
-  if (!excludeIds || !excludeIds.size) return rows || [];
-  return (rows || []).filter(a => !a.iclosed_call_id || !excludeIds.has(a.iclosed_call_id));
+  return (rows || []).filter(a => {
+    if (typeof a.ghl_appointment_id === 'string' && a.ghl_appointment_id.startsWith('opp:')) return false;
+    if (excludeIds && excludeIds.size && a.iclosed_call_id && excludeIds.has(a.iclosed_call_id)) return false;
+    return true;
+  });
 }
 
 async function getSalesIntelligence(query) {
@@ -2982,25 +2990,30 @@ async function getSalesIntelligence(query) {
 }
 
 // ─── OUTCOME-DERIVED ATTENDANCE TRUTH ────────────────────────────────────────
-// The revops_appointments.attended boolean is unreliable (logged on ~22% of
-// rows; even `won` calls show attended=false). The logged OUTCOME (GHL since\n// the 2026-07-23 cutover; iClosed for frozen history) is the real
-// signal of whether a call happened:
-//   no_show                              → did not attend
-//   won | lost | follow_up | disqualified → attended (the call took place)
-//   no outcome row yet                   → pending (excluded from show-rate denom)
+// The logged OUTCOME (GHL since the 2026-07-23 cutover; iClosed for frozen
+// history) is the primary signal of whether a call happened. Full DB enum:
+//   no_show                                          → did not attend
+//   rescheduled                                      → didn't happen as booked; own bucket
+//                                                      (NOT pending — a rescheduled row would
+//                                                      otherwise inflate "Pending: N" forever)
+//   won | lost | follow_up | nurture | disqualified  → attended (the call took place)
+//   no outcome row yet                               → pending (excluded from show-rate denom)
 // A "qualified attended call" (AQC) = attended AND not disqualified, i.e. the
 // prospect was a real fit and the call happened. Used by both setter and closer
 // stats so show rate / AQC can never diverge between the two reports.
-const SHOWED_OUTCOMES = new Set(['won', 'lost', 'follow_up', 'disqualified']);
+const SHOWED_OUTCOMES = new Set(['won', 'lost', 'follow_up', 'nurture', 'disqualified']);
 function classifyOutcome(outcomeRow) {
   const o = (outcomeRow?.outcome || '').toLowerCase().trim();
-  if (!o) return { showed: false, noShow: false, qualifiedAttended: false, pending: true };
-  if (o === 'no_show') return { showed: false, noShow: true, qualifiedAttended: false, pending: false };
+  if (!o) return { showed: false, noShow: false, qualifiedAttended: false, pending: true, rescheduled: false };
+  if (o === 'no_show') return { showed: false, noShow: true, qualifiedAttended: false, pending: false, rescheduled: false };
+  if (o === 'rescheduled') return { showed: false, noShow: false, qualifiedAttended: false, pending: false, rescheduled: true };
   if (SHOWED_OUTCOMES.has(o)) {
-    return { showed: true, noShow: false, qualifiedAttended: o !== 'disqualified', pending: false };
+    return { showed: true, noShow: false, qualifiedAttended: o !== 'disqualified', pending: false, rescheduled: false };
   }
-  // Unknown/rescheduled/other → treat as pending (don't penalize show rate)
-  return { showed: false, noShow: false, qualifiedAttended: false, pending: true };
+  // A value outside the known enum means GHL/dash added something new — say so
+  // instead of silently excluding it from every show-rate denominator.
+  console.warn(`classifyOutcome: unknown outcome "${o}" — treated as pending; extend the enum handling`);
+  return { showed: false, noShow: false, qualifiedAttended: false, pending: true, rescheduled: false };
 }
 
 // ─── CLOSER WEEKLY STATS (GHL-native) ────────────────────────────────────────
@@ -3012,7 +3025,7 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
 
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id')
+    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id, ghl_appointment_id')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -3102,7 +3115,7 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
   // 1. Flywheel appointments in range + their outcomes
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, scheduled_start, iclosed_call_id, setter_id, source, prospect:prospect_id ( email )')
+    .select('id, scheduled_start, iclosed_call_id, ghl_appointment_id, setter_id, source, prospect:prospect_id ( email )')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -3461,7 +3474,7 @@ async function runMondayGapDetection(_correlationId) {
       const excludeIds = await getNonFlywheelCallIds();
       const { data: noShowsRaw } = await portalSupabase
         .from('revops_appointments')
-        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
+        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, prospect:prospect_id(full_name)')
         .eq('attended', false)
         .gte('scheduled_start', sevenDaysAgo);
       const noShows = filterFlywheelAppts(noShowsRaw, excludeIds);
@@ -3492,7 +3505,7 @@ async function runMondayGapDetection(_correlationId) {
       const fourteenDaysAgo = new Date(nowTs - 14 * 24 * 60 * 60 * 1000).toISOString();
       const { data: attendedRaw } = await portalSupabase
         .from('revops_appointments')
-        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
+        .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, prospect:prospect_id(full_name)')
         .eq('attended', true)
         .lte('scheduled_start', fortyEightHAgo)
         .gte('scheduled_start', fourteenDaysAgo);
@@ -4079,18 +4092,29 @@ async function _scrapeMetaCacToday() {
   return +(spend / sales).toFixed(2);
 }
 
-/// Cost-per-booking: Meta total spend today / iClosed calls booked today
+// CR-anchored day bounds as UTC instants. The old `${date}T00:00:00` strings
+// (built from UTC dates, interpreted as UTC by Postgres) drifted the day window
+// 6 hours vs Costa Rica — CR-evening calls landed on the wrong day.
+function _crDayBoundsUtc(daysAgo = 0) {
+  const dayStr = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000)
+    .toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const start = `${dayStr}T06:00:00.000Z`; // CR midnight (UTC-6, no DST)
+  const end   = new Date(Date.parse(start) + 24 * 60 * 60 * 1000).toISOString();
+  return { start, end, dayStr };
+}
+
+/// Cost-per-booking: Meta total spend today / sales calls booked today
 async function _scrapeMetaCostPerBookingToday() {
   const row = await _metaAccountInsights('today');
   if (!row) return null;
   const spend = parseFloat(row.spend || 0);
   if (spend <= 0) return null;
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(0);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id')
-    .gte('booked_at', `${todayStr}T00:00:00`)
-    .lt('booked_at',  `${todayStr}T23:59:59`);
+    .select('id, iclosed_call_id, ghl_appointment_id')
+    .gte('booked_at', day.start)
+    .lt('booked_at',  day.end);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
   const count = filterFlywheelAppts(data, excludeIds).length;
@@ -4116,27 +4140,28 @@ async function _scrapeGhlNewContactsToday() {
 
 // Calls booked yesterday (flywheel-only; booked_at populated by dash for GHL rows)
 async function _scrapeIclosedCallsBookedYesterday() {
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id')
-    .gte('booked_at', `${yesterday}T00:00:00`)
-    .lt('booked_at',  `${yesterday}T23:59:59`);
+    .select('id, iclosed_call_id, ghl_appointment_id')
+    .gte('booked_at', day.start)
+    .lt('booked_at',  day.end);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
   return filterFlywheelAppts(data, excludeIds).length;
 }
 
-// Calls held yesterday (outcome-derived showed count, flywheel-only). The raw
-// `attended` boolean is unreliable (~22% logged) — use classifyOutcome, the same
-// truth the weekly stats use.
+// Calls held yesterday (flywheel-only). Held = GHL marked the call showed
+// (attended=true via the call_showed workflow, live since ~Jul 28) OR the
+// logged outcome says it happened — catches showed-but-outcome-not-yet-logged
+// calls. Same definition dash's isHeld uses; attended=false alone never counts.
 async function _scrapeIclosedCallsHeldYesterday() {
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id')
-    .gte('scheduled_start', `${yesterday}T00:00:00`)
-    .lt('scheduled_start',  `${yesterday}T23:59:59`);
+    .select('id, iclosed_call_id, ghl_appointment_id, attended')
+    .gte('scheduled_start', day.start)
+    .lt('scheduled_start',  day.end);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
   const appts = filterFlywheelAppts(data, excludeIds);
@@ -4146,30 +4171,31 @@ async function _scrapeIclosedCallsHeldYesterday() {
     .select('appointment_id, outcome')
     .in('appointment_id', appts.map(a => a.id));
   const outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
-  return appts.filter(a => classifyOutcome(outcomesById[a.id]).showed).length;
+  return appts.filter(a => a.attended === true || classifyOutcome(outcomesById[a.id]).showed).length;
 }
 
 // Sales yesterday (won outcomes logged in GHL — EOD tables retired at cutover)
 async function _scrapeIclosedSalesYesterday() {
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await portalSupabase
     .from('revops_sales_outcomes')
     .select('id, outcome, created_at')
     .eq('outcome', 'won')
-    .gte('created_at', `${yesterday}T00:00:00`)
-    .lt('created_at',  `${yesterday}T23:59:59`);
+    .gte('created_at', day.start)
+    .lt('created_at',  day.end);
   if (error) throw new Error(error.message);
   return (data || []).length;
 }
 
-// Close rate yesterday = won ÷ showed for calls scheduled yesterday (outcome-derived).
+// Close rate yesterday = won ÷ held for calls scheduled yesterday.
+// Held uses the same attended-or-outcome definition as calls-held above.
 async function _scrapeCloseRateYesterday() {
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id')
-    .gte('scheduled_start', `${yesterday}T00:00:00`)
-    .lt('scheduled_start',  `${yesterday}T23:59:59`);
+    .select('id, iclosed_call_id, ghl_appointment_id, attended')
+    .gte('scheduled_start', day.start)
+    .lt('scheduled_start',  day.end);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
   const appts = filterFlywheelAppts(data, excludeIds);
@@ -4179,25 +4205,25 @@ async function _scrapeCloseRateYesterday() {
     .select('appointment_id, outcome')
     .in('appointment_id', appts.map(a => a.id));
   const outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
-  let showed = 0, won = 0;
+  let held = 0, won = 0;
   for (const a of appts) {
     const o = outcomesById[a.id];
-    if (classifyOutcome(o).showed) showed += 1;
+    if (a.attended === true || classifyOutcome(o).showed) held += 1;
     if ((o?.outcome || '').toLowerCase() === 'won') won += 1;
   }
-  if (showed <= 0) return null;
-  return +(won / showed).toFixed(4);
+  if (held <= 0) return null;
+  return +(won / held).toFixed(4);
 }
 
 // Setter-booked calls yesterday (native setter_id — EOD tables retired at cutover)
 async function _scrapeSetterCallsBookedYesterday() {
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id, setter_id')
+    .select('id, iclosed_call_id, ghl_appointment_id, setter_id')
     .not('setter_id', 'is', null)
-    .gte('booked_at', `${yesterday}T00:00:00`)
-    .lt('booked_at',  `${yesterday}T23:59:59`);
+    .gte('booked_at', day.start)
+    .lt('booked_at',  day.end);
   if (error) throw new Error(error.message);
   const excludeIds = await getNonFlywheelCallIds();
   return filterFlywheelAppts(data, excludeIds).length;
@@ -4509,7 +4535,7 @@ function _businessDaysBetween(fromMs, toMs) {
 async function _countSalesCallsSince(sinceISO) {
   const { data: appts, error } = await portalSupabase
     .from('revops_appointments')
-    .select('id, iclosed_call_id, scheduled_start')
+    .select('id, iclosed_call_id, ghl_appointment_id, scheduled_start')
     .gte('scheduled_start', sinceISO)
     .lt('scheduled_start', new Date().toISOString());
   if (error) throw error;
@@ -6663,7 +6689,7 @@ async function runSalesStandup(_correlationId) {
     // Today's appointments (flywheel-only — excludes partner-consulting 1:1s)
     const { data: todayCallsRaw } = await portalSupabase
       .from('revops_appointments')
-      .select('id, closer_id, scheduled_start, iclosed_call_id, prospect:prospect_id(full_name)')
+      .select('id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, prospect:prospect_id(full_name)')
       .gte('scheduled_start', todayStartISO)
       .lte('scheduled_start', todayEndISO)
       .order('scheduled_start', { ascending: true });
