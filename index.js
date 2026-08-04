@@ -4795,6 +4795,7 @@ async function transcribeAudio(fileBuffer, filename) {
 // opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
 //                     calls it, callClaude returns { structured: <tool input> } instead
 //                     of text. Used by /agent/consult for schema-constrained verdicts.
+// opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
 async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
   const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
   let lastErr;
@@ -4860,7 +4861,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
-      ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'));
+      ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
+       .filter(t => !(opts.dropTools || []).includes(t.name));
       if (opts.finalTool) TOOLS.push(opts.finalTool);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
@@ -8892,6 +8894,9 @@ const SUBMIT_VERDICTS_TOOL = {
   },
 };
 
+// Hard-banned in consult mode: circular evidence (REVI verifying itself) and all mutating tools.
+const CONSULT_DROP_TOOLS = ['get_revi_intelligence', 'save_knowledge', 'send_email', 'draft_outbound_email', 'draft_reply_email', 'draft_channel_post', 'create_slack_reminder', 'create_calendar_event', 'add_calendar_attendees', 'create_notion_task', 'create_scheduled_task', 'delete_scheduled_task', 'clean_duplicate_tasks', 'update_portal_record'];
+
 const CONSULT_SYSTEM_APPEND = `
 
 AGENT CONSULT MODE: You are answering an API request from REVI (the sales-call coaching and leadership-initiative agent), not a Slack user. Rules for this request only:
@@ -8930,6 +8935,7 @@ async function handleAgentConsult(req, res) {
         const result = await callClaude([{ role: 'user', content: msg }], 3, null, correlationId, {
           systemAppend: CONSULT_SYSTEM_APPEND,
           finalTool: SUBMIT_VERDICTS_TOOL,
+          dropTools: CONSULT_DROP_TOOLS,
         });
         const requestedIds = new Set(items.map(i => String(i.id)));
         const raw = (result && result.structured && Array.isArray(result.structured.verdicts)) ? result.structured.verdicts : [];
@@ -8945,6 +8951,7 @@ async function handleAgentConsult(req, res) {
         console.log(`Agent consult [${correlationId}]: question`);
         const answer = await callClaude([{ role: 'user', content: payload.question.slice(0, 4000) }], 3, null, correlationId, {
           systemAppend: CONSULT_SYSTEM_APPEND,
+          dropTools: CONSULT_DROP_TOOLS,
         });
         return json(200, { ok: true, answer: (typeof answer === 'string' ? answer : '').slice(0, 4000) });
       }
