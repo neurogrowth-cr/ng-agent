@@ -3646,9 +3646,21 @@ async function runNightlyLearning(correlationId) {
       if (reviDigest) digest += `\n\n=== REVI (sales coaching + leadership initiatives) ===\n${reviDigest}`;
     } catch (reviErr) { console.error('Nightly learning — REVI digest error:', reviErr.message); }
 
+    // Auto strike mover daily roll-up — replaces the old per-run Slack posts.
+    // Non-fatal: nightly learning proceeds strike-blind if the audit log is
+    // unreachable, and the Slack line then says so.
+    let strikeSlackLine = '';
+    try {
+      const strike = await strikeBuildDailyDigest(24);
+      if (strike) {
+        digest += `\n\n=== AUTO STRIKE MOVER (setter pipeline automation, last 24h) ===\n${strike.digestBlock}`;
+        strikeSlackLine = `\n${strike.slackLine}`;
+      }
+    } catch (strikeErr) { console.error('Nightly learning — strike mover digest error:', strikeErr.message); }
+
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), a spike in failures, or unusually high move volume (intel). A routine day (sweeps ran, few or no moves, transient failures) needs NO entry\n\n${digest}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
@@ -3712,7 +3724,7 @@ async function runNightlyLearning(correlationId) {
     }
 
     console.log(`Nightly learning complete. ${saved} knowledge entries saved, ${ronOnlyEntries.length} confidential (Ron-only).`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI | Knowledge entries saved: ${saved}${learnedBlock}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI + strike mover | Knowledge entries saved: ${saved}${strikeSlackLine}${learnedBlock}`);
 
     // Confidential (financial/billing) findings go to Ron's DM only.
     if (ronOnlyEntries.length) {
@@ -8502,32 +8514,95 @@ async function runAutoStrikeMover(correlationId) {
     if (throttleMs > 0) await new Promise(r => setTimeout(r, throttleMs));
   }
 
-  const skipBreakdown = Object.entries(skipCounts).sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
-  const verb = isLive ? 'Moved' : 'Would move';
+  // Per-sweep stats persist to agent_activity so the nightly learning report can
+  // roll up the day (strikeBuildDailyDigest). Transient GHL 401/503 failures stay
+  // in metadata, not status — they self-heal next sweep and shouldn't trip the
+  // status<>'ok' error monitoring index.
+  logActivity({
+    event_type: 'strike_sweep', event_source: 'cron', action: 'runAutoStrikeMover',
+    correlation_id: correlationId,
+    metadata: { mode, scanned: cards.length, moved: moves.length, capped,
+                skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
+  });
+
+  // Per-run Slack posts are dry-run-only (testing visibility). Live mode is
+  // silent here — the nightly learning report carries the daily summary.
+  if (!isLive) {
+    const skipBreakdown = Object.entries(skipCounts).sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+    const lines = [
+      `AUTO STRIKE MOVER — DRY RUN`,
+      '',
+      `Cards scanned: ${cards.length} | Would move: ${moves.length}${capped ? ` (+${capped} over the ${maxMoves}/run cap, next sweep)` : ''}`,
+      '',
+      `Skips: ${skipBreakdown}`,
+    ];
+    if (moves.length) {
+      lines.push('');
+      lines.push(...moves.slice(0, 25).map(m => `• ${m.name}: ${m.from} → ${m.to} (${m.reason})`));
+      if (moves.length > 25) lines.push(`• …and ${moves.length - 25} more.`);
+    }
+    if (failures.length) {
+      lines.push('');
+      lines.push(`${failures.length} failure(s): ${failures.slice(0, 3).join(' | ')}`);
+    }
+    lines.push('', `Set STRIKE_MOVER_MODE=live on Railway to let these moves actually happen.`);
+    try {
+      await postToSlack(AGENT_CHANNEL, lines.join('\n'));
+    } catch (err) { console.error('strike mover summary post failed:', err.message); }
+  }
+
+  console.log(`runAutoStrikeMover done — scanned ${cards.length}, ${isLive ? 'moved' : 'would move'} ${moves.length}, failures ${failures.length} (mode=${mode})`);
+}
+
+// Daily roll-up of strike_sweep audit rows for the nightly learning report.
+// Reads agent_activity through the anon key — needs the scoped select policy
+// from migrations/012_strike_sweep_read.sql. Zero sweeps is itself a signal
+// (cron dead) and still returns content rather than null.
+async function strikeBuildDailyDigest(hours = 24) {
+  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  const { data: sweeps, error } = await portalSupabase.from('agent_activity')
+    .select('created_at, metadata')
+    .eq('event_type', 'strike_sweep')
+    .gte('created_at', since)
+    .order('created_at', { ascending: true });
+  if (error) throw new Error(`strike sweep query: ${error.message}`);
+  if (!sweeps || !sweeps.length) {
+    return {
+      digestBlock: `0 sweeps ran in the last ${hours}h — the auto strike mover cron may be dead (expected 8/day, 7am-9pm CR). Flag as an alert.`,
+      slackLine: `Strike mover: 0 sweeps in last ${hours}h — cron may be down`,
+    };
+  }
+  const allMoves = [], allFailures = [], skipTotals = {};
+  let moved = 0, capped = 0, dryRuns = 0, lastScanned = 0;
+  for (const s of sweeps) {
+    const m = s.metadata || {};
+    if (m.mode !== 'live') dryRuns++;
+    moved += m.moved || 0;
+    capped += m.capped || 0;
+    lastScanned = m.scanned ?? lastScanned;
+    for (const [k, v] of Object.entries(m.skips || {})) skipTotals[k] = (skipTotals[k] || 0) + v;
+    allMoves.push(...(m.moves || []));
+    allFailures.push(...(m.failures || []));
+  }
   const lines = [
-    `AUTO STRIKE MOVER — ${isLive ? 'LIVE' : 'DRY RUN'}`,
-    '',
-    `Cards scanned: ${cards.length} | ${verb}: ${moves.length}${capped ? ` (+${capped} over the ${maxMoves}/run cap, next sweep)` : ''}`,
-    '',
-    `Skips: ${skipBreakdown}`,
+    `${sweeps.length} sweep(s)${dryRuns ? ` (${dryRuns} dry-run)` : ''} | pipeline cards in scope: ~${lastScanned} | cards moved: ${moved}${capped ? ` | deferred over per-run cap: ${capped}` : ''}`,
   ];
-  if (moves.length) {
-    lines.push('');
-    lines.push(...moves.slice(0, 25).map(m => `• ${m.name}: ${m.from} → ${m.to} (${m.reason})`));
-    if (moves.length > 25) lines.push(`• …and ${moves.length - 25} more.`);
+  if (allMoves.length) {
+    lines.push('Moves:');
+    lines.push(...allMoves.slice(0, 40).map(m => `• ${m.name}: ${m.from} → ${m.to} (${m.reason})`));
+    if (allMoves.length > 40) lines.push(`• …and ${allMoves.length - 40} more.`);
   }
-  if (failures.length) {
-    lines.push('');
-    lines.push(`${failures.length} failure(s): ${failures.slice(0, 3).join(' | ')}`);
+  const skipBreakdown = Object.entries(skipTotals).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}=${v}`).join(', ');
+  if (skipBreakdown) lines.push(`Skip totals across sweeps (same card counted each sweep): ${skipBreakdown}`);
+  if (allFailures.length) {
+    lines.push(`${allFailures.length} transient failure(s) (self-healing, card retried next sweep): ${allFailures.slice(0, 5).join(' | ')}`);
   }
-  if (!isLive) lines.push('', `Set STRIKE_MOVER_MODE=live on Railway to let these moves actually happen.`);
-
-  try {
-    await postToSlack(AGENT_CHANNEL, lines.join('\n'));
-  } catch (err) { console.error('strike mover summary post failed:', err.message); }
-
-  console.log(`runAutoStrikeMover done — scanned ${cards.length}, ${verb.toLowerCase()} ${moves.length}, failures ${failures.length} (mode=${mode})`);
+  return {
+    digestBlock: lines.join('\n'),
+    slackLine: `Strike mover (last ${hours}h): ${sweeps.length} sweeps | ${moved} card(s) moved | ${allFailures.length} transient failure(s)`,
+  };
 }
 
 // ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─
