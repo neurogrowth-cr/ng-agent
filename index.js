@@ -1071,11 +1071,11 @@ function registerDynamicCron(task) {
       try {
         const todayEvents = await getCalendarEvents(0, 1);
         if (todayEvents && !todayEvents.includes('error') && !todayEvents.includes('No events')) {
-          liveContext += `\n\nTODAY'S CALENDAR:\n${todayEvents}`;
+          liveContext += `\n\nTODAY'S CALENDAR (${_crDayLabel(0)} CR):\n${todayEvents}`;
         }
         const tomorrowEvents = await getCalendarEvents(1, 1);
         if (tomorrowEvents && !tomorrowEvents.includes('error') && !tomorrowEvents.includes('No events')) {
-          liveContext += `\n\nTOMORROW'S CALENDAR:\n${tomorrowEvents}`;
+          liveContext += `\n\nTOMORROW'S CALENDAR (${_crDayLabel(1)} CR):\n${tomorrowEvents}`;
         }
         if (deliversToRonOnly) {
           const emails = await getRecentEmails();
@@ -1124,7 +1124,9 @@ function registerDynamicCron(task) {
         }
       }
 
-      // Setter leaderboard (Tue + Sat) — rolling last 7 days, setters only.
+      // Setter leaderboard (Tue + Sat) — MONTH-TO-DATE, setters only. CR-anchored:
+      // resets on the 1st of each month (Ron 2026-08-04 — this is the monthly
+      // top-performer board, not a rolling week).
       // Meshed intel: GHL bookings/outcomes (truth) + setter_claims (#ng-sales-goats
       // ✋ flow) + REVI call scores (lead quality of what each setter feeds closers)
       // + GHL conversation hygiene. Each enrichment is non-fatal — the leaderboard
@@ -1132,8 +1134,9 @@ function registerDynamicCron(task) {
       if (task.name === 'Setter Leaderboard') {
         try {
           const now = new Date();
+          const todayCR   = now.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
           const weekEnd   = now;
-          const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          const weekStart = new Date(`${todayCR.slice(0, 8)}01T06:00:00.000Z`); // CR midnight on the 1st (UTC-6, no DST)
           weeklySetterStats = await getSetterWeeklyStats(weekStart.toISOString(), weekEnd.toISOString());
           const setterBlock = formatSetterWeeklyStatsBlock(weeklySetterStats, weekStart.toISOString(), weekEnd.toISOString());
 
@@ -1146,11 +1149,13 @@ function registerDynamicCron(task) {
               .not('setter_id', 'is', null)
               .gte('scheduled_start', weekStart.toISOString())
               .lte('scheduled_start', weekEnd.toISOString())
-              .limit(25);
+              .limit(150); // sized for a full month-to-date window, not 7 days
             const bySetter = {};
+            const seenEmails = new Set(); // a rebooked prospect is one lead, one REVI lookup
             for (const a of (wkAppts || [])) {
               const email = a.prospect?.email;
-              if (!email) continue;
+              if (!email || seenEmails.has(email)) continue;
+              seenEmails.add(email);
               const scored = await reviFindCallsByProspect(email, 1);
               const sc = scored[0];
               if (!sc || sc.overall_score == null) continue;
@@ -1987,20 +1992,36 @@ function extractPlainTextBody(payload) {
 }
 
 // ─── GOOGLE CALENDAR ──────────────────────────────────────────────────────────
+// Day windows are CR-anchored (same contract as _crDayBoundsUtc): daysFromNow
+// counts Costa Rica calendar days and each window is exactly daysRange×24h from
+// CR midnight. The old server-local Date math ran on Railway's UTC clock — after
+// 6 PM CR "today" was already tomorrow — and setHours(29,…) on the end bound made
+// every window 48h wide, so Friday-evening reports carried Monday's events under
+// a "TOMORROW'S CALENDAR" label (the Win Da Week bug).
+function _crMidnightUtc(daysFromNow = 0) {
+  const todayCR = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const d = new Date(`${todayCR}T06:00:00.000Z`); // CR midnight (UTC-6, no DST)
+  d.setUTCDate(d.getUTCDate() + daysFromNow);
+  return d;
+}
+function _crDayLabel(daysFromNow = 0) {
+  return _crMidnightUtc(daysFromNow).toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'long', month: 'short', day: 'numeric' });
+}
 async function getCalendarEvents(daysFromNow = 0, daysRange = 1) {
   const auth     = getGoogleAuth();
   const calendar = google.calendar({ version: 'v3', auth });
-  const startDate = new Date();
-  startDate.setDate(startDate.getDate() + daysFromNow);
-  startDate.setHours(6, 0, 0, 0);
-  const endDate = new Date(startDate);
-  endDate.setDate(endDate.getDate() + daysRange);
-  endDate.setHours(29, 59, 59, 0);
+  const startDate = _crMidnightUtc(daysFromNow);
+  const endDate   = new Date(startDate.getTime() + daysRange * 24 * 60 * 60 * 1000);
   const res = await calendar.events.list({ calendarId: 'primary', timeMin: startDate.toISOString(), timeMax: endDate.toISOString(), singleEvents: true, orderBy: 'startTime' });
   const events = res.data.items || [];
   if (!events.length) return 'No events found in that range.';
   return events.map(e => {
-    const when = e.start.dateTime || e.start.date;
+    // CR weekday + wall clock, never the raw ISO string — the event's own offset
+    // (e.g. a Cancun -05:00 organizer) reads as the wrong hour, and without a
+    // weekday the model can't sanity-check a "today/tomorrow" label.
+    const when = e.start.dateTime
+      ? `${new Date(e.start.dateTime).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} CR`
+      : `${new Date(`${e.start.date}T12:00:00Z`).toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric' })} (all day)`;
     const guestCount = (e.attendees || []).length;
     return `${when} — ${e.summary} [id: ${e.id}${guestCount ? ` | ${guestCount} guests` : ''}]`;
   }).join('\n');
@@ -2887,15 +2908,19 @@ async function getSalesIntelligence(query) {
     const excludeIds = await getNonFlywheelCallIds();
     const appointments = filterFlywheelAppts(appointmentsRaw, excludeIds);
 
-    // ── Query outcomes ─────────────────────────────────────────────────────
-    const { data: outcomes } = await portalSupabase
-      .from('revops_sales_outcomes')
-      .select('appointment_id, outcome, offer_pitched, proposed_value, closed_revenue, close_date, lost_reason, objection_category, notes')
-      .order('created_at', { ascending: false })
-      .limit(200);
+    // ── Query outcomes (scoped to these appointments, like the stats fns) ──
+    const apptIdList = (appointments || []).map(a => a.id);
+    let outcomes = [];
+    if (apptIdList.length) {
+      const { data } = await portalSupabase
+        .from('revops_sales_outcomes')
+        .select('appointment_id, outcome, offer_pitched, proposed_value, closed_revenue, close_date, lost_reason, objection_category, notes, updated_at')
+        .in('appointment_id', apptIdList);
+      outcomes = data || [];
+    }
 
     const outcomeMap = {};
-    (outcomes || []).forEach(o => { outcomeMap[o.appointment_id] = o; });
+    outcomes.forEach(o => { outcomeMap[o.appointment_id] = o; });
     const appts = appointments || [];
 
     if (!appts.length) {
@@ -2919,7 +2944,18 @@ async function getSalesIntelligence(query) {
           const closer  = resolveSalesMember(a.closer_id);
           const time    = formatICTime(a.scheduled_start, { hour: '2-digit', minute: '2-digit' });
           const outcome = outcomeMap[a.id];
-          const status  = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
+          // A call that hasn't happened yet can't have an outcome. GHL reschedules
+          // reuse the appointment row, so a pre-reschedule no_show outcome (and a
+          // stale attended=false) rides along — surface it as "rebooked", never as
+          // the outcome of the upcoming call.
+          let status;
+          if (new Date(a.scheduled_start) > new Date()) {
+            status = ((outcome?.outcome || '').toLowerCase() === 'no_show' || a.attended === false)
+              ? 'scheduled — rebooked after earlier no-show'
+              : 'scheduled';
+          } else {
+            status = outcome ? `outcome: ${outcome.outcome}` : (a.attended === false ? 'no-show' : a.attended === true ? 'attended' : 'scheduled');
+          }
           // Native setter attribution (GHL createdBy → setter_id). NULL on a GHL
           // row = widget self-booked or closer-booked. Live GHL opp lookup only
           // for legacy iClosed rows that never had a setter_id.
@@ -3060,7 +3096,9 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
     const name = resolveSalesMember(a.closer_id);
     if (!result[name]) result[name] = { source: 'ghl', calls_booked: 0, attended: 0, no_shows: 0, pending: 0, sold: 0, revenue: 0 };
     result[name].calls_booked += 1;
-    const o = outcomesById[a.id];
+    // An outcome row on a call that hasn't happened yet is a reschedule leftover
+    // (GHL reuses the appointment row) — treat the call as pending, not decided.
+    const o = new Date(a.scheduled_start) > new Date() ? null : outcomesById[a.id];
     // Attendance is derived from the OUTCOME, not the broken attended boolean.
     const c = classifyOutcome(o);
     if (c.showed)  result[name].attended += 1;  // attended = showed up (call happened)
@@ -3147,7 +3185,10 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
   }
 
   // OWNERSHIP MAP: who CLAIMED each prospect in #ng-sales-goats (✋ flow →
-  // setter_claims). 45-day lookback — claims usually precede the call by days.
+  // setter_claims). 45-day lookback from the WINDOW START (not end) — claims
+  // usually precede the call by days, and anchoring on the start keeps the
+  // lookback valid for wide windows like month-to-date, where a late-month call
+  // could otherwise outrun a fixed lookback from the window end.
   // Latest claim per prospect email wins.
   const claimOwnerByEmail = {};
   {
@@ -3155,7 +3196,7 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
       .from('setter_claims')
       .select('prospect_email, claimed_by_setter_name, claimed_at')
       .not('prospect_email', 'is', null)
-      .gte('claimed_at', new Date(new Date(weekEndIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString())
+      .gte('claimed_at', new Date(new Date(weekStartIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString())
       .order('claimed_at', { ascending: true });
     for (const c of (claimHist || [])) {
       const k = (c.prospect_email || '').toLowerCase().trim();
@@ -3182,7 +3223,9 @@ async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
       if (!leadsByOwner[owner]) leadsByOwner[owner] = new Set();
       leadsByOwner[owner].add(prospectEmail);
     }
-    const c = classifyOutcome(outcomesById[a.id]);
+    // Same reschedule-leftover guard as getCloserWeeklyStats: no outcome can
+    // describe a call that hasn't happened yet.
+    const c = classifyOutcome(new Date(a.scheduled_start) > new Date() ? null : outcomesById[a.id]);
     if (c.showed)            slot.attended += 1;
     if (c.noShow)            slot.no_shows += 1;
     if (c.pending)           slot.pending  += 1;
@@ -3213,7 +3256,7 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   if (dropped.length) console.warn(`Setter stats: dropping unresolved id row(s) from leaderboard: ${dropped.join(', ')}`);
   const names = Object.keys(stats).filter(n => !isUnresolvedSalesId(n));
   if (!names.length) {
-    return `No setter activity (GHL bookings or lead claims) found for the week ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
+    return `No setter activity (GHL bookings or lead claims) found for ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
   // Ranked by the setter-CONTROLLED outcome first: calls from leads they own.
   // Converted calls (AQC) and claims break ties — quality still matters, but a
@@ -3228,7 +3271,9 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     (b.s.aqc || 0) - (a.s.aqc || 0) ||
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
 
-  const lines = [`SETTER WEEKLY STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
+  // Window-agnostic header — the leaderboard cron passes month-to-date, the sales
+  // standup passes a 7-day window; the dates say which.
+  const lines = [`SETTER STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
   lines.push(`(Ordered by what the setter CONTROLS: leads claimed → calls from those leads, then the shared/downstream numbers. ATTRIBUTION: a call belongs to the setter who CLAIMED the prospect (the ✋ flow in #ng-sales-goats). It does not matter whether the setter or the prospect clicked book — the setter owns the lead either way. GHL's recorded booker is only a fallback for calls on leads nobody claimed. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Ranked by calls.)`);
   ranked.forEach(({ name, s, showRate, decided }, idx) => {
     const showRateStr = showRate === null ? 'pending' : `${showRate}%`;
@@ -3612,7 +3657,7 @@ async function runNightlyLearning(correlationId) {
     try {
       const tomorrowEvents = await getCalendarEvents(1, 1);
       if (tomorrowEvents && !tomorrowEvents.includes('error')) {
-        digest += `\n\n=== CALENDAR (tomorrow) ===\n${tomorrowEvents}`;
+        digest += `\n\n=== CALENDAR (tomorrow — ${_crDayLabel(1)} CR) ===\n${tomorrowEvents}`;
       }
     } catch (e) { console.error('Nightly learning — calendar fetch error:', e.message); }
 
@@ -3659,7 +3704,7 @@ async function runNightlyLearning(correlationId) {
     } catch (strikeErr) { console.error('Nightly learning — strike mover digest error:', strikeErr.message); }
 
     if (!digest) return;
-    const todayStr = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
+    const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), a spike in failures, or unusually high move volume (intel). A routine day (sweeps ran, few or no moves, transient failures) needs NO entry\n\n${digest}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });

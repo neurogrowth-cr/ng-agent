@@ -96,3 +96,19 @@ So GHL produces two contact records per real lead, each with its own contact_id,
 - **Distinguish "no signal" from "negative signal" in every metric.** `pending` (no outcome row) is not `no_show`. Anything derived from a missing row needs an independent source of truth — Fathom recordings are the reliable one for "did this call happen".
 - GHL specifics worth remembering: its "In calendar" trigger filter is **single-select** — cover N calendars with N duplicate trigger cards (they OR together into the same action). Its public API is **list-only for workflows** (`GET /workflows/{id}` → 404), and the builder SPA won't render in an automated browser tab, so every workflow edit is manual UI work.
 - Vercel blocks deploys whose GitHub commit author has no linked Vercel account, even when that person's *email* is already on the team — it matches on GitHub login. Fix once via Account → Authentication → Login Connections rather than redeploying by hand each time.
+
+## 2026-08-04 — An outcome attached to a call that hasn't happened yet is always stale
+
+**Symptom.** Daily Call Roster printed `outcome: no-show` on Daniela Bruno's fresh 2 PM call (and José Manuel's Aug 5 call).
+
+**Root cause chain.** GHL reschedules reuse the appointment (same appointmentId) and keep `appointmentStatus=noshow`; the Outcome workflow re-fires on the update carrying the NEW startTime + the STALE status; dash upserts in place and `revops_sales_outcomes` is unique per appointment — so the old booking's no-show becomes "the outcome" of the upcoming call.
+
+**Rule.** Any report joining `revops_appointments` × `revops_sales_outcomes` must gate on `scheduled_start <= now()` before treating an outcome (or the `attended` boolean) as describing that call. Fixed in `getSalesIntelligence` today-branch + both weekly-stats fns; upstream guard in dash PR #22 (`clearStaleNoShowState`). Also: `reschedule_count` is 0 on rows that demonstrably rescheduled 2-3×  — never use it as a signal.
+
+## 2026-08-04 — Date math on the server clock is wrong after 6 PM CR; label calendar blocks with resolved dates
+
+**Symptom.** On Fridays Max said "tomorrow is the Win Da Week meeting" (it's Mondays).
+
+**Root cause.** `getCalendarEvents` built day windows with `new Date()`+`setDate`/`setHours` — server-local (Railway = UTC), so after 6 PM CR "today" was already tomorrow — and `setHours(29,…)` on the end bound made every window 48h wide. The block was injected as `TOMORROW'S CALENDAR:` with raw ISO event lines (no weekday, organizer's -05:00 offset), so the model had nothing to cross-check the label against and trusted it.
+
+**Rules.** (1) Never compute a "day" from the process clock — derive the CR date string first (`toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' })`), then build UTC instants (pattern: `_crMidnightUtc` / `_crDayBoundsUtc`). (2) Any context block making a temporal claim ("today", "tomorrow") must carry the resolved date + weekday in the label AND in each line, so the LLM can catch a mislabel instead of amplifying it. (3) `setHours(29,…)` rolls the date forward a day — it's a window-width bug wearing a convenience-trick costume.
