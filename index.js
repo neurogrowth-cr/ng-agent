@@ -9155,6 +9155,229 @@ function attachSocketWatchdog() {
   client.on('connected', () => onUp('connected'));
 }
 
+// ─── MAKE SCENARIO HEALTH ───────────────────────────────────────────────────
+// Make auto-deactivates a scenario when it errors at initialization (an invalid
+// blueprint, a broken connection). Incoming webhooks queue rather than vanish, so
+// nothing is lost — but CAPI events go stale and setters see no booking alerts
+// until someone reads the Make email. That is the blind spot this closes: on
+// 2026-08-04 [PROD] GHL Appt Booked sat deactivated for ~7 min and the only
+// signal was an email to Ron's inbox.
+//
+// Watches every scenario whose name starts with [PROD] so new ones are covered
+// without a code change. Inert unless MAKE_API_TOKEN is set.
+const MAKE_API_TOKEN   = process.env.MAKE_API_TOKEN || null;
+const MAKE_API_BASE    = process.env.MAKE_API_BASE  || 'https://us2.make.com/api/v2';
+const MAKE_TEAM_ID     = process.env.MAKE_TEAM_ID   || '432699';
+const MAKE_ALERT_CHANNEL = process.env.MAKE_ALERT_CHANNEL || OPS_CHANNEL;
+
+// Scenarios that are [PROD]-named but deactivated ON PURPOSE, so the watchdog does
+// not cry wolf. 5776020 [PROD] Auto Strike Mover was superseded by Max's own
+// runAutoStrikeMover cron and turned off deliberately. Cleaner long-term fix is to
+// rename retired scenarios out of the [PROD] prefix (Ron already does this with
+// [DISABLED …] / [ARCHIVED …]) and drop them from this list.
+const MAKE_WATCHDOG_IGNORE = new Set(
+  String(process.env.MAKE_WATCHDOG_IGNORE || '5776020')
+    .split(',').map(s => s.trim()).filter(Boolean)
+);
+
+// scenarioId -> reason we already alerted on. Cleared when the scenario recovers.
+// In-memory by design (matches the socket watchdog): after a Railway restart a
+// still-broken scenario re-alerts on the next hourly run, which is the behaviour
+// we want — a restart should never silently swallow an open outage.
+const makeScenarioAlerted = new Map();
+
+async function postMakeHealthAlert(text) {
+  try {
+    let channel = MAKE_ALERT_CHANNEL;
+    try {
+      const channels = await getCachedChannelList();
+      const match = channels.find(c => c.name === String(MAKE_ALERT_CHANNEL).replace('#', ''));
+      if (match) channel = match.id;
+    } catch (e) {
+      console.error('postMakeHealthAlert: channel lookup failed, posting by name:', e.message);
+    }
+    await slack.client.chat.postMessage({ channel, text });
+  } catch (e) {
+    console.error('postMakeHealthAlert: failed to post alert:', e.message);
+  }
+}
+
+async function checkMakeScenarioHealth(correlationId) {
+  if (!MAKE_API_TOKEN) return;
+
+  // Paginate rather than assume one page holds the team's ~50 scenarios — Make does
+  // not document the default pg[limit], and a silent truncation here would drop
+  // scenarios from the watch list without any visible symptom.
+  const all = [];
+  const PAGE = 100;
+  for (let offset = 0; offset < 1000; ) {
+    const url = `${MAKE_API_BASE}/scenarios?teamId=${encodeURIComponent(MAKE_TEAM_ID)}`
+              + `&pg%5Blimit%5D=${PAGE}&pg%5Boffset%5D=${offset}`;
+    const res = await fetch(url, { headers: { Authorization: `Token ${MAKE_API_TOKEN}` } });
+    if (!res.ok) {
+      // A dead token is itself an outage of the watchdog — say so once per occurrence
+      // rather than failing silently, which is the exact failure mode being fixed here.
+      const body = await res.text().catch(() => '');
+      console.error(`Make health: API ${res.status} — ${body.slice(0, 300)}`);
+      if (!makeScenarioAlerted.has('__api__')) {
+        makeScenarioAlerted.set('__api__', `api_${res.status}`);
+        await postMakeHealthAlert(
+          `⚠️ <@${RON_SLACK_ID}> Max cannot reach the Make API (HTTP ${res.status}) — the [PROD] scenario watchdog is blind until this is fixed. Check MAKE_API_TOKEN in Railway.`
+        );
+      }
+      return;
+    }
+    const payload = await res.json();
+    const page = Array.isArray(payload.scenarios) ? payload.scenarios : [];
+    all.push(...page);
+    if (!page.length) break;
+    offset += page.length; // advance by what was actually returned, not what was asked for
+  }
+  makeScenarioAlerted.delete('__api__');
+
+  const scenarios = all.filter(s =>
+    String(s.name || '').startsWith('[PROD]') && !MAKE_WATCHDOG_IGNORE.has(String(s.id))
+  );
+  if (!scenarios.length) {
+    console.log('Make health: no [PROD] scenarios returned — nothing to check.');
+    return;
+  }
+
+  for (const s of scenarios) {
+    // Three distinct failure modes, most severe first:
+    //   inactive — Make stopped it (error or manual): nothing runs at all
+    //   invalid  — the blueprint is broken; this is what PRECEDES a deactivation
+    //   dlq      — still active, but runs are failing and piling up as incomplete
+    //              executions. This is the class Make emails as "the scenario has
+    //              NOT been paused" — isActive stays true through every failed run,
+    //              so without this a scenario can fail 100% of the time and look green.
+    const reason = s.isActive === false ? 'inactive'
+                 : s.isinvalid === true ? 'invalid'
+                 : Number(s.dlqCount) > 0 ? 'dlq'
+                 : null;
+    const previous = makeScenarioAlerted.get(s.id);
+
+    if (reason && previous !== reason) {
+      makeScenarioAlerted.set(s.id, reason);
+      const detail = reason === 'inactive'
+        ? 'is *DEACTIVATED* — incoming webhooks are queuing and no CAPI events or Slack alerts are firing from it.'
+        : reason === 'invalid'
+        ? 'has an *INVALID BLUEPRINT* — it will auto-deactivate on the next incoming event.'
+        : `is active but has *${s.dlqCount} incomplete execution(s)* queued — runs are erroring even though Make has not paused it.`;
+      const consequence = reason === 'dlq'
+        ? 'Each incomplete execution is a booking that did not get its CAPI event or Slack alert.'
+        : 'Nothing is lost while it is down — webhooks replay on reactivation — but fix it before the queue ages.';
+      await postMakeHealthAlert(
+        `🚨 <@${RON_SLACK_ID}> Make scenario *${s.name}* (${s.id}) ${detail}\n` +
+        `${consequence}\n` +
+        `https://us2.make.com/${MAKE_TEAM_ID}/scenarios/${s.id}/edit`
+      );
+      logActivity({
+        event_type: 'alert', event_source: 'cron', action: 'make_scenario_down',
+        status: reason, output: { scenario_id: s.id, name: s.name }, correlation_id: correlationId,
+      });
+    } else if (!reason && previous) {
+      makeScenarioAlerted.delete(s.id);
+      await postMakeHealthAlert(`✅ Make scenario *${s.name}* (${s.id}) is active again — queued webhooks replay automatically.`);
+    }
+  }
+
+  const down = scenarios.filter(s => makeScenarioAlerted.has(s.id)).length;
+  console.log(`Make health: checked ${scenarios.length} [PROD] scenario(s), ${down} down.`);
+}
+
+if (MAKE_API_TOKEN) {
+  // Every 10 min, not hourly: the 2026-08-04 outage lasted ~4 minutes end to end,
+  // and an hourly poll would have seen isActive:true on both sides of it. One API
+  // call per tick.
+  cron.schedule('*/10 * * * *', wrapCronJob('checkMakeScenarioHealth', async (c) => { await checkMakeScenarioHealth(c); }), { timezone: 'America/Costa_Rica' });
+  console.log('Registered static cron: Make [PROD] scenario watchdog (*/10 * * * *)');
+} else {
+  console.warn('Make scenario watchdog NOT registered — MAKE_API_TOKEN is not set.');
+}
+
+// ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
+// The scenario watchdog above only sees Make. Make can be perfectly green while
+// the booking pipeline is broken upstream of it — if a GHL workflow stops firing
+// the webhook, Make has nothing to error on and reports full health. That is not
+// hypothetical: the GHL customData bug (tasks/todo.md, 2026-08-02) silently
+// skipped 33 deliveries with no system anywhere reporting a fault.
+//
+// So this watches the OUTCOME instead of the plumbing: every booking that landed
+// in revops_appointments should have a matching booked-alert row, written by the
+// Make scenario's ng_register_booked_alert RPC. A gap means the chain broke
+// somewhere — GHL, Make, or Supabase — and it does not care which.
+const bookingDivergenceAlerted = new Set();
+const DIVERGENCE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const DIVERGENCE_GRACE_MS    = 30 * 60 * 1000; // in-flight bookings are not gaps
+
+async function checkBookingAlertDivergence(correlationId) {
+  const now   = Date.now();
+  const since = new Date(now - DIVERGENCE_LOOKBACK_MS).toISOString();
+  const until = new Date(now - DIVERGENCE_GRACE_MS).toISOString();
+
+  const { data: apptsRaw, error: apptErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('ghl_appointment_id, iclosed_call_id, source, created_at')
+    .eq('source', 'ghl')
+    .gte('created_at', since)
+    .lte('created_at', until)
+    .limit(200);
+  if (apptErr) { console.error('Booking divergence: appointments read failed:', apptErr.message); return; }
+
+  const excludeIds = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(apptsRaw, excludeIds)
+    .filter(a => typeof a.ghl_appointment_id === 'string' && a.ghl_appointment_id);
+  if (!appts.length) { console.log('Booking divergence: no bookings in window.'); return; }
+
+  const ids = appts.map(a => a.ghl_appointment_id);
+  const { data: alertRows, error: alertErr } = await portalSupabase
+    .from('ng_appt_slack_alerts')
+    .select('appointment_id')
+    .eq('kind', 'booked')
+    .in('appointment_id', ids);
+  // FAIL CLOSED. An unreadable alerts table makes every booking look unalerted,
+  // which would fire a full-window false alarm and teach everyone to ignore this
+  // channel. Silence plus a loud log is the correct failure here.
+  if (alertErr) { console.error('Booking divergence: alerts read failed, skipping run:', alertErr.message); return; }
+
+  const alerted = new Set((alertRows || []).map(r => r.appointment_id));
+  const missing = appts.filter(a => !alerted.has(a.ghl_appointment_id));
+
+  // Only alert on gaps not already reported, so a standing gap does not re-post
+  // every 30 min while it is being fixed.
+  const fresh = missing.filter(a => !bookingDivergenceAlerted.has(a.ghl_appointment_id));
+  for (const a of missing) bookingDivergenceAlerted.add(a.ghl_appointment_id);
+  // Bound the memo so a long-running process cannot grow it without limit.
+  if (bookingDivergenceAlerted.size > 500) {
+    for (const id of [...bookingDivergenceAlerted].slice(0, bookingDivergenceAlerted.size - 500)) {
+      bookingDivergenceAlerted.delete(id);
+    }
+  }
+
+  console.log(`Booking divergence: ${appts.length} booking(s) in window, ${missing.length} without a booked alert (${fresh.length} new).`);
+  if (!fresh.length) return;
+
+  const lines = fresh.slice(0, 10).map(a =>
+    `• \`${a.ghl_appointment_id}\` — booked ${new Date(a.created_at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`
+  );
+  const more = fresh.length > 10 ? `\n…and ${fresh.length - 10} more.` : '';
+  await postMakeHealthAlert(
+    `🚨 <@${RON_SLACK_ID}> *${fresh.length} booking(s) landed with no booked-alert posted* in the last 6h.\n` +
+    `The appointment reached Supabase but the Make scenario never registered an alert for it — so the chain broke somewhere between GHL, Make and Supabase. Setters did not see these in #ng-sales-goats, and the Meta CAPI Schedule/Qualified events are likely missing too.\n` +
+    lines.join('\n') + more
+  );
+  logActivity({
+    event_type: 'alert', event_source: 'cron', action: 'booking_alert_divergence',
+    status: 'gap', output: { missing: fresh.map(a => a.ghl_appointment_id) }, correlation_id: correlationId,
+  });
+}
+
+// Every 30 min — the 30-minute grace window means a tighter cadence cannot
+// surface anything sooner, and this costs two Supabase reads per run.
+cron.schedule('*/30 * * * *', wrapCronJob('checkBookingAlertDivergence', async (c) => { await checkBookingAlertDivergence(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: booking → alert divergence check (*/30 * * * *)');
+
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
   try {
