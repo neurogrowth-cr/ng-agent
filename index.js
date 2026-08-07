@@ -498,6 +498,8 @@ const RON_ONLY_TOOLS = new Set([
   'add_calendar_attendees',
   // REVI coaching teardowns + leadership initiatives are Ron-only material.
   'get_revi_intelligence',
+  // The weekly recap is a Ron-only DM surface (spend, CAC, revenue).
+  'preview_weekly_recap',
 ]);
 
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
@@ -2285,6 +2287,44 @@ async function getMetaAdsSummary(datePreset = 'last_7d') {
       purchases !== '0' ? `Sales (Meta Purchase events): ${purchases} | CAC: $${cac}` : 'Sales (Meta Purchase events): 0',
     ].join('\n');
   } catch (err) { return `Meta Ads summary error: ${err.message}`; }
+}
+
+// Structured Meta insights for an EXACT date window (CR calendar dates).
+// The weekly recap needs numbers (not a preformatted string) so it can render
+// WoW deltas and reconcile Meta form leads against the GHL lead feed. Returns
+// null on any failure — the caller renders "unavailable" instead of embedding
+// an error string in the report body like getMetaAdsSummary does.
+async function getMetaAdsRange(sinceStr, untilStr) {
+  try {
+    const accountId = process.env.META_AD_ACCOUNT_ID;
+    const token     = process.env.META_ACCESS_TOKEN;
+    if (!accountId || !token) return null;
+    const fields    = 'spend,impressions,clicks,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type';
+    const timeRange = encodeURIComponent(JSON.stringify({ since: sinceStr, until: untilStr }));
+    const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/insights?fields=${fields}&time_range=${timeRange}&access_token=${token}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.message);
+    const d         = json.data?.[0] || {};
+    const spend     = parseFloat(d.spend || 0);
+    const leads     = parseInt((d.actions || []).find(a => a.action_type === 'lead')?.value     || '0', 10);
+    const purchases = parseInt((d.actions || []).find(a => a.action_type === 'purchase')?.value || '0', 10);
+    return {
+      spend,
+      impressions: parseInt(d.impressions || 0, 10),
+      reach:       parseInt(d.reach || 0, 10),
+      clicks:      parseInt(d.clicks || 0, 10),
+      ctr:         parseFloat(d.ctr || 0),
+      cpc:         parseFloat(d.cpc || 0),
+      cpm:         parseFloat(d.cpm || 0),
+      leads,
+      purchases,
+      formCpl: leads     > 0 ? +(spend / leads).toFixed(2)     : null,
+      cac:     purchases > 0 ? +(spend / purchases).toFixed(2) : null,
+    };
+  } catch (err) {
+    console.error('getMetaAdsRange error:', err.message);
+    return null;
+  }
 }
 
 async function getMetaCampaigns(datePreset = 'last_7d', limit = 10) {
@@ -4259,20 +4299,23 @@ async function _scrapeMetaCostPerBookingToday() {
   return +(spend / count).toFixed(2);
 }
 
-// GHL new contacts today (both funnels — universal lead-volume signal)
+// New leads today — Form/WA funnel via lead_posts (deduped GHL lead feed).
+// Replaces the old raw GET /contacts/ call, which passed v1 startDate/endDate
+// params to the v2 endpoint and had no res.ok check, so every API failure was
+// silently recorded as a legitimate 0 and poisoned the anomaly baseline.
+// lead_posts rows are written by the GHL lead-intake webhook and already
+// deduped against the FB→WhatsApp duplicate-contact path (one logical lead
+// per slack_message_ts). Errors THROW so the anomaly cron records a scrape
+// error instead of a fake zero. Metric key is a frozen metric_observations PK.
 async function _scrapeGhlNewContactsToday() {
-  const locationId = process.env.GHL_LOCATION_ID;
-  const apiKey     = process.env.GHL_API_KEY;
-  if (!locationId || !apiKey) return null;
-  const headers  = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28' };
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const res  = await fetch(
-    `https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&startDate=${todayStr}&endDate=${todayStr}&limit=100`,
-    { headers }
-  );
-  const data = await res.json();
-  if (data.meta?.total !== undefined) return data.meta.total;
-  return (data.contacts || []).length;
+  const day = _crDayBoundsUtc(0);
+  const { data, error } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts')
+    .gte('posted_at', day.start)
+    .lt('posted_at',  day.end);
+  if (error) throw new Error(error.message);
+  return new Set((data || []).map(r => r.slack_message_ts).filter(Boolean)).size;
 }
 
 // Calls booked yesterday (flywheel-only; booked_at populated by dash for GHL rows)
@@ -4810,8 +4853,10 @@ const METRIC_REGISTRY = [
   { name: 'meta_form_cpl_today',          domain: 'marketing',   scrape: _scrapeMetaFormCplToday,          label: 'Meta Form CPL (today)' },
   { name: 'meta_cac_today',               domain: 'marketing',   scrape: _scrapeMetaCacToday,               label: 'Meta CAC via Meta Purchase events (today)' },
   { name: 'meta_cost_per_booking_today',  domain: 'marketing',   scrape: _scrapeMetaCostPerBookingToday,    label: 'Meta cost-per-booking (today)' },
-  // Lead volume — GHL is the universal truth-source (covers both VSL + Form funnels)
-  { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'GHL new contacts (today)' },
+  // Lead volume — lead_posts (GHL lead-intake webhook, Form/WA funnel; VSL
+  // self-bookers skip the lead feed and surface as booked appointments below).
+  // Key frozen (metric_observations PK with baseline history) — label only.
+  { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'New leads (Form/WA funnel, today)' },
   // Call pipeline — revops_appointments (GHL-native since 2026-07-23) is the truth-source.
   // NOTE: the iclosed_* metric KEYS are historical and frozen ON PURPOSE — they are
   // primary keys in metric_observations with baseline history. Rename = severed baselines.
@@ -5066,6 +5111,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
+          { name: 'preview_weekly_recap', description: 'Generate the Weekly Sales & Marketing Recap right now (week-to-date: Monday CR through this moment) and return it as text WITHOUT posting it anywhere. Use when Ron asks to preview, test, or see the weekly recap on demand — the Friday 5 PM cron still posts the real one.', input_schema: { type: 'object', properties: {} } },
           { name: 'get_revi_intelligence', description: "Query REVI (the sales-call coaching + leadership-initiative agent) data. Topics: 'coaching' = per-closer scores, outcomes, and latest coaching focus (query = optional closer name); 'initiatives' = open leadership initiatives from Win Da Week / Management Sync / Product Sync meetings, with owners, next steps, and days stalled; 'deals' = recent won/lost deals with loss reasons and pattern tags; 'prospect' = REVI's scored calls + buying signals for one prospect (query = email or name, required); 'scoreboard' = all-closer comparison. Use for any question about call coaching, closer performance quality, why deals are lost, or what initiatives are open/stalled.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'coaching | initiatives | deals | prospect | scoreboard' }, query: { type: 'string', description: 'Prospect email/name (topic=prospect) or closer name (topic=coaching). Optional otherwise.' }, days: { type: 'number', description: 'Lookback window in days. Defaults: coaching 14, deals 30, scoreboard 7.' } }, required: ['topic'] } },
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
@@ -5134,6 +5180,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
             (out.skipped.length ? `\n\nSkipped: ${out.skipped.map(s => s.metric + ' (' + s.reason + ')').join(', ')}` : '') +
             (out.errors.length ? `\n\nErrors: ${out.errors.map(e => e.metric + ': ' + e.error).join('; ')}` : '');
         }
+        else if (toolUse.name === 'preview_weekly_recap')   result = await runWeeklySalesMarketingRecap(null, { preview: true });
         else if (toolUse.name === 'query_metric_history')   result = await queryMetricHistory(toolUse.input.metric, Math.min(toolUse.input.days || 30, 90));
         else if (toolUse.name === 'get_revi_intelligence')  result = await queryReviIntelligence(toolUse.input.topic, toolUse.input.query || null, toolUse.input.days);
         else if (toolUse.name === 'draft_outbound_email')   result = await draftOutboundEmail(toolUse.input, userId);
@@ -7248,112 +7295,339 @@ async function runStaleLeadDailySweep(_correlationId) {
 }
 
 // ─── WEEKLY SALES & MARKETING RECAP ──────────────────────────────────────────
-// Fires Friday 5 PM CR. DMs Ron only with 7-day sales + marketing summary.
-async function runWeeklySalesMarketingRecap(_correlationId) {
+// Fires Friday 5 PM CR. DMs Ron only. Every number is computed LIVE at report
+// time from the authoritative sources (lead_posts, revops_appointments +
+// revops_sales_outcomes, Meta insights with an exact matching date window) —
+// never from summing daily metric_observations snapshots, which is how the old
+// version reported "0 leads / 0.1% close rate" for months.
+
+// CR-anchored recap window: Monday 00:00 CR → now, plus the same elapsed
+// window one week earlier for WoW deltas. Meta windows are CR calendar dates
+// (Graph API time_range is date-granular).
+function crRecapBounds(now = new Date()) {
+  const toDateStr = d => d.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const todayStr   = toDateStr(now);
+  const todayStart = new Date(`${todayStr}T06:00:00Z`); // CR midnight (UTC-6, no DST)
+  const crDow      = new Date(`${todayStr}T00:00:00Z`).getUTCDay(); // 0=Sun..6=Sat
+  const monOffset  = crDow === 0 ? 6 : crDow - 1;
+  const weekStart  = new Date(todayStart.getTime() - monOffset * 24 * 60 * 60 * 1000);
+  const weekAgoMs  = 7 * 24 * 60 * 60 * 1000;
+  const label = d => d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+  return {
+    startIso:     weekStart.toISOString(),
+    endIso:       now.toISOString(),
+    prevStartIso: new Date(weekStart.getTime() - weekAgoMs).toISOString(),
+    prevEndIso:   new Date(now.getTime() - weekAgoMs).toISOString(),
+    metaSince:     toDateStr(weekStart),
+    metaUntil:     todayStr,
+    prevMetaSince: toDateStr(new Date(weekStart.getTime() - weekAgoMs)),
+    prevMetaUntil: toDateStr(new Date(now.getTime() - weekAgoMs)),
+    monLabel: label(weekStart),
+    endLabel: label(now),
+  };
+}
+
+// Deduped Form/WA-funnel leads in window, per-source — same one-logical-lead-
+// per-slack_message_ts dedup as the LEADS TODAY branch of getSalesIntelligence
+// (FB→WA dup contacts share the original post's ts). Throws on Supabase error.
+async function getWeeklyLeadStats(startIso, endIso) {
+  const { data, error } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts, source, posted_at')
+    .gte('posted_at', startIso)
+    .lt('posted_at', endIso);
+  if (error) throw new Error(error.message);
+  const byTs = new Map(); // ts → source (earliest row wins)
+  for (const r of (data || [])) {
+    if (!r.slack_message_ts || byTs.has(r.slack_message_ts)) continue;
+    byTs.set(r.slack_message_ts, r.source || 'Unknown');
+  }
+  const bySource = {};
+  for (const src of byTs.values()) bySource[src] = (bySource[src] || 0) + 1;
+  return { total: byTs.size, bySource };
+}
+
+// One-cohort weekly pipeline stats, flywheel-filtered, GHL-native.
+// Show/close/revenue numbers all come from the scheduled_start cohort so they
+// are internally consistent; "booked" (booked_at cohort) is a separate
+// booking-velocity number and is never a show-rate denominator.
+async function getWeeklySalesStats(startIso, endIso) {
+  const excludeIds = await getNonFlywheelCallIds();
+
+  const { data: bookedRaw, error: bookedErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, setter_id, iclosed_call_id, ghl_appointment_id')
+    .gte('booked_at', startIso)
+    .lt('booked_at', endIso);
+  if (bookedErr) throw new Error(bookedErr.message);
+  const booked = filterFlywheelAppts(bookedRaw, excludeIds);
+
+  const { data: schedRaw, error: schedErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, scheduled_start, attended, iclosed_call_id, ghl_appointment_id')
+    .gte('scheduled_start', startIso)
+    .lt('scheduled_start', endIso);
+  if (schedErr) throw new Error(schedErr.message);
+  const appts = filterFlywheelAppts(schedRaw, excludeIds);
+
+  let outcomesById = {};
+  const apptIds = appts.map(a => a.id);
+  if (apptIds.length) {
+    const { data: outcomes, error: outErr } = await portalSupabase
+      .from('revops_sales_outcomes')
+      .select('appointment_id, outcome, closed_revenue')
+      .in('appointment_id', apptIds);
+    if (outErr) throw new Error(outErr.message);
+    outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
+  }
+
+  let held = 0, noShows = 0, pending = 0, rescheduled = 0, won = 0, revenue = 0;
+  const nowMs = Date.now();
+  for (const a of appts) {
+    // Outcome on a call that hasn't happened yet is a reschedule leftover
+    // (GHL reuses the appointment row) — treat as pending, same as the
+    // closer/setter weekly stats.
+    const o = new Date(a.scheduled_start).getTime() > nowMs ? null : outcomesById[a.id];
+    const c = classifyOutcome(o);
+    if (a.attended === true || c.showed) held += 1;
+    if (c.noShow)      noShows += 1;
+    if (c.pending)     pending += 1;
+    if (c.rescheduled) rescheduled += 1;
+    if (o) {
+      if ((o.outcome || '').toLowerCase() === 'won') won += 1;
+      revenue += Number(o.closed_revenue || 0);
+    }
+  }
+
+  // Wins LOGGED in the window regardless of when the call happened — a deal
+  // closed this week on a call scheduled two weeks ago shows here, not in
+  // `won` (which is cohort-scoped). Same created_at basis as the daily
+  // iclosed_sales_yest scraper, so the recap can't contradict the anomaly DMs.
+  const { data: loggedRows, error: loggedErr } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('id, closed_revenue, created_at')
+    .eq('outcome', 'won')
+    .gte('created_at', startIso)
+    .lt('created_at', endIso);
+  if (loggedErr) throw new Error(loggedErr.message);
+
+  // Show rate excludes pending + rescheduled from the denominator (house
+  // convention — fresh bookings with no outcome yet must not drag it down).
+  const decided = held + noShows;
+  return {
+    bookedInWindow:     booked.length,
+    selfBookedInWindow: booked.filter(a => !a.setter_id).length, // VSL self-book proxy
+    scheduled: appts.length,
+    held, noShows, pending, rescheduled, won, revenue,
+    wonLogged:     (loggedRows || []).length,
+    revenueLogged: (loggedRows || []).reduce((s, r) => s + Number(r.closed_revenue || 0), 0),
+    showRatePct:  decided > 0 ? Math.round((held / decided) * 100) : null,
+    closeRatePct: held > 0 ? Math.round((won / held) * 100) : null,
+  };
+}
+
+// '(▲ +3 WoW)' / '(▼ −2 WoW)' / '(= flat WoW)'; '' when either side is missing.
+function fmtDelta(cur, prev, { money = false } = {}) {
+  if (cur == null || prev == null) return '';
+  const d = cur - prev;
+  const mag = money ? `$${Math.abs(d).toLocaleString()}` : `${Math.abs(d)}`;
+  if (d === 0) return ' (= flat WoW)';
+  return d > 0 ? ` (▲ +${mag} WoW)` : ` (▼ −${mag} WoW)`;
+}
+
+// First line of a knowledge value, trimmed to a sentence boundary — never cut
+// mid-sentence like the old substring(0, 120) truncation.
+function firstSentence(text, max = 200) {
+  const line = (text || '').split('\n')[0].trim();
+  if (line.length <= max) return line;
+  const cut = line.slice(0, max);
+  const lastStop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+  if (lastStop > 40) return cut.slice(0, lastStop + 1);
+  return cut.slice(0, cut.lastIndexOf(' ')) + '…';
+}
+
+// 2–3 sentence READ paragraph from the deterministic stat block. This is the
+// one place report-feedback lessons are actually APPLIED (the old version
+// prepended them as text without changing anything). Non-fatal: '' on failure
+// and the recap posts without a READ section.
+async function composeRecapNarrative(statText, lessons) {
+  try {
+    const lessonBlock = (lessons || []).length
+      ? `\n\nApply these standing corrections from Ron's past feedback:\n${lessons.map(l => `- ${l.value}`).join('\n')}`
+      : '';
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: `You are Max, NeuroGrowth's ops agent, writing the executive takeaway for Ron's weekly sales & marketing recap. Below is the final stat block (all numbers are verified — copy any number verbatim, never recompute or rephrase a stat's meaning).\n\n${statText}${lessonBlock}\n\nWrite the takeaway: 2–3 SHORT sentences, 60 words max, plain text. Sentence 1: the single most important thing that happened this week. Sentence 2: the one thing to watch or act on. Restate at most two numbers total. No preamble, no markdown, no bullet points, no run-on sentences.` }],
+    });
+    return res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  } catch (err) {
+    console.error('composeRecapNarrative error:', err.message);
+    return '';
+  }
+}
+
+async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } = {}) {
   console.log('Running weekly sales & marketing recap...');
   try {
-    // Date range labels for the week (Mon–Fri)
-    const now     = new Date();
-    const dayOfWk = now.getDay(); // 0=Sun, 5=Fri
-    const monday  = new Date(now); monday.setDate(now.getDate() - (dayOfWk === 0 ? 6 : dayOfWk - 1)); monday.setHours(0,0,0,0);
-    const monLabel = monday.toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
-    const friLabel = now.toLocaleDateString('en-US',    { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+    const b = crRecapBounds();
 
-    // ── Meta Ads summary ──────────────────────────────────────────────────
-    const metaSummary = await getMetaAdsSummary('last_7d');
+    // Each fetch degrades to null on failure so one broken source costs its
+    // section, not the whole report.
+    const safe = (fn, label) => fn().catch(err => { console.error(`Recap ${label} error:`, err.message); return null; });
 
-    // ── metric_observations from primary supabase ─────────────────────────
-    async function fetchMetric(metricName) {
-      const { data } = await supabase
-        .from('metric_observations')
-        .select('metric, value, observed_at')
-        .eq('metric', metricName)
-        .order('observed_at', { ascending: false })
-        .limit(7);
-      return data || [];
-    }
-
-    const [newContacts, callsBooked, callsHeld, salesRows, closeRates] = await Promise.all([
-      fetchMetric('ghl_new_contacts_today'),
-      fetchMetric('iclosed_calls_booked_yest'),
-      fetchMetric('iclosed_calls_held_yest'),
-      fetchMetric('iclosed_sales_yest'),
-      fetchMetric('close_rate_yesterday'),
+    const [leads, prevLeads, sales, prevSales, meta, prevMeta, anomalyRows, opsFlagRows, clientRows, lessons] = await Promise.all([
+      safe(() => getWeeklyLeadStats(b.startIso, b.endIso), 'leads'),
+      safe(() => getWeeklyLeadStats(b.prevStartIso, b.prevEndIso), 'prev-leads'),
+      safe(() => getWeeklySalesStats(b.startIso, b.endIso), 'sales'),
+      safe(() => getWeeklySalesStats(b.prevStartIso, b.prevEndIso), 'prev-sales'),
+      getMetaAdsRange(b.metaSince, b.metaUntil),          // already null on error
+      getMetaAdsRange(b.prevMetaSince, b.prevMetaUntil),
+      // σ-anomalies only — source-scoped so nightly-learning ops items, REVI
+      // infra health, and confidential rows can never appear as "anomalies".
+      safe(async () => {
+        const { data, error } = await supabase
+          .from('agent_knowledge')
+          .select('key, value, updated_at')
+          .eq('category', 'alert')
+          .eq('source', 'anomaly-detection')
+          .ilike('key', 'anomaly:%')
+          .gte('updated_at', b.startIso)
+          .order('updated_at', { ascending: false });
+        if (error) throw new Error(error.message);
+        return data || [];
+      }, 'anomalies'),
+      safe(async () => {
+        const { data, error } = await supabase
+          .from('agent_knowledge')
+          .select('key')
+          .eq('category', 'alert')
+          .in('source', ['nightly-learning', 'revi-cross-check'])
+          .not('key', 'ilike', 'confidential:%')
+          .gte('updated_at', b.startIso);
+        if (error) throw new Error(error.message);
+        return data || [];
+      }, 'ops-flags'),
+      safe(async () => {
+        const { data, error } = await supabase
+          .from('agent_knowledge')
+          .select('key, value, updated_at')
+          .eq('category', 'client')
+          .gte('updated_at', b.startIso)
+          .order('updated_at', { ascending: false })
+          .limit(30);
+        if (error) throw new Error(error.message);
+        return data || [];
+      }, 'client-updates'),
+      safe(() => getReportLessons('weekly-sales-marketing-recap'), 'lessons'),
     ]);
 
-    const sumMetric  = rows => rows.reduce((s, r) => s + (parseFloat(r.value) || 0), 0);
-    const avgMetric  = rows => rows.length ? (sumMetric(rows) / rows.length) : 0;
+    const parts = [`📈 Weekly Sales & Marketing Recap — ${b.monLabel} to ${b.endLabel} (week through report time)`];
 
-    const totalContacts  = Math.round(sumMetric(newContacts));
-    const avgContactsDay = newContacts.length ? (totalContacts / newContacts.length).toFixed(1) : 'N/A';
-    const totalBooked    = Math.round(sumMetric(callsBooked));
-    const totalHeld      = Math.round(sumMetric(callsHeld));
-    const showRatePct    = totalBooked > 0 ? Math.round((totalHeld / totalBooked) * 100) : 0;
-    const totalSales     = Math.round(sumMetric(salesRows));
-    const avgCloseRate   = avgMetric(closeRates).toFixed(1);
+    // ── LEADS ─────────────────────────────────────────────────────────────
+    parts.push('', '`LEADS`');
+    if (leads) {
+      parts.push(`Form/WA funnel (GHL lead feed): *${leads.total}*${fmtDelta(leads.total, prevLeads?.total)}`);
+      const srcLine = Object.entries(leads.bySource).sort((a, z) => z[1] - a[1]).map(([s, c]) => `${s}: ${c}`).join(' | ');
+      if (srcLine) parts.push(`  ${srcLine}`);
+    } else {
+      parts.push('Lead feed unavailable this run.');
+    }
+    if (sales) parts.push(`VSL self-booked calls: *${sales.selfBookedInWindow}*${fmtDelta(sales.selfBookedInWindow, prevSales?.selfBookedInWindow)}`);
 
-    // ── Anomalies from agent_knowledge ────────────────────────────────────
-    const sevenDaysAgoISO = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const { data: alerts } = await supabase
-      .from('agent_knowledge')
-      .select('key, value')
-      .eq('category', 'alert')
-      .gte('updated_at', sevenDaysAgoISO)
-      .order('updated_at', { ascending: false })
-      .limit(20);
-
-    // ── Build message ─────────────────────────────────────────────────────
-    const parts = [
-      `📈 Weekly Sales & Marketing Recap — Week of ${monLabel} to ${friLabel}`,
-      '',
-      `💰 META SPEND`,
-      metaSummary,
-      '',
-      `📥 LEAD VOLUME (GHL — both funnels)`,
-      `New contacts this week: ${totalContacts} total (avg ${avgContactsDay}/day)`,
-      '',
-      `📞 SALES PIPELINE`,
-      `Calls booked: ${totalBooked} | Calls held: ${totalHeld} | Show rate: ${showRatePct}%`,
-      `Closes: ${totalSales} | Avg close rate: ${avgCloseRate}%`,
-    ];
-
-    if (alerts && alerts.length) {
-      parts.push('');
-      parts.push(`🚨 ANOMALIES THIS WEEK (${alerts.length})`);
-      alerts.forEach(a => {
-        parts.push(`• ${a.key} — ${(a.value || '').substring(0, 120)}`);
-      });
+    // ── SALES PIPELINE ────────────────────────────────────────────────────
+    parts.push('', '`SALES PIPELINE` (calls scheduled this week, flywheel only)');
+    if (sales) {
+      const waiting = [];
+      if (sales.pending)     waiting.push(`${sales.pending} awaiting outcome`);
+      if (sales.rescheduled) waiting.push(`${sales.rescheduled} rescheduled`);
+      parts.push(`Booked this week: *${sales.bookedInWindow}*${fmtDelta(sales.bookedInWindow, prevSales?.bookedInWindow)}`);
+      parts.push(
+        `Held: *${sales.held}* | No-shows: ${sales.noShows} | Show rate: *${sales.showRatePct == null ? 'n/a' : sales.showRatePct + '%'}*` +
+        (waiting.length ? ` (${waiting.join(', ')})` : '')
+      );
+      parts.push(
+        `Closes: *${sales.won}* | Close rate: *${sales.closeRatePct == null ? 'n/a' : sales.closeRatePct + '%'}* | Revenue: *$${sales.revenue.toLocaleString()}*` +
+        fmtDelta(sales.revenue, prevSales?.revenue, { money: true })
+      );
+      // A win logged this week on an older call is real revenue that the
+      // cohort line above won't show — surface it so "Closes: 0" can't
+      // contradict a "sale won yesterday" anomaly DM.
+      if (sales.wonLogged !== sales.won) {
+        parts.push(`Wins logged this week (incl. calls from earlier weeks): *${sales.wonLogged}* | $${sales.revenueLogged.toLocaleString()}`);
+      }
+    } else {
+      parts.push('Pipeline data unavailable this run.');
     }
 
-    // Pull client-level updates from team threads and nightly learning this week
-    const { data: clientUpdates } = await supabase
-      .from('agent_knowledge')
-      .select('key, value')
-      .eq('category', 'client')
-      .gte('updated_at', sevenDaysAgoISO)
-      .order('updated_at', { ascending: false })
-      .limit(10);
-    if (clientUpdates && clientUpdates.length) {
-      parts.push('');
-      parts.push(`👥 CLIENT UPDATES FROM TEAM (this week)`);
-      clientUpdates.forEach(r => {
-        const clientName = (r.key.split(':')[1] || r.key).replace(/-/g, ' ');
-        parts.push(`• ${clientName}: ${(r.value || '').substring(0, 150)}`);
-      });
+    // ── META ADS ──────────────────────────────────────────────────────────
+    parts.push('', `\`META ADS\` (${b.metaSince} → ${b.metaUntil})`);
+    if (meta) {
+      parts.push(`Spend: *$${meta.spend.toFixed(2)}*${fmtDelta(Math.round(meta.spend), prevMeta ? Math.round(prevMeta.spend) : null, { money: true })} | CTR: ${meta.ctr.toFixed(2)}% | CPC: $${meta.cpc.toFixed(2)} | CPM: $${meta.cpm.toFixed(2)}`);
+      parts.push(`Form leads: ${meta.leads} | Form CPL: *${meta.formCpl == null ? 'n/a' : '$' + meta.formCpl.toFixed(2)}*`);
+      parts.push(`Sales (Meta Purchase events): ${meta.purchases} | CAC: *${meta.cac == null ? 'n/a' : '$' + meta.cac.toFixed(2)}*`);
+      if (leads) {
+        const delta = leads.total - meta.leads;
+        const flag = meta.leads > 0 && Math.abs(delta) / meta.leads > 0.2 ? ' — over 20% apart, worth a look' : '';
+        parts.push(`Reconciliation: Meta ${meta.leads} form leads vs ${leads.total} in GHL lead feed (Δ ${delta >= 0 ? '+' : ''}${delta})${flag}`);
+      }
+    } else {
+      parts.push('Meta data unavailable this run.');
     }
 
-    const recapLessons = await getReportLessons('weekly-sales-marketing-recap');
-    if (recapLessons.length) {
-      parts.unshift(`[Corrections applied from feedback]\n${recapLessons.map(l => `• ${l.value}`).join('\n')}\n`);
+    // ── ANOMALIES (σ-detection only) ──────────────────────────────────────
+    parts.push('', '`ANOMALIES` (σ-detection, this week)');
+    if (anomalyRows && anomalyRows.length) {
+      // Latest per metric: key = anomaly:<metric>:<date>, rows arrive newest-first.
+      const seen = new Set();
+      let shown = 0;
+      for (const a of anomalyRows) {
+        const metric = a.key.split(':')[1] || a.key;
+        if (seen.has(metric)) continue;
+        seen.add(metric);
+        parts.push(`• ${firstSentence(a.value)}`);
+        if (++shown >= 5) break;
+      }
+      const hidden = seen.size < anomalyRows.length ? anomalyRows.length - shown : 0;
+      if (hidden > 0) parts.push(`(+${hidden} repeat firings of the same metrics)`);
+    } else {
+      parts.push('No σ-anomalies this week.');
     }
-    parts.push('');
-    parts.push('See something off? Reply to this message tagging @Max with the correction.');
+    if (opsFlagRows && opsFlagRows.length) {
+      parts.push(`${opsFlagRows.length} ops/client flags logged this week (already DMed as they fired).`);
+    }
 
+    // ── CLIENT UPDATES (latest per client) ────────────────────────────────
+    if (clientRows && clientRows.length) {
+      parts.push('', '`CLIENT UPDATES`');
+      const seenClients = new Set();
+      let shown = 0;
+      for (const r of clientRows) {
+        const slug = r.key.split(':')[1] || r.key;
+        if (seenClients.has(slug)) continue;
+        seenClients.add(slug);
+        // Nightly learning occasionally files a report/digest title as a
+        // "client" — real client slugs are short; skip implausible ones.
+        if (slug.length > 40 || /reporte|report|semana|resumen/i.test(slug)) continue;
+        parts.push(`• ${slug.replace(/-/g, ' ').toUpperCase()}: ${firstSentence(r.value)}`);
+        if (++shown >= 6) break;
+      }
+    }
+
+    // ── READ (narrative — where feedback lessons are actually applied) ────
+    const statText = parts.join('\n');
+    const narrative = await composeRecapNarrative(statText, lessons);
+    if (narrative) parts.splice(1, 0, '', '`READ`', narrative);
+
+    parts.push('', 'See something off? Reply to this message tagging @Max with the correction.');
     const msg = parts.join('\n');
+
+    if (preview) return msg;
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: msg });
     console.log('Weekly sales & marketing recap sent to Ron.');
   } catch (err) {
     console.error('Weekly sales & marketing recap error:', err.message);
+    if (preview) return `⚠️ Recap preview failed: ${err.message}`;
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Weekly sales & marketing recap cron failed: ${err.message}` });
   }
 }
