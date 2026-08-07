@@ -4568,10 +4568,17 @@ async function queryReviIntelligence(topic, query = null, days = null) {
 }
 
 // ── REVI cross-checks cron ───────────────────────────────────────────────────
-// C3 heartbeat: REVI scores calls from Fathom recordings. If sales calls were
-// held (metric_observations, iclosed_calls_held_yest) but REVI hasn't scored
-// anything in 2+ business days, its ingestion is silently dead (exactly the
-// 2026-07-16 Fathom team-sharing incident). Alert-only — silent when healthy.
+// C3 heartbeat: REVI scores calls from Fathom recordings. GHL appointments alone
+// can't prove a stall — the 2026-08-04 false alarm counted 4 appointments whose
+// recordings were all activation-host calls REVI rightly skipped (and one GHL
+// appointment can carry the wrong closer_id, so a roster filter can't fix it).
+// REVI now publishes revi.engine_heartbeat (what its poller actually saw), which
+// splits the old single guess into three real failure modes:
+//   poller down (stale last_poll_at) / Fathom feed dark despite appointments
+//   (the 2026-07-16 team-sharing incident) / closer recordings seen but unscored.
+// Recordings flowing with none closer-hosted = no closer-qual calls = healthy.
+// Falls back to the legacy appointments-vs-scores heuristic when the heartbeat
+// row isn't there yet. Alert-only — silent when healthy.
 // C1 coverage + C2 outcome reconciliation land with the GHL migration.
 function _businessDaysBetween(fromMs, toMs) {
   let count = 0;
@@ -4605,6 +4612,27 @@ async function _countSalesCallsSince(sinceISO) {
 
 async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   const alerts = [];
+  const alertKinds = [];
+
+  // REVI's poller heartbeat — single row, written every poll cycle (~12 min).
+  // Absent until ng-revi's heartbeat deploy lands; treat any read failure the same.
+  let hb = null;
+  try {
+    const { data: hbRows } = await reviSupabase
+      .from('engine_heartbeat').select('*').eq('id', 'poller').limit(1);
+    hb = hbRows && hbRows[0] ? hbRows[0] : null;
+  } catch (hbErr) {
+    console.warn('REVI heartbeat read failed (falling back to legacy stall heuristic):', hbErr.message);
+  }
+  const lastPollAt = hb ? new Date(hb.last_poll_at).getTime() : null;
+  const pollerDown = lastPollAt !== null && Date.now() - lastPollAt > 60 * 60 * 1000;
+  if (pollerDown) {
+    alertKinds.push('poller-down');
+    alerts.push(
+      `🔴 *REVI's Fathom poller is down.* Last successful poll: ${new Date(lastPollAt).toISOString().slice(0, 16).replace('T', ' ')} UTC ` +
+      `(cadence is ~12 min). Check the ng-sales-REVI Railway service for a crash loop, then the Fathom API.`
+    );
+  }
 
   // Check 1 — scoring freshness vs. calls actually held.
   const { data: lastScoredRows, error: lsErr } = await reviSupabase
@@ -4616,16 +4644,50 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   const lastScoredAt = lastScoredRows && lastScoredRows[0] ? new Date(lastScoredRows[0].created_at).getTime() : 0;
   const quietBizDays = _businessDaysBetween(lastScoredAt, Date.now());
 
-  if (quietBizDays >= 2) {
-    const sinceISO = new Date(lastScoredAt || Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  // Poller down already alerted above — a scoring-freshness alert on top would
+  // just restate the same outage.
+  if (!pollerDown && quietBizDays >= 2) {
+    const sinceMs = lastScoredAt || Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const sinceISO = new Date(sinceMs).toISOString();
     const heldSince = await _countSalesCallsSince(sinceISO);
     if (heldSince > 0) {
-      alerts.push(
-        `🔇 *REVI appears stalled.* ${heldSince} sales call(s) held since ${sinceISO.slice(0, 10)}, ` +
-        `but REVI hasn't scored anything in ${quietBizDays} business days ` +
-        `(last scored call: ${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}).\n` +
-        `Check: Fathom API key / team sharing (broke silently on Jul 16), the ng-sales-REVI Railway service, and REVI's poll logs.`
-      );
+      const lastScoredStr = lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never';
+      const seenCloserSince = hb && hb.last_closer_seen_at && new Date(hb.last_closer_seen_at).getTime() > sinceMs;
+      const seenAnySince = hb && hb.last_seen_at && new Date(hb.last_seen_at).getTime() > sinceMs;
+      if (!hb) {
+        // Legacy heuristic — appointments vs. scores is the only signal available.
+        alertKinds.push('stall-legacy');
+        alerts.push(
+          `🔇 *REVI appears stalled.* ${heldSince} sales call(s) held since ${sinceISO.slice(0, 10)}, ` +
+          `but REVI hasn't scored anything in ${quietBizDays} business days ` +
+          `(last scored call: ${lastScoredStr}).\n` +
+          `Check: Fathom API key / team sharing (broke silently on Jul 16), the ng-sales-REVI Railway service, and REVI's poll logs. ` +
+          `Caveat: GHL appointments can be activation calls REVI rightly skips (2026-08-04 false alarm) — check skip reasons in the poll logs first.`
+        );
+      } else if (seenCloserSince) {
+        alertKinds.push('seen-unscored');
+        alerts.push(
+          `🟡 *REVI sees closer calls but isn't scoring them.* The poller has seen closer-hosted recordings since ${sinceISO.slice(0, 10)} ` +
+          `(newest: ${String(hb.last_closer_seen_at).slice(0, 10)}), yet nothing scored in ${quietBizDays} business days ` +
+          `(last scored call: ${lastScoredStr}).\n` +
+          `Check REVI's poll logs for skip reasons — all sub-10-min no-shows is benign; empty transcripts or scoring errors are not.`
+        );
+      } else if (seenAnySince) {
+        // Recordings are flowing but none are closer-hosted: closers genuinely held
+        // nothing scoreable (appointments were activation calls, no-shows, or
+        // misattributed in GHL). Exactly the 2026-08-04 false alarm — stay silent.
+        console.log(
+          `REVI cross-checks: ${quietBizDays} quiet biz days but the Fathom feed is alive with no closer-hosted recordings — no stall.`
+        );
+      } else {
+        alertKinds.push('feed-dark');
+        alerts.push(
+          `🔇 *REVI's Fathom feed is dark.* ${heldSince} sales call(s) on the calendar since ${sinceISO.slice(0, 10)}, ` +
+          `the poller is running, but it has seen NO new recordings at all in that window ` +
+          `(last scored call: ${lastScoredStr}).\n` +
+          `This is the Jul 16 signature — check the Fathom API key / team sharing first, then whether the team stopped recording.`
+        );
+      }
     }
   }
 
@@ -4637,6 +4699,7 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
     .eq('status', 'draft')
     .lt('created_at', dayAgoISO);
   if (stuck && stuck.length) {
+    alertKinds.push('stuck-drafts');
     alerts.push(
       `📄 *REVI has ${stuck.length} coaching run(s) stuck in draft >24h* ` +
       `(run dates: ${[...new Set(stuck.map(s => s.run_date))].join(', ')}). ` +
@@ -4647,10 +4710,13 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   if (!alerts.length) { console.log('REVI cross-checks: healthy, staying silent.'); return { alerts: [] }; }
   if (dryRun) { console.log('REVI cross-checks dry-run alerts:\n' + alerts.join('\n\n')); return { alerts }; }
 
-  // Dedup: one alert per distinct condition (stall keyed on last-scored date,
-  // stuck drafts keyed on their run dates) — not one per day the condition persists.
+  // Dedup: one alert per distinct condition (keyed on alert type + last-scored
+  // date, stuck drafts on their run dates) — not one per day it persists. The
+  // type marker keeps a poller-down alert from suppressing a later feed-dark
+  // alert that shares the same last-scored date.
   const stuckDates = (stuck || []).map(s => s.run_date).sort().join(',');
-  const dedupKey = `revi-health:${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}:${stuckDates || 'none'}`;
+  const alertKind = alertKinds.join('+');
+  const dedupKey = `revi-health:${alertKind}:${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}:${stuckDates || 'none'}`;
   const { data: already } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
   if (already && already.length) { console.log(`REVI cross-checks: alert already sent for ${dedupKey}.`); return { alerts, deduped: true }; }
 
