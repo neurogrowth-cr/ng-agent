@@ -23,7 +23,7 @@ Trigger: Max claimed activation call dates "aren't stored" — they live in cust
 - [x] ng-agent commit `f8931ac` (Max reliability package + Make watchdog + replay script) pushed to main → Railway deploy `99969be9` SUCCESS 20:03 UTC, clean boot, 10 dynamic crons; watchdog logs "NOT registered — MAKE_API_TOKEN is not set" as designed
 - [x] getGlobalLessons query verified live against agent_knowledge (0 rows yet — block empty until first correction is captured)
 - [x] dash: branch rebased on origin/main, pushed, [PR #28](https://github.com/neurogrowth-cr/dash.neurogrowth.io/pull/28) open; worktree removed
-- [ ] Ron: merge dash PR #28 after Vercel preview check
+- [x] dash PR #28 MERGED (Ron's go, 2026-08-11 20:10 UTC) — Vercel production deploy `dpl_F4ZL5scJ` READY, aliased to dash.neurogrowth.io
 - [ ] Ron: tell Josue standup Day-7/Day-14 numbers are now activation-call-anchored (will shift for some clients)
 - [ ] Ron: set MAKE_API_TOKEN in Railway to arm the Make watchdog (scope scenarios:read)
 - [ ] Watch: tomorrow 8:30 AM CR roster + 9 AM standup DMs — day lines should carry (YYYY-MM-DD) anchors
