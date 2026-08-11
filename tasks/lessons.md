@@ -1,5 +1,40 @@
 # Lessons
 
+## 2026-08-07 — Derived metrics that discard their source date create "data doesn't exist" hallucinations
+
+**Symptom.** Max told Ron the portal "doesn't store" activation call dates. It does — `customer_activities.completed_at` joined to a template title containing 'activation call'. Max's own `get_client_status` reads that exact field, computes `daysSince`, then throws the date away and prints only "Day N since activation call".
+
+**Root causes (all four mattered).**
+- Tool outputs surfaced only the derived integer, never the source timestamp — so Max's honest reading of its own output was "no date available".
+- `search_portal_schema` matches table/column NAMES only; "activation call" is a row VALUE (template title), so schema search structurally can't find it. An empty schema search proves nothing.
+- Zero data dictionary in the system prompt — no table map, joins, or recipes.
+- The feedback learning loop injected lessons only into scheduled reports; interactive chats got none, so corrections never stuck.
+
+**Takeaways.**
+- When a tool computes a derived value (day count, rate, delta), print the source anchor next to it. Costs nothing, kills a whole class of "not stored" claims.
+- Keep a PORTAL DATA MAP in the system prompt with canonical recipes for business concepts that live as row values.
+- Never let an agent claim data "doesn't exist" without: data map → schema search → at least one actual SELECT.
+
+## 2026-08-07 — `go_live_at` is a provisioning date, not the launch date
+
+**Symptom.** Planned launch-SLA KPI as "activation call → flywheel_ai_onboarding.go_live_at". SQL spot-check: go_live_at PRECEDES the activation call for all 7 checked clients (it's set when the account is provisioned).
+
+**Real launch signal (verified vs Ron's tracking sheet, matches ±2 days):** latest `customer_activities.completed_at` where template title contains 'campaign qa check' or 'campaign validation'.
+
+**Takeaway.** Column names lie. Before anchoring any KPI on a timestamp column, spot-check its ordering against a known ground truth (here: sheet launch dates). One SELECT caught what two independent plans (dash KPI + Max data map) both got wrong.
+
+## 2026-08-04 — Make blueprint edits via API can brick a live scenario; validate modules first
+
+**Symptom.** After adding an HTTP module to `[PROD] GHL Appt Booked → CAPI + Slack Alert` (5148796) via `scenarios_update`, the scenario failed at *initialization* ("Cannot read properties of undefined (reading 'account')"), ran 0 operations, and Make **auto-deactivated** it — live booking webhooks started queuing.
+
+**Root cause.** The `http:ActionSendData` mapper was missing the mandatory `rejectUnauthorized` field (and module-level `parameters: {handleErrors, useNewZLibDeCompress}`). `scenarios_update` accepts an invalid blueprint without complaint; the failure only surfaces on the next incoming event.
+
+**Fixes/takeaways.**
+- ALWAYS run `validate_module_configuration` (org 2866980 / team 432699) on any new/edited module BEFORE `scenarios_update` on a live scenario. It caught the missing field precisely.
+- After any `scenarios_update`, check `isinvalid`/`isActive` in the response and call `scenarios_activate` if needed — an init error deactivates the scenario and a later update does NOT reactivate it.
+- Webhook payloads queue while a scenario is broken/inactive and replay on activation — nothing is lost, but they replay under whatever blueprint is live at that moment (our queued test replayed under the reverted blueprint and posted a stray booked alert).
+- Recovery order that worked: revert to last-known-good blueprint → reactivate → validate the new module offline → reapply → re-test with a synthetic webhook POST and confirm via operations count (filtered module = one fewer op).
+
 ## 2026-05-13 — Slack listeners on private channels need `message.groups`, not `message.channels`
 
 **Symptom.** The iClosed "Strategy call booked" relay (a `slack.event('message')` listener watching `#ng-sales-goats`) never fired once since it shipped — zero `iclosed-setter-reveal-*` rows in `agent_knowledge`, no threaded setter reveals, despite many qualifying iClosed posts.
@@ -96,6 +131,63 @@ So GHL produces two contact records per real lead, each with its own contact_id,
 - **Distinguish "no signal" from "negative signal" in every metric.** `pending` (no outcome row) is not `no_show`. Anything derived from a missing row needs an independent source of truth — Fathom recordings are the reliable one for "did this call happen".
 - GHL specifics worth remembering: its "In calendar" trigger filter is **single-select** — cover N calendars with N duplicate trigger cards (they OR together into the same action). Its public API is **list-only for workflows** (`GET /workflows/{id}` → 404), and the builder SPA won't render in an automated browser tab, so every workflow edit is manual UI work.
 - Vercel blocks deploys whose GitHub commit author has no linked Vercel account, even when that person's *email* is already on the team — it matches on GitHub login. Fix once via Account → Authentication → Login Connections rather than redeploying by hand each time.
+
+## 2026-08-06 — Verify a data recovery by entity identity, never by row count or timing
+
+**Symptom.** Two GHL "Workflow Error Detected" emails. Root cause turned out to be malformed
+`customData` keys in two GHL workflows: `Outcome: Follow-up` shipped a literal TAB in the key
+(`"\tng_event"`), and `Neurogrowth Dashboard Webhook` collapsed its whole mapping to one key
+literally named `undefined`. Both made dash normalize the payload to `unknown` → skipped, while
+still returning **200**, so nothing ever alarmed.
+
+**The near-miss.** After the fix, `revops_sales_outcomes` showed 10 fresh `follow_up` rows in a
+6-minute burst. Row count roughly matched the 14 lost deliveries, and the timing looked exactly
+like a replay. I reported it as "recovered". Cross-checking `contact_id` showed only **1** of the
+14 lost contacts overlapped — 9 of the 10 were new people whose outcomes had simply flowed in
+correctly post-fix. The backlog of 13 was still missing.
+
+**Takeaways.**
+- **A recovery is proven by matching entity IDs, not by counting rows or noticing a plausible
+  burst.** "N rows appeared and N were lost" is a coincidence until the identifiers line up.
+  The query that settles it is a set difference on the entity key, not a `count(*)`.
+- **A fix working for new traffic says nothing about the backlog.** Separate the two claims
+  explicitly: "new events flow correctly" and "old events were recovered" need separate proof.
+- **200 OK is not success.** Dash returned 200 on every malformed delivery and recorded
+  `status='skipped'` in the row. Any ingestion path with a skip/quarantine state needs a
+  standing count of skipped-by-reason; otherwise a broken producer is indistinguishable from
+  a quiet one. This is the same silent-failure shape as the 2026-07-28 allowlist lesson.
+- **Store the raw payload.** `ghl_webhook_deliveries.payload` is the only reason root-causing
+  was possible at all, and the only reason replay is still on the table — the follow-up outcome
+  existed nowhere else (the admin backfill route pulls appointments/opportunities from the GHL
+  API by date and cannot reconstruct it).
+- **Check the malformed key at the byte level.** `\tng_event` renders identically to `ng_event`
+  in most UIs. Compare `jsonb_object_keys` output, not the rendered label.
+
+## 2026-08-06 — Make blueprints are a shared checkout: fetch-modify-write races clobber parallel edits silently
+
+**Symptom.** The Closer/Setter relabel + setter line pushed to Make scenario 5148796 at 20:01 UTC
+was gone by the next booking alert (22:59 UTC): the message still said `Host:` with no setter.
+Execution history showed a second `modify` event at 20:11 UTC — a parallel session (working on
+CAPI match quality) had fetched the blueprint BEFORE 20:01, made its own edits (`country` field,
+`action_source: system_generated`), and pushed the whole thing back, silently reverting the Slack
+text. The exact same race ate the 2026-08-05 "Assigned to" edit (project-state recorded it shipped;
+the 09:05 UTC blueprint edit that day wiped it).
+
+**Why it happens.** `scenarios_update` wholesale-REPLACES the blueprint — there is no merge, no
+version check, no conflict error. Two sessions doing fetch→edit→push always end with last-writer-wins,
+and the loser gets zero signal. This is the Make equivalent of the shared-git-checkout rule in
+global CLAUDE.md; the remote state can change between your fetch and your push.
+
+**Takeaways.**
+- **Fetch immediately before update, never edit a blueprint fetched minutes earlier.** Minimize
+  the fetch→push window.
+- **After pushing, re-fetch and diff the field you changed** — the update response echoing success
+  only proves YOUR write landed, not that it survived. Also scan `executions_list` for `modify`
+  events after your own; any later `modify` you didn't make means your edit may be gone.
+- **When re-applying over a clobber, merge — don't counter-clobber.** The 20:11 edit contained real
+  CAPI improvements; the re-push had to keep them (edit the CURRENT blueprint, not your old copy).
+- **When Ron reports "the fix didn't take", check `lastEdit`/modify history FIRST** before assuming
+  the original edit was wrong — on this team, concurrent-session clobber is the leading cause.
 
 ## 2026-08-04 — An outcome attached to a call that hasn't happened yet is always stale
 

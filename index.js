@@ -92,7 +92,7 @@ const SYSTEM_PROMPT_BASE = `CRITICAL OPERATING RULES — NEVER VIOLATE THESE:
 
 5. When asked to reply or post in a Slack channel, always use draft_channel_post to prepare the message. The draft goes to the person who asked (or escalates to Ron — see escalation criteria in the team-tier section). Never post directly to a channel unless triggered from within that channel.
 
-6. When Ron asks for a portal data field that the pre-built tools don't cover (anything beyond onboarding phase status, Phase 0 pipeline, alerts, or sales intelligence — e.g. client emails, LinkedIn handles, any ad-hoc lookup), do NOT guess table names and do NOT say you lack access. Call search_portal_schema with keywords from Ron's question, pick the best-matching table from the grouped result, then call query_portal_db with a SELECT statement. Only fall back to list_portal_tables if schema search returns nothing.
+6. Portal data lookups — applies to EVERY user, not just Ron. When asked for a portal data field the pre-built tools don't cover (client emails, LinkedIn handles, activation call dates, any ad-hoc lookup), do NOT guess table names and do NOT say you lack access. Check the PORTAL DATA MAP below first — if the field has a recipe there, go straight to query_portal_db with it. Otherwise call search_portal_schema, pick the best-matching table from the grouped result, then call query_portal_db with a SELECT statement. HARD RULE: NEVER claim a field or piece of data "doesn't exist", "isn't stored", or "isn't available" until you have (a) consulted the data map, (b) run search_portal_schema, AND (c) attempted at least one query_portal_db SELECT against the most plausible table. An empty schema search proves nothing — business concepts stored as row values (template titles, step names, statuses) only surface by querying the table. Only fall back to list_portal_tables if all of the above return nothing.
 
 ---
 
@@ -191,6 +191,31 @@ METRICS TO MONITOR
 ---
 
 System prompt version: April 2026. Maintained in index.js — no external file dependency.`;
+
+// ─── PORTAL DATA MAP ─────────────────────────────────────────────────────────
+// Injected into EVERY prompt (Ron + team). Keep tight — this rides every request.
+const SYSTEM_PROMPT_DATA_MAP = `
+
+PORTAL DATA MAP — where portal data actually lives (query via query_portal_db):
+
+KEY TABLES
+- client_dashboards — one row per client. id (uuid — joins to customer_activities.customer_id), client_name, email, customer_status (phase_0|phase_1|phase_2|phase_3|live|blocked), customer_type, is_active, created_at, stabilization_started_at, linkedin_handler.
+- customer_activities — per-client checklist items. customer_id → client_dashboards.id (a few legacy rows point at customer_onboarding.id — check both), template_id → customer_activity_templates.id, status, assigned_to, notes, completed_at (timestamptz — the REAL calendar date the activity was completed).
+- customer_activity_templates — id, title, order_index, category. Titles like "Activation Call Completed" are ROW VALUES here, not column names.
+- customer_onboarding — intake form: email, first_name, last_name, company, service_tier, payment_status, onboarding_completed_at.
+- v_phase0_fulfillment — pre-portal pipeline view: phase0_step, days_in_phase0, terms_accepted_at, booking_calendar_url.
+- flywheel_activation_workflow — customer_id, step_name (activation_call_done, activation_recap_done, campaign_configuration_approved, flywheel_ready), completed_at.
+- flywheel_ai_onboarding (+ _workflow) — flywheel intake, linkedin_handle, clerk_user_id. WARNING: go_live_at is a PROVISIONING timestamp set before the activation call — it is NOT the campaign launch date.
+- revops_appointments / revops_sales_outcomes / revops_prospects / setter_claims / lead_posts — GHL-native sales truth since the 2026-07-23 cutover.
+- iclosed_webhook_deliveries / ghl_webhook_deliveries — raw webhook payload history (iClosed rows frozen at cutover).
+- In Max's OWN Supabase, NOT the portal (use knowledge/metric tools, not query_portal_db): agent_knowledge, conversations, scheduled_tasks, metric_observations, setter_attributions.
+
+CANONICAL RECIPES
+- Activation call date for a client = customer_activities.completed_at joined to customer_activity_templates where templates.title ILIKE '%activation call%' AND customer_activities.customer_id = the client's client_dashboards.id. This date IS stored. Every "Day N since activation call" figure in reports is computed FROM this raw date — when someone asks for the date itself, return the date.
+- Launch date (campaign go-live) = latest customer_activities.completed_at where the joined template title contains 'campaign qa check' or 'campaign validation' (verified 2026-08-07: these match the team's tracked launch dates; go_live_at does NOT). Time to launch = activation call date → this launch date.
+- Stabilization day counts anchor on client_dashboards.stabilization_started_at, not the activation call.
+
+TOOL LIMITATION — search_portal_schema matches TABLE and COLUMN NAMES ONLY. Business concepts stored as row values ("activation call", template titles, step names, statuses) will never match a schema search. An empty schema search means nothing — check this data map and run query_portal_db before concluding anything.`;
 
 const SYSTEM_PROMPT_RULES = `
 
@@ -356,7 +381,7 @@ When you escalate, tell the user clearly: "This one needs Ron's call — I'm rou
 
 You have access to GHL (live sales source since the 2026-07-23 cutover; iClosed is frozen history), Meta Ads, the portal, Supabase, Slack, Notion, and Google Drive/Docs/Sheets. You do NOT have access to Ron's Gmail or Google Calendar — if asked, explain that those are Ron-only and offer to help a different way.`;
 
-const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
+const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_DATA_MAP + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
 
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
 const OPS_CHANNEL           = process.env.OPS_CHANNEL           || '#ng-fullfillment-ops';
@@ -682,7 +707,7 @@ When they ask about ops health, pull fulfillment channel activity, recent gap de
 
   const baseContext = roleContext[member.role] || roleContext.fulfillment;
   const channelList = perms.canReadChannels.join(', ');
-  return `${SYSTEM_PROMPT_BASE}${SYSTEM_PROMPT_RULES}${SYSTEM_PROMPT_TEAM_TIER}\n\n---\nCURRENT USER CONTEXT:\n${baseContext}\n\nThis user can access these channels: ${channelList}\nAddress this person by their first name: ${member.name}.\nKeep responses focused on their operational scope. Do not share sensitive business financials or information outside their role.`;
+  return `${SYSTEM_PROMPT_BASE}${SYSTEM_PROMPT_DATA_MAP}${SYSTEM_PROMPT_RULES}${SYSTEM_PROMPT_TEAM_TIER}\n\n---\nCURRENT USER CONTEXT:\n${baseContext}\n\nThis user can access these channels: ${channelList}\nAddress this person by their first name: ${member.name}.\nKeep responses focused on their operational scope. Do not share sensitive business financials or information outside their role.`;
 }
 
 // ─── SUPABASE: CONVERSATION MEMORY ───────────────────────────────────────────
@@ -880,6 +905,58 @@ async function getReportLessons(reportId) {
     return data || [];
   } catch (err) {
     console.error('getReportLessons error:', err.message);
+    return [];
+  }
+}
+
+// ── Interactive correction learning ──────────────────────────────────────────
+// Cheap two-stage correction detector for DMs and non-report threads: regex
+// gate first, then Haiku confirms it's a real correction and extracts the
+// lesson. Fire-and-forget at call sites — never blocks the reply. Saved
+// lessons flow back into every interactive chat via getGlobalLessons().
+const CORRECTION_HINT_RE = /\b(wrong|incorrect|not (?:true|right|correct)|that'?s (?:not|false)|correction|you (?:said|claimed|told)|does exist|we do (?:have|store|track)|s[ií] (?:existe|hay|tenemos)|est[áa] mal|incorrecto|no es (?:cierto|correcto|as[ií]))\b/i;
+
+async function detectAndSaveCorrection(userText, priorAssistantText, userId) {
+  try {
+    if (!userText || !priorAssistantText) return null;
+    if (!CORRECTION_HINT_RE.test(userText)) return null;
+    const prompt = `Max (an ops agent) previously said:\n${priorAssistantText.slice(0, 1200)}\n\nThe user replied:\n${userText.slice(0, 800)}\n\nIs the user CORRECTING a factual claim or behavior of Max's (not just disagreeing, negotiating, or changing topic)? If yes respond JSON: {"topic":"<2-4 word kebab-case topic>","lesson":"<2-3 sentences: what Max got wrong and what to do instead>"}. If no: {"topic":null}. JSON only, no markdown fences.`;
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+    if (!parsed?.topic) return null;
+    const key = `correction:${parsed.topic}:${new Date().toISOString().slice(0, 10)}`;
+    await upsertKnowledge('process', key, parsed.lesson, 'correction', userId, 'shared');
+    console.log(`Correction lesson saved: ${key}`);
+    return parsed.lesson;
+  } catch (err) {
+    console.error('detectAndSaveCorrection error:', err.message);
+    return null;
+  }
+}
+
+// Global lessons for INTERACTIVE chats (scheduled reports already inject their
+// own via getReportLessons). Shared-visibility only — private notes must not
+// leak into other users' prompts. Hard-capped: rides every request.
+async function getGlobalLessons() {
+  try {
+    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const { data } = await supabase
+      .from('agent_knowledge')
+      .select('value, updated_at')
+      .eq('category', 'process')
+      .eq('visibility', 'shared')
+      .in('source', ['report-feedback', 'correction'])
+      .gte('updated_at', cutoff)
+      .order('updated_at', { ascending: false })
+      .limit(10);
+    return data || [];
+  } catch (err) {
+    console.error('getGlobalLessons error:', err.message);
     return [];
   }
 }
@@ -2282,6 +2359,32 @@ async function getMetaAds(adSetId = null, datePreset = 'last_7d') {
   } catch (err) { return `Meta ads error: ${err.message}`; }
 }
 
+// ─── SHARED DAY-ANCHOR RESOLUTION ────────────────────────────────────────────
+// Single source of truth for "Day N" math. Returns the raw anchor DATE so every
+// consumer can print the calendar date, not just the day count. titleOf(templateId)
+// must return the template title string ('' if unknown) — callers keep their
+// existing map shapes and pass a tiny closure. Anchor priority: phase_3
+// stabilization_started_at → activation call completed_at → portal created_at.
+function resolveDayAnchor(dash, activities, titleOf) {
+  const activation = (activities || []).find(a =>
+    (titleOf(a.template_id) || '').toLowerCase().includes('activation call') && a.completed_at);
+  let startISO, label;
+  if (dash.customer_status === 'phase_3' && dash.stabilization_started_at) {
+    startISO = dash.stabilization_started_at; label = 'since stabilization start';
+  } else if (activation) {
+    startISO = activation.completed_at;       label = 'since activation call';
+  } else if (dash.created_at) {
+    startISO = dash.created_at;               label = 'since portal creation';
+  } else {
+    return { startDate: null, daysSince: null, label: 'no anchor date', anchorDate: null };
+  }
+  const startDate = new Date(startISO);
+  const daysSince = Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+  // en-CA gives YYYY-MM-DD; CR timezone so an evening UTC timestamp doesn't roll to the next day
+  const anchorDate = startDate.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  return { startDate, daysSince, label, anchorDate };
+}
+
 // ─── PORTAL: CLIENT STATUS ────────────────────────────────────────────────────
 // FIX 2: Single definition only. Queries client_dashboards (correct schema).
 // The old customer_onboarding-based duplicate has been removed entirely.
@@ -2368,29 +2471,11 @@ async function getClientStatus(clientName = null) {
       }[dash.customer_status] || `⚪ ${dash.customer_status}`;
       const statusEmoji = statusLabel.split(' ')[0];
 
-      // Day 1 anchor logic — depends on phase:
-      // Phase 3: use stabilization_started_at (the correct stabilization Day 1)
-      // All others: use Activation Call completed_at (14-day SLA anchor)
-      // Fall back to portal created_at if neither is available
-      const activationCallAct = activities.find(a => {
-        const title = (templateMap[a.template_id]?.title || '').toLowerCase();
-        return title.includes('activation call') && a.completed_at;
-      });
-      let startDate, dayAnchor;
-      if (dash.customer_status === 'phase_3' && dash.stabilization_started_at) {
-        startDate  = new Date(dash.stabilization_started_at);
-        dayAnchor  = 'since stabilization start';
-      } else if (activationCallAct) {
-        startDate  = new Date(activationCallAct.completed_at);
-        dayAnchor  = 'since activation call';
-      } else {
-        startDate  = dash.created_at ? new Date(dash.created_at) : null;
-        dayAnchor  = 'since portal creation';
-      }
-      const daysSince = startDate ? Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+      // Day 1 anchor — shared logic; anchorDate surfaces the raw calendar date
+      const { daysSince, label: dayAnchor, anchorDate } = resolveDayAnchor(dash, activities, id => templateMap[id]?.title);
       const lines = [
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
-        `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}`,
+        `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}${anchorDate ? ` (${anchorDate})` : ''}`,
         total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
         blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
         pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
@@ -2604,15 +2689,10 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
         }
       }
 
-      // ── Day anchor: activation call completed_at → fallback to created_at ──
-      const activationAct = allActs.find(a => {
-        const title = (templateMap[a.template_id] || '').toLowerCase();
-        return title.includes('activation call') && a.completed_at;
-      });
-      const startDate = activationAct
-        ? new Date(activationAct.completed_at)
-        : (dash.created_at ? new Date(dash.created_at) : null);
-      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+      // ── Day anchor: shared logic (activation call completed_at → created_at) ──
+      const anchor = resolveDayAnchor(dash, allActs, id => templateMap[id]);
+      const daysSince = anchor.daysSince ?? 0;
+      const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
       // ── Blocked activity details ──
       const blockedActs = allActs.filter(a => a.status === 'blocked');
@@ -2620,15 +2700,15 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
 
       if (dash.customer_status === 'blocked') {
         if (dailyMode) continue; // long-standing blocked clients move to weekly wrap-up
-        alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
+        alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince}${anchorSuffix})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
       } else if (daysSince >= 14) {
         if (dailyMode && daysSince > 30) {
           const recentActivity = allActs.some(a => a.completed_at && (now - new Date(a.completed_at).getTime()) <= fourteenDaysMs);
           if (!recentActivity) continue; // aged + dormant — suppress from daily
         }
-        alerts.push(`🔴 OVERDUE — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince} (past 14-day window)`);
+        alerts.push(`🔴 OVERDUE — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}${anchorSuffix} (past 14-day window)`);
       } else if (daysSince >= 7) {
-        alerts.push(`🟡 AT RISK — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}`);
+        alerts.push(`🟡 AT RISK — ${dash.client_name || dash.email} | ${dash.customer_status} | Day ${daysSince}${anchorSuffix}`);
       }
     }
     // ── Phase 0 alerts — pre-portal clients stuck or ready for handoff ──────────
@@ -3478,26 +3558,23 @@ async function runMondayGapDetection(_correlationId) {
 
       if (!acts.length) continue;
 
-      // ── Day anchor: activation call completed_at → fallback to created_at ──
-      // Fetch all activities (not just in-progress) to find completed activation call
+      // ── Day anchor: shared logic. Fetch all activities (not just in-progress)
+      // to find the completed activation call ──
       const { data: allActsForAnchor } = await portalSupabase.from('customer_activities').select('template_id, status, completed_at').eq('customer_id', dash.id);
-      const activationAct = (allActsForAnchor || []).find(a => {
-        const title = (tMap[a.template_id] || '').toLowerCase();
-        return title.includes('activation call') && a.completed_at;
-      });
-      const startDate = activationAct ? new Date(activationAct.completed_at) : (dash.created_at ? new Date(dash.created_at) : null);
-      const daysSince = startDate ? Math.floor((now - startDate.getTime()) / (1000*60*60*24)) : 0;
+      const anchor = resolveDayAnchor(dash, allActsForAnchor || [], id => tMap[id]);
+      const daysSince = anchor.daysSince ?? 0;
+      const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
       const staleActs = acts.filter(a => { const u = a.updated_at ? new Date(a.updated_at).getTime() : 0; return (now - u) > (72*60*60*1000); });
       let gapLine = '';
       if (dash.customer_status === 'blocked') {
         const blockedTitles = acts.filter(a=>a.status==='blocked').map(a=>tMap[a.template_id]||'Unknown').join(', ');
-        gapLine = `🔴 BLOCKED — ${dash.client_name} (Day ${daysSince}): ${blockedTitles}`;
+        gapLine = `🔴 BLOCKED — ${dash.client_name} (Day ${daysSince}${anchorSuffix}): ${blockedTitles}`;
       } else if (daysSince >= 14) {
-        gapLine = `🔴 OVERDUE — ${dash.client_name} still in ${dash.customer_status} at Day ${daysSince} (past 14-day window)`;
+        gapLine = `🔴 OVERDUE — ${dash.client_name} still in ${dash.customer_status} at Day ${daysSince}${anchorSuffix} (past 14-day window)`;
       } else if (daysSince >= 7 && staleActs.length > 0) {
         const assignees = [...new Set(staleActs.map(a=>(a.assigned_to||'').split('@')[0]))].join(', ');
-        gapLine = `🟡 STALE — ${dash.client_name} (Day ${daysSince}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`;
+        gapLine = `🟡 STALE — ${dash.client_name} (Day ${daysSince}${anchorSuffix}): ${staleActs.length} activities with no update in 72hrs. Assigned to: ${assignees}`;
       }
       if (gapLine) {
         const clientCtx = await getClientContext(dash.client_name);
@@ -4921,6 +4998,15 @@ async function transcribeAudio(fileBuffer, filename) {
 // opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
 async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
   const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
+  // Learned lessons ride every interactive prompt (fetched once, not per retry).
+  // Scheduled reports inject their own scoped lessons via getReportLessons.
+  let lessonBlock = '';
+  try {
+    const lessons = await getGlobalLessons();
+    if (lessons.length) {
+      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
+    }
+  } catch { /* lessons are best-effort — never block a reply */ }
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -4941,7 +5027,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
 - Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
 - For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
 - Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
-      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + emailProxyGuidance + (opts.systemAppend || '');
+      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + lessonBlock + emailProxyGuidance + (opts.systemAppend || '');
 
       const TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
@@ -5067,7 +5153,10 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
       logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id);
 
       // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
-      const MAX_TOOL_ROUNDS = 5;
+      // 7 rounds: rule #6 mandates data-map → schema search → query before any
+      // "doesn't exist" claim; stacked with search_knowledge + a status tool a
+      // realistic chain exceeds the old cap of 5.
+      const MAX_TOOL_ROUNDS = 7;
       let currentMessages = [...messages];
 
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -5786,6 +5875,10 @@ slack.message(async ({ message, say }) => {
     correlation_id,
   });
   const history = await loadHistory(userId);
+  // Correction learning: if this DM corrects something Max just said, capture
+  // the lesson (fire-and-forget — never blocks the reply).
+  const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
+  detectAndSaveCorrection(message.text, typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', userId).catch(() => {});
   const threadHint = await getActiveThreadHint(userId);
   history.push({ role: 'user', content: (message.text || '') + threadHint });
   try {
@@ -5859,6 +5952,11 @@ slack.event('app_mention', async ({ event, say }) => {
           } catch (lessonErr) {
             console.error('Lesson extraction error:', lessonErr.message);
           }
+        } else {
+          // Thread not rooted in a Max report, but Max may have spoken earlier
+          // in it — if this mention corrects him, capture the lesson too.
+          const lastMaxMsg = [...threadMessages].reverse().find(m => m.bot_id);
+          if (lastMaxMsg) detectAndSaveCorrection(cleanText, lastMaxMsg.text || '', userId).catch(() => {});
         }
 
         // Extract and store client-specific context from any thread (not just Max bot posts)
@@ -6351,9 +6449,22 @@ async function runFulfillmentStandup(_correlationId) {
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
       .order('days_in_phase0', { ascending: false });
 
-    // Helper: day count anchored to activation call or created_at
+    // Day anchors: the status-filtered allActivities fetch above excludes completed
+    // rows, so fetch completed activities separately (one batched query) to find
+    // each client's activation call — the true 14-day SLA anchor. Previously this
+    // anchored on created_at only, which skewed Day-7/Day-14 flags for any client
+    // whose portal row predates their activation call.
+    const { data: anchorActs } = await portalSupabase
+      .from('customer_activities')
+      .select('customer_id, template_id, completed_at')
+      .not('completed_at', 'is', null);
+    const anchorsByClient = {};
+    (anchorActs || []).forEach(a => { (anchorsByClient[a.customer_id] = anchorsByClient[a.customer_id] || []).push(a); });
+    function getDayAnchor(dash) {
+      return resolveDayAnchor(dash, anchorsByClient[dash.id] || [], id => tMap[id]);
+    }
     function getDayCount(dash) {
-      return dash.created_at ? Math.floor((now - new Date(dash.created_at).getTime()) / (1000 * 60 * 60 * 24)) : null;
+      return getDayAnchor(dash).daysSince;
     }
 
     // Helper: phase label
@@ -6388,11 +6499,13 @@ async function runFulfillmentStandup(_correlationId) {
     josueLines.push(...renderDelta('Blocked', dBlocked.new, dBlocked.resolved, dBlocked.unchanged, name => {
       const d = blocked.find(x => x.client_name === name);
       const acts = d ? (actsByClient[d.id] || []).filter(a => a.status === 'blocked').map(a => tMap[a.template_id] || 'Unknown').join(', ') : '';
-      return `${name} — Day ${d ? getDayCount(d) : '?'}${acts ? ` | blocked on: ${acts}` : ''}`;
+      const anchor = d ? getDayAnchor(d) : null;
+      return `${name} — Day ${anchor?.daysSince ?? '?'}${anchor?.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : ''}${acts ? ` | blocked on: ${acts}` : ''}`;
     }));
     josueLines.push(...renderDelta('Day 14 TODAY', dH14.new, dH14.resolved, dH14.unchanged, name => {
       const d = hitting14Today.find(x => x.client_name === name);
-      return `${name} (${d ? phaseLabel[d.customer_status] || d.customer_status : ''}) — must launch today`;
+      const anchor = d ? getDayAnchor(d) : null;
+      return `${name} (${d ? phaseLabel[d.customer_status] || d.customer_status : ''})${anchor?.anchorDate ? ` — ${anchor.label} ${anchor.anchorDate}` : ''} — must launch today`;
     }));
     josueLines.push(...renderDelta('Day 7 at-risk', dH7.new, dH7.resolved, dH7.unchanged, name => {
       const d = hitting7Today.find(x => x.client_name === name);
@@ -6542,7 +6655,10 @@ async function runFulfillmentStandup(_correlationId) {
         const due  = slaDueToday.find(d => d.client_name === name);
         const over = slaOverdue.find(d => d.client_name === name);
         if (due)  return `${name} — Day 14 TODAY | ${phaseLabel[due.customer_status] || due.customer_status} | must activate by EOD`;
-        if (over) return `${name} — Day ${getDayCount(over)} | ${phaseLabel[over.customer_status] || over.customer_status} | past 14-day SLA`;
+        if (over) {
+          const anchor = getDayAnchor(over);
+          return `${name} — Day ${anchor.daysSince}${anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : ''} | ${phaseLabel[over.customer_status] || over.customer_status} | past 14-day SLA`;
+        }
         return name;
       }));
     } else {
@@ -9220,6 +9336,229 @@ function attachSocketWatchdog() {
   client.on('authenticated', () => onUp('authenticated'));
   client.on('connected', () => onUp('connected'));
 }
+
+// ─── MAKE SCENARIO HEALTH ───────────────────────────────────────────────────
+// Make auto-deactivates a scenario when it errors at initialization (an invalid
+// blueprint, a broken connection). Incoming webhooks queue rather than vanish, so
+// nothing is lost — but CAPI events go stale and setters see no booking alerts
+// until someone reads the Make email. That is the blind spot this closes: on
+// 2026-08-04 [PROD] GHL Appt Booked sat deactivated for ~7 min and the only
+// signal was an email to Ron's inbox.
+//
+// Watches every scenario whose name starts with [PROD] so new ones are covered
+// without a code change. Inert unless MAKE_API_TOKEN is set.
+const MAKE_API_TOKEN   = process.env.MAKE_API_TOKEN || null;
+const MAKE_API_BASE    = process.env.MAKE_API_BASE  || 'https://us2.make.com/api/v2';
+const MAKE_TEAM_ID     = process.env.MAKE_TEAM_ID   || '432699';
+const MAKE_ALERT_CHANNEL = process.env.MAKE_ALERT_CHANNEL || OPS_CHANNEL;
+
+// Scenarios that are [PROD]-named but deactivated ON PURPOSE, so the watchdog does
+// not cry wolf. 5776020 [PROD] Auto Strike Mover was superseded by Max's own
+// runAutoStrikeMover cron and turned off deliberately. Cleaner long-term fix is to
+// rename retired scenarios out of the [PROD] prefix (Ron already does this with
+// [DISABLED …] / [ARCHIVED …]) and drop them from this list.
+const MAKE_WATCHDOG_IGNORE = new Set(
+  String(process.env.MAKE_WATCHDOG_IGNORE || '5776020')
+    .split(',').map(s => s.trim()).filter(Boolean)
+);
+
+// scenarioId -> reason we already alerted on. Cleared when the scenario recovers.
+// In-memory by design (matches the socket watchdog): after a Railway restart a
+// still-broken scenario re-alerts on the next hourly run, which is the behaviour
+// we want — a restart should never silently swallow an open outage.
+const makeScenarioAlerted = new Map();
+
+async function postMakeHealthAlert(text) {
+  try {
+    let channel = MAKE_ALERT_CHANNEL;
+    try {
+      const channels = await getCachedChannelList();
+      const match = channels.find(c => c.name === String(MAKE_ALERT_CHANNEL).replace('#', ''));
+      if (match) channel = match.id;
+    } catch (e) {
+      console.error('postMakeHealthAlert: channel lookup failed, posting by name:', e.message);
+    }
+    await slack.client.chat.postMessage({ channel, text });
+  } catch (e) {
+    console.error('postMakeHealthAlert: failed to post alert:', e.message);
+  }
+}
+
+async function checkMakeScenarioHealth(correlationId) {
+  if (!MAKE_API_TOKEN) return;
+
+  // Paginate rather than assume one page holds the team's ~50 scenarios — Make does
+  // not document the default pg[limit], and a silent truncation here would drop
+  // scenarios from the watch list without any visible symptom.
+  const all = [];
+  const PAGE = 100;
+  for (let offset = 0; offset < 1000; ) {
+    const url = `${MAKE_API_BASE}/scenarios?teamId=${encodeURIComponent(MAKE_TEAM_ID)}`
+              + `&pg%5Blimit%5D=${PAGE}&pg%5Boffset%5D=${offset}`;
+    const res = await fetch(url, { headers: { Authorization: `Token ${MAKE_API_TOKEN}` } });
+    if (!res.ok) {
+      // A dead token is itself an outage of the watchdog — say so once per occurrence
+      // rather than failing silently, which is the exact failure mode being fixed here.
+      const body = await res.text().catch(() => '');
+      console.error(`Make health: API ${res.status} — ${body.slice(0, 300)}`);
+      if (!makeScenarioAlerted.has('__api__')) {
+        makeScenarioAlerted.set('__api__', `api_${res.status}`);
+        await postMakeHealthAlert(
+          `⚠️ <@${RON_SLACK_ID}> Max cannot reach the Make API (HTTP ${res.status}) — the [PROD] scenario watchdog is blind until this is fixed. Check MAKE_API_TOKEN in Railway.`
+        );
+      }
+      return;
+    }
+    const payload = await res.json();
+    const page = Array.isArray(payload.scenarios) ? payload.scenarios : [];
+    all.push(...page);
+    if (!page.length) break;
+    offset += page.length; // advance by what was actually returned, not what was asked for
+  }
+  makeScenarioAlerted.delete('__api__');
+
+  const scenarios = all.filter(s =>
+    String(s.name || '').startsWith('[PROD]') && !MAKE_WATCHDOG_IGNORE.has(String(s.id))
+  );
+  if (!scenarios.length) {
+    console.log('Make health: no [PROD] scenarios returned — nothing to check.');
+    return;
+  }
+
+  for (const s of scenarios) {
+    // Three distinct failure modes, most severe first:
+    //   inactive — Make stopped it (error or manual): nothing runs at all
+    //   invalid  — the blueprint is broken; this is what PRECEDES a deactivation
+    //   dlq      — still active, but runs are failing and piling up as incomplete
+    //              executions. This is the class Make emails as "the scenario has
+    //              NOT been paused" — isActive stays true through every failed run,
+    //              so without this a scenario can fail 100% of the time and look green.
+    const reason = s.isActive === false ? 'inactive'
+                 : s.isinvalid === true ? 'invalid'
+                 : Number(s.dlqCount) > 0 ? 'dlq'
+                 : null;
+    const previous = makeScenarioAlerted.get(s.id);
+
+    if (reason && previous !== reason) {
+      makeScenarioAlerted.set(s.id, reason);
+      const detail = reason === 'inactive'
+        ? 'is *DEACTIVATED* — incoming webhooks are queuing and no CAPI events or Slack alerts are firing from it.'
+        : reason === 'invalid'
+        ? 'has an *INVALID BLUEPRINT* — it will auto-deactivate on the next incoming event.'
+        : `is active but has *${s.dlqCount} incomplete execution(s)* queued — runs are erroring even though Make has not paused it.`;
+      const consequence = reason === 'dlq'
+        ? 'Each incomplete execution is a booking that did not get its CAPI event or Slack alert.'
+        : 'Nothing is lost while it is down — webhooks replay on reactivation — but fix it before the queue ages.';
+      await postMakeHealthAlert(
+        `🚨 <@${RON_SLACK_ID}> Make scenario *${s.name}* (${s.id}) ${detail}\n` +
+        `${consequence}\n` +
+        `https://us2.make.com/${MAKE_TEAM_ID}/scenarios/${s.id}/edit`
+      );
+      logActivity({
+        event_type: 'alert', event_source: 'cron', action: 'make_scenario_down',
+        status: reason, output: { scenario_id: s.id, name: s.name }, correlation_id: correlationId,
+      });
+    } else if (!reason && previous) {
+      makeScenarioAlerted.delete(s.id);
+      await postMakeHealthAlert(`✅ Make scenario *${s.name}* (${s.id}) is active again — queued webhooks replay automatically.`);
+    }
+  }
+
+  const down = scenarios.filter(s => makeScenarioAlerted.has(s.id)).length;
+  console.log(`Make health: checked ${scenarios.length} [PROD] scenario(s), ${down} down.`);
+}
+
+if (MAKE_API_TOKEN) {
+  // Every 10 min, not hourly: the 2026-08-04 outage lasted ~4 minutes end to end,
+  // and an hourly poll would have seen isActive:true on both sides of it. One API
+  // call per tick.
+  cron.schedule('*/10 * * * *', wrapCronJob('checkMakeScenarioHealth', async (c) => { await checkMakeScenarioHealth(c); }), { timezone: 'America/Costa_Rica' });
+  console.log('Registered static cron: Make [PROD] scenario watchdog (*/10 * * * *)');
+} else {
+  console.warn('Make scenario watchdog NOT registered — MAKE_API_TOKEN is not set.');
+}
+
+// ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
+// The scenario watchdog above only sees Make. Make can be perfectly green while
+// the booking pipeline is broken upstream of it — if a GHL workflow stops firing
+// the webhook, Make has nothing to error on and reports full health. That is not
+// hypothetical: the GHL customData bug (tasks/todo.md, 2026-08-02) silently
+// skipped 33 deliveries with no system anywhere reporting a fault.
+//
+// So this watches the OUTCOME instead of the plumbing: every booking that landed
+// in revops_appointments should have a matching booked-alert row, written by the
+// Make scenario's ng_register_booked_alert RPC. A gap means the chain broke
+// somewhere — GHL, Make, or Supabase — and it does not care which.
+const bookingDivergenceAlerted = new Set();
+const DIVERGENCE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const DIVERGENCE_GRACE_MS    = 30 * 60 * 1000; // in-flight bookings are not gaps
+
+async function checkBookingAlertDivergence(correlationId) {
+  const now   = Date.now();
+  const since = new Date(now - DIVERGENCE_LOOKBACK_MS).toISOString();
+  const until = new Date(now - DIVERGENCE_GRACE_MS).toISOString();
+
+  const { data: apptsRaw, error: apptErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('ghl_appointment_id, iclosed_call_id, source, created_at')
+    .eq('source', 'ghl')
+    .gte('created_at', since)
+    .lte('created_at', until)
+    .limit(200);
+  if (apptErr) { console.error('Booking divergence: appointments read failed:', apptErr.message); return; }
+
+  const excludeIds = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(apptsRaw, excludeIds)
+    .filter(a => typeof a.ghl_appointment_id === 'string' && a.ghl_appointment_id);
+  if (!appts.length) { console.log('Booking divergence: no bookings in window.'); return; }
+
+  const ids = appts.map(a => a.ghl_appointment_id);
+  const { data: alertRows, error: alertErr } = await portalSupabase
+    .from('ng_appt_slack_alerts')
+    .select('appointment_id')
+    .eq('kind', 'booked')
+    .in('appointment_id', ids);
+  // FAIL CLOSED. An unreadable alerts table makes every booking look unalerted,
+  // which would fire a full-window false alarm and teach everyone to ignore this
+  // channel. Silence plus a loud log is the correct failure here.
+  if (alertErr) { console.error('Booking divergence: alerts read failed, skipping run:', alertErr.message); return; }
+
+  const alerted = new Set((alertRows || []).map(r => r.appointment_id));
+  const missing = appts.filter(a => !alerted.has(a.ghl_appointment_id));
+
+  // Only alert on gaps not already reported, so a standing gap does not re-post
+  // every 30 min while it is being fixed.
+  const fresh = missing.filter(a => !bookingDivergenceAlerted.has(a.ghl_appointment_id));
+  for (const a of missing) bookingDivergenceAlerted.add(a.ghl_appointment_id);
+  // Bound the memo so a long-running process cannot grow it without limit.
+  if (bookingDivergenceAlerted.size > 500) {
+    for (const id of [...bookingDivergenceAlerted].slice(0, bookingDivergenceAlerted.size - 500)) {
+      bookingDivergenceAlerted.delete(id);
+    }
+  }
+
+  console.log(`Booking divergence: ${appts.length} booking(s) in window, ${missing.length} without a booked alert (${fresh.length} new).`);
+  if (!fresh.length) return;
+
+  const lines = fresh.slice(0, 10).map(a =>
+    `• \`${a.ghl_appointment_id}\` — booked ${new Date(a.created_at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`
+  );
+  const more = fresh.length > 10 ? `\n…and ${fresh.length - 10} more.` : '';
+  await postMakeHealthAlert(
+    `🚨 <@${RON_SLACK_ID}> *${fresh.length} booking(s) landed with no booked-alert posted* in the last 6h.\n` +
+    `The appointment reached Supabase but the Make scenario never registered an alert for it — so the chain broke somewhere between GHL, Make and Supabase. Setters did not see these in #ng-sales-goats, and the Meta CAPI Schedule/Qualified events are likely missing too.\n` +
+    lines.join('\n') + more
+  );
+  logActivity({
+    event_type: 'alert', event_source: 'cron', action: 'booking_alert_divergence',
+    status: 'gap', output: { missing: fresh.map(a => a.ghl_appointment_id) }, correlation_id: correlationId,
+  });
+}
+
+// Every 30 min — the 30-minute grace window means a tighter cadence cannot
+// surface anything sooner, and this costs two Supabase reads per run.
+cron.schedule('*/30 * * * *', wrapCronJob('checkBookingAlertDivergence', async (c) => { await checkBookingAlertDivergence(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: booking → alert divergence check (*/30 * * * *)');
 
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
