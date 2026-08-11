@@ -18,11 +18,16 @@ Trigger: Max claimed activation call dates "aren't stored" — they live in cust
 - [x] **Launch definition corrected mid-build:** plan assumed `go_live_at` = launch. Real data: go_live_at PREDATES the activation call for all 7 spot-checked clients (it's a provisioning timestamp). Actual launch = `Campaign QA check`/`Campaign Validation` activity completed_at — matches Ron's sheet ±2 days. Config: `launchActivityMatchers`.
 - [x] Ground-truth SQL vs sheet: Brújula 8d within SLA; UMC 7d; Licita 5d; CR Fishing 5d; Palantier 11d; Synapse 29d OVER; Ubuntu Tech launched 2026-08-03 (TTL 20d OVER — sheet was stale). NEW: Selva Design + CONAUDITA activation 7/17, Day 21+, never launched → will trip the over-SLA alert.
 
-## Rollout (waiting on Ron)
-- [ ] ng-agent: changes are UNCOMMITTED in the shared checkout, intermixed with the (also uncommitted) Make-watchdog work in index.js — decide whether to commit both together or have the watchdog session land first
-- [ ] ng-agent → Railway deploy (outside 9AM CR standup); tell Josue standup day counts are now activation-call-anchored
-- [ ] dash: push `feat/launch-sla-kpis` → PR → Vercel preview → promote; then remove worktree
-- [ ] Follow-up flagged (separate PR): activation-call-activity-gate.ts:14 exact-equality title match would miss "Activation Call Completed" — it gates a write path, verify prod template titles first
+## Rollout (2026-08-11, Ron approved "full commit")
+- [x] Local main was 15 commits behind origin — fast-forwarded, stash-pop conflicts in index.js (1: opts.systemAppend × lessonBlock — combined), lessons.md and project-state.md (both sides kept, date-ordered; restored the 2026-08-04 Make-lesson header the auto-merge ate)
+- [x] ng-agent commit `f8931ac` (Max reliability package + Make watchdog + replay script) pushed to main → Railway deploy `99969be9` SUCCESS 20:03 UTC, clean boot, 10 dynamic crons; watchdog logs "NOT registered — MAKE_API_TOKEN is not set" as designed
+- [x] getGlobalLessons query verified live against agent_knowledge (0 rows yet — block empty until first correction is captured)
+- [x] dash: branch rebased on origin/main, pushed, [PR #28](https://github.com/neurogrowth-cr/dash.neurogrowth.io/pull/28) open; worktree removed
+- [ ] Ron: merge dash PR #28 after Vercel preview check
+- [ ] Ron: tell Josue standup Day-7/Day-14 numbers are now activation-call-anchored (will shift for some clients)
+- [ ] Ron: set MAKE_API_TOKEN in Railway to arm the Make watchdog (scope scenarios:read)
+- [ ] Watch: tomorrow 8:30 AM CR roster + 9 AM standup DMs — day lines should carry (YYYY-MM-DD) anchors
+- [ ] Follow-up (separate PR): activation-call-activity-gate.ts:14 exact-equality title match would miss "Activation Call Completed" — gates a write path, verify prod template titles first
 
 ## Review
 Part A closes the incident class three ways: the date is now IN the tool output (no lookup needed), the data map + rule #6 make ad-hoc lookups deterministic, and corrections now persist into every future interactive chat. Part B puts the same truth on the portal with a data-verified launch definition. Biggest catch of the session: `go_live_at` is not a launch date — both the plan and Max's first data-map draft had it wrong; SQL spot-check caught it before ship.
