@@ -25,7 +25,8 @@ Trigger: Max claimed activation call dates "aren't stored" — they live in cust
 - [x] dash: branch rebased on origin/main, pushed, [PR #28](https://github.com/neurogrowth-cr/dash.neurogrowth.io/pull/28) open; worktree removed
 - [x] dash PR #28 MERGED (Ron's go, 2026-08-11 20:10 UTC) — Vercel production deploy `dpl_F4ZL5scJ` READY, aliased to dash.neurogrowth.io
 - [ ] Ron: tell Josue standup Day-7/Day-14 numbers are now activation-call-anchored (will shift for some clients)
-- [ ] Ron: set MAKE_API_TOKEN in Railway to arm the Make watchdog (scope scenarios:read)
+- [x] Ron set MAKE_API_TOKEN → Railway deploy `5549a68b` SUCCESS 20:33 UTC; watchdog registered (`*/10 * * * *` CR). **First sweep verified live 20:40:00 UTC: 705ms, status ok, us2 token authenticated (no blind-watchdog alert), Auto Strike Mover correctly ignored.** Fired one true-positive: `make_scenario_down / dlq` on 5148796 (2 incomplete executions) — Slack alert confirmed in #ng-fullfillment-ops at 14:40 CST. First real proof the dlq branch works: Make reports isActive:true while runs pile up failing.
+- [ ] Ron: clear the 2 incomplete executions on Make scenario 5148796 (Incomplete executions tab → inspect/retry; they are replayable). Watchdog posts its own ✅ all-clear on the next sweep once the queue is empty. Each queued item = a booking with no CAPI event and no setter Slack alert.
 - [ ] Watch: tomorrow 8:30 AM CR roster + 9 AM standup DMs — day lines should carry (YYYY-MM-DD) anchors
 - [ ] Follow-up (separate PR): activation-call-activity-gate.ts:14 exact-equality title match would miss "Activation Call Completed" — gates a write path, verify prod template titles first
 
