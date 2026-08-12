@@ -1,5 +1,9 @@
 # Lessons
 
+> **Convention (since 2026-08-12): APPEND new lessons at the BOTTOM of this file
+> (newest LAST). Never insert at the top — parallel sessions collide when everyone
+> writes to the same first lines.**
+
 ## 2026-08-07 — Derived metrics that discard their source date create "data doesn't exist" hallucinations
 
 **Symptom.** Max told Ron the portal "doesn't store" activation call dates. It does — `customer_activities.completed_at` joined to a template title containing 'activation call'. Max's own `get_client_status` reads that exact field, computes `daysSince`, then throws the date away and prints only "Day N since activation call".
@@ -204,3 +208,21 @@ global CLAUDE.md; the remote state can change between your fetch and your push.
 **Root cause.** `getCalendarEvents` built day windows with `new Date()`+`setDate`/`setHours` — server-local (Railway = UTC), so after 6 PM CR "today" was already tomorrow — and `setHours(29,…)` on the end bound made every window 48h wide. The block was injected as `TOMORROW'S CALENDAR:` with raw ISO event lines (no weekday, organizer's -05:00 offset), so the model had nothing to cross-check the label against and trusted it.
 
 **Rules.** (1) Never compute a "day" from the process clock — derive the CR date string first (`toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' })`), then build UTC instants (pattern: `_crMidnightUtc` / `_crDayBoundsUtc`). (2) Any context block making a temporal claim ("today", "tomorrow") must carry the resolved date + weekday in the label AND in each line, so the LLM can catch a mislabel instead of amplifying it. (3) `setHours(29,…)` rolls the date forward a day — it's a window-width bug wearing a convenience-trick costume.
+
+## 2026-08-12 — Parallel sessions clobber each other via stale checkouts and top-of-file docs
+
+**Symptom.** Three confirmed incidents: (1) 2026-05-26 — a docs-only session committed a stale copy of `index.js` (stale stash pop), reverting a just-merged PR's +88 lines; hand-repaired 2 min later (`ad44677`). (2) 2026-08-11 — `f8931ac` (direct push to main, no PR) hand-copied the Make-watchdog code from unmerged branch `make-scenario-watchdog` but rewrote its `project-state.md` entry from stale knowledge — main's docs said hourly polling while the shipped code ran `*/10`, and `dlqCount` + `checkBookingAlertDivergence` went undocumented until 2026-08-12. (3) Same class outside git: Make blueprint fetch-modify-write races (see the 2026-08-06 lesson above).
+
+**Root causes.**
+- Sessions editing the shared checkout, where another session's `stash`/`checkout` changes files under them.
+- Both `project-state.md` and `lessons.md` prepended new entries at the top — every concurrent session wrote to the same first lines, guaranteeing conflicts or silent overwrites.
+- 28 of the 40 commits before this fix went straight to main with no PR, so half the work never got a merge base; hand-copying a branch's code instead of merging it orphans the branch AND forks the docs.
+
+**Fixes shipped 2026-08-12.**
+- Docs are now append-at-bottom (newest LAST) with `merge=union` in `.gitattributes`; old entries archived to `tasks/archive/`.
+- Repo `CLAUDE.md` + CI + permission deny on `git push origin main`: all changes via PR from an isolated worktree off fresh `origin/main`.
+
+**Takeaways.**
+- Never hand-copy code from another session's branch — merge or cherry-pick the actual commit, or the docs and git history fork.
+- A "docs-only" commit that touches `index.js` is always a bug; CI now rejects it.
+- When two writers share one mutable surface (checkout, Make blueprint, prepend-at-top file), the fix is always the same: isolate copies (worktrees), make writes commutative (append + union), or serialize through a queue (PRs).

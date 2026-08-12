@@ -1,0 +1,7 @@
+# Union merge for append-only docs: parallel additions from two sessions both
+# survive a merge instead of conflicting. Only safe because these files are
+# append-at-bottom by convention (see the note at the top of each).
+tasks/project-state.md merge=union
+tasks/lessons.md merge=union
+tasks/todo.md merge=union
+tasks/archive/*.md merge=union
