@@ -7431,6 +7431,10 @@ cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (
 // set STRIKE_MOVER_MODE=live on Railway to arm it.
 cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }), { timezone: 'America/Costa_Rica' });
 
+// Daily strike-mover digest to the sales channel — 9:30 PM CR, right after the
+// day's last sweep, so the 24h window covers exactly today's 8 sweeps.
+cron.schedule('30 21 * * *', wrapCronJob('runStrikeSalesDigest', async (c) => { await runStrikeSalesDigest(c); }), { timezone: 'America/Costa_Rica' });
+
 // Setter attribution reconcile cron RETIRED 2026-07-26 — GHL records the booker
 // natively in revops_appointments.setter_id; the leaderboard reads it directly.
 
@@ -8800,6 +8804,7 @@ async function strikeBuildDailyDigest(hours = 24) {
     return {
       digestBlock: `0 sweeps ran in the last ${hours}h — the auto strike mover cron may be dead (expected 8/day, 7am-9pm CR). Flag as an alert.`,
       slackLine: `Strike mover: 0 sweeps in last ${hours}h — cron may be down`,
+      salesBlock: `⚠️ *PIPELINE AUTO-MOVER* ran 0 sweeps in the last ${hours}h — it may be down. Ron has been flagged; move cards by hand until the all-clear.`,
     };
   }
   const allMoves = [], allFailures = [], skipTotals = {};
@@ -8828,10 +8833,36 @@ async function strikeBuildDailyDigest(hours = 24) {
   if (allFailures.length) {
     lines.push(`${allFailures.length} transient failure(s) (self-healing, card retried next sweep): ${allFailures.slice(0, 5).join(' | ')}`);
   }
+  // Sales-facing variant: plain language, no skip-key jargon, no sweep mechanics.
+  const transitionTallies = {};
+  for (const m of allMoves) {
+    const key = `${m.from} → ${m.to}`;
+    transitionTallies[key] = (transitionTallies[key] || 0) + 1;
+  }
+  const salesLines = [`*PIPELINE AUTO-MOVER — last ${hours}h*`, `Cards moved: *${moved}*`];
+  for (const [transition, n] of Object.entries(transitionTallies).sort((a, b) => b[1] - a[1])) {
+    salesLines.push(`• ${transition}: ${n}`);
+  }
+  if (allMoves.length) {
+    salesLines.push('', ...allMoves.slice(0, 20).map(m => `› ${m.name}: ${m.from} → ${m.to}`));
+    if (allMoves.length > 20) salesLines.push(`› …and ${allMoves.length - 20} more.`);
+  }
+  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups typed in GHL count), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
+
   return {
     digestBlock: lines.join('\n'),
     slackLine: `Strike mover (last ${hours}h): ${sweeps.length} sweeps | ${moved} card(s) moved | ${allFailures.length} transient failure(s)`,
+    salesBlock: salesLines.join('\n'),
   };
+}
+
+// Daily sales-visible digest of the auto strike mover. Exists because live mode
+// went silent on 2026-08-04 (per-run posts removed) and sales concluded the
+// mover was broken — movement has to be visible where sales lives.
+async function runStrikeSalesDigest(correlationId) {
+  const { salesBlock } = await strikeBuildDailyDigest(24);
+  await postToSlack(SALES_CHANNEL, salesBlock);
+  logActivity({ event_type: 'slack_message', event_source: 'cron', action: 'runStrikeSalesDigest', output: { text: salesBlock.slice(0, 2000) }, correlation_id: correlationId });
 }
 
 // ─── RECOVERABLE-LEADS CAMPAIGN (Cycle 4-lite — draft & approve via reactions) ─
