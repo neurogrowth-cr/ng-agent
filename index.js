@@ -215,7 +215,17 @@ CANONICAL RECIPES
 - Launch date (campaign go-live) = latest customer_activities.completed_at where the joined template title contains 'campaign qa check' or 'campaign validation' (verified 2026-08-07: these match the team's tracked launch dates; go_live_at does NOT). Time to launch = activation call date → this launch date.
 - Stabilization day counts anchor on client_dashboards.stabilization_started_at, not the activation call.
 
-TOOL LIMITATION — search_portal_schema matches TABLE and COLUMN NAMES ONLY. Business concepts stored as row values ("activation call", template titles, step names, statuses) will never match a schema search. An empty schema search means nothing — check this data map and run query_portal_db before concluding anything.`;
+TOOL LIMITATION — search_portal_schema matches TABLE and COLUMN NAMES ONLY. Business concepts stored as row values ("activation call", template titles, step names, statuses) will never match a schema search. An empty schema search means nothing — check this data map and run query_portal_db before concluding anything.
+
+OPS MASTER TRACKER (Google Sheet the ops team maintains by hand — query via get_ops_tracker, open to everyone):
+- tab=infrastructure — per-client setup state: Sales Navigator, Prosp license, webhook, Prosp tag, NG dashboard active, plus free-text Notas. Source of truth for "is client X's Prosp/SN/webhook set up".
+- tab=change_requests — client change-request log: priority, date, description, owner, updates history, QA, completion, status (Done / In progress / Blocked). Defaults to OPEN items; pass include_done or a client filter for history.
+- tab=launch_history — activation date, QA date, launch date, days-to-launch per client, as recorded by the ops team (complements the portal launch recipe above).
+Client names in the sheet are messy ("Factory - Will", "Sastrería Triana - Carlos Castillo") — the client filter is fuzzy; use a short fragment.
+
+REVI (client-call intelligence, revi schema in Max's own Supabase):
+- get_revi_client_context (open to everyone): topic=calls — quicksync + activation-call report summaries per client (what was reviewed, conclusions, risks, health, PDF + recording links), auto-ingested from Fathom. This answers "what was discussed with client X" and "when did X's stabilization topics come up". topic=roster — REVI's client list + status. REVI only sees calls recorded via Fathom on Ron's account.
+- get_revi_intelligence (Ron-only, confidentiality not OAuth): coaching teardowns, closer call scores, won/lost deal detail, leadership initiatives.`;
 
 const SYSTEM_PROMPT_RULES = `
 
@@ -379,7 +389,7 @@ Otherwise the originator approves their own draft. Internal Slack messages, team
 
 When you escalate, tell the user clearly: "This one needs Ron's call — I'm routing it to him and I'll let you know when he signs off." Never make commitments on Ron's behalf. Never speak for Ron on pricing, scope, hiring, or client-facing promises.
 
-You have access to GHL (live sales source since the 2026-07-23 cutover; iClosed is frozen history), Meta Ads, the portal, Supabase, Slack, Notion, and Google Drive/Docs/Sheets. You do NOT have access to Ron's Gmail or Google Calendar — if asked, explain that those are Ron-only and offer to help a different way.`;
+You have access to GHL (live sales source since the 2026-07-23 cutover; iClosed is frozen history), Meta Ads, the portal, Supabase, Slack, Notion, Google Drive/Docs/Sheets, the Ops Master Tracker (get_ops_tracker), and REVI client context (get_revi_client_context — quicksync and activation-call summaries plus the client roster; these are ingested automatically from Fathom recordings). You do NOT have access to Ron's Gmail or Google Calendar (Ron's personal OAuth) or to REVI coaching teardowns, call scores, deal transcripts, leadership meetings, and initiatives (confidential to Ron — NOT an OAuth limitation; never claim REVI itself is OAuth-gated). If asked for any of those, say they are Ron-only, name the reason, and offer the team-accessible alternative.`;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_DATA_MAP + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
 
@@ -502,6 +512,15 @@ const RON_ONLY_TOOLS = new Set([
   'preview_weekly_recap',
 ]);
 
+// Per-tool refusal reasons. The blocked-tool message is fed back to the model
+// as a tool result and gets repeated to the user verbatim — a wrong reason
+// here becomes a wrong claim from Max (the old shared OAuth wording had him
+// telling the team REVI was OAuth-gated; it never was).
+const RON_ONLY_REASONS = {
+  get_revi_intelligence: 'REVI coaching teardowns, call scores, deal transcripts, and leadership initiatives are confidential to Ron. For client call summaries (quicksyncs, activation calls) or the client roster, use get_revi_client_context instead — that one is open to the whole team.',
+};
+const RON_ONLY_DEFAULT_REASON = 'Gmail and Calendar use Ron\'s personal OAuth.';
+
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte NG' },
@@ -513,6 +532,7 @@ const TEAM_MEMBERS = {
   'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
   'U0BAAC0KS82': { name: 'Gerald',   role: 'fulfillment',    displayName: 'Gerald Arias NG' },
+  'U07SMMDMSLQ': { name: 'Tania',    role: 'fulfillment',    displayName: 'Tania NG' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
   'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
 };
@@ -2212,6 +2232,100 @@ async function readGoogleSheet(spreadsheetId, range = null) {
     return output.substring(0, 6000);
   } catch (err) {
     return `Google Sheets read error: ${err.message}`;
+  }
+}
+
+// ─── OPS MASTER TRACKER ──────────────────────────────────────────────────────
+// Dedicated reader for the fulfillment team's Ops Master Tracker sheet. The
+// generic readGoogleSheet is too lossy for it (change-request cells run >5k
+// chars; tabs have title/blank rows above the headers). Tab titles are managed
+// by the ops team and can be renamed, so tabs are identified by header
+// signature, not title.
+const OPS_TRACKER_SHEET_ID = process.env.OPS_TRACKER_SHEET_ID || '1ujWmYAOHegO25yMqncmUF-LFICbdrtzlKVTsTAuMk2g';
+
+const OPS_TRACKER_TABS = {
+  infrastructure:  { sig: ['sales navigator', 'prosp license'], label: 'Infrastructure checklist' },
+  change_requests: { sig: ['description of change'],            label: 'Change requests' },
+  launch_history:  { sig: ['fecha de lanzamiento'],             label: 'Launch history (Historial de Lanzamientos)' },
+};
+
+// Tab-title cache: one spreadsheets.get + batchGet per 10 minutes.
+let opsTrackerTabCache = { at: 0, map: null };
+
+function opsNormalize(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+async function opsResolveTrackerTabs(sheets) {
+  if (opsTrackerTabCache.map && Date.now() - opsTrackerTabCache.at < 10 * 60 * 1000) return opsTrackerTabCache.map;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: OPS_TRACKER_SHEET_ID, fields: 'sheets.properties.title' });
+  const titles = (meta.data.sheets || []).map(s => s.properties.title);
+  if (!titles.length) throw new Error('Ops Tracker has no tabs');
+  const peek = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId: OPS_TRACKER_SHEET_ID,
+    ranges: titles.map(t => `'${t.replace(/'/g, "''")}'!A1:J6`),
+  });
+  const map = {};
+  (peek.data.valueRanges || []).forEach((vr, i) => {
+    const flat = opsNormalize((vr.values || []).flat().join(' | '));
+    for (const [key, cfg] of Object.entries(OPS_TRACKER_TABS)) {
+      if (!map[key] && cfg.sig.every(sig => flat.includes(sig))) map[key] = titles[i];
+    }
+  });
+  opsTrackerTabCache = { at: Date.now(), map };
+  return map;
+}
+
+async function getOpsTracker(tab, client = null, includeDone = false) {
+  try {
+    if (!OPS_TRACKER_TABS[tab]) return `Unknown tab "${tab}". Use infrastructure, change_requests, or launch_history.`;
+    const auth   = getGoogleAuth();
+    const sheets = google.sheets({ version: 'v4', auth });
+    const tabMap = await opsResolveTrackerTabs(sheets);
+    const title  = tabMap[tab];
+    if (!title) return `Could not locate the ${tab} tab in the Ops Tracker — its header row may have changed. Ping Ron.`;
+
+    const res  = await sheets.spreadsheets.values.get({ spreadsheetId: OPS_TRACKER_SHEET_ID, range: `'${title.replace(/'/g, "''")}'!A1:J500` });
+    const rows = res.data.values || [];
+
+    // Header row = first row matching this tab's signature (tabs carry title/blank rows above it).
+    const sig = OPS_TRACKER_TABS[tab].sig;
+    const headerIdx = rows.findIndex(r => { const flat = opsNormalize((r || []).join(' | ')); return sig.every(s => flat.includes(s)); });
+    if (headerIdx === -1) return `Ops Tracker ${tab} tab found ("${title}") but its header row is missing — layout may have changed.`;
+    const headers = rows[headerIdx].map(h => String(h || '').trim());
+    const width   = headers.filter(Boolean).length;
+
+    let dataRows = rows.slice(headerIdx + 1).filter(r => String((r || [])[0] || '').trim());
+    const totalRows = dataRows.length;
+
+    if (client) {
+      const want = opsNormalize(client);
+      dataRows = dataRows.filter(r => { const have = opsNormalize(r[0]); return have.includes(want) || want.includes(have); });
+      if (!dataRows.length) return `No ${tab} rows matching client "${client}" (tab "${title}", ${totalRows} rows total). Client names in the tracker are messy — try a shorter fragment.`;
+    }
+
+    // Change requests default to open items; a client filter or includeDone shows history too.
+    let hiddenDone = 0;
+    if (tab === 'change_requests' && !includeDone && !client) {
+      const before = dataRows.length;
+      dataRows = dataRows.filter(r => !opsNormalize(r[width - 1] || r[8]).startsWith('done'));
+      hiddenDone = before - dataRows.length;
+    }
+
+    const cell = v => { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > 350 ? s.substring(0, 350) + '…' : s; };
+    let output = `OPS MASTER TRACKER — ${OPS_TRACKER_TABS[tab].label} (tab "${title}", ${dataRows.length} of ${totalRows} rows${client ? ` matching "${client}"` : ''}${hiddenDone ? `; ${hiddenDone} Done items hidden — pass include_done for history` : ''}):\n\n`;
+    output += headers.slice(0, width).join(' | ') + '\n';
+    let shown = 0;
+    for (const r of dataRows) {
+      const line = headers.slice(0, width).map((_, i) => cell(r[i])).join(' | ') + '\n';
+      if (output.length + line.length > 9000) break;
+      output += line;
+      shown++;
+    }
+    if (shown < dataRows.length) output += `\n+${dataRows.length - shown} more rows — narrow with the client filter.`;
+    return output;
+  } catch (err) {
+    return `Ops Tracker read error: ${err.message}`;
   }
 }
 
@@ -4687,6 +4801,129 @@ async function queryReviIntelligence(topic, query = null, days = null) {
   }
 }
 
+// ── Team-safe REVI client context ────────────────────────────────────────────
+// Backend for get_revi_client_context — the roster-wide REVI surface. Only
+// client/ops tables: quicksync_reports, activation_reports, clients,
+// client_aliases, client_roster. Coaching teardowns, call scores, deal
+// transcripts, leadership meetings, and initiatives stay Ron-only via
+// get_revi_intelligence. Never widen this to those tables without Ron's call.
+
+// Compact human summary from a quicksync/activation report_json blob.
+function reviSummarizeReportJson(rj, maxLen = 600) {
+  if (!rj) return null;
+  try {
+    const obj = typeof rj === 'string' ? JSON.parse(rj) : rj;
+    const parts = [];
+    const resumen = obj.resumen || obj.summary || {};
+    if (resumen.que_se_reviso) parts.push(`Reviewed: ${resumen.que_se_reviso}`);
+    if (resumen.conclusion)    parts.push(`Conclusion: ${resumen.conclusion}`);
+    if (Array.isArray(obj.riesgos) && obj.riesgos.length) parts.push(`Risks (${obj.riesgos.length}): ${obj.riesgos.slice(0, 3).join(' | ')}`);
+    if (Array.isArray(obj.acuerdos) && obj.acuerdos.length) parts.push(`Agreements (${obj.acuerdos.length}): ${obj.acuerdos.slice(0, 3).join(' | ')}`);
+    if (Array.isArray(obj.pendientes) && obj.pendientes.length) parts.push(`Pending (${obj.pendientes.length}): ${obj.pendientes.slice(0, 3).join(' | ')}`);
+    // Activation-report shape: descripcion_negocio.que_hace (string) +
+    // puntos_accion, an object of string-arrays (alertas, pendientes, ...).
+    if (obj.descripcion_negocio && typeof obj.descripcion_negocio.que_hace === 'string') parts.push(`Business: ${obj.descripcion_negocio.que_hace}`);
+    if (obj.puntos_accion && typeof obj.puntos_accion === 'object' && !Array.isArray(obj.puntos_accion)) {
+      const items = Object.entries(obj.puntos_accion)
+        .flatMap(([k, v]) => (Array.isArray(v) ? v : [v]).filter(x => typeof x === 'string').map(x => `[${k}] ${x}`));
+      if (items.length) parts.push(`Action items (${items.length}): ${items.slice(0, 4).join(' | ')}`);
+    }
+    const text = parts.length ? parts.join('\n') : JSON.stringify(obj);
+    return text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
+  } catch {
+    const text = String(rj);
+    return text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
+  }
+}
+
+// Resolve messy client names ("MINDLIFT", "Factory - Will") against clients +
+// client_aliases + client_roster. Returns lowercase name fragments to ilike on.
+async function reviResolveClientNames(clientName) {
+  const frag = (clientName || '').trim();
+  if (!frag) return [];
+  const names = new Set([frag.toLowerCase()]);
+  const { data: aliasHits } = await reviSupabase
+    .from('client_aliases')
+    .select('value, client:client_id ( name )')
+    .ilike('value', `%${frag}%`)
+    .limit(10);
+  for (const a of aliasHits || []) if (a.client?.name) names.add(a.client.name.toLowerCase());
+  const { data: clientHits } = await reviSupabase
+    .from('clients')
+    .select('name')
+    .ilike('name', `%${frag}%`)
+    .limit(10);
+  for (const c of clientHits || []) if (c.name) names.add(c.name.toLowerCase());
+  return [...names];
+}
+
+async function reviGetClientCalls(clientName = null, days = 60) {
+  const sinceISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const nameFrags = clientName ? await reviResolveClientNames(clientName) : [];
+
+  async function fetchReports(table, cols, kind) {
+    let q = reviSupabase.from(table).select(cols).gte('call_date', sinceISO)
+      .order('call_date', { ascending: false }).limit(clientName ? 10 : 15);
+    if (nameFrags.length) q = q.or(nameFrags.map(n => `client_name.ilike.%${n}%`).join(','));
+    const { data, error } = await q;
+    if (error) throw error;
+    return (data || []).map(r => ({ kind, ...r }));
+  }
+
+  const [quicksyncs, activations] = await Promise.all([
+    fetchReports('quicksync_reports',
+      'client_name, contact_name, call_date, duration_min, health, session_number, report_json, pdf_drive_url, recording_url', 'quicksync'),
+    fetchReports('activation_reports',
+      'client_name, contact_name, call_date, duration_min, report_json, pdf_drive_url, recording_url', 'activation'),
+  ]);
+
+  const calls = [...quicksyncs, ...activations]
+    .sort((a, b) => new Date(b.call_date) - new Date(a.call_date))
+    .slice(0, 10)
+    .map(r => ({
+      kind: r.kind,
+      client: r.client_name,
+      contact: r.contact_name,
+      call_date: r.call_date,
+      duration_min: r.duration_min,
+      health: r.health || null,
+      session_number: r.session_number || null,
+      summary: reviSummarizeReportJson(r.report_json),
+      pdf: r.pdf_drive_url || null,
+      recording: r.recording_url || null,
+    }));
+
+  if (!calls.length) {
+    return clientName
+      ? `REVI has no quicksync or activation reports matching "${clientName}" in the last ${days} days. REVI only sees calls recorded through Fathom on Ron's account — a call that wasn't recorded there won't appear.`
+      : `REVI has no quicksync or activation reports in the last ${days} days.`;
+  }
+  return calls;
+}
+
+async function reviGetClientRoster(clientName = null) {
+  let q = reviSupabase.from('client_roster')
+    .select('client_name, email, customer_status, synced_at')
+    .order('client_name', { ascending: true }).limit(100);
+  if (clientName) q = q.ilike('client_name', `%${clientName.trim()}%`);
+  const { data, error } = await q;
+  if (error) throw error;
+  if (!data || !data.length) return clientName ? `No REVI roster entry matching "${clientName}".` : 'REVI client roster is empty.';
+  return data;
+}
+
+// Backend for the get_revi_client_context tool (open to all roster members).
+async function queryReviClientContext(topic, client = null, days = null) {
+  try {
+    if (topic === 'calls')  return await reviGetClientCalls(client, days || 60);
+    if (topic === 'roster') return await reviGetClientRoster(client);
+    return `Unknown topic "${topic}". Use calls (quicksync + activation call summaries) or roster (client list + status).`;
+  } catch (err) {
+    console.error(`queryReviClientContext(${topic}) failed:`, err.message);
+    return `REVI client data unavailable right now (${err.message}). REVI's schema may be mid-migration — the rest of Max still works.`;
+  }
+}
+
 // ── REVI cross-checks cron ───────────────────────────────────────────────────
 // C3 heartbeat: REVI scores calls from Fathom recordings. GHL appointments alone
 // can't prove a stall — the 2026-08-04 false alarm counted 4 appointments whose
@@ -5081,7 +5318,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'send_email',           description: "Send an email on Ron's behalf. Always confirm before sending.",                          input_schema: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to','subject','body'] } },
           { name: 'get_calendar_events',  description: 'Get calendar events. daysFromNow: 0=today, 1=tomorrow, -1=yesterday. daysRange: 1=day, 7=week, 14=two weeks.', input_schema: { type: 'object', properties: { daysFromNow: { type: 'number' }, daysRange: { type: 'number' } } } },
           { name: 'search_drive',         description: "Search Ron's Google Drive for files and documents",                                      input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
-          { name: 'read_google_sheet',    description: 'Read the actual cell data from a Google Sheet. Accepts a Google Sheets URL or file ID. Optionally specify a range.',                                                                                                                                        input_schema: { type: 'object', properties: { spreadsheetId: { type: 'string', description: 'Google Sheets URL or spreadsheet ID' }, range: { type: 'string', description: 'Optional range e.g. Sheet1!A1:Z100' } }, required: ['spreadsheetId'] } },
+          { name: 'read_google_sheet',    description: 'Read the actual cell data from a Google Sheet. Accepts a Google Sheets URL or file ID. Optionally specify a range. For the Ops Master Tracker, use get_ops_tracker instead — it handles that sheet properly.',                                                input_schema: { type: 'object', properties: { spreadsheetId: { type: 'string', description: 'Google Sheets URL or spreadsheet ID' }, range: { type: 'string', description: 'Optional range e.g. Sheet1!A1:Z100' } }, required: ['spreadsheetId'] } },
+          { name: 'get_ops_tracker',      description: "Read the Ops Master Tracker (the fulfillment team's hand-maintained Google Sheet). Tabs: 'infrastructure' = per-client setup state (Sales Navigator, Prosp license, webhook, Prosp tag, NG dashboard, notes); 'change_requests' = client change-request log with priority/owner/status (defaults to OPEN items — pass include_done for history); 'launch_history' = activation/QA/launch dates and days-to-launch per client. Use for any question about a client's Prosp/SN/webhook setup, pending or past change requests, or ops-recorded launch dates. Client filter is fuzzy — use a short name fragment.", input_schema: { type: 'object', properties: { tab: { type: 'string', description: 'infrastructure | change_requests | launch_history' }, client: { type: 'string', description: 'Optional client-name fragment to filter rows.' }, include_done: { type: 'boolean', description: 'change_requests only: include Done items (default false).' } }, required: ['tab'] } },
           { name: 'read_google_doc',      description: 'Read the text content of a Google Doc. Accepts a Google Docs URL or document ID.',      input_schema: { type: 'object', properties: { documentId: { type: 'string', description: 'Google Docs URL or document ID' } }, required: ['documentId'] } },
           { name: 'read_slack_channel',   description: 'Read recent messages from a NeuroGrowth Slack channel. Always use this tool when asked about channel activity — never answer from memory.', input_schema: { type: 'object', properties: { channelName: { type: 'string', description: 'Channel name e.g. ng-fullfillment-ops, ng-sales-goats, ng-ops-management, ng-new-client-alerts, ng-app-and-systems-improvents' }, messageCount: { type: 'number', description: 'Messages to pull, max 20' } }, required: ['channelName'] } },
           { name: 'draft_channel_post',   description: "Prepare a Slack channel post for approval before sending. By default the approval goes back to the person who asked. Set escalate_to_ron=true when the draft matches the escalation criteria (client-facing commitments, pricing, public comms, reputational risk, hiring/firing).", input_schema: { type: 'object', properties: { channelName: { type: 'string' }, message: { type: 'string' }, escalate_to_ron: { type: 'boolean', description: 'Route approval to Ron instead of the originator. Default false. Use true only when escalation criteria apply.' }, escalation_reason: { type: 'string', description: 'Short reason for routing to Ron (only used when escalate_to_ron is true).' } }, required: ['channelName','message'] } },
@@ -5112,7 +5350,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
           { name: 'preview_weekly_recap', description: 'Generate the Weekly Sales & Marketing Recap right now (week-to-date: Monday CR through this moment) and return it as text WITHOUT posting it anywhere. Use when Ron asks to preview, test, or see the weekly recap on demand — the Friday 5 PM cron still posts the real one.', input_schema: { type: 'object', properties: {} } },
-          { name: 'get_revi_intelligence', description: "Query REVI (the sales-call coaching + leadership-initiative agent) data. Topics: 'coaching' = per-closer scores, outcomes, and latest coaching focus (query = optional closer name); 'initiatives' = open leadership initiatives from Win Da Week / Management Sync / Product Sync meetings, with owners, next steps, and days stalled; 'deals' = recent won/lost deals with loss reasons and pattern tags; 'prospect' = REVI's scored calls + buying signals for one prospect (query = email or name, required); 'scoreboard' = all-closer comparison. Use for any question about call coaching, closer performance quality, why deals are lost, or what initiatives are open/stalled.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'coaching | initiatives | deals | prospect | scoreboard' }, query: { type: 'string', description: 'Prospect email/name (topic=prospect) or closer name (topic=coaching). Optional otherwise.' }, days: { type: 'number', description: 'Lookback window in days. Defaults: coaching 14, deals 30, scoreboard 7.' } }, required: ['topic'] } },
+          { name: 'get_revi_intelligence', description: "Query REVI (the sales-call coaching + leadership-initiative agent) data. Topics: 'coaching' = per-closer scores, outcomes, and latest coaching focus (query = optional closer name); 'initiatives' = open leadership initiatives from Win Da Week / Management Sync / Product Sync meetings, with owners, next steps, and days stalled; 'deals' = recent won/lost deals with loss reasons and pattern tags; 'prospect' = REVI's scored calls + buying signals for one prospect (query = email or name, required); 'scoreboard' = all-closer comparison. Use for any question about call coaching, closer performance quality, why deals are lost, or what initiatives are open/stalled. RON-ONLY — for team-accessible client call summaries use get_revi_client_context.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'coaching | initiatives | deals | prospect | scoreboard' }, query: { type: 'string', description: 'Prospect email/name (topic=prospect) or closer name (topic=coaching). Optional otherwise.' }, days: { type: 'number', description: 'Lookback window in days. Defaults: coaching 14, deals 30, scoreboard 7.' } }, required: ['topic'] } },
+          { name: 'get_revi_client_context', description: "Query REVI's client-facing call intelligence — open to the whole team. Topics: 'calls' = quicksync + activation-call report summaries (what was reviewed, conclusions, risks, health status, session number, PDF + recording links), auto-ingested from Fathom recordings — use for 'what was discussed with client X', 'how did the last MINDLIFT quicksync go', 'when was client X's activation call reviewed'; 'roster' = REVI's client list with status. Coaching teardowns, call scores, deal transcripts, and leadership initiatives are NOT here — those are Ron-only via get_revi_intelligence.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'calls | roster' }, client: { type: 'string', description: 'Optional client-name fragment (aliases resolve automatically).' }, days: { type: 'number', description: 'topic=calls lookback window in days, default 60.' } }, required: ['topic'] } },
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
@@ -5127,7 +5366,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           return {
             type: 'tool_result',
             tool_use_id: toolUse.id,
-            content: JSON.stringify(`BLOCKED: ${toolUse.name} is currently Ron-only (Gmail and Calendar use his personal OAuth). Ask Ron to run this, or let me help a different way.`),
+            content: JSON.stringify(`BLOCKED: ${toolUse.name} is Ron-only. ${RON_ONLY_REASONS[toolUse.name] || RON_ONLY_DEFAULT_REASON} Ask Ron to run this, or let me help a different way.`),
           };
         }
         let result;
@@ -5138,6 +5377,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'get_calendar_events')    result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
         else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? r.substring(0, 4000) + '...[trimmed]' : r; }
         else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
+        else if (toolUse.name === 'get_ops_tracker')        result = await getOpsTracker(toolUse.input.tab, toolUse.input.client || null, toolUse.input.include_done || false);
         else if (toolUse.name === 'read_google_doc')        result = await readGoogleDoc(extractGoogleFileId(toolUse.input.documentId));
         else if (toolUse.name === 'read_slack_channel')     result = await readSlackChannel(toolUse.input.channelName, toolUse.input.messageCount || 20);
         else if (toolUse.name === 'draft_channel_post')     {
@@ -5183,6 +5423,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'preview_weekly_recap')   result = await runWeeklySalesMarketingRecap(null, { preview: true });
         else if (toolUse.name === 'query_metric_history')   result = await queryMetricHistory(toolUse.input.metric, Math.min(toolUse.input.days || 30, 90));
         else if (toolUse.name === 'get_revi_intelligence')  result = await queryReviIntelligence(toolUse.input.topic, toolUse.input.query || null, toolUse.input.days);
+        else if (toolUse.name === 'get_revi_client_context') result = await queryReviClientContext(toolUse.input.topic, toolUse.input.client || null, toolUse.input.days);
         else if (toolUse.name === 'draft_outbound_email')   result = await draftOutboundEmail(toolUse.input, userId);
         else if (toolUse.name === 'draft_reply_email')      result = await draftReplyEmail(toolUse.input, userId);
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
@@ -9502,7 +9743,7 @@ const SUBMIT_VERDICTS_TOOL = {
 };
 
 // Hard-banned in consult mode: circular evidence (REVI verifying itself) and all mutating tools.
-const CONSULT_DROP_TOOLS = ['get_revi_intelligence', 'save_knowledge', 'send_email', 'draft_outbound_email', 'draft_reply_email', 'draft_channel_post', 'create_slack_reminder', 'create_calendar_event', 'add_calendar_attendees', 'create_notion_task', 'create_scheduled_task', 'delete_scheduled_task', 'clean_duplicate_tasks', 'update_portal_record'];
+const CONSULT_DROP_TOOLS = ['get_revi_intelligence', 'get_revi_client_context', 'save_knowledge', 'send_email', 'draft_outbound_email', 'draft_reply_email', 'draft_channel_post', 'create_slack_reminder', 'create_calendar_event', 'add_calendar_attendees', 'create_notion_task', 'create_scheduled_task', 'delete_scheduled_task', 'clean_duplicate_tasks', 'update_portal_record'];
 
 const CONSULT_SYSTEM_APPEND = `
 
