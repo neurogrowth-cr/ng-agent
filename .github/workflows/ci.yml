@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check
+        run: node --check index.js
+
+      - name: Tests (no install needed — plain node)
+        run: |
+          node test/strike-rules.test.js
+          node test/make-watchdog.test.js
+          node test/booking-gates.test.js
+
+      # A "docs" branch that touches index.js is the 2026-05-26 failure mode:
+      # a docs-only session committing a stale copy of the monolith.
+      - name: Docs-branch guard
+        if: github.event_name == 'pull_request'
+        env:
+          BRANCH: ${{ github.head_ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD")
+          if { [[ "$BRANCH" == docs/* ]] || [[ "$TITLE" == docs:* ]]; } && echo "$CHANGED" | grep -qx 'index.js'; then
+            echo "::error::A docs branch modifies index.js — likely a stale working copy. Split the code change into its own branch."
+            exit 1
+          fi
+
+      # Large deletions from the monolith usually mean a stale copy is reverting
+      # someone else's merged work. Intentional big changes: add label major-change.
+      - name: Revert detector (index.js deletions)
+        if: github.event_name == 'pull_request'
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          DELETED=$(git diff --numstat "origin/${BASE}...HEAD" -- index.js | awk '{s+=$2} END {print s+0}')
+          echo "index.js lines deleted vs base: ${DELETED}"
+          if [ "${DELETED}" -gt 50 ] && [[ ",${LABELS}," != *",major-change,"* ]]; then
+            echo "::error::This PR deletes ${DELETED} lines from index.js without the 'major-change' label. If intentional, add the label; if not, your branch likely holds a stale copy of index.js."
+            exit 1
+          fi
