@@ -26,6 +26,7 @@ jobs:
           node test/make-watchdog.test.js
           node test/make-triage.test.js
           node test/booking-gates.test.js
+          node test/outcome-loop.test.js
 
       # A "docs" branch that touches index.js is the 2026-05-26 failure mode:
       # a docs-only session committing a stale copy of the monolith.
