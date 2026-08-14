@@ -40,7 +40,13 @@ function build({ env = {}, scenarios = [], dlqs = [], failRetry = new Set(),
     const u = new URL(url);
     const p = u.pathname.replace('/api/v2', '');
     calls.push({ method: (init.method || 'GET').toUpperCase(), path: p });
-    if (p === '/scenarios') return reply({ scenarios });
+    // Serve page 0 only; every later offset is empty so the pagination loop
+    // terminates. Returning the same page for every offset would replay the
+    // scenario ~1000 times per sweep and silently defeat any per-poll streak logic.
+    if (p === '/scenarios') {
+      const off = Number(u.searchParams.get('pg[offset]') || 0);
+      return reply({ scenarios: off === 0 ? scenarios : [] });
+    }
     if (/^\/scenarios\/[^/]+$/.test(p)) {
       return reply({ scenario: scenarios.find(s => String(s.id) === p.split('/')[2]) });
     }
@@ -169,6 +175,23 @@ const drain = () => new Promise(r => setImmediate(r));
     check('13b and a proposal is posted', t.posted.length, 1);
     await t.checkMakeScenarioHealth('c2'); await drain();
     check('13c repeat sweep with unchanged reason does NOT re-triage', t.triaged.length, 1);
+  }
+  {
+    // The interaction between DLQ damping and triage: a queued DLQ must survive
+    // DLQ_CONFIRM_POLLS before it counts as a reason at all, so triage must stay
+    // silent through the unconfirmed polls and fire exactly once on confirmation.
+    // Neither PR covers this on its own — damping is tested without triage, and
+    // the triage tests above all use the immediate `inactive` reason.
+    const QUEUED = [SCEN(5148796, '[PROD] GHL Appt Booked', { dlqCount: 2 })];
+    const t = build({ env: { MAKE_TRIAGE_ENABLED: 'true' }, scenarios: QUEUED,
+                      dlqs: [{ id: 'a', created: hoursAgo(1) }, { id: 'b', created: hoursAgo(1) }],
+                      triageResult: { recommended_action: 'retry_dlqs', dlq_ids: ['a','b'], summary: 's', root_cause: 'r', confidence: 'high' } });
+    await t.checkMakeScenarioHealth('p1'); await drain();
+    await t.checkMakeScenarioHealth('p2'); await drain();
+    check('13d unconfirmed DLQ does not triage (no LLM burned on a flap)', [t.triaged.length, t.alerts.length], [0, 0]);
+    await t.checkMakeScenarioHealth('p3'); await drain();
+    check('13e confirmed DLQ triages exactly once', t.triaged.length, 1);
+    check('13f and carries the dlq ids through to the proposal', t.posted[0].payload.dlq_ids, ['a','b']);
   }
   {
     const t = build({ env: { MAKE_TRIAGE_ENABLED: 'true' }, scenarios: DOWN, hasOpen: true });
