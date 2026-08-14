@@ -171,15 +171,61 @@ const page = (offset, scenarios) => ({ offset, scenarios });
 }).then(() => {
 
 // 9. A scenario that is active but piling up incomplete executions still alerts —
-//    this is the "has NOT been paused" class that isActive alone never catches.
+//    the "has NOT been paused" class isActive never catches — but only once the
+//    queue has PERSISTED, so a flapping dlqCount cannot spam the channel.
   return (async () => {
     const { fn, posted } = build({ pages: [page(0, [
       SCEN(5148796, '[PROD] GHL Appt Booked → CAPI + Slack Alert', { dlqCount: 4 }),
     ])] });
     await fn('c');
-    check('9a active-but-erroring scenario alerts', posted.length, 1);
-    check('9b names the incomplete executions', posted[0].includes('4 incomplete execution(s)'), true);
-    check('9c does not call it deactivated', posted[0].includes('DEACTIVATED'), false);
+    check('9a first DLQ poll stays quiet', posted.length, 0);
+    await fn('c');
+    check('9b second DLQ poll stays quiet', posted.length, 0);
+    await fn('c');
+    check('9c sustained DLQ alerts on the third poll', posted.length, 1);
+    check('9d names the incomplete executions', posted[0].includes('4 incomplete execution(s)'), true);
+    check('9e does not call it deactivated', posted[0].includes('DEACTIVATED'), false);
+    await fn('c');
+    check('9f no repeat while the queue persists', posted.length, 1);
+  })();
+
+}).then(() => {
+
+// 9b. THE FLAPPING CASE: dlqCount oscillating never reaches the threshold, so it
+//     never alerts. This is the 2026-08-13 05:00/05:10/05:20 pattern.
+  return (async () => {
+    let dlq = 2;
+    const posted = [];
+    const factory = new Function(
+      'process', 'fetch', 'slack', 'getCachedChannelList', 'logActivity', 'OPS_CHANNEL', 'RON_SLACK_ID', 'console',
+      `${block}; return checkMakeScenarioHealth;`
+    );
+    const fn = factory(
+      { env: { MAKE_API_TOKEN: 'tok', MAKE_API_BASE: 'https://make.test/api/v2', MAKE_TEAM_ID: '432699' } },
+      async (url) => {
+        const off = Number(new URL(url).searchParams.get('pg[offset]') || 0);
+        const rows = off === 0 ? [SCEN(5148796, '[PROD] GHL Appt Booked → CAPI + Slack Alert', { dlqCount: dlq })] : [];
+        return { ok: true, status: 200, json: async () => ({ scenarios: rows }) };
+      },
+      { client: { chat: { postMessage: async ({ text }) => { posted.push(text); } } } },
+      async () => { throw new Error('no cache'); }, () => {}, '#ng-fullfillment-ops', 'U05HXGX18H3',
+      { log: () => {}, warn: () => {}, error: () => {} },
+    );
+    for (let i = 0; i < 12; i++) { dlq = i % 2 ? 0 : 2; await fn('c'); }
+    check('9g a flapping DLQ never alerts', posted.length, 0);
+
+    // …but once it stops flapping and stays queued, it does alert.
+    dlq = 2;
+    await fn('c'); await fn('c'); await fn('c');
+    check('9h a settled DLQ still alerts', posted.length, 1);
+
+    // Recovery is damped too: one clear poll is not enough for an all-clear.
+    dlq = 0;
+    await fn('c');
+    check('9i one clear poll posts no premature all-clear', posted.length, 1);
+    await fn('c'); await fn('c');
+    check('9j sustained clear posts exactly one all-clear', posted.length, 2);
+    check('9k all-clear is the recovery message', posted[1].startsWith('✅'), true);
   })();
 
 }).then(() => {
