@@ -10282,6 +10282,16 @@ const MAKE_WATCHDOG_IGNORE = new Set(
 // we want — a restart should never silently swallow an open outage.
 const makeScenarioAlerted = new Map();
 
+// dlqCount oscillates: Make retries incomplete executions, so the count drops to
+// zero and comes back. Testing it raw produced three alert/all-clear pairs in
+// twenty minutes on 2026-08-13 (05:00, 05:10, 05:20) — the fastest way to teach
+// everyone to mute the channel. Both edges are damped: a DLQ must persist for
+// DLQ_CONFIRM_POLLS before it alerts, and must stay clear just as long before the
+// all-clear. isActive/isinvalid are unambiguous and stay immediate.
+const DLQ_CONFIRM_POLLS = 3; // ~30 min at the */10 cadence
+const makeDlqStreak   = new Map(); // scenarioId -> consecutive polls with dlqCount > 0
+const makeClearStreak = new Map(); // scenarioId -> consecutive clear polls while alerted
+
 // ── Agentic remediation config ──────────────────────────────────────────────
 // Triage is opt-in. Unset → every agentic path below is inert and the watchdog
 // behaves exactly as it did before, which is also what keeps the untouched
@@ -10483,11 +10493,18 @@ async function checkMakeScenarioHealth(correlationId) {
     //              executions. This is the class Make emails as "the scenario has
     //              NOT been paused" — isActive stays true through every failed run,
     //              so without this a scenario can fail 100% of the time and look green.
-    const reason = s.isActive === false ? 'inactive'
-                 : s.isinvalid === true ? 'invalid'
-                 : Number(s.dlqCount) > 0 ? 'dlq'
-                 : null;
+    const hardReason = s.isActive === false ? 'inactive'
+                     : s.isinvalid === true ? 'invalid'
+                     : null;
+
+    // Streak bookkeeping for the noisy signal. A dip resets it, so a flapping
+    // queue never reaches the threshold and never alerts.
+    const dlqStreak = Number(s.dlqCount) > 0 ? (makeDlqStreak.get(s.id) || 0) + 1 : 0;
+    if (dlqStreak) makeDlqStreak.set(s.id, dlqStreak); else makeDlqStreak.delete(s.id);
+
+    const reason = hardReason || (dlqStreak >= DLQ_CONFIRM_POLLS ? 'dlq' : null);
     const previous = makeScenarioAlerted.get(s.id);
+    if (reason) makeClearStreak.delete(s.id);
 
     if (reason && previous !== reason) {
       makeScenarioAlerted.set(s.id, reason);
@@ -10516,6 +10533,15 @@ async function checkMakeScenarioHealth(correlationId) {
           .catch(e => console.error(`Make triage failed for ${s.id}:`, e.message));
       }
     } else if (!reason && previous) {
+      // Damp the recovery edge too. Posting "recovered" on the first clear poll of
+      // a flapping queue is what turned one incident into three all-clears.
+      // A genuine fix (deactivated → active, queue drained) holds across polls.
+      const clear = (makeClearStreak.get(s.id) || 0) + 1;
+      if (previous === 'dlq' && clear < DLQ_CONFIRM_POLLS) {
+        makeClearStreak.set(s.id, clear);
+        continue;
+      }
+      makeClearStreak.delete(s.id);
       makeScenarioAlerted.delete(s.id);
       await postMakeHealthAlert(`✅ Make scenario *${s.name}* (${s.id}) is active again — queued webhooks replay automatically.`);
     }
