@@ -226,3 +226,22 @@ global CLAUDE.md; the remote state can change between your fetch and your push.
 - Never hand-copy code from another session's branch — merge or cherry-pick the actual commit, or the docs and git history fork.
 - A "docs-only" commit that touches `index.js` is always a bug; CI now rejects it.
 - When two writers share one mutable surface (checkout, Make blueprint, prepend-at-top file), the fix is always the same: isolate copies (worktrees), make writes commutative (append + union), or serialize through a queue (PRs).
+
+## 2026-08-13 — In-memory approval state is unusable for anything a cron triggers
+
+**Symptom.** Designing an "alert fires → Max proposes a fix → human approves → execute" flow, the obvious move was to reuse the existing `APPROVAL_NEEDED` sentinel + "reply yes" machinery. It would have silently failed in production most of the time.
+
+**Why it doesn't work for alerts.** `pendingApprovals` is a plain module-level object: 30-minute TTL, wiped by every Railway deploy, keyed by approver ID only (a second draft silently overwrites the first), no thread awareness, and its stage-2 phrase list is an exact-match English array — "sí", "dale", or even "yes do it" match nothing. That's all fine for its actual use case (a human asks for a draft and approves it seconds later in the same DM). It is completely wrong when the two events are separated by hours and a redeploy, which is exactly the shape of every cron-fired alert.
+
+**The pattern that does work, already in the codebase.** The campaign-draft approval stores the entire payload in the Slack message's own `metadata.event_payload` and rehydrates it via `conversations.history` when someone reacts. No TTL, no server state, survives restarts, works days later. Idempotency comes from whether the bot already reacted to that message.
+
+**Takeaways.**
+- **Match approval-state durability to the gap between propose and approve.** Seconds → memory is fine. Hours, or anything a cron starts → the state must live somewhere that survives a deploy. The message itself is the cheapest such place and needs no migration.
+- When two approval patterns already exist in a codebase, the newer/more-used one isn't automatically the right one — check what each assumes about elapsed time.
+- Post-hoc "has the bot already reacted?" idempotency leaves a real double-execute window when two people react at once. An atomic claim (win `reactions.add` or bail on `already_reacted`) closes it.
+
+## 2026-08-13 — Fire-and-forget code makes negative assertions pass vacuously
+
+**Symptom.** A new test asserted "a `no_action` triage verdict posts no proposal" and "a failed triage doesn't post" — both passed on the first run. They were meaningless: the triage call is deliberately fire-and-forget (`fn(...).catch(...)`, not awaited, so it can never block or break the alert loop it rides on), so the assertions ran before the promise chain had done anything at all. The one test that caught it was the *positive* case — "a proposal IS posted" — which failed with 0.
+
+**Takeaway.** Any test asserting that something did NOT happen, against code that starts unawaited async work, must drain the microtask queue first (`await new Promise(r => setImmediate(r))`). Otherwise every negative assertion in that file is green for the wrong reason. Write at least one positive assertion in the same block — it's the only thing that reveals the problem.

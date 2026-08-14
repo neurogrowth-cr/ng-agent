@@ -5278,6 +5278,9 @@ async function transcribeAudio(fileBuffer, filename) {
 //                     calls it, callClaude returns { structured: <tool input> } instead
 //                     of text. Used by /agent/consult for schema-constrained verdicts.
 // opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
+// opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
+//                     dropTools, for narrow modes like alert triage where banning ~38 tools
+//                     by name would be unmaintainable. [] means finalTool only.
 async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
   const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
   // Learned lessons ride every interactive prompt (fetched once, not per retry).
@@ -5355,8 +5358,12 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
+          { name: 'make_list_dlqs', description: 'List the incomplete executions (DLQ) queued on a Make scenario: id, when it failed, and the error reason. Read-only. Use this before make_get_dlq. Incomplete executions are runs that errored and piled up while Make still reports the scenario as active.', input_schema: { type: 'object', properties: { scenario_id: { type: 'string', description: 'Make scenario id, e.g. 5148796' }, limit: { type: 'number', description: 'Default 10, max 25.' } }, required: ['scenario_id'] } },
+          { name: 'make_get_dlq',   description: 'Get one Make incomplete execution: which module failed, the error, and the input bundle that caused it. The bundle carries the real contact/appointment ids, so use it to name who was affected. Read-only.', input_schema: { type: 'object', properties: { dlq_id: { type: 'string' } }, required: ['dlq_id'] } },
       ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
-       .filter(t => !(opts.dropTools || []).includes(t.name));
+       .filter(t => !(opts.dropTools || []).includes(t.name))
+       .filter(t => !opts.onlyTools || opts.onlyTools.includes(t.name))
+       .filter(t => process.env.MAKE_API_TOKEN || !t.name.startsWith('make_'));
       if (opts.finalTool) TOOLS.push(opts.finalTool);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
@@ -5426,6 +5433,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'get_revi_client_context') result = await queryReviClientContext(toolUse.input.topic, toolUse.input.client || null, toolUse.input.days);
         else if (toolUse.name === 'draft_outbound_email')   result = await draftOutboundEmail(toolUse.input, userId);
         else if (toolUse.name === 'draft_reply_email')      result = await draftReplyEmail(toolUse.input, userId);
+        else if (toolUse.name === 'make_list_dlqs')         result = await listMakeDlqs(toolUse.input.scenario_id, toolUse.input.limit);
+        else if (toolUse.name === 'make_get_dlq')           result = await getMakeDlqDetail(toolUse.input.dlq_id);
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
       }
 
@@ -9883,6 +9892,244 @@ function attachSocketWatchdog() {
   client.on('connected', () => onUp('connected'));
 }
 
+// ─── ALERT TRIAGE BRIDGE ────────────────────────────────────────────────────
+// Detectors in this file historically format a string, post it to Slack, and stop —
+// Max never sees his own alerts, so nothing can act on them. This bridge closes that
+// loop: a detector hands over a structured alert plus the remediation actions it is
+// willing to authorize, Max investigates with read-only tools, and returns ONE
+// structured proposal. Nothing executes here; execution is the reaction route below.
+// Same finalTool + systemAppend shape as handleAgentConsult (REVI → Max verdicts).
+
+const REMEDIATION_CHANNEL = process.env.REMEDIATION_CHANNEL || OPS_CHANNEL;
+const REMEDIATION_COOLDOWN_MS = Number(process.env.REMEDIATION_COOLDOWN_H || 6) * 60 * 60 * 1000;
+// Armed in stages: with this set, proposals still post and ✅ still resolves them,
+// but the executor is never reached. Lets the triage reasoning be judged on real
+// alerts before it can touch production Make.
+const REMEDIATION_DRY_RUN = String(process.env.REMEDIATION_DRY_RUN || '') === 'true';
+
+const TRIAGE_SYSTEM_APPEND = `
+
+ALERT TRIAGE MODE: an automated detector fired and you are diagnosing it, not chatting.
+- Investigate with the tools you were given. Every claim must come from a tool result in THIS request. Do not speculate.
+- Name the concrete affected records (contact, appointment, booking) when the data contains them. "Some executions failed" is a useless proposal.
+- Recommend exactly one action from the allowed list. If the evidence supports none of them, or the real fix is a human code/blueprint change, recommend no_action or escalate and say why.
+- risk_notes is mandatory whenever you recommend an action: state plainly what goes wrong if a human approves this and you were wrong.
+- Plain text only. No markdown, no asterisks, no emoji, no bullet characters.
+- You are PROPOSING. You have no write access here. Never say you fixed, retried, restarted, or resolved anything.`;
+
+function buildTriageTool(actionIds) {
+  return {
+    name: 'propose_remediation',
+    description: 'Submit your single final triage verdict. Call this exactly once; it ends the triage.',
+    input_schema: {
+      type: 'object',
+      required: ['summary', 'root_cause', 'recommended_action', 'confidence'],
+      properties: {
+        summary:            { type: 'string', description: 'One or two plain sentences a human reads first. Name the real records.' },
+        root_cause:         { type: 'string', description: 'What actually broke, citing the evidence you found.' },
+        recommended_action: { type: 'string', enum: [...actionIds, 'no_action', 'escalate'] },
+        dlq_ids:            { type: 'array', items: { type: 'string' }, description: 'Retry actions only: the specific incomplete-execution ids to retry. Omit otherwise.' },
+        confidence:         { type: 'string', enum: ['high', 'medium', 'low'] },
+        risk_notes:         { type: 'string', description: 'What breaks if a human approves this and you are wrong.' },
+      },
+    },
+  };
+}
+
+// alert = { alertKey, source, title, facts{}, actions[{id,description}], guidance,
+//           onlyTools[], correlationId }
+async function triageAlert(alert) {
+  const factLines   = Object.entries(alert.facts || {}).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+  const actionLines = (alert.actions || []).map(a => `  ${a.id} — ${a.description}`).join('\n');
+  const msg = [
+    `AUTOMATED ALERT from ${alert.source}. Diagnose it, then call propose_remediation exactly once.`,
+    '', `Alert: ${alert.title}`, 'Facts:', factLines,
+    '', 'Actions a human may approve:', actionLines,
+    '  no_action — the alert is benign or self-resolving',
+    '  escalate — a human must intervene; no automated action is safe',
+    '', alert.guidance || '',
+  ].join('\n');
+
+  const result = await callClaude([{ role: 'user', content: msg }], 3, null, alert.correlationId, {
+    systemAppend: TRIAGE_SYSTEM_APPEND,
+    finalTool:    buildTriageTool((alert.actions || []).map(a => a.id)),
+    onlyTools:    alert.onlyTools || [],
+  });
+  const proposal = result && result.structured;
+  if (!proposal || !proposal.recommended_action) return null;  // completeness guard
+  return proposal;
+}
+
+async function resolveOpsChannelId() {
+  try {
+    const channels = await getCachedChannelList();
+    const match = channels.find(c => c.name === String(REMEDIATION_CHANNEL).replace('#', ''));
+    if (match) return match.id;
+  } catch (e) {
+    console.error('resolveOpsChannelId failed:', e.message);
+  }
+  return REMEDIATION_CHANNEL;
+}
+
+// Restart-safe dedup: the Slack message IS the state, so this survives the redeploys
+// that wipe every in-memory Map in this file. Any proposal for this alertKey inside
+// the cooldown — pending, executed, OR dismissed — suppresses a new one.
+// Fails CLOSED: if history is unreadable we suppress, because the alternative is a
+// proposal storm every 10 minutes. The plain watchdog alert still fires regardless.
+async function hasOpenRemediationProposal(alertKey) {
+  try {
+    const channel = await resolveOpsChannelId();
+    if (String(channel).startsWith('#')) return true;   // never resolved to an id → cannot dedup
+    const hist = await slack.client.conversations.history({
+      channel, limit: 200, include_all_metadata: true,
+      oldest: String((Date.now() - REMEDIATION_COOLDOWN_MS) / 1000),
+    });
+    return (hist.messages || []).some(m =>
+      m.metadata && m.metadata.event_type === 'remediation_proposal' &&
+      m.metadata.event_payload && m.metadata.event_payload.alert_key === alertKey);
+  } catch (e) {
+    console.error('hasOpenRemediationProposal failed, suppressing to be safe:', e.message);
+    return true;
+  }
+}
+
+async function postRemediationProposal({ alertKey, executor, title, proposal, payload, correlationId }) {
+  const channel = await resolveOpsChannelId();
+  const dry = REMEDIATION_DRY_RUN;
+  const lines = [
+    `🛠 *Remediation proposed* — ${title}${dry ? '  _(DRY RUN)_' : ''}`,
+    '',
+    proposal.summary,
+    '',
+    `*Root cause:* ${proposal.root_cause}`,
+    `*Proposed action:* \`${proposal.recommended_action}\` (confidence: ${proposal.confidence})`,
+    proposal.risk_notes ? `*Risk if wrong:* ${proposal.risk_notes}` : null,
+    '',
+    dry ? '_Dry run — ✅ will explain what would happen, but will not touch Make._'
+        : '✅ to execute · ❌ to dismiss. Any NeuroGrowth roster member may approve.',
+  ].filter(Boolean);
+
+  const res = await slack.client.chat.postMessage({
+    channel, text: lines.join('\n'),
+    // Slack metadata must be flat primitives/arrays and small — it is the durable
+    // state the reaction handler rehydrates from. Never put a payload bundle here.
+    metadata: {
+      event_type: 'remediation_proposal',
+      event_payload: {
+        v: 1, alert_key: alertKey, executor,
+        action: proposal.recommended_action,
+        dry_run: dry ? 'true' : 'false',
+        correlation_id: correlationId || '',
+        ...payload,
+      },
+    },
+  });
+  logActivity({
+    event_type: 'remediation', event_source: 'cron', action: 'remediation_proposed',
+    status: proposal.confidence, channel_id: res.channel, thread_ts: res.ts,
+    output: { alert_key: alertKey, executor, action: proposal.recommended_action,
+              summary: proposal.summary, risk_notes: proposal.risk_notes || null },
+    metadata: payload, correlation_id: correlationId,
+  });
+  return res;
+}
+
+// Claim-lock emoji: whoever wins reactions.add executes. Stronger than checking
+// existing reactions after the fact (the campaign flow does that, and it leaves a
+// real double-execute window when two people react at once).
+const REMEDIATION_LOCK_EMOJI = 'hourglass_flowing_sand';
+
+function summariseRemediation(meta, r) {
+  if (meta.executor === 'make_scenario_reactivate') {
+    return r.already_active ? `${r.scenario} was already active.`
+                            : `${r.scenario} restarted — queued webhooks replay automatically.`;
+  }
+  const extra = [
+    r.gone && r.gone.length ? `${r.gone.length} already resolved` : null,
+    r.too_old && r.too_old.length ? `${r.too_old.length} skipped (past the CAPI dedup window)` : null,
+    r.failed && r.failed.length ? `${r.failed.length} failed` : null,
+    r.capped ? `capped at ${MAKE_RETRY_CAP}` : null,
+  ].filter(Boolean).join(', ');
+  return `retried ${r.retried} incomplete execution(s) on ${r.scenario}${extra ? ` — ${extra}` : ''}.`;
+}
+
+// Returns true when the reaction was ours (handled), false to fall through.
+async function handleRemediationReaction(event, baseEmoji) {
+  const channel = event.item.channel, ts = event.item.ts;
+  const hist = await slack.client.conversations.history({
+    channel, latest: ts, limit: 1, inclusive: true, include_all_metadata: true,
+  });
+  const msg = hist.messages && hist.messages[0];
+  if (!msg || msg.ts !== ts) return false;
+  const meta = msg.metadata && msg.metadata.event_type === 'remediation_proposal'
+    ? msg.metadata.event_payload : null;
+  if (!meta) return false;   // not a proposal — fall through
+
+  // The proposal lives in a team-visible channel, so a live Make write must not be
+  // triggerable by anyone who happens to be in it.
+  if (!isRosterMember(event.user)) {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts,
+      text: `<@${event.user}> you're not on the NeuroGrowth roster, so I can't act on that. Ask Ron.` });
+    return true;
+  }
+
+  try {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: REMEDIATION_LOCK_EMOJI });
+  } catch (e) {
+    const err = String((e && e.data && e.data.error) || e.message || '');
+    if (err.includes('already_reacted')) {
+      console.log(`remediation ${meta.alert_key}: already claimed, ignoring duplicate reaction`);
+      return true;
+    }
+    throw e;
+  }
+
+  const corr  = meta.correlation_id || newCorrelationId();
+  const react = (name) => slack.client.reactions.add({ channel, timestamp: ts, name }).catch(() => {});
+  const reply = (text) => slack.client.chat.postMessage({ channel, thread_ts: ts, text });
+
+  if (CAMPAIGN_SKIP_EMOJIS.has(baseEmoji)) {
+    await react('no_entry');
+    await reply(`Dismissed by <@${event.user}>. Nothing executed. The watchdog keeps alerting, but I won't re-propose for ${Math.round(REMEDIATION_COOLDOWN_MS / 3600000)}h.`);
+    logActivity({ event_type: 'remediation', event_source: 'slack', action: 'remediation_rejected',
+      actor_user_id: event.user, channel_id: channel, thread_ts: ts,
+      output: { alert_key: meta.alert_key, executor: meta.executor, action: meta.action },
+      correlation_id: corr });
+    return true;
+  }
+
+  if (meta.dry_run === 'true') {
+    await react('eyes');
+    await reply(`Dry run — would have run \`${meta.executor}\` on scenario ${meta.scenario_id}${meta.dlq_ids ? ` for ${meta.dlq_ids.length} queued item(s)` : ''}. Nothing was touched. Unset REMEDIATION_DRY_RUN to arm this.`);
+    logActivity({ event_type: 'remediation', event_source: 'slack', action: 'remediation_dry_run',
+      actor_user_id: event.user, channel_id: channel, thread_ts: ts,
+      output: { alert_key: meta.alert_key, executor: meta.executor }, correlation_id: corr });
+    return true;
+  }
+
+  let result;
+  try {
+    if (meta.executor === 'make_dlq_retry')                 result = await retryMakeDlqs(meta.scenario_id, meta.dlq_ids || []);
+    else if (meta.executor === 'make_scenario_reactivate')  result = await reactivateMakeScenario(meta.scenario_id);
+    else result = { ok: false, error: `Unknown executor "${meta.executor}".` };
+  } catch (err) {
+    result = { ok: false, error: err.message };
+  }
+
+  await react(result.ok ? 'white_check_mark' : 'warning');
+  await reply(result.ok
+    ? `✅ Executed by <@${event.user}> — ${summariseRemediation(meta, result)}`
+    : `❌ Not executed: ${result.error}`);
+  logActivity({
+    event_type: 'remediation', event_source: 'slack',
+    action: result.ok ? 'remediation_executed' : 'remediation_blocked',
+    status: result.ok ? 'ok' : 'blocked',
+    actor_user_id: event.user, channel_id: channel, thread_ts: ts,
+    output: { alert_key: meta.alert_key, executor: meta.executor, result }, correlation_id: corr,
+  });
+  return true;
+}
+
 // ─── MAKE SCENARIO HEALTH ───────────────────────────────────────────────────
 // Make auto-deactivates a scenario when it errors at initialization (an invalid
 // blueprint, a broken connection). Incoming webhooks queue rather than vanish, so
@@ -9913,6 +10160,142 @@ const MAKE_WATCHDOG_IGNORE = new Set(
 // still-broken scenario re-alerts on the next hourly run, which is the behaviour
 // we want — a restart should never silently swallow an open outage.
 const makeScenarioAlerted = new Map();
+
+// ── Agentic remediation config ──────────────────────────────────────────────
+// Triage is opt-in. Unset → every agentic path below is inert and the watchdog
+// behaves exactly as it did before, which is also what keeps the untouched
+// test/make-watchdog.test.js green (it builds this block with a fixed set of
+// injected params, so an ungated callClaude would ReferenceError).
+const MAKE_TRIAGE_ENABLED = String(process.env.MAKE_TRIAGE_ENABLED || '') === 'true';
+const MAKE_RETRY_CAP      = Number(process.env.MAKE_RETRY_CAP || 10);
+// Meta dedups CAPI events on a deterministic event_id (ghl_schedule_<appointmentId>)
+// for 48h. Scenario 5148796 sets event_time to {{now}}, so retrying an execution that
+// already fired its CAPI modules AFTER that window can double-count a Schedule /
+// Qualified conversion and corrupt ad optimization. Refuse those; a human can still
+// force one by hand in Make.
+const MAKE_DLQ_MAX_AGE_MS = Number(process.env.MAKE_DLQ_MAX_AGE_H || 44) * 60 * 60 * 1000;
+
+// Thin wrapper on the ghlFetchJson convention: bare fetch, throw on !ok, no retry.
+async function makeApi(path, init = {}) {
+  const res = await fetch(`${MAKE_API_BASE}${path}`, {
+    ...init,
+    headers: { Authorization: `Token ${MAKE_API_TOKEN}`, 'Content-Type': 'application/json', ...(init.headers || {}) },
+  });
+  const body = await res.text().catch(() => '');
+  if (!res.ok) throw new Error(`Make ${init.method || 'GET'} ${path} → ${res.status}: ${body.slice(0, 200)}`);
+  try { return body ? JSON.parse(body) : {}; } catch { return {}; }
+}
+
+// ── DLQ (incomplete executions) reads — exposed to Max as read-only tools ────
+async function listMakeDlqs(scenarioId, limit = 10) {
+  if (!MAKE_API_TOKEN) return { error: 'MAKE_API_TOKEN not set' };
+  try {
+    const n = Math.min(Number(limit) || 10, 25);
+    const out = await makeApi(`/dlqs?scenarioId=${encodeURIComponent(scenarioId)}&pg%5Blimit%5D=${n}`);
+    // Envelope key varies by Make API version — accept either shape rather than
+    // silently returning zero rows and reading as "queue is empty".
+    const rows = Array.isArray(out.dlqs) ? out.dlqs
+               : Array.isArray(out.incompleteExecutions) ? out.incompleteExecutions
+               : [];
+    return {
+      scenario_id: String(scenarioId), count: rows.length,
+      dlqs: rows.map(d => ({
+        id: String(d.id),
+        created: d.created || d.timestamp || d.executionDate || null,
+        resolved: d.resolved === undefined ? null : d.resolved,
+        reason: d.reason || d.error || null,
+        index: d.index === undefined ? null : d.index,
+      })),
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+async function getMakeDlqDetail(dlqId) {
+  if (!MAKE_API_TOKEN) return { error: 'MAKE_API_TOKEN not set' };
+  const id = encodeURIComponent(String(dlqId));
+  const [detail, bundle] = await Promise.all([
+    makeApi(`/dlqs/${id}`).catch(e => ({ error: e.message })),
+    makeApi(`/dlqs/${id}/bundle`).catch(e => ({ error: e.message })),
+  ]);
+  // Hard truncate: a bundle is arbitrary customer payload heading into an LLM context.
+  return { id: String(dlqId), detail, bundle: JSON.stringify(bundle).slice(0, 6000) };
+}
+
+// ── Executors (run only after a human ✅ on a proposal) ──────────────────────
+// Allow-list gate shared by both executors. Returns a human-readable "Blocked: …"
+// rather than throwing, matching the PORTAL_WRITE_WHITELIST convention.
+async function assertRemediableScenario(scenarioId) {
+  const s = (await makeApi(`/scenarios/${encodeURIComponent(scenarioId)}`)).scenario;
+  if (!s) return { blocked: `Blocked: Make scenario ${scenarioId} not found.` };
+  if (!String(s.name || '').startsWith('[PROD]')) {
+    return { blocked: `Blocked: "${s.name}" is not a [PROD] scenario — remediation is [PROD]-only.` };
+  }
+  if (MAKE_WATCHDOG_IGNORE.has(String(s.id))) {
+    return { blocked: `Blocked: "${s.name}" is on MAKE_WATCHDOG_IGNORE — it is switched off on purpose.` };
+  }
+  return { scenario: s };
+}
+
+async function retryMakeDlqs(scenarioId, dlqIds) {
+  const gate = await assertRemediableScenario(scenarioId);
+  if (gate.blocked) return { ok: false, error: gate.blocked };
+
+  const asked = [...new Set((dlqIds || []).map(String))];
+  if (!asked.length) return { ok: false, error: 'Blocked: no incomplete-execution ids supplied.' };
+
+  // Re-list live DLQs at EXECUTION time, hours after the proposal was written:
+  // drops ids the model hallucinated, ids a human already cleared by hand, and
+  // ids now too old for Meta's CAPI dedup window.
+  const live = await listMakeDlqs(scenarioId, 25);
+  if (live.error) return { ok: false, error: `Blocked: could not re-read the queue (${live.error}).` };
+  const byId = new Map((live.dlqs || []).map(d => [String(d.id), d]));
+  const tooOld = [], gone = [];
+  const ids = asked.filter(id => {
+    const d = byId.get(id);
+    if (!d) { gone.push(id); return false; }
+    const t = d.created ? Date.parse(d.created) : NaN;
+    if (Number.isFinite(t) && Date.now() - t > MAKE_DLQ_MAX_AGE_MS) { tooOld.push(id); return false; }
+    return true;
+  }).slice(0, MAKE_RETRY_CAP);
+
+  if (!ids.length) {
+    return { ok: false, gone, too_old: tooOld,
+      error: `Blocked: nothing retryable — ${gone.length} already resolved, ${tooOld.length} past the ${Math.round(MAKE_DLQ_MAX_AGE_MS / 3600000)}h CAPI-dedup window.` };
+  }
+
+  const results = [];
+  for (const id of ids) {
+    try {
+      await makeApi(`/dlqs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+      results.push({ id, ok: true });
+    } catch (e) {
+      results.push({ id, ok: false, error: e.message });
+    }
+  }
+  const okIds = results.filter(r => r.ok).map(r => r.id);
+  return {
+    ok: okIds.length > 0, scenario: gate.scenario.name, retried: okIds.length,
+    failed: results.filter(r => !r.ok), gone, too_old: tooOld,
+    capped: asked.length > MAKE_RETRY_CAP,
+  };
+}
+
+async function reactivateMakeScenario(scenarioId) {
+  const gate = await assertRemediableScenario(scenarioId);
+  if (gate.blocked) return { ok: false, error: gate.blocked };
+  const s = gate.scenario;
+  // The 2026-08-04 guard, re-checked HERE because hours pass between proposal and ✅:
+  // starting a scenario whose blueprint is invalid just auto-deactivates it again on
+  // the next incoming event, and looks like the fix worked until the next booking.
+  if (s.isinvalid === true) {
+    return { ok: false, error: `Blocked: "${s.name}" has an INVALID BLUEPRINT. Reactivating would auto-deactivate again on the next event. Fix the blueprint first: https://us2.make.com/${MAKE_TEAM_ID}/scenarios/${s.id}/edit` };
+  }
+  if (s.isActive === true) return { ok: true, already_active: true, scenario: s.name };
+  await makeApi(`/scenarios/${encodeURIComponent(scenarioId)}/start`, { method: 'POST' });
+  return { ok: true, scenario: s.name };
+}
 
 async function postMakeHealthAlert(text) {
   try {
@@ -10004,6 +10387,13 @@ async function checkMakeScenarioHealth(correlationId) {
         event_type: 'alert', event_source: 'cron', action: 'make_scenario_down',
         status: reason, output: { scenario_id: s.id, name: s.name }, correlation_id: correlationId,
       });
+      // Agentic triage. This branch already guarantees "reason CHANGED", so triage
+      // cannot fire on every 10-minute sweep. Fire-and-forget with a hard catch —
+      // triage must never break the alert loop it rides on.
+      if (MAKE_TRIAGE_ENABLED) {
+        proposeMakeRemediation(s, reason, correlationId)
+          .catch(e => console.error(`Make triage failed for ${s.id}:`, e.message));
+      }
     } else if (!reason && previous) {
       makeScenarioAlerted.delete(s.id);
       await postMakeHealthAlert(`✅ Make scenario *${s.name}* (${s.id}) is active again — queued webhooks replay automatically.`);
@@ -10012,6 +10402,69 @@ async function checkMakeScenarioHealth(correlationId) {
 
   const down = scenarios.filter(s => makeScenarioAlerted.has(s.id)).length;
   console.log(`Make health: checked ${scenarios.length} [PROD] scenario(s), ${down} down.`);
+}
+
+// The Make watchdog's triage consumer. Called fire-and-forget from
+// checkMakeScenarioHealth; must never throw into the alert loop.
+async function proposeMakeRemediation(s, reason, correlationId) {
+  // 'invalid' is deliberately NOT triaged: neither authorized action repairs a broken
+  // blueprint, and reactivateMakeScenario refuses it anyway. That one stays human.
+  if (reason !== 'dlq' && reason !== 'inactive') return;
+
+  const alertKey = `make:${s.id}`;
+  if (await hasOpenRemediationProposal(alertKey)) {
+    console.log(`Make triage: proposal for ${alertKey} already open/recent, skipping.`);
+    return;
+  }
+
+  const actions = reason === 'inactive'
+    ? [{ id: 'reactivate_scenario', description: 'Restart the scenario in Make. Queued webhooks replay automatically. Only safe if the blueprint is valid.' }]
+    : [{ id: 'retry_dlqs', description: 'Retry specific incomplete executions. You must supply dlq_ids. Max 10 per approval.' }];
+
+  const proposal = await triageAlert({
+    alertKey, source: 'make_watchdog', correlationId,
+    title: `${s.name} (${s.id}) — ${reason}`,
+    facts: {
+      scenario_id: s.id, scenario_name: s.name, reason,
+      isActive: s.isActive, isinvalid: s.isinvalid, dlqCount: s.dlqCount === undefined ? 0 : s.dlqCount,
+      link: `https://us2.make.com/${MAKE_TEAM_ID}/scenarios/${s.id}/edit`,
+    },
+    onlyTools: ['make_list_dlqs', 'make_get_dlq'],
+    guidance: [
+      'Start with make_list_dlqs for this scenario_id, then make_get_dlq on the individual entries (at most 5) to see which MODULE failed and which contact or appointment the bundle names. Name the real bookings in your summary.',
+      'RETRY SAFETY for [PROD] GHL Appt Booked (5148796): modules 2 and 8 are GHL contact lookups that run BEFORE the two Meta CAPI events (module 3 Schedule, module 4 Qualified). A failure at 2 or 8 means CAPI never fired, so a retry is a pure win. Modules 21 and 23 run AFTER CAPI, so a retry re-sends both events; they carry deterministic event_ids (ghl_schedule_<appointmentId>) so Meta dedups them, but only inside a 48h window. State which case you are in.',
+      'Slack double-posting is already prevented by an atomic dedupe RPC at module 9 — do not raise it as a risk.',
+      'For dlq, recommend retry_dlqs and list the specific dlq_ids. For inactive, recommend reactivate_scenario — unless isinvalid is true, in which case recommend escalate.',
+    ].join('\n'),
+  });
+
+  if (!proposal) {
+    console.error(`Make triage: no structured proposal returned for ${alertKey}`);
+    return;
+  }
+
+  if (proposal.recommended_action === 'no_action' || proposal.recommended_action === 'escalate') {
+    logActivity({
+      event_type: 'remediation', event_source: 'cron', action: 'remediation_declined',
+      status: proposal.recommended_action,
+      output: { alert_key: alertKey, summary: proposal.summary, root_cause: proposal.root_cause },
+      correlation_id: correlationId,
+    });
+    if (proposal.recommended_action === 'escalate') {
+      await postMakeHealthAlert(`🧭 <@${RON_SLACK_ID}> Triage on *${s.name}* (${s.id}): ${proposal.summary}\nNo safe automated fix — a human is needed. ${proposal.root_cause}`);
+    }
+    return;
+  }
+
+  await postRemediationProposal({
+    alertKey, correlationId, proposal,
+    executor: proposal.recommended_action === 'reactivate_scenario' ? 'make_scenario_reactivate' : 'make_dlq_retry',
+    title: `Make · ${s.name} (${s.id})`,
+    payload: {
+      scenario_id: String(s.id), scenario_name: String(s.name),
+      dlq_ids: (proposal.dlq_ids || []).map(String).slice(0, MAKE_RETRY_CAP),
+    },
+  });
 }
 
 if (MAKE_API_TOKEN) {
@@ -10244,6 +10697,19 @@ slack.event('reaction_added', async ({ event }) => {
         // Fall through — could still be a non-campaign DM reaction we don't care about
       }
       return; // DM reaction was campaign-shaped but no metadata → ignore
+    }
+
+    // Route 1b: remediation proposal in an ops channel — any roster member ✅/❌.
+    // Sits ahead of lead-claim because both accept ✅; safe either way since Route 2
+    // hard-returns on any channel that isn't LEAD_CHANNEL_ID. handleRemediationReaction
+    // returns false when the message isn't a proposal, so we fall through cleanly.
+    if (!String(event.item.channel || '').startsWith('D') &&
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji))) {
+      const handled = await handleRemediationReaction(event, baseEmoji).catch(err => {
+        console.error('remediation reaction handler error:', err.message);
+        return true;   // it WAS ours and it blew up — do not fall through to lead-claim
+      });
+      if (handled) return;
     }
 
     // Route 2: lead-claim in #ng-sales-goats (existing flow)
