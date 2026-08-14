@@ -40,6 +40,18 @@ const portalPg = process.env.PORTAL_READONLY_DATABASE_URL
     })
   : null;
 
+// Write-scoped portal connection (role max_outcome_writer: INSERT on
+// revops_sales_outcomes + UPDATE(status) on revops_prospects, nothing else).
+// Separate from portalPg so a bug in any read path can never gain write access.
+const portalWriterPg = process.env.PORTAL_WRITER_DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.PORTAL_WRITER_DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 2,
+      idleTimeoutMillis: 30_000,
+    })
+  : null;
+
 function logLlmFromAnthropicResponse(response, durationMs, correlation_id) {
   if (!response) return;
   logActivity({
@@ -5461,6 +5473,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
           { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'closer_monthly_scorecard', description: "Monthly per-closer scorecard from the shared closer_month_scorecard view — the SAME numbers as the portal page /admin/closer-scorecard, so never recompute month stats another way when asked for a closer's month. Returns calls assigned, outcomes logged, pending, showed, no-shows, qualified attended, won/lost/follow-up/DQ, show rate, close rate on shows, revenue, plus a REVI recording reality-check (calls that verifiably happened but were never logged, avg call score, no-show-vs-recording flags) and the month's unattributed outcomes. Months are America/Costa_Rica calendar months anchored on the call's scheduled time. When pending is high, always caveat that show/close rates are unreliable — pending does not mean the call didn't happen.", input_schema: { type: 'object', properties: { month: { type: 'string', description: "Month as YYYY-MM, e.g. 2026-07. For 'last month' compute from today's date in CR time." }, closer: { type: 'string', description: 'Optional closer email or name fragment (jose, ron, jonathan). Omit for all closers.' } }, required: ['month'] } },
+          { name: 'log_call_outcome', description: "Log a sales-call outcome to the portal (revops_sales_outcomes) on EXPLICIT human instruction ONLY. Use when a closer or Ron states an outcome in their own words ('won 3500', 'that call was a no show', 'log Marco as lost') — typically replying to an outcome reminder/proposal DM. NEVER call this from your own inference, a REVI read, a transcript, or a report — if a human did not state the outcome in this conversation, do not call this tool. won REQUIRES revenue (the real closed amount; ask if not given — never guess). Writes are first-writer-wins: an existing outcome is never overwritten, the tool will tell you if one exists. Also promotes the prospect's pipeline status per the shared dash contract.", input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Prospect email (preferred) or name fragment to find their appointment.' }, date: { type: 'string', description: 'Optional call date YYYY-MM-DD (CR time) to disambiguate when the prospect had multiple calls.' }, outcome: { type: 'string', enum: ['won', 'lost', 'follow_up', 'disqualified', 'no_show'], description: 'The outcome the human stated.' }, revenue: { type: 'number', description: 'Closed revenue in USD — required when outcome is won.' }, note: { type: 'string', description: 'Optional short context, e.g. who instructed it and why.' } }, required: ['prospect', 'outcome'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
@@ -5528,6 +5541,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'create_calendar_event')  result = await createCalendarEvent(toolUse.input.summary, toolUse.input.startISO, toolUse.input.endISO, toolUse.input.attendees || [], toolUse.input.description || '', toolUse.input.location || '');
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
         else if (toolUse.name === 'closer_monthly_scorecard') result = await getCloserMonthlyScorecard(toolUse.input.month, toolUse.input.closer);
+        else if (toolUse.name === 'log_call_outcome')       result = await logCallOutcomeTool(toolUse.input);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
         else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
@@ -7314,10 +7328,161 @@ async function runSalesStandup(_correlationId) {
   }
 }
 
+// ─── OUTCOME WRITE CONTRACT (mirrored from dash) ─────────────────────────────
+// Duplicated contract #2 with dash.neurogrowth.io (like the 36h REVI join in
+// the scorecard): mirrors src/lib/integrations/revops-ingest/status-map.ts +
+// outcome-map.ts. If dash changes RANK, the terminal set, or outcome→status
+// targets, change BOTH places. Validated empirically during the Aug-12 replay.
+const OUTCOME_STATUS_RANK = {
+  prospect: 10, qualified: 20, appointment_booked: 30, nurture: 35,
+  appointment_held: 40, won: 100, lost: 100, disqualified: 100, converted: 100, merged: 100,
+};
+const OUTCOME_TERMINAL_STATUSES = new Set(['won', 'lost', 'disqualified', 'converted', 'merged']);
+const OUTCOME_TO_STATUS = {
+  won: 'won', lost: 'lost', follow_up: 'nurture', nurture: 'nurture',
+  disqualified: 'disqualified', no_show: 'appointment_held', rescheduled: 'appointment_booked',
+};
+// Status to write on the prospect when `outcome` is logged, or null for no
+// change. Never regresses rank; never leaves a terminal status for a
+// non-terminal one (mirrors mergeProspectStatus + prospectStatusFromOutcome).
+function nextProspectStatusForOutcome(outcome, current) {
+  const incoming = OUTCOME_TO_STATUS[outcome];
+  if (!incoming || incoming === current) return null;
+  if (OUTCOME_TERMINAL_STATUSES.has(current) && !OUTCOME_TERMINAL_STATUSES.has(incoming)) return null;
+  if (OUTCOME_TERMINAL_STATUSES.has(incoming)) return incoming;
+  if ((OUTCOME_STATUS_RANK[incoming] || 0) > (OUTCOME_STATUS_RANK[current] || 0)) return incoming;
+  return null;
+}
+
+// REVI deal_outcome → outcome Max may PROPOSE for one-tap confirmation.
+// `won` is deliberately absent: a verbal close is not a payment — the closer
+// must type `won <amount>` themselves. `pending` = REVI has no read.
+const REVI_PROPOSABLE = { stall: 'follow_up', lost: 'lost' };
+function proposalFromReviRead(dealOutcome) {
+  const d = String(dealOutcome || '').toLowerCase();
+  if (REVI_PROPOSABLE[d]) return { outcome: REVI_PROPOSABLE[d], wonHint: false };
+  if (d === 'won') return { outcome: null, wonHint: true };
+  return { outcome: null, wonHint: false };
+}
+
+// Nearest unmatched REVI recording for the same prospect email within the
+// 36h join window (same contract as the scorecard overlay). Marks the
+// returned recording matched so one recording never vouches for two calls.
+const OUTCOME_MATCH_PAD_MS = 36 * 3600 * 1000;
+function matchRecordingToCall(recordings, email, apptMs) {
+  const em = String(email || '').toLowerCase();
+  if (!em || !Number.isFinite(apptMs)) return null;
+  let best = null;
+  for (const r of recordings) {
+    if (r.matched || r.email !== em) continue;
+    const dist = Math.abs(r.at - apptMs);
+    if (dist > OUTCOME_MATCH_PAD_MS) continue;
+    if (!best || dist < Math.abs(best.at - apptMs)) best = r;
+  }
+  if (best) best.matched = true;
+  return best;
+}
+
+const VALID_LOGGABLE_OUTCOMES = new Set(['won', 'lost', 'follow_up', 'disqualified', 'no_show']);
+
+// Writes one outcome row + the matching prospect-status promotion in a single
+// transaction. NEVER overwrites: the unique index on appointment_id makes the
+// insert first-writer-wins, so a human-logged outcome can never be clobbered.
+async function logOutcomeToPortal({ appointmentId, outcome, source, notes, closedRevenue }) {
+  if (!portalWriterPg) return { ok: false, reason: 'not_configured', message: 'PORTAL_WRITER_DATABASE_URL not set.' };
+  if (!VALID_LOGGABLE_OUTCOMES.has(outcome)) return { ok: false, reason: 'bad_outcome', message: `Outcome must be one of: ${[...VALID_LOGGABLE_OUTCOMES].join(', ')}` };
+  if (outcome === 'won' && !(Number(closedRevenue) > 0)) return { ok: false, reason: 'won_needs_revenue', message: 'Logging won requires the closed revenue amount.' };
+  const client = await portalWriterPg.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO revops_sales_outcomes (appointment_id, outcome, notes, source, closed_revenue, close_date)
+       VALUES ($1, $2, $3, $4, $5, CASE WHEN $2 = 'won' THEN (now() AT TIME ZONE 'America/Costa_Rica')::date END)
+       ON CONFLICT (appointment_id) DO NOTHING
+       RETURNING id`,
+      [appointmentId, outcome, notes || null, source, closedRevenue == null ? null : Number(closedRevenue)]
+    );
+    if (!ins.rowCount) {
+      await client.query('ROLLBACK');
+      const { rows } = await client.query('SELECT outcome, source FROM revops_sales_outcomes WHERE appointment_id = $1', [appointmentId]);
+      return { ok: false, reason: 'exists', existing: rows[0] || null };
+    }
+    let statusChange = null;
+    const { rows: prow } = await client.query(
+      `SELECT p.id, p.status FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      [appointmentId]
+    );
+    if (prow.length) {
+      const next = nextProspectStatusForOutcome(outcome, prow[0].status);
+      if (next) {
+        await client.query('UPDATE revops_prospects SET status = $1, updated_at = now() WHERE id = $2', [next, prow[0].id]);
+        statusChange = `${prow[0].status} → ${next}`;
+      }
+    }
+    await client.query('COMMIT');
+    return { ok: true, outcomeId: ins.rows[0].id, statusChange };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    return { ok: false, reason: 'error', message: err.message };
+  } finally {
+    client.release();
+  }
+}
+
+// Agent-tool wrapper: resolve a prospect to their appointment, then write the
+// outcome the human stated. Resolution is read-only via portalPg; the write
+// goes through logOutcomeToPortal (first-writer-wins, never overwrites).
+async function logCallOutcomeTool({ prospect, date, outcome, revenue, note }) {
+  if (!portalPg) return 'Portal read-only DB not configured. Set PORTAL_READONLY_DATABASE_URL in .env.';
+  const frag = `%${String(prospect || '').trim().toLowerCase()}%`;
+  if (frag === '%%') return 'ERROR: prospect (name or email) is required.';
+  const { rows } = await portalPg.query(
+    `SELECT a.id, a.scheduled_start, a.closer_id, p.full_name, p.email, o.outcome AS existing_outcome, o.source AS existing_source
+       FROM revops_appointments a
+       JOIN revops_prospects p ON p.id = a.prospect_id
+       LEFT JOIN revops_sales_outcomes o ON o.appointment_id = a.id
+      WHERE (lower(coalesce(p.email,'')) LIKE $1 OR lower(p.full_name) LIKE $1)
+        AND ($2::date IS NULL OR (a.scheduled_start AT TIME ZONE 'America/Costa_Rica')::date = $2::date)
+        AND a.scheduled_start <= now()
+      ORDER BY a.scheduled_start DESC
+      LIMIT 5`,
+    [frag, date || null]
+  );
+  if (!rows.length) return `No past appointment found for "${prospect}"${date ? ` on ${date}` : ''}. Check the name/email or give me the call date.`;
+  const fmt = r => `${r.full_name} <${r.email || 'no email'}> — ${formatICTime(r.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} CR — closer ${r.closer_id}${r.existing_outcome ? ` — ALREADY LOGGED: ${r.existing_outcome}` : ''}`;
+  const target = rows[0];
+  if (rows.length > 1 && !date) {
+    const sameDay = rows.filter(r => String(r.scheduled_start) === String(target.scheduled_start));
+    if (sameDay.length > 1 || rows.slice(1).some(r => !r.existing_outcome)) {
+      return `Ambiguous — ${rows.length} past appointments match "${prospect}". Tell me which date:\n${rows.map(fmt).join('\n')}`;
+    }
+  }
+  if (target.existing_outcome) {
+    return `That call already has an outcome: ${target.existing_outcome} (source: ${target.existing_source}). I never overwrite outcomes — if it's wrong, tell Ron; a correction needs a deliberate fix, not a silent replace.`;
+  }
+  const result = await logOutcomeToPortal({
+    appointmentId: target.id,
+    outcome,
+    source: 'closer',
+    notes: note ? `Logged via Max: ${note}` : 'Logged via Max on explicit closer/Ron instruction',
+    closedRevenue: revenue,
+  });
+  if (!result.ok) {
+    if (result.reason === 'won_needs_revenue') return 'Logging won needs the amount — e.g. revenue: 3500.';
+    if (result.reason === 'exists') return `Already logged as ${result.existing?.outcome} — no change (first writer wins).`;
+    if (result.reason === 'not_configured') return 'Outcome write path not configured (PORTAL_WRITER_DATABASE_URL missing on ng-pm-MAX). Log it in GHL instead and tell Ron.';
+    return `Write failed: ${result.message || result.reason}`;
+  }
+  return `Logged ${outcome}${revenue ? ` ($${revenue})` : ''} for ${target.full_name} (${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call).${result.statusChange ? ` Prospect status: ${result.statusChange}.` : ''} Scorecard + portal reflect it immediately.`;
+}
+
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
 // Fires 4 PM CR every day. DMs the owning closer for any call >24h old that
 // still has no outcome logged in GHL. Re-nudges daily (de-duped via
 // agent_knowledge) and escalates to Ron once unlogged 3+ days despite reminders.
+// Calls with a matching REVI recording get a PRE-FILLED proposal DM instead of
+// a generic nudge: ✅ logs REVI's read (source revi_confirmed), a text reply
+// corrects it. Facts auto-surface; judgments always get a human ✅.
 async function runUnloggedOutcomeReminders(_correlationId) {
   console.log('Running unlogged-outcome reminders...');
   try {
@@ -7344,7 +7509,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     // .ghl for GHL rows) and require a call identity.
     const { data: pastCalls } = await portalSupabase
       .from('revops_appointments')
-      .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name)')
+      .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name, email)')
       .lte('scheduled_start', cutoff)
       .gte('scheduled_start', floorIso);
 
@@ -7431,13 +7596,52 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       }
     }
 
+    // REVI recordings for the unlogged window — same 36h contract as the
+    // scorecard overlay. Best-effort: a REVI outage degrades to the classic
+    // reminder, never blocks it.
+    let reviRecordings = [];
+    try {
+      const starts = unlogged.map(a => new Date(a.scheduled_start).getTime()).filter(Number.isFinite);
+      if (starts.length) {
+        const lo = new Date(Math.min(...starts) - OUTCOME_MATCH_PAD_MS).toISOString();
+        const hi = new Date(Math.max(...starts) + OUTCOME_MATCH_PAD_MS).toISOString();
+        const [{ data: reviClosers }, { data: scores }] = await Promise.all([
+          reviSupabase.from('revi_closers').select('id, fathom_host_email'),
+          reviSupabase.from('closer_call_scores')
+            .select('closer_id, prospect_email, call_date, duration_min, overall_score, deal_outcome, recording_url, prospect_signals')
+            .gte('call_date', lo).lte('call_date', hi),
+        ]);
+        const closerByReviId = {};
+        for (const rc of (reviClosers || [])) {
+          if (rc.fathom_host_email) closerByReviId[rc.id] = rc.fathom_host_email.toLowerCase();
+        }
+        reviRecordings = (scores || [])
+          .filter(s => s.prospect_email && s.call_date)
+          .map(s => ({
+            email: s.prospect_email.toLowerCase(),
+            closer: closerByReviId[s.closer_id] || null,
+            at: new Date(s.call_date).getTime(),
+            durationMin: s.duration_min == null ? null : Math.round(Number(s.duration_min)),
+            score: s.overall_score == null ? null : Number(s.overall_score),
+            dealOutcome: s.deal_outcome || null,
+            url: s.recording_url || null,
+            signals: s.prospect_signals || null,
+            matched: false,
+          }));
+      }
+    } catch (reviErr) {
+      console.error('Unlogged-outcome reminders: REVI overlay unavailable, falling back to plain nudges:', reviErr.message);
+    }
+
     // Feedback-loop lessons ───────────────────────────────────────────────────
     const lessons = await getReportLessons('unlogged-outcome-reminder');
     const lessonNote = lessons.length
       ? `[Corrections applied from feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`
       : '';
 
-    // DM each closer their list ───────────────────────────────────────────────
+    // DM each closer: pre-filled proposal per recording-verified call (capped),
+    // then the classic aggregate list for the rest ────────────────────────────
+    const PROPOSALS_PER_CLOSER_PER_RUN = 5;
     for (const [closerEmail, entries] of Object.entries(unloggedByCloser)) {
       const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
       if (!slackId) {
@@ -7446,24 +7650,96 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       }
       const closerName = resolveSalesMember(closerEmail);
       const firstName  = (typeof closerName === 'string' ? closerName : '').split(' ')[0] || 'there';
-      try {
-        const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an outcome in GHL:\n`];
-        lines.push(`⚠️ Outcome not logged (${entries.length}):`);
-        entries.forEach(({ appt, count }) => {
-          const pName = appt.prospect?.full_name || 'Unknown';
-          const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-          const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
-          const nudge = count > 1 ? ` · reminded ${count}×` : '';
-          lines.push(`• ${pName} — ${dStr} CR — held ${heldDays}d ago${nudge}`);
-        });
-        lines.push('');
-        lines.push('Please set the outcome on the opportunity card in GHL when you get a sec.');
-        lines.push('');
-        lines.push('See something off? Thread on this message and tag @Max with the correction.');
-        await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
-        console.log(`Unlogged-outcome reminder sent to ${closerName} (${entries.length} calls)`);
-      } catch (closerErr) {
-        console.error(`Unlogged-outcome reminder to ${closerName} failed:`, closerErr.message);
+
+      let proposalsSent = 0;
+      const aggregate = []; // entries that get (or stay on) the classic list
+
+      for (const entry of entries) {
+        const { appt } = entry;
+        const email = (appt.prospect?.email || '').toLowerCase();
+        const pName = appt.prospect?.full_name || 'Unknown';
+        const proposalKey = `outcome-proposal:${appt.id}`;
+
+        // One proposal DM per appointment, ever — after that it rides the
+        // aggregate list with a pointer back to the pending proposal.
+        const { data: sentBefore } = await supabase
+          .from('agent_knowledge').select('value').eq('key', proposalKey).limit(1);
+        if (sentBefore && sentBefore.length) {
+          aggregate.push({ ...entry, proposalPending: String(sentBefore[0].value || '').startsWith('proposed') });
+          continue;
+        }
+
+        const rec = proposalsSent < PROPOSALS_PER_CLOSER_PER_RUN
+          ? matchRecordingToCall(reviRecordings, email, new Date(appt.scheduled_start).getTime())
+          : null;
+        const { outcome: proposed, wonHint } = proposalFromReviRead(rec?.dealOutcome);
+        if (!rec || (!proposed && !wonHint)) {
+          aggregate.push(entry);
+          continue;
+        }
+
+        const dStr = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        const durStr = rec.durationMin ? `${rec.durationMin} min` : 'recorded';
+        const scoreStr = rec.score != null ? ` · call score ${rec.score}/10` : '';
+        const sig = rec.signals || {};
+        const sigBits = [sig.buying_signal_strength && `buying signal: ${sig.buying_signal_strength}`, sig.objection_type && `objection: ${sig.objection_type}`, sig.stated_timeline && `timeline: ${sig.stated_timeline}`].filter(Boolean);
+        const sigLine = sigBits.length ? `\n🔎 ${sigBits.join(' · ')}` : '';
+        const lines = [`📋 Outcome check — *${pName}* — ${dStr} CR`];
+        lines.push(`🎙 Recording found (${durStr}${scoreStr}) — this call verifiably happened, but no outcome is logged yet.`);
+        if (wonHint) {
+          lines.push(`🤖 REVI heard a close on this call 🎉 — I never log *won* on my own. Reply \`won <amount>\` to log it once payment is real.${sigLine}`);
+          lines.push('');
+          lines.push('Or reply `follow up` / `lost` / `dq` / `no show` if it landed differently.');
+        } else {
+          lines.push(`🤖 REVI's read: *${proposed.replace('_', ' ')}*${sigLine}`);
+          lines.push('');
+          lines.push(`React ✅ to log *${proposed.replace('_', ' ')}* · ❌ to dismiss · or reply \`won <amount>\` / \`lost\` / \`dq\` / \`follow up\` / \`no show\` to correct.`);
+        }
+        try {
+          await slack.client.chat.postMessage({
+            channel: slackId,
+            text: lines.join('\n'),
+            metadata: {
+              event_type: 'outcome_proposal',
+              event_payload: {
+                appointment_id: appt.id,
+                prospect_name: pName,
+                proposed_outcome: proposed || '',
+                won_hint: !!wonHint,
+                closer_email: closerEmail,
+              },
+            },
+          });
+          await upsertKnowledge('process', proposalKey, `proposed|${todayISO}`, 'outcome-proposal');
+          proposalsSent += 1;
+        } catch (propErr) {
+          console.error(`Outcome proposal DM to ${closerName} failed:`, propErr.message);
+          aggregate.push(entry);
+        }
+      }
+      if (proposalsSent) console.log(`Outcome proposals sent to ${closerName}: ${proposalsSent}`);
+
+      if (aggregate.length) {
+        try {
+          const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an outcome in GHL:\n`];
+          lines.push(`⚠️ Outcome not logged (${aggregate.length}):`);
+          aggregate.forEach(({ appt, count, proposalPending }) => {
+            const pName = appt.prospect?.full_name || 'Unknown';
+            const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
+            const nudge = count > 1 ? ` · reminded ${count}×` : '';
+            const pend  = proposalPending ? ' · ✅ the proposal above or reply to it' : '';
+            lines.push(`• ${pName} — ${dStr} CR — held ${heldDays}d ago${nudge}${pend}`);
+          });
+          lines.push('');
+          lines.push('Set the outcome on the opportunity card in GHL, or just reply here (e.g. `won 3500`, `lost`, `follow up`) and I\'ll log it for you.');
+          lines.push('');
+          lines.push('See something off? Thread on this message and tag @Max with the correction.');
+          await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
+          console.log(`Unlogged-outcome reminder sent to ${closerName} (${aggregate.length} calls)`);
+        } catch (closerErr) {
+          console.error(`Unlogged-outcome reminder to ${closerName} failed:`, closerErr.message);
+        }
       }
     }
 
@@ -10733,6 +11009,64 @@ console.log('Registered static cron: booking → alert divergence check (*/30 * 
 const CAMPAIGN_APPROVE_EMOJIS = new Set(['white_check_mark', 'heavy_check_mark', 'check', 'ballot_box_with_check']);
 const CAMPAIGN_SKIP_EMOJIS    = new Set(['x', 'no_entry', 'no_entry_sign', 'negative_squared_cross_mark']);
 
+// ✅/❌ on an outcome-proposal DM. Ownership is structural — the DM channel is
+// private to the closer it was sent to — but we still verify the reactor is
+// that closer (or Ron) against the message metadata before writing anything.
+async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+  const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
+  if (event.user !== RON_SLACK_ID && event.user !== expectedSlackId) {
+    console.log(`outcome-proposal ${payload.appointment_id}: reaction from ${event.user} is not the owning closer, ignoring`);
+    return;
+  }
+  // Already actioned? Max stamps ✅ / no_entry / warning after handling.
+  const actioned = (dmMsg.reactions || []).find(r =>
+    ['white_check_mark', 'no_entry', 'warning'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+  if (actioned) {
+    console.log(`outcome-proposal ${payload.appointment_id} already actioned, ignoring`);
+    return;
+  }
+
+  if (CAMPAIGN_SKIP_EMOJIS.has(baseEmoji)) {
+    await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `dismissed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'no_entry' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: 'Dismissed — nothing logged. Log the real outcome in GHL, or reply here (`won <amount>` / `lost` / `dq` / `follow up` / `no show`) and I\'ll log it.' });
+    return;
+  }
+  if (!CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) return;
+
+  if (!payload.proposed_outcome) {
+    // won-hint (or read-less) proposal: ✅ is not enough on purpose.
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: payload.won_hint
+      ? 'I never log *won* from a reaction — reply `won <amount>` to confirm it (amount = what was actually closed).'
+      : 'No REVI read to confirm here — reply `won <amount>` / `lost` / `dq` / `follow up` / `no show` and I\'ll log it.' });
+    return;
+  }
+
+  const result = await logOutcomeToPortal({
+    appointmentId: payload.appointment_id,
+    outcome: payload.proposed_outcome,
+    source: 'revi_confirmed',
+    notes: `REVI-proposed outcome confirmed via Slack by <@${event.user}> (prospect: ${payload.prospect_name})`,
+  });
+  if (result.ok) {
+    await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${payload.proposed_outcome.replace('_', ' ')}* for ${payload.prospect_name}.${statusNote} Portal + scorecard will pick it up immediately.` });
+  } else if (result.reason === 'exists') {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.` });
+  } else {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Couldn't log it: ${result.message || result.reason}. Log it in GHL directly, or tell Ron the outcome write path is down.` });
+    if (result.reason === 'not_configured') {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: '⚠️ Outcome proposal ✅ failed: PORTAL_WRITER_DATABASE_URL is not set on ng-pm-MAX, so one-tap outcome logging is dead. The proposal DMs are still going out.' }).catch(() => {});
+    }
+  }
+}
+
 slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
@@ -10740,6 +11074,28 @@ slack.event('reaction_added', async ({ event }) => {
 
     // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
     const baseEmoji = String(event.reaction || '').split('::')[0];
+
+    // Route 0: outcome-proposal DM — sits ahead of the campaign route because
+    // closers are not in SLACK_TO_GHL_USER, so the campaign gate would swallow
+    // their ✅ (its no-metadata fallthrough hard-returns for DM channels).
+    // Only intercepts messages whose metadata says outcome_proposal; every
+    // other DM reaction falls through to Route 1 untouched.
+    if (String(event.item.channel || '').startsWith('D') &&
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji))) {
+      try {
+        const hist = await slack.client.conversations.history({
+          channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
+        });
+        const msg = hist.messages && hist.messages[0];
+        if (msg?.metadata?.event_type === 'outcome_proposal' && msg.metadata.event_payload) {
+          await handleOutcomeProposalReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+      } catch (opErr) {
+        console.error('outcome-proposal reaction pre-route error:', opErr.message);
+        // fall through — campaign route may still own this reaction
+      }
+    }
 
     // Route 1: campaign-draft DM — Ron OR the assigned setter approves/skips a
     // generated re-engagement message. Stalled-cron drafts now land in the setter's
