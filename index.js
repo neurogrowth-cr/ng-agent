@@ -3348,6 +3348,125 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
   return result;
 }
 
+// ─── CLOSER MONTHLY SCORECARD (shared view) ──────────────────────────────────
+// Reads public.closer_month_scorecard / closer_month_unattributed via the
+// read-only portal PG connection — the SAME Postgres views the portal's
+// /admin/closer-scorecard page uses (dash migration 20260813120000). Never
+// recompute these numbers in JS; the view is the single source of truth.
+// REVI overlay join contract mirrors the dash API route
+// (src/app/api/revops/reports/closer-scorecard): same prospect email +
+// call_date within 36h of scheduled_start; recordings only UPGRADE
+// pending -> "verifiably happened", absence of a recording proves nothing.
+async function getCloserMonthlyScorecard(month, closerQuery) {
+  const err = ensurePortalPg(); if (err) return err;
+  if (!/^\d{4}-\d{2}$/.test(month || '')) return 'ERROR: month must be YYYY-MM, e.g. 2026-07.';
+
+  const { rows: allRows } = await portalPg.query(
+    'SELECT * FROM closer_month_scorecard WHERE month = $1 ORDER BY calls_assigned DESC', [month]
+  );
+  if (!allRows.length) return `No scorecard rows for ${month}.`;
+
+  const frag = (closerQuery || '').trim().toLowerCase();
+  const rows = frag ? allRows.filter(r => r.closer_id.includes(frag)) : allRows;
+  if (!rows.length) {
+    return `No closer matching "${closerQuery}" in ${month}. Closers with data: ${allRows.map(r => r.closer_id).join(', ')}`;
+  }
+
+  const { rows: unRows } = await portalPg.query(
+    'SELECT outcomes, won, revenue FROM closer_month_unattributed WHERE month = $1', [month]
+  );
+
+  // REVI overlay. CR is UTC-6 with no DST, so the CR month is a fixed UTC interval.
+  const [y, mo] = month.split('-').map(Number);
+  const startMs = Date.UTC(y, mo - 1, 1, 6, 0, 0);
+  const endMs = Date.UTC(y, mo, 1, 6, 0, 0);
+  const PAD = 36 * 3600 * 1000;
+  let overlayByCloser = {};
+  try {
+    const [{ data: reviClosers }, { data: scores }, apptQ] = await Promise.all([
+      reviSupabase.from('revi_closers').select('id, fathom_host_email'),
+      reviSupabase.from('closer_call_scores')
+        .select('closer_id, prospect_email, call_date, overall_score')
+        .gte('call_date', new Date(startMs - PAD).toISOString())
+        .lt('call_date', new Date(endMs + PAD).toISOString()),
+      portalPg.query(
+        `SELECT a.closer_id, a.scheduled_start, lower(p.email) AS email, o.outcome
+           FROM revops_appointments a
+           JOIN revops_prospects p ON p.id = a.prospect_id
+           LEFT JOIN revops_sales_outcomes o ON o.appointment_id = a.id
+          WHERE a.scheduled_start >= $1 AND a.scheduled_start < $2
+            AND COALESCE(a.ghl_appointment_id, '') NOT LIKE 'opp:%'`,
+        [new Date(startMs).toISOString(), new Date(endMs).toISOString()]
+      ),
+    ]);
+    const closerByReviId = {};
+    for (const rc of (reviClosers || [])) {
+      if (rc.fathom_host_email) closerByReviId[rc.id] = rc.fathom_host_email.toLowerCase();
+    }
+    const recsByCloser = {};
+    for (const s of (scores || [])) {
+      const closer = closerByReviId[s.closer_id];
+      if (!closer || !s.prospect_email || !s.call_date) continue;
+      (recsByCloser[closer] = recsByCloser[closer] || []).push({
+        email: s.prospect_email.toLowerCase(),
+        at: new Date(s.call_date).getTime(),
+        score: s.overall_score == null ? null : Number(s.overall_score),
+        matched: false,
+      });
+    }
+    for (const r of rows) {
+      const closer = r.closer_id;
+      const recs = recsByCloser[closer] || [];
+      const inMonth = recs.filter(x => x.at >= startMs && x.at < endMs);
+      let verified = 0;
+      const discrepancies = [];
+      for (const a of apptQ.rows) {
+        if ((a.closer_id || '').toLowerCase() !== closer || !a.email || !a.scheduled_start) continue;
+        const apptAt = new Date(a.scheduled_start).getTime();
+        const rec = recs.find(x => !x.matched && x.email === a.email && Math.abs(x.at - apptAt) <= PAD);
+        if (!rec) continue;
+        if (a.outcome == null) { rec.matched = true; verified += 1; }
+        else if (a.outcome === 'no_show') { rec.matched = true; discrepancies.push(a.email); }
+      }
+      const scoreVals = inMonth.map(x => x.score).filter(x => x != null);
+      overlayByCloser[closer] = {
+        scored: inMonth.length,
+        avgScore: scoreVals.length ? Math.round(10 * scoreVals.reduce((s, v) => s + v, 0) / scoreVals.length) / 10 : null,
+        verified,
+        discrepancies,
+      };
+    }
+  } catch (e) {
+    console.error('getCloserMonthlyScorecard REVI overlay:', e.message);
+    overlayByCloser = {};
+  }
+
+  const lines = [`CLOSER MONTHLY SCORECARD — ${month} (CR months, scheduled-time anchored; same view as the portal page /admin/closer-scorecard)`];
+  for (const r of rows) {
+    lines.push('');
+    lines.push(`${r.closer_id}`);
+    lines.push(`• Calls assigned: ${r.calls_assigned} (${r.unique_prospects} unique prospects) | Outcomes logged: ${r.outcomes_logged} | Pending: ${r.pending}`);
+    lines.push(`• Showed: ${r.showed} | No-shows: ${r.no_shows} | Qualified attended: ${r.qualified_attended} | Show rate: ${r.show_rate_pct != null ? r.show_rate_pct + '%' : 'n/a'}`);
+    lines.push(`• Won: ${r.won} | Lost: ${r.lost} | Follow-up: ${r.follow_up} | DQ: ${r.disqualified} | Close rate on shows: ${r.close_rate_on_shows_pct != null ? r.close_rate_on_shows_pct + '%' : 'n/a'} | Revenue: $${Number(r.revenue).toLocaleString()}`);
+    const ov = overlayByCloser[r.closer_id];
+    if (ov) {
+      let reviLine = `• REVI reality-check: ${ov.scored} recorded calls scored${ov.avgScore != null ? `, avg score ${ov.avgScore}` : ''}`;
+      if (ov.verified > 0) reviLine += ` — ${ov.verified} of the ${r.pending} pending calls verifiably HAPPENED (recording exists, outcome never logged)`;
+      lines.push(reviLine);
+      if (ov.discrepancies.length) lines.push(`• DATA FLAG: marked no-show but a recording exists: ${ov.discrepancies.join(', ')}`);
+    }
+    if (r.pending > 0 && r.pending / r.calls_assigned >= 0.3) {
+      lines.push(`• CAVEAT: ${r.pending}/${r.calls_assigned} calls have no logged outcome — show/close rates are unreliable, and pending does NOT mean the call didn't happen.`);
+    }
+  }
+  if (unRows.length && Number(unRows[0].outcomes) > 0) {
+    const u = unRows[0];
+    lines.push('');
+    lines.push(`Unattributed outcomes in ${month} (no scheduled call to attach to — real results, credited to no closer): ${u.outcomes} outcomes, ${u.won} won, $${Number(u.revenue).toLocaleString()}.`);
+  }
+  return lines.join('\n');
+}
+
 function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   const dropped = Object.keys(stats).filter(isUnresolvedSalesId);
   if (dropped.length) console.warn(`Closer stats: dropping unresolved id row(s) from leaderboard: ${dropped.join(', ')}`);
@@ -5341,6 +5460,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
           { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'closer_monthly_scorecard', description: "Monthly per-closer scorecard from the shared closer_month_scorecard view — the SAME numbers as the portal page /admin/closer-scorecard, so never recompute month stats another way when asked for a closer's month. Returns calls assigned, outcomes logged, pending, showed, no-shows, qualified attended, won/lost/follow-up/DQ, show rate, close rate on shows, revenue, plus a REVI recording reality-check (calls that verifiably happened but were never logged, avg call score, no-show-vs-recording flags) and the month's unattributed outcomes. Months are America/Costa_Rica calendar months anchored on the call's scheduled time. When pending is high, always caveat that show/close rates are unreliable — pending does not mean the call didn't happen.", input_schema: { type: 'object', properties: { month: { type: 'string', description: "Month as YYYY-MM, e.g. 2026-07. For 'last month' compute from today's date in CR time." }, closer: { type: 'string', description: 'Optional closer email or name fragment (jose, ron, jonathan). Omit for all closers.' } }, required: ['month'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
           { name: 'create_scheduled_task',description: 'Create a new recurring scheduled task that Max will run automatically.',                  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Short name for the task' }, schedule: { type: 'string', description: 'Natural language schedule e.g. every Monday at 9am' }, prompt: { type: 'string', description: 'The instruction Max will execute at each scheduled run' }, channel: { type: 'string', description: 'Slack channel to post results to' } }, required: ['name','schedule','prompt'] } },
           { name: 'list_scheduled_tasks', description: 'List all scheduled tasks Max is currently running.',                                     input_schema: { type: 'object', properties: {} } },
@@ -5407,6 +5527,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'add_calendar_attendees') result = await addCalendarAttendees(toolUse.input.eventId, toolUse.input.attendees);
         else if (toolUse.name === 'create_calendar_event')  result = await createCalendarEvent(toolUse.input.summary, toolUse.input.startISO, toolUse.input.endISO, toolUse.input.attendees || [], toolUse.input.description || '', toolUse.input.location || '');
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
+        else if (toolUse.name === 'closer_monthly_scorecard') result = await getCloserMonthlyScorecard(toolUse.input.month, toolUse.input.closer);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
         else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
