@@ -342,3 +342,21 @@ scope `scenarios:read`) and sets `MAKE_API_TOKEN` in Railway.
 Rename `[PROD] Auto Strike Mover` to `[RETIRED] …` in Make (matching the existing
 `[DISABLED …]` / `[ARCHIVED …]` convention) and drop the `MAKE_WATCHDOG_IGNORE` default —
 naming beats an ID allowlist.
+
+---
+
+# TODO — Alert triage bridge (Make DLQ first consumer) — session 2026-08-14/15
+
+Plan: ~/.claude/plans/how-can-max-never-sorted-parnas.md (approved: generic bridge + Make DLQ consumer; channel-visible proposals, roster ✅; retry + reactivate)
+
+- [x] PR #47 merged + deployed (`c07950c`) — generic bridge, emoji approval, executors, 30 tests
+- [x] PR #49 (parallel session) rebased onto #47, conflict resolved, merged + deployed (`9e64db3`) — DLQ damping
+- [x] Interaction tests 13d–13f added (damping × triage); fixed a pagination bug in the triage test's own stub
+- [x] Ron set `MAKE_TRIAGE_ENABLED=true` + `REMEDIATION_DRY_RUN=true` on ng-pm-MAX
+- [x] Rollout step 1 verified live: Max listed the real DLQ entries via `make_list_dlqs` (proves `dlqs:read` scope + envelope + timestamp parsing → the 44h guard is functional, not a silent no-op)
+- [x] First real triage 04:10 UTC — `no_action`, correct reasoning, declined the offered action. Smoke scenario deleted.
+- [ ] **Ron: discard (not retry) the 2 Aug-5 entries** — [scenario 5148796](https://us2.make.com/432699/scenarios/5148796/edit) → Incomplete executions → Delete. Diagnosed as test artifacts from that day's blueprint edits; ✅ all-clear posts ~30 min after the queue empties (damping applies to the recovery edge too).
+- [ ] **Watch the first REAL proposal** — this is the untested path (Ron chose to let a real incident prove it). Check: (a) the message carries `metadata.event_payload`; (b) ✅ produces a threaded reply. Silence on ✅ = missing `reactions:write`/`channels:history` in #ng-fullfillment-ops.
+- [ ] Then unset `REMEDIATION_DRY_RUN` to arm for real (rollout step 3)
+- [ ] Optional, still unverified: `POST /scenarios/{id}/start` (reactivate executor) — a 404 surfaces as a ❌ thread reply, not a crash
+- [ ] Separate PR: `runMondayGapDetection` bare `correlationId` ReferenceError — the Monday gap report has never posted when gaps existed
