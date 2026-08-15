@@ -3817,7 +3817,12 @@ async function runWeeklyPortalTrends(_correlationId) {
 }
 
 // ─── PORTAL: MONDAY GAP DETECTION ────────────────────────────────────────────
-async function runMondayGapDetection(_correlationId) {
+// The param is USED (passed to executeChannelPost below), so it must not carry the
+// unused-underscore prefix — with `_correlationId` the post line referenced an
+// undefined `correlationId`, threw a ReferenceError while evaluating its arguments,
+// and the surrounding catch swallowed it. The early return on an empty `gaps` array
+// meant that only ever happened on the weeks that HAD something to report.
+async function runMondayGapDetection(correlationId) {
   console.log('Running Monday gap detection...');
   try {
     const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true).in('customer_status', ['phase_1','phase_2','blocked']);
@@ -5727,22 +5732,31 @@ async function postToSlack(channel, text, threadTs = null) {
   await slack.client.chat.postMessage(payload);
 }
 
+// `say` is absent on cron paths — there is no originating Slack conversation to
+// reply into. Every say() here must therefore be guarded: an unguarded one threw a
+// TypeError immediately AFTER the channel post succeeded, and the catch below then
+// called say() again and threw a second time, propagating out. Callers with a real
+// `say` (the approval flow) are unaffected.
 async function executeChannelPost(channelName, message, say, correlationId) {
+  const reply = async (text) => {
+    if (typeof say === 'function') await say(text);
+    else console.log(`executeChannelPost: ${text}`);
+  };
   try {
     const channels = await getCachedChannelList();
     const channel  = channels.find(c => c.name === channelName.replace('#', ''));
-    if (!channel) { await say(`Could not find channel ${channelName}.`); }
+    if (!channel) { await reply(`Could not find channel ${channelName}.`); }
     else {
       await slack.client.chat.postMessage({ channel: channel.id, text: message });
       if (correlationId) {
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: channel.id, output: { text: String(message).slice(0, 2000) }, correlation_id: correlationId });
       }
-      await say(`Posted to ${channelName}.`);
+      await reply(`Posted to ${channelName}.`);
       if (correlationId) {
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: `Posted to ${channelName}.`.slice(0, 2000) }, correlation_id: correlationId });
       }
     }
-  } catch (err) { await say(`Something went wrong posting: ${err.message}`); }
+  } catch (err) { await reply(`Something went wrong posting: ${err.message}`); }
 }
 
 // ─── EMAIL PROXY: tool handlers ───────────────────────────────────────────────

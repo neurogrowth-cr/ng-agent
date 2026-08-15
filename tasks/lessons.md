@@ -257,3 +257,21 @@ global CLAUDE.md; the remote state can change between your fetch and your push.
 **Symptom.** Two docs PRs that each only *appended* to the bottom of `tasks/project-state.md` still collided: PR #52 flipped to `mergeStateStatus: DIRTY / mergeable: CONFLICTING` the moment PR #53 merged, despite `.gitattributes` declaring `tasks/project-state.md merge=union`.
 
 **Takeaway.** Custom merge drivers live in the local git config and run on the machine doing the merge. GitHub's server-side merge ignores them, so the union guardrail protects `git pull`/`git rebase` on a workstation but does **not** stop a PR from conflicting. When a docs PR goes CONFLICTING: rebase it locally (where union resolves cleanly), verify no entry got duplicated — union keeps *both* sides, so a restructured file can silently gain a second copy of an entry — then force-push. Also merge docs PRs promptly; in this repo `main` moved four times during one PR's life and dirtied it twice.
+
+## 2026-08-15 — The unused-underscore convention can silently kill a whole report
+
+**Symptom.** The Monday delivery gap report had never posted whenever it actually had gaps. No alert, no error surfaced, months of silence that looked exactly like "no gaps this week."
+
+**Root cause, two faults stacked.**
+1. `runMondayGapDetection(_correlationId)` used the leading-underscore "this param is unused" convention — but the param WAS used, four lines from the end: `executeChannelPost(OPS_CHANNEL, message, null, correlationId)`. That threw a `ReferenceError` while evaluating the call arguments, so the post function was never entered.
+2. Even with that fixed, `executeChannelPost` called `say()` unguarded. On cron paths `say` is `null`, so the channel post SUCCEEDED and then the confirmation threw a `TypeError` — and the `catch` called `say()` again, throwing a second time.
+
+Both were swallowed by `catch (err) { console.error(...) }`.
+
+**Why it hid for so long.** The function returns early when `gaps.length === 0`. The broken line only ran on the weeks that had something to report — so the failure was perfectly anti-correlated with anyone noticing. A quiet week and a broken week produced identical output: nothing.
+
+**Takeaways.**
+- **`_name` is a claim, not a decoration.** Prefixing a parameter asserts "nothing in this body reads it." If anything does, you get a ReferenceError that only fires on the path that reads it. Grep the body before adding the underscore — a sweep of the other nine `_correlationId` crons found no second instance, but only because they genuinely never use it.
+- **An optional callback must be guarded at every call site, including inside the catch.** A `catch` that calls the same possibly-null function it is catching for turns one fault into two and propagates out.
+- **`catch { console.error }` on a scheduled job is indistinguishable from success.** Nothing reads Railway logs on a Monday. Any cron whose failure mode is "posts nothing" needs either a heartbeat row or an alert on the empty case — the same silent-failure shape as the 2026-07-28 allowlist and the 2026-08-06 skipped-webhook lessons.
+- **A regression test for an invisible bug must be proven to fail against the old code.** Running the new test against `git show origin/main:index.js` failed 7 of 12 checks; the one that passed (`the message actually reaches the channel`) is what confirmed the post itself was fine and only the confirmation threw.
