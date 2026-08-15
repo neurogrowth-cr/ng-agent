@@ -4544,16 +4544,25 @@ async function _scrapeMetaCostPerBookingToday() {
   return +(spend / count).toFixed(2);
 }
 
-// New leads today — Form/WA funnel via lead_posts (deduped GHL lead feed).
+// New leads YESTERDAY — Form/WA funnel via lead_posts (deduped GHL lead feed).
 // Replaces the old raw GET /contacts/ call, which passed v1 startDate/endDate
 // params to the v2 endpoint and had no res.ok check, so every API failure was
 // silently recorded as a legitimate 0 and poisoned the anomaly baseline.
 // lead_posts rows are written by the GHL lead-intake webhook and already
 // deduped against the FB→WhatsApp duplicate-contact path (one logical lead
 // per slack_message_ts). Errors THROW so the anomaly cron records a scrape
-// error instead of a fake zero. Metric key is a frozen metric_observations PK.
+// error instead of a fake zero.
+//
+// Window is YESTERDAY (_crDayBoundsUtc(1)), matching every other sales scraper.
+// It was briefly `today`, which meant the 6 AM CR anomaly cron only ever saw
+// CR midnight–06:00 — a ~6-hour slice reported under a "today" label (first
+// real value was 5 when the full day was ~35). Expect a one-time level shift
+// upward as the 28-day baseline refills with full-day values.
+//
+// Metric key `ghl_new_contacts_today` is a FROZEN metric_observations PK with
+// baseline history — the name is now historical, like the iclosed_* keys.
 async function _scrapeGhlNewContactsToday() {
-  const day = _crDayBoundsUtc(0);
+  const day = _crDayBoundsUtc(1);
   const { data, error } = await supabase
     .from('lead_posts')
     .select('slack_message_ts')
@@ -5224,7 +5233,7 @@ const METRIC_REGISTRY = [
   // Lead volume — lead_posts (GHL lead-intake webhook, Form/WA funnel; VSL
   // self-bookers skip the lead feed and surface as booked appointments below).
   // Key frozen (metric_observations PK with baseline history) — label only.
-  { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'New leads (Form/WA funnel, today)' },
+  { name: 'ghl_new_contacts_today',       domain: 'sales',       scrape: _scrapeGhlNewContactsToday,        label: 'New leads (Form/WA funnel, yesterday)' },
   // Call pipeline — revops_appointments (GHL-native since 2026-07-23) is the truth-source.
   // NOTE: the iclosed_* metric KEYS are historical and frozen ON PURPOSE — they are
   // primary keys in metric_observations with baseline history. Rename = severed baselines.
@@ -8183,20 +8192,38 @@ async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } 
     if (sales) parts.push(`VSL self-booked calls: *${sales.selfBookedInWindow}*${fmtDelta(sales.selfBookedInWindow, prevSales?.selfBookedInWindow)}`);
 
     // ── SALES PIPELINE ────────────────────────────────────────────────────
-    parts.push('', '`SALES PIPELINE` (calls scheduled this week, flywheel only)');
+    // Two DIFFERENT cohorts share this block, so both are labelled explicitly.
+    // "Booked" counts calls whose booked_at fell in the window (booking
+    // velocity); everything below it counts calls whose scheduled_start fell in
+    // the window (what actually happened). They legitimately disagree — a call
+    // booked Monday for next month is in the first and not the second. The
+    // first live run printed "Booked: 14" directly above "Held: 7 … 13 awaiting
+    // outcome" (7+13=20), which reads as an arithmetic error unless the two
+    // cohorts and the scheduled total are named on the page.
+    parts.push('', '`SALES PIPELINE` (flywheel only)');
     if (sales) {
       const waiting = [];
       if (sales.pending)     waiting.push(`${sales.pending} awaiting outcome`);
       if (sales.rescheduled) waiting.push(`${sales.rescheduled} rescheduled`);
-      parts.push(`Booked this week: *${sales.bookedInWindow}*${fmtDelta(sales.bookedInWindow, prevSales?.bookedInWindow)}`);
+      parts.push(`New bookings made this week: *${sales.bookedInWindow}*${fmtDelta(sales.bookedInWindow, prevSales?.bookedInWindow)} (booking velocity — may be for later dates)`);
+      parts.push(`Calls on the calendar this week: *${sales.scheduled}*${fmtDelta(sales.scheduled, prevSales?.scheduled)}`);
+      // Show rate denominator is decided calls only (held + no-shows); pending
+      // and rescheduled are excluded, so say what it was computed on.
+      const decided = sales.held + sales.noShows;
       parts.push(
-        `Held: *${sales.held}* | No-shows: ${sales.noShows} | Show rate: *${sales.showRatePct == null ? 'n/a' : sales.showRatePct + '%'}*` +
-        (waiting.length ? ` (${waiting.join(', ')})` : '')
+        `  Held: *${sales.held}* | No-shows: ${sales.noShows} | Show rate: *${sales.showRatePct == null ? 'n/a' : sales.showRatePct + '%'}*` +
+        (sales.showRatePct == null ? '' : ` (of ${decided} decided)`) +
+        (waiting.length ? ` · ${waiting.join(', ')}` : '')
       );
       parts.push(
-        `Closes: *${sales.won}* | Close rate: *${sales.closeRatePct == null ? 'n/a' : sales.closeRatePct + '%'}* | Revenue: *$${sales.revenue.toLocaleString()}*` +
+        `  Closes: *${sales.won}* | Close rate: *${sales.closeRatePct == null ? 'n/a' : sales.closeRatePct + '%'}* | Revenue: *$${sales.revenue.toLocaleString()}*` +
         fmtDelta(sales.revenue, prevSales?.revenue, { money: true })
       );
+      // Close rate on a thin decided base is a discipline signal, not a
+      // performance one — say so rather than letting "0%" read as lost deals.
+      if (sales.pending > 0 && sales.pending >= sales.held) {
+        parts.push(`  ⚠️ ${sales.pending} of ${sales.scheduled} calls have no outcome logged — close rate is computed on the ${sales.held} held call(s) that do.`);
+      }
       // A win logged this week on an older call is real revenue that the
       // cohort line above won't show — surface it so "Closes: 0" can't
       // contradict a "sale won yesterday" anomaly DM.
