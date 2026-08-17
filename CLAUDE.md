@@ -32,7 +32,7 @@ suggestions.
 
 ## Before marking done
 
-- `node --check index.js` plus the three test files in `test/` (plain `node`,
+- `node --check index.js` plus every test file in `test/` (plain `node`,
   no install needed).
 - A PR that deletes >50 lines from `index.js` needs the `major-change` label —
   CI fails it otherwise (stale-copy revert detector).

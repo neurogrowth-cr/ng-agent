@@ -10123,8 +10123,33 @@ function hasOptOutSignal(messages) {
   return null;
 }
 
+// GHL enforces a per-location burst limit, and Max is his own worst offender: the
+// hourly runAutoStrikeMover pages every card in four stages and then reads a
+// conversation per card. On 2026-08-17 20:00 UTC a setter's ✅ landed 22s into that
+// burst, the contact PUT came back 429, and the claim was simply dropped (a second
+// claim 40s later went through untouched — purely transient).
+//
+// Everything on the claim path and the sweep path goes through here now. Returns the
+// Response unchanged so callers keep their own error handling; only 429/5xx are
+// retried, since a 401/404 will never come good.
+const GHL_RETRY_DELAYS_MS = [1000, 3000, 8000];
+async function ghlFetch(url, init = {}, { retries = GHL_RETRY_DELAYS_MS.length, label = '' } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, init);
+    if (!(res.status === 429 || res.status >= 500) || attempt >= retries) return res;
+    // GHL usually omits Retry-After; honour it when present so we back off by their
+    // clock rather than ours, but never park a Slack reaction handler for minutes.
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const wait = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(retryAfter * 1000, 30000)
+      : GHL_RETRY_DELAYS_MS[Math.min(attempt, GHL_RETRY_DELAYS_MS.length - 1)];
+    console.warn(`GHL ${res.status}${label ? ` on ${label}` : ''} — retry ${attempt + 1}/${retries} in ${wait}ms`);
+    await new Promise(r => setTimeout(r, wait));
+  }
+}
+
 async function ghlGetConversationMessages(conversationId) {
-  const res = await fetch(`https://services.leadconnectorhq.com/conversations/${conversationId}/messages?limit=20`, {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/conversations/${conversationId}/messages?limit=20`, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
   });
   if (!res.ok) throw new Error(`GHL messages fetch ${res.status}`);
@@ -10136,9 +10161,9 @@ async function ghlGetConversationMessages(conversationId) {
 }
 
 async function ghlGetContact(contactId) {
-  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
-  });
+  }, { label: `GET /contacts/${contactId}` });
   if (!res.ok) return null;
   const data = await res.json();
   return data.contact || data || null;
@@ -10726,9 +10751,10 @@ const STRIKE_LEAD_SILENCE_MS = 24 * 60 * 60 * 1000; // lead quiet this long ⇒ 
 const _strikeConvoCache = new Map();
 
 async function ghlFetchJson(url) {
-  const res = await fetch(url, {
+  const endpoint = url.split('?')[0].split('/').slice(-2).join('/');
+  const res = await ghlFetch(url, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
-  });
+  }, { label: endpoint });
   if (!res.ok) throw new Error(`GHL ${res.status} on ${url.split('?')[0].split('/').slice(-2).join('/')}`);
   return res.json();
 }
@@ -10750,6 +10776,12 @@ async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40 } = {}
     startAfter   = data.meta?.startAfter;
     startAfterId = data.meta?.startAfterId;
     if (!startAfter || !startAfterId) break;
+    // Same throttle the per-card loop in runAutoStrikeMover uses. Four stages of
+    // back-to-back paging with no gap is what opened the 2026-08-17 burst that
+    // 429'd a setter's claim; a few hundred ms across a sweep that runs for
+    // minutes costs nothing.
+    const pageThrottleMs = parseInt(process.env.STRIKE_MOVER_THROTTLE_MS || '120', 10);
+    if (pageThrottleMs > 0) await new Promise(r => setTimeout(r, pageThrottleMs));
   }
   return out;
 }
@@ -10766,7 +10798,7 @@ async function ghlFindConversationId(contactId) {
 }
 
 async function ghlMoveOpportunityStage(oppId, stageId, pipelineId = STRIKE_PIPELINE_ID) {
-  const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
@@ -10774,7 +10806,7 @@ async function ghlMoveOpportunityStage(oppId, stageId, pipelineId = STRIKE_PIPEL
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ pipelineId, pipelineStageId: stageId }),
-  });
+  }, { label: `PUT /opportunities/${oppId}` });
   if (!res.ok) throw new Error(`opp PUT ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
   return true;
 }
@@ -12671,9 +12703,9 @@ slack.event('reaction_added', async ({ event }) => {
     const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
     try {
       // 1. Reassign the contact
-      const putRes = await fetch(`https://services.leadconnectorhq.com/contacts/${meta.contact_id}`, {
+      const putRes = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${meta.contact_id}`, {
         method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
-      });
+      }, { label: `PUT /contacts/${meta.contact_id} (claim)` });
       if (!putRes.ok) {
         const errBody = await putRes.text();
         throw new Error(`GHL PUT /contacts/${meta.contact_id} → ${putRes.status}: ${errBody.slice(0, 200)}`);
@@ -12684,9 +12716,10 @@ slack.event('reaction_added', async ({ event }) => {
       //    Allow-list comes from GHL_SETTER_PIPELINE_IDS env var (comma-separated).
       const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4')
         .split(',').map(s => s.trim()).filter(Boolean);
-      const oppsRes = await fetch(
+      const oppsRes = await ghlFetch(
         `https://services.leadconnectorhq.com/opportunities/search?location_id=${meta.location_id}&contact_id=${meta.contact_id}`,
         { headers: ghlAuth },
+        { label: `GET /opportunities/search (claim ${meta.contact_id})` },
       );
       const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
       const allOpps = oppsData.opportunities || [];
@@ -12697,9 +12730,9 @@ slack.event('reaction_added', async ({ event }) => {
       }
       const oppResults = await Promise.all(opps.map(async (opp) => {
         try {
-          const r = await fetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
+          const r = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
             method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
-          });
+          }, { label: `PUT /opportunities/${opp.id} (claim)` });
           if (!r.ok) {
             const eb = await r.text();
             console.warn(`opp PUT ${opp.id} → ${r.status}: ${eb.slice(0, 150)}`);
@@ -12771,9 +12804,23 @@ slack.event('reaction_added', async ({ event }) => {
       console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
     } catch (apiErr) {
       console.error('Lead claim GHL write failed:', apiErr.message);
+      // A dropped claim used to leave nothing but a console line — no row to query
+      // when asking "how often does this happen?".
+      logActivity({
+        event_type: 'ghl_lead_claim_failed', event_source: 'slack', action: 'lead_claim',
+        actor_user_id: event.user, channel_id: channel, status: 'error',
+        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, error: apiErr.message },
+        correlation_id: claimCorr,
+      });
+      // Rate limiting / GHL hiccups survive the retries only when GHL is genuinely
+      // busy. The claim emoji was never added, so re-reacting is a clean retry —
+      // that's the one instruction worth giving, not "reach out to Ron".
+      const transientStatus = (apiErr.message.match(/→ (429|5\d\d):/) || [])[1] || null;
       await slack.client.chat.postMessage({
         channel, thread_ts: timestamp,
-        text: `<@${event.user}> tried to claim, but GHL update failed: ${apiErr.message}. Reach out to Ron.`,
+        text: transientStatus
+          ? `<@${event.user}> your claim didn't stick — GHL returned ${transientStatus} (rate limit / busy) and it still failed after ${GHL_RETRY_DELAYS_MS.length} retries. Remove your ✅ and add it again in a minute. Still failing? Reach out to Ron.`
+          : `<@${event.user}> tried to claim, but GHL update failed: ${apiErr.message}. Reach out to Ron.`,
       });
     }
   } catch (err) {
