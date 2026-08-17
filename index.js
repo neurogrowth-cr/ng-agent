@@ -223,7 +223,8 @@ KEY TABLES
 - In Max's OWN Supabase, NOT the portal (use knowledge/metric tools, not query_portal_db): agent_knowledge, conversations, scheduled_tasks, metric_observations, setter_attributions.
 
 CANONICAL RECIPES
-- Activation call date for a client = customer_activities.completed_at joined to customer_activity_templates where templates.title ILIKE '%activation call%' AND customer_activities.customer_id = the client's client_dashboards.id. This date IS stored. Every "Day N since activation call" figure in reports is computed FROM this raw date — when someone asks for the date itself, return the date.
+- Activation call date for a client comes from the dashboard CRM, in this order. (1) flywheel_activation_workflow.completed_at where step_name = 'activation_call_done' AND metadata->>'source' = 'ghl_webhook' AND customer_id = the client's client_dashboards.id — the canonical anchor for the 14-day Build and Release window, written automatically when the activation appointment is marked held. Rows WITHOUT that metadata source were ticked by hand and carry a bulk timestamp (the historical backfill stamped May calls with 2026-06-19), so do not read them as the call date. (2) flywheel_ai_onboarding.activation_call_scheduled_for, joined on email (lower(flywheel_ai_onboarding.email) = lower(client_dashboards.email)) — the booking-side date, real and safe to quote. Clients live in the dashboard CRM: never read an activation date, or any other fulfillment state, off a GHL contact field or tag. When someone asks for the date itself, return the date.
+- LAST-RESORT FALLBACK when both CRM sources above are null = customer_activities.completed_at joined to customer_activity_templates where templates.title ILIKE '%activation call%' AND customer_activities.customer_id = the client's client_dashboards.id. This is a fulfillment CHECKBOX, not the call: measured across 16 clients it lagged the real call by a median of 6 days and by up to 40. Always say the number is based on the checkbox when you use this fallback, and treat the resulting Day N as optimistic.
 - Launch date (campaign go-live) = latest customer_activities.completed_at where the joined template title contains 'campaign qa check' or 'campaign validation' (verified 2026-08-07: these match the team's tracked launch dates; go_live_at does NOT). Time to launch = activation call date → this launch date.
 - Stabilization day counts anchor on client_dashboards.stabilization_started_at, not the activation call.
 
@@ -2525,20 +2526,94 @@ async function getMetaAds(adSetId = null, datePreset = 'last_7d') {
   } catch (err) { return `Meta ads error: ${err.message}`; }
 }
 
+// ─── ACTIVATION CALL DATE ─────────────────────────────────────────────────────
+// The real activation call date — the start line of the 14-day Build & Release
+// window. Read ONLY from the dashboard CRM. Clients are the dashboard's domain;
+// GHL is the sales spine and holds no fulfillment state, so nothing here reads a
+// GHL contact field or tag.
+//
+// Why this exists: the portal's "Activation Call Completed" checkbox is a
+// fulfillment tick, not the call. Measured 2026-08-18 across 16 clients with both
+// dates, the checkbox lagged the real call by a MEDIAN of 6 days and by as much as
+// 40 — on a 14-day window. Every Day-N figure anchored on the checkbox understated
+// elapsed time, so clients read younger and less overdue than they were.
+//
+// Two CRM sources, and the order matters:
+//   1. flywheel_activation_workflow.activation_call_done — the canonical anchor
+//      (its table comment has documented the 14-day count since March, and the
+//      B&R clock spec anchors the billing window on it). BUT completed_at is only
+//      a real held-timestamp when the row came from the GHL appointment webhook.
+//      Rows ticked by hand carry a bulk timestamp — the historical backfill
+//      stamped calls held in May with 2026-06-19 — so trusting those blindly
+//      reintroduces exactly the drift this function exists to remove. Only
+//      metadata.source = 'ghl_webhook' rows are treated as real.
+//   2. flywheel_ai_onboarding.activation_call_scheduled_for — the booking-side
+//      date (GHL embed on the client portal, plus a Fathom-verified backfill of
+//      19 historical clients). Real dates, so a good second choice.
+// Anything else falls through to the checkbox, which the anchor labels as soft.
+async function loadActivationDates() {
+  const heldByClientId = new Map();   // client_dashboards.id → ISO (real held event)
+  const dateByEmail    = new Map();   // lowercased email      → ISO (booking side)
+
+  const { data: steps, error: stepErr } = await portalSupabase
+    .from('flywheel_activation_workflow')
+    .select('customer_id, completed_at, metadata')
+    .eq('step_name', 'activation_call_done')
+    .not('completed_at', 'is', null);
+  if (stepErr) console.log(`[activation] activation_call_done read failed: ${stepErr.message}`);
+  for (const r of steps || []) {
+    if (r.customer_id && r.metadata?.source === 'ghl_webhook') heldByClientId.set(r.customer_id, r.completed_at);
+  }
+
+  let from = 0;
+  const PAGE_SIZE = 200;
+  while (true) {
+    const { data: page, error } = await portalSupabase
+      .from('flywheel_ai_onboarding')
+      .select('email, activation_call_scheduled_for')
+      .not('activation_call_scheduled_for', 'is', null)
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) { console.log(`[activation] onboarding dates read failed: ${error.message}`); break; }
+    if (!page || !page.length) break;
+    for (const r of page) {
+      if (r.email) dateByEmail.set(r.email.toLowerCase(), r.activation_call_scheduled_for);
+    }
+    if (page.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  // Returned as a lookup so callers pass the client row and stay ignorant of which
+  // CRM table won — the sources will shift as the webhook route fills in.
+  return function activationFor(dash) {
+    if (!dash) return null;
+    return heldByClientId.get(dash.id)
+      || dateByEmail.get((dash.email || '').toLowerCase())
+      || null;
+  };
+}
+
 // ─── SHARED DAY-ANCHOR RESOLUTION ────────────────────────────────────────────
 // Single source of truth for "Day N" math. Returns the raw anchor DATE so every
 // consumer can print the calendar date, not just the day count. titleOf(templateId)
 // must return the template title string ('' if unknown) — callers keep their
 // existing map shapes and pass a tiny closure. Anchor priority: phase_3
-// stabilization_started_at → activation call completed_at → portal created_at.
-function resolveDayAnchor(dash, activities, titleOf) {
+// stabilization_started_at → real activation call date → activation call checkbox
+// completed_at → portal created_at.
+//
+// activationISO is the real call date (see loadActivationDates). When it is absent
+// we still fall back to the checkbox, but the label says so — a report reading
+// "since activation call (checkbox)" is telling you that client's Day N is soft and
+// probably optimistic.
+function resolveDayAnchor(dash, activities, titleOf, activationISO = null) {
   const activation = (activities || []).find(a =>
     (titleOf(a.template_id) || '').toLowerCase().includes('activation call') && a.completed_at);
   let startISO, label;
   if (dash.customer_status === 'phase_3' && dash.stabilization_started_at) {
     startISO = dash.stabilization_started_at; label = 'since stabilization start';
+  } else if (activationISO) {
+    startISO = activationISO;                 label = 'since activation call';
   } else if (activation) {
-    startISO = activation.completed_at;       label = 'since activation call';
+    startISO = activation.completed_at;       label = 'since activation call (checkbox)';
   } else if (dash.created_at) {
     startISO = dash.created_at;               label = 'since portal creation';
   } else {
@@ -2588,6 +2663,7 @@ async function getClientStatus(clientName = null) {
       .eq('is_active', true);
     const templateMap = {};
     (templates || []).forEach(t => { templateMap[t.id] = t; });
+    const activationFor = await loadActivationDates();
 
     const results = await Promise.all(dashboards.map(async (dash) => {
       const { data: onboarding } = await portalSupabase
@@ -2638,7 +2714,7 @@ async function getClientStatus(clientName = null) {
       const statusEmoji = statusLabel.split(' ')[0];
 
       // Day 1 anchor — shared logic; anchorDate surfaces the raw calendar date
-      const { daysSince, label: dayAnchor, anchorDate } = resolveDayAnchor(dash, activities, id => templateMap[id]?.title);
+      const { daysSince, label: dayAnchor, anchorDate } = resolveDayAnchor(dash, activities, id => templateMap[id]?.title, activationFor(dash));
       const lines = [
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
         `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}${anchorDate ? ` (${anchorDate})` : ''}`,
@@ -2832,6 +2908,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       .select('id, title');
     const templateMap = {};
     (templates || []).forEach(t => { templateMap[t.id] = t.title; });
+    const activationFor = await loadActivationDates();
 
     const now    = Date.now();
     const alerts = [];
@@ -2855,8 +2932,8 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
         }
       }
 
-      // ── Day anchor: shared logic (activation call completed_at → created_at) ──
-      const anchor = resolveDayAnchor(dash, allActs, id => templateMap[id]);
+      // ── Day anchor: shared logic (real activation date → checkbox → created_at) ──
+      const anchor = resolveDayAnchor(dash, allActs, id => templateMap[id], activationFor(dash));
       const daysSince = anchor.daysSince ?? 0;
       const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
@@ -3839,6 +3916,7 @@ async function runMondayGapDetection(correlationId) {
     const { data: templates } = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
     const tMap = {};
     (templates || []).forEach(t => { tMap[t.id] = t.title; });
+    const activationFor = await loadActivationDates();
     const now  = Date.now();
     const gaps = [];
     for (const dash of dashboards) {
@@ -3860,7 +3938,7 @@ async function runMondayGapDetection(correlationId) {
       // ── Day anchor: shared logic. Fetch all activities (not just in-progress)
       // to find the completed activation call ──
       const { data: allActsForAnchor } = await portalSupabase.from('customer_activities').select('template_id, status, completed_at').eq('customer_id', dash.id);
-      const anchor = resolveDayAnchor(dash, allActsForAnchor || [], id => tMap[id]);
+      const anchor = resolveDayAnchor(dash, allActsForAnchor || [], id => tMap[id], activationFor(dash));
       const daysSince = anchor.daysSince ?? 0;
       const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
@@ -4703,7 +4781,7 @@ async function _scrapePhaseCycleP50(targetStatus) {
   // currently in `targetStatus` (rough proxy for "time spent in this phase").
   const { data: dashboards, error } = await portalSupabase
     .from('client_dashboards')
-    .select('id, created_at, customer_status')
+    .select('id, email, created_at, customer_status')
     .eq('is_active', true)
     .eq('customer_status', targetStatus);
   if (error) throw new Error(error.message);
@@ -4715,6 +4793,7 @@ async function _scrapePhaseCycleP50(targetStatus) {
   const tmap = {};
   (templates || []).forEach(t => { tmap[t.id] = (t.title || '').toLowerCase(); });
 
+  const activationFor = await loadActivationDates();
   const days = [];
   for (const d of dashboards) {
     const { data: acts } = await portalSupabase
@@ -4722,7 +4801,10 @@ async function _scrapePhaseCycleP50(targetStatus) {
       .select('template_id, completed_at')
       .eq('customer_id', d.id);
     const activation = (acts || []).find(a => (tmap[a.template_id] || '').includes('activation call') && a.completed_at);
-    const start = activation ? new Date(activation.completed_at) : (d.created_at ? new Date(d.created_at) : null);
+    const real = activationFor(d);
+    const start = real ? new Date(real)
+      : activation ? new Date(activation.completed_at)
+      : (d.created_at ? new Date(d.created_at) : null);
     if (!start) continue;
     days.push(Math.floor((Date.now() - start.getTime()) / (24 * 60 * 60 * 1000)));
   }
@@ -4734,7 +4816,7 @@ async function _scrapePhaseCycleP50(targetStatus) {
 async function _scrapeDay7AtRiskCount() {
   const { data: dashboards, error } = await portalSupabase
     .from('client_dashboards')
-    .select('id, created_at, customer_status')
+    .select('id, email, created_at, customer_status')
     .eq('is_active', true)
     .in('customer_status', ['phase_1', 'phase_2']);
   if (error) throw new Error(error.message);
@@ -4746,6 +4828,7 @@ async function _scrapeDay7AtRiskCount() {
   const tmap = {};
   (templates || []).forEach(t => { tmap[t.id] = (t.title || '').toLowerCase(); });
 
+  const activationFor = await loadActivationDates();
   let count = 0;
   for (const d of dashboards) {
     const { data: acts } = await portalSupabase
@@ -4753,7 +4836,10 @@ async function _scrapeDay7AtRiskCount() {
       .select('template_id, completed_at')
       .eq('customer_id', d.id);
     const activation = (acts || []).find(a => (tmap[a.template_id] || '').includes('activation call') && a.completed_at);
-    const start = activation ? new Date(activation.completed_at) : (d.created_at ? new Date(d.created_at) : null);
+    const real = activationFor(d);
+    const start = real ? new Date(real)
+      : activation ? new Date(activation.completed_at)
+      : (d.created_at ? new Date(d.created_at) : null);
     if (!start) continue;
     const days = Math.floor((Date.now() - start.getTime()) / (24 * 60 * 60 * 1000));
     if (days >= 7) count++;
@@ -7223,8 +7309,9 @@ async function runFulfillmentStandup(_correlationId) {
       .not('completed_at', 'is', null);
     const anchorsByClient = {};
     (anchorActs || []).forEach(a => { (anchorsByClient[a.customer_id] = anchorsByClient[a.customer_id] || []).push(a); });
+    const activationFor = await loadActivationDates();
     function getDayAnchor(dash) {
-      return resolveDayAnchor(dash, anchorsByClient[dash.id] || [], id => tMap[id]);
+      return resolveDayAnchor(dash, anchorsByClient[dash.id] || [], id => tMap[id], activationFor(dash));
     }
     function getDayCount(dash) {
       return getDayAnchor(dash).daysSince;
