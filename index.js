@@ -10568,6 +10568,93 @@ async function handleRemediationReaction(event, baseEmoji) {
   return true;
 }
 
+// ─── GHL APPOINTMENT DELETION SWEEP ─────────────────────────────────────────
+// Deleting an appointment in GHL fires NO workflow and NO webhook — the call
+// silently vanishes from every report while Slack stays quiet (the 🔴 cancel
+// alert only fires on a status change). This sweep probes upcoming ingested
+// appointments against the GHL API and routes true deletions through the same
+// cancel-alert pipeline (dedupe + outbox + Make scenario 5822303) via the
+// portal RPC ng_mark_appt_deleted, which also marks the revops row cancelled
+// the way dash's cancelled-mode upsert does. Direction is always "by team":
+// clients cannot delete an appointment — they can only cancel (status change),
+// which flows through the webhook path with its own by-client/by-team label.
+const GHL_APPT_PROBE_BASE = 'https://services.leadconnectorhq.com/calendars/events/appointments/';
+
+// Pure classifier — extracted verbatim by test/appt-deletion-sweep.test.js, keep
+// dependency-free. GHL surfaces deletion two ways depending on the endpoint era:
+// a 404, or a 200 whose appointment carries deleted:true. A cancelled status is
+// NOT a deletion — the webhook path owns that alert.
+function classifyGhlApptProbe(httpStatus, body) {
+  if (httpStatus === 404) return 'deleted';
+  if (httpStatus < 200 || httpStatus >= 300) return 'error';
+  const appt = body && body.appointment ? body.appointment : null;
+  if (!appt) return 'error';
+  if (appt.deleted === true) return 'deleted';
+  const st = String(appt.appoinmentStatus || appt.appointmentStatus || '').toLowerCase();
+  if (st === 'cancelled' || st === 'canceled') return 'cancelled';
+  return 'active';
+}
+
+async function runApptDeletionSweep(correlationId) {
+  if (!process.env.GHL_API_KEY) return;
+  // Yesterday → +45 days: recent enough that a deletion still matters to the
+  // team, far enough out to cover everything bookable. Rows already marked
+  // cancelled (webhook path or a previous sweep) are skipped client-side —
+  // qualification_snapshot json filtering is clearer here than in PostgREST.
+  const sinceIso = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+  const untilIso = new Date(Date.now() + 45 * 24 * 3600 * 1000).toISOString();
+  const { data: appts, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('ghl_appointment_id, scheduled_start, qualification_snapshot')
+    .eq('source', 'ghl')
+    .not('ghl_appointment_id', 'is', null)
+    .gte('scheduled_start', sinceIso)
+    .lte('scheduled_start', untilIso)
+    .order('scheduled_start', { ascending: true })
+    .limit(80);
+  if (error) { console.error('apptDeletionSweep: query failed:', error.message); return; }
+  const candidates = (appts || []).filter(a => {
+    const snap = a.qualification_snapshot;
+    return !(snap && (snap.cancelled === true || snap.cancelled === 'true'));
+  });
+
+  let probed = 0, deleted = 0, errors = 0;
+  for (const a of candidates) {
+    let state;
+    try {
+      const res = await fetch(GHL_APPT_PROBE_BASE + encodeURIComponent(a.ghl_appointment_id), {
+        headers: { Authorization: `Bearer ${process.env.GHL_API_KEY}`, Version: '2021-07-28' },
+      });
+      const body = res.status === 404 ? null : await res.json().catch(() => null);
+      state = classifyGhlApptProbe(res.status, body);
+    } catch (e) {
+      errors++;
+      // Three transport failures = GHL (or the network) is down; a half-swept
+      // list is fine — every appointment is re-probed on the next run.
+      if (errors >= 3) { console.error('apptDeletionSweep: aborting, GHL unreachable:', e.message); return; }
+      continue;
+    }
+    probed++;
+    if (state === 'error') { errors++; continue; }
+    if (state !== 'deleted') continue;
+    const { data: outcome, error: rpcErr } = await portalSupabase
+      .rpc('ng_mark_appt_deleted', { p_ghl_appointment_id: a.ghl_appointment_id });
+    if (rpcErr) {
+      console.error(`apptDeletionSweep: mark failed for ${a.ghl_appointment_id}:`, rpcErr.message);
+      errors++;
+    } else {
+      deleted++;
+      console.log(`apptDeletionSweep: ${a.ghl_appointment_id} deleted in GHL → ${outcome}`);
+    }
+  }
+  console.log(`apptDeletionSweep [${correlationId}]: probed ${probed}/${candidates.length}, deleted ${deleted}, errors ${errors}`);
+}
+
+// Every 3 hours across the CR working day — deletions are rare, and each run
+// re-probes the full window, so a missed run self-heals on the next.
+cron.schedule('20 7-19/3 * * *', wrapCronJob('runApptDeletionSweep', async (c) => { await runApptDeletionSweep(c); }), { timezone: 'America/Costa_Rica' });
+// ─── end GHL APPOINTMENT DELETION SWEEP ─────────────────────────────────────
+
 // ─── MAKE SCENARIO HEALTH ───────────────────────────────────────────────────
 // Make auto-deactivates a scenario when it errors at initialization (an invalid
 // blueprint, a broken connection). Incoming webhooks queue rather than vanish, so
