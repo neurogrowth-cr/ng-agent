@@ -120,9 +120,28 @@ check('no_show is the only outcome that means they did not show', g.appointmentS
 check('no outcome implies nothing', g.appointmentStatusForOutcome(null), null);
 check('already showed → skip', R({ ghlStatus: 'showed', recording: REC }),
   { status: null, action: 'skip', reason: 'already_showed', conflict: false });
-check('GHL says noshow but REVI recorded it → CONFLICT, never flip (the Daniela Bruno case)',
-  R({ ghlStatus: 'noshow', recording: REC }),
+const CALL = Date.parse('2026-08-04T20:00:00Z');
+const AFTER = CALL + 6 * 3600e3, BEFORE = CALL - 4 * 86400e3;
+check('GHL says noshow AFTER the call but REVI recorded it → CONFLICT, never flip',
+  R({ ghlStatus: 'noshow', recording: REC, statusWrittenAtMs: AFTER, startMs: CALL }),
   { status: null, action: 'skip', reason: 'conflict_recording_vs_status', conflict: true });
+
+// GHL reuses the appointment row on reschedule, so attendance set for an
+// EARLIER booking rides onto the new date. The real Daniela Bruno row: no-show
+// logged Jul 28 for a Jul 24 call, rebooked to Aug 4, then a 74-min recording.
+// 3 of 16 post-cutover terminal statuses were stale exactly this way.
+check('attendance written BEFORE the call is a leftover — the recording wins, no conflict',
+  R({ ghlStatus: 'noshow', recording: REC, statusWrittenAtMs: BEFORE, startMs: CALL }),
+  { status: 'showed', action: 'write', reason: 'stale_status_superseded_by_recording', conflict: false });
+check('a stale `showed` is not treated as settled either (the Melina Yáñez row)',
+  R({ ghlStatus: 'showed', recording: null, statusWrittenAtMs: BEFORE, startMs: CALL }),
+  { status: null, action: 'defer', reason: 'stale_status_no_evidence', conflict: false });
+check('cancelling BEFORE a call is normal, never stale',
+  R({ ghlStatus: 'cancelled', recording: null, statusWrittenAtMs: BEFORE, startMs: CALL }),
+  { status: null, action: 'skip', reason: 'already_cancelled', conflict: false });
+check('missing timestamps fall back to trusting the status (never invent staleness)',
+  R({ ghlStatus: 'noshow', recording: null }),
+  { status: null, action: 'skip', reason: 'already_noshow', conflict: false });
 check('GHL says cancelled but REVI recorded it → conflict', R({ ghlStatus: 'cancelled', recording: REC }).conflict, true);
 check('noshow with no recording is just a skip, not a conflict', R({ ghlStatus: 'noshow', recording: null }),
   { status: null, action: 'skip', reason: 'already_noshow', conflict: false });

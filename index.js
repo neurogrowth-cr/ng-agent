@@ -7868,13 +7868,34 @@ function resolveAppointmentStatus(evidence = {}) {
   const current = String(evidence.ghlStatus || '').toLowerCase();
   const hasRecording = !!evidence.recording;
 
-  // A recording alongside a terminal status means the call happened anyway (or
-  // was cancelled after the fact). Never silently flip a human's answer.
   if (APPT_TERMINAL_STATUSES.has(current)) {
-    if (hasRecording && (current === 'noshow' || current === 'cancelled')) {
-      return { status: null, action: 'skip', reason: 'conflict_recording_vs_status', conflict: true };
+    // GHL REUSES the appointment row on reschedule, so an attendance answer
+    // set for an earlier booking rides along onto the new date. Attendance
+    // written BEFORE the call started cannot be describing that call — it is
+    // a leftover, not an answer, and must not count as dispositioned.
+    // (Cancelling before a call is normal, so `cancelled` is exempt.)
+    // Real case: Daniela Bruno — no-showed Jul 24, rebooked to Aug 4, the
+    // Jul 28 `noshow` followed her onto the Aug 4 row, and she then sat
+    // through a 74-minute recorded call. 3 of 16 post-cutover terminal
+    // statuses were stale this way, all of them rescheduled rows.
+    const staleAttendance = (current === 'showed' || current === 'noshow')
+      && Number.isFinite(evidence.statusWrittenAtMs)
+      && Number.isFinite(evidence.startMs)
+      && evidence.statusWrittenAtMs < evidence.startMs;
+
+    if (!staleAttendance) {
+      // A recording alongside a status a human set AFTER the call is a real
+      // disagreement. Never silently flip it.
+      if (hasRecording && (current === 'noshow' || current === 'cancelled')) {
+        return { status: null, action: 'skip', reason: 'conflict_recording_vs_status', conflict: true };
+      }
+      return { status: null, action: 'skip', reason: `already_${current}`, conflict: false };
     }
-    return { status: null, action: 'skip', reason: `already_${current}`, conflict: false };
+    // Stale: fall through and let the evidence below answer for the real call.
+    if (hasRecording) {
+      return { status: 'showed', action: 'write', reason: 'stale_status_superseded_by_recording', conflict: false };
+    }
+    return { status: null, action: 'defer', reason: 'stale_status_no_evidence', conflict: false };
   }
   // Cancelled / rescheduled are already answered upstream by the GHL
   // "Outcome: Cancelled" workflow → dash chain. Consume it, never re-ask.
@@ -8503,6 +8524,11 @@ async function fetchGhlAppointmentStatuses(fromMs, toMs) {
           status: String(e.appointmentStatus || e.appoinmentStatus || '').toLowerCase(),
           contactId: e.contactId || null,
           rescheduledAt: e.rescheduledAt || null,
+          // When the status was last written vs when the call actually starts —
+          // together these expose a status left over from an earlier booking of
+          // this same (reused) row.
+          statusWrittenAtMs: Date.parse(e.dateUpdated || '') || null,
+          startMs: Date.parse(e.startTime || '') || null,
         };
       }
     } catch (err) {
@@ -8580,6 +8606,8 @@ async function runAppointmentStatusSync(_correlationId) {
         recording: rec,
         cancelled: isAppointmentCancelled(appt),
         rescheduled: false, // orphans are already dropped by fetchDueSalesCalls
+        statusWrittenAtMs: ghl?.statusWrittenAtMs,
+        startMs: ghl?.startMs ?? Date.parse(appt.scheduled_start),
       });
 
       if (verdict.conflict) {
