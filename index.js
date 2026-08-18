@@ -4803,18 +4803,27 @@ async function reviGetCalendarTaxonomy() {
   for (const t of tax || []) {
     byCalendar.set(t.calendar_id, { ...t, track: t.track || groupTrack[t.group_id] || 'unknown' });
   }
-  const salesCalendarIds = new Set([...byCalendar.values()]
-    .filter(c => c.track === 'sales' && c.is_active !== false)
+  const idsForTrack = (track) => new Set([...byCalendar.values()]
+    .filter(c => c.track === track && c.is_active !== false)
     .map(c => c.calendar_id));
+  const salesCalendarIds = idsForTrack('sales');
+  // Fulfilment calls are watched for missing recordings too: an unrecorded client
+  // check-in means a CLIENT silently gets no report. That is the Jacobo Lau case
+  // (booked 2026-08-05 on the Internal-1:1-with-Ron calendar, never recorded, no
+  // report, nobody noticed). `internal` and `unknown` stay unwatched — the first
+  // is deliberately report-free, and the second has no agreed meaning yet.
+  const fulfilmentCalendarIds = idsForTrack('fulfilment');
+  const watchedCalendarIds = new Set([...salesCalendarIds, ...fulfilmentCalendarIds]);
   const syncedAt = (tax || []).map(t => t.synced_at).filter(Boolean).sort().pop() || null;
-  return { byCalendar, salesCalendarIds, groups: groups || [], syncedAt };
+  return { byCalendar, salesCalendarIds, fulfilmentCalendarIds, watchedCalendarIds, groups: groups || [], syncedAt };
 }
 
-// Sales-track appointments in a window — the input to the missing-recordings
-// check. Sourced from REVI's GHL mirror rather than portal.revops_appointments
-// because only the mirror carries the GHL appointment id the ledger joins on.
-async function reviGetSalesAppointmentsBetween(startISO, endISO, salesCalendarIds) {
-  const ids = [...(salesCalendarIds || [])];
+// Appointments on the WATCHED calendars in a window — the input to the
+// missing-recordings check. Sourced from REVI's GHL mirror rather than
+// portal.revops_appointments because only the mirror carries the GHL appointment
+// id the ledger joins on, and because dash only ingests the sales calendars.
+async function reviGetWatchedAppointmentsBetween(startISO, endISO, calendarIds) {
+  const ids = [...(calendarIds || [])];
   if (!ids.length) return [];
   const { data, error } = await reviSupabase
     .from('calendar_appointments')
@@ -5179,7 +5188,7 @@ async function _countSalesCallsSince(sinceISO) {
   return filterFlywheelAppts(appts || [], excludeIds).length;
 }
 
-// Pure: decide which sales appointments are genuinely missing a recording, and
+// Pure: decide which booked calls are genuinely missing a recording, and
 // how confidently we can say the call actually happened.
 //
 // WARMUP is the whole reason this is a function rather than three inline lines.
@@ -5362,13 +5371,13 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   try { taxonomy = await reviGetCalendarTaxonomy(); }
   catch (te) { console.warn('REVI calendar taxonomy read failed (skipping missing-recordings check):', te.message); }
 
-  if (taxonomy && taxonomy.salesCalendarIds.size) {
+  if (taxonomy && taxonomy.watchedCalendarIds.size) {
     try {
       // 90 min of grace so a call that just ended isn't flagged before Fathom
       // has published it.
       const endISO = new Date(Date.now() - 90 * 60 * 1000).toISOString();
       const startISO = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const appts = await reviGetSalesAppointmentsBetween(startISO, endISO, taxonomy.salesCalendarIds);
+      const appts = await reviGetWatchedAppointmentsBetween(startISO, endISO, taxonomy.watchedCalendarIds);
       const held = appts.filter(a => ['confirmed', 'showed'].includes(String(a.appointment_status || '').toLowerCase()));
 
       if (held.length) {
@@ -5406,21 +5415,43 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
           const { happened: confirmedHappened, ambiguous } =
             classifyMissingRecordings({ held, ledgerRows: ledger7, outcomeApptIds: [...outcomeFor] });
 
-          const byPerson = {};
-          for (const a of missing) {
-            const who = resolveSalesMember(a.assigned_user_id) || a.assigned_user_id || 'unassigned';
-            (byPerson[who] = byPerson[who] || []).push(a);
-          }
-          const lines = Object.entries(byPerson).map(([who, rows]) => {
-            const days = [...new Set(rows.map(r => String(r.start_time).slice(0, 10)))].sort().join(', ');
-            return `• *${who}* — ${rows.length} on ${days}`;
-          });
+          // Split by track: an unrecorded SALES call costs coaching and pipeline
+          // truth, an unrecorded CHECK-IN means a client silently gets no report.
+          // Different follow-up, so they must not be pooled into one number.
+          const trackOf = a => (taxonomy.byCalendar.get(a.calendar_id) || {}).track || 'unknown';
+          const groupLines = (rows) => {
+            const byPerson = {};
+            for (const a of rows) {
+              const who = resolveSalesMember(a.assigned_user_id) || a.assigned_user_id || 'unassigned';
+              (byPerson[who] = byPerson[who] || []).push(a);
+            }
+            return Object.entries(byPerson).map(([who, rs]) => {
+              const days = [...new Set(rs.map(r => String(r.start_time).slice(0, 10)))].sort().join(', ');
+              const where = [...new Set(rs.map(r => (taxonomy.byCalendar.get(r.calendar_id) || {}).calendar_name || r.calendar_id))].join(', ');
+              return `• *${who}* — ${rs.length} on ${days} (${where})`;
+            });
+          };
+          const salesMissing = missing.filter(a => trackOf(a) === 'sales');
+          const fulfilMissing = missing.filter(a => trackOf(a) === 'fulfilment');
 
           alertKinds.push('missing-recordings');
           missingApptIds.push(...missing.map(a => a.ghl_appointment_id));
-          const parts = [`🎥 *${missing.length} sales appointment(s) have no Fathom recording.*`, lines.join('\n')];
+          const parts = [`🎥 *${missing.length} booked call(s) have no Fathom recording.*`];
+          if (salesMissing.length) {
+            parts.push(`*Sales — ${salesMissing.length}:*\n` + groupLines(salesMissing).join('\n'));
+          }
+          if (fulfilMissing.length) {
+            parts.push(
+              `*Fulfilment — ${fulfilMissing.length}:* a client check-in with no recording means that client gets NO report and nobody finds out.\n`
+              + groupLines(fulfilMissing).join('\n'));
+          }
           if (confirmedHappened.length) {
             parts.push(`${confirmedHappened.length} of these have a logged outcome (or are marked \`showed\`) — those calls demonstrably happened, so the recording is genuinely missing. Check whether the recorder joined.`);
+          }
+          if (fulfilMissing.length && !confirmedHappened.length) {
+            // Outcomes only exist for sales calls, so a fulfilment miss can never
+            // be corroborated that way. Say so rather than implying it was checked.
+            parts.push('Fulfilment bookings carry no sales outcome to corroborate against, so those stay ambiguous until someone confirms the call happened.');
           }
           if (ambiguous.length) {
             parts.push(`${ambiguous.length} have no logged outcome. GHL still shows them \`confirmed\`, but in this location that is the BOOKING status — set at booking time and rarely updated — so it cannot tell an unrecorded call from an unmarked no-show. Logging the outcome resolves it either way.`);

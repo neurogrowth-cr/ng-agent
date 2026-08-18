@@ -1,8 +1,11 @@
 // Tests the missing-recordings divergence check.  Run:  node test/revi-missing-recordings.test.js
 //
-// The gap this closes: on 2026-08-17 closer Jose Carranza had 4 confirmed sales
-// appointments and Fathom recorded ZERO. Nothing compared bookings against
-// recordings, so nothing fired and nobody noticed until Ron asked.
+// The gap this closes, in both directions:
+//   SALES  — 2026-08-17, closer Jose Carranza had 4 confirmed appointments and
+//            Fathom recorded ZERO. Nothing fired; nobody noticed until Ron asked.
+//   FULFIL — 2026-08-05, the "Jacobo Lau" client check-in was booked and never
+//            recorded, so that client got no report and nobody found out.
+// Nothing compared bookings against recordings, in either track.
 //
 // The two ways this check can be WORSE than useless:
 //   1. Firing on cold start. revi.call_ledger is empty on the deploy that
@@ -17,7 +20,7 @@ const path = require('path');
 
 const SRC = fs.readFileSync(process.argv[2] || path.join(__dirname, '..', 'index.js'), 'utf8');
 const block = SRC.slice(
-  SRC.indexOf('// Pure: decide which sales appointments are genuinely missing'),
+  SRC.indexOf('// Pure: decide which booked calls are genuinely missing'),
   SRC.indexOf('// END REVI CROSS-CHECK PURE HELPERS'),
 );
 const { classifyMissingRecordings } = new Function(`${block}; return { classifyMissingRecordings };`)();
@@ -89,6 +92,30 @@ check('`showed` with no recording is asserted, not hedged',
     held: [appt('X', '2026-08-17T17:00:00+00', 'showed')], ledgerRows: LEDGER,
   }).happened.map(a => a.ghl_appointment_id),
   ['X']);
+
+// 8. FULFILMENT is watched too. The Jacobo Lau case: a client check-in booked on
+//    2026-08-05 that was never recorded — so that client got no report and
+//    nobody found out. Sales-only scoping would still miss it today.
+check('a fulfilment check-in with no recording is flagged, not ignored',
+  classifyMissingRecordings({
+    held: [{ ghl_appointment_id: 'lml3p5rsQZWKx9hXZify', start_time: '2026-08-05T20:30:00+00',
+             appointment_status: 'confirmed', calendar_id: 'rRh3CZnC4DlF3Fo1HqXq',
+             assigned_user_id: 'zoGW530iDnPOFqQNfssc' }],
+    ledgerRows: [{ call_date: '2026-08-05T00:00:00+00', ghl_appointment_id: 'other' }],
+  }).missing.map(a => a.ghl_appointment_id),
+  ['lml3p5rsQZWKx9hXZify']);
+
+// 9. ...and it stays AMBIGUOUS: revops_sales_outcomes only covers sales calls, so
+//    a fulfilment miss can never be corroborated that way. The alert must not
+//    imply it checked something it cannot check.
+check('a fulfilment miss cannot be corroborated by a sales outcome',
+  (() => { const r = classifyMissingRecordings({
+      held: [{ ghl_appointment_id: 'lml3p5rsQZWKx9hXZify', start_time: '2026-08-05T20:30:00+00',
+               appointment_status: 'confirmed', calendar_id: 'rRh3CZnC4DlF3Fo1HqXq' }],
+      ledgerRows: [{ call_date: '2026-08-05T00:00:00+00', ghl_appointment_id: 'other' }],
+      outcomeApptIds: [] });
+    return [r.happened.length, r.ambiguous.length]; })(),
+  [0, 1]);
 
 let failed = 0;
 for (const c of cases) {
