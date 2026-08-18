@@ -8468,6 +8468,18 @@ const EMAIL_TO_GHL_USER_ID = {
 };
 
 const LEAD_CHANNEL_ID = 'C0AJANQBYUE'; // #ng-sales-goats
+
+// ─── SELF-SERVE (VSL / landing page) LEADS ───────────────────────────────────
+// Prospects who book themselves off the VSL land on their own calendar. Nobody
+// set them, so they must NOT go out as a claimable lead card: a setter reacting
+// ✋ takes ownership of an organic booking and the setter/leaderboard numbers
+// stop being true. These get an FYI threaded under the Make booking card instead.
+const SELF_SERVE_CALENDAR_ID = 'HXLeEjxpa0gdiTPNiAzc'; // "LinkedIn Flywheel - Self Serving"
+const SELF_SERVE_SOURCE_RE   = /self[\s._-]?serv/i;
+// The Make booking card lands ~16s after the booking, but ordering vs. this
+// webhook is not guaranteed — wait it out before looking for the parent post.
+const SELF_SERVE_FYI_DELAY_MS = 90 * 1000;
+
 const LEAD_CLAIM_EMOJIS = new Set(['raised_hand', 'hand', 'white_check_mark', 'heavy_check_mark']);
 const LEAD_CLAIMED_EMOJI = 'white_check_mark';
 
@@ -8530,6 +8542,31 @@ function formatPhoneDisplay(cc, national) {
   return `+${cc}${national}`;
 }
 
+// Post the self-serve FYI as a thread reply under the Make booking card for the
+// same contact. Falls back to a top-level post when no parent is found, so the
+// lead is never silently swallowed. Returns the ts the lead was recorded under.
+async function postSelfServeLeadFyi({ text, contactId, correlationId }) {
+  let threadTs = null;
+  try {
+    const history = await slack.client.conversations.history({ channel: LEAD_CHANNEL_ID, limit: 30 });
+    const parent = (history.messages || []).find(m =>
+      typeof m.text === 'string' && m.text.includes(`/contacts/detail/${contactId}`) && !m.thread_ts);
+    if (parent) threadTs = parent.ts;
+  } catch (histErr) {
+    console.error('self-serve FYI: history lookup failed:', histErr.message);
+  }
+  const posted = await slack.client.chat.postMessage({
+    channel: LEAD_CHANNEL_ID,
+    text,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+  });
+  logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: LEAD_CHANNEL_ID, output: { text: text.slice(0, 2000) }, correlation_id: correlationId });
+  console.log(threadTs
+    ? `self-serve FYI threaded under booking card ${threadTs} (contact ${contactId})`
+    : `self-serve FYI posted top-level — no booking card found for contact ${contactId}`);
+  return threadTs || posted.ts;
+}
+
 async function handleGHLWebhook(req, res) {
   // Auth check — reject requests that don't include the correct secret header
   // Set GHL_WEBHOOK_SECRET in env vars and configure GHL to send it as x-ghl-secret
@@ -8576,11 +8613,19 @@ async function handleGHLWebhook(req, res) {
         const leadContext = cd.context || payload.context || '';
 
         let resolvedAssignedTo = assignedTo;
-        if (!resolvedAssignedTo && contactId) {
+        // Fetched once and reused: the webhook payload alone can't tell us whether
+        // this lead booked itself (self-serve) — the contact's source/attribution can.
+        let ghlContact = null;
+        if (contactId) {
           try {
-            const contactRes  = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } });
+            const contactRes = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } });
             const contactData = await contactRes.json();
-            const assignedUser = contactData.contact?.assignedTo || contactData.assignedTo || '';
+            ghlContact = contactData.contact || contactData || null;
+          } catch (apiErr) { console.error('GHL contact lookup error:', apiErr.message); }
+        }
+        if (!resolvedAssignedTo && ghlContact) {
+          try {
+            const assignedUser = ghlContact.assignedTo || '';
             if (assignedUser) {
               try {
                 const usersRes  = await fetch(`https://services.leadconnectorhq.com/users/?locationId=${process.env.GHL_LOCATION_ID}`, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } });
@@ -8593,8 +8638,18 @@ async function handleGHLWebhook(req, res) {
               if (displayName) resolvedAssignedTo = displayName;
               console.log(`GHL resolved assignedTo: ${resolvedAssignedTo}`);
             }
-          } catch (apiErr) { console.error('GHL contact lookup error:', apiErr.message); }
+          } catch (apiErr) { console.error('GHL assignedTo resolve error:', apiErr.message); }
         }
+
+        // Self-serve = booked straight off the VSL/landing page. Three independent
+        // signals because each one alone has a hole: the webhook source is missing
+        // on some payloads, and a contact created long before the VSL launched keeps
+        // its original source but still books on the self-serve calendar.
+        const attributionMediumIds = [ghlContact?.attributionSource?.mediumId, ghlContact?.lastAttributionSource?.mediumId].filter(Boolean);
+        const isSelfServe = SELF_SERVE_SOURCE_RE.test(sourceRaw || '')
+          || SELF_SERVE_SOURCE_RE.test(ghlContact?.source || '')
+          || attributionMediumIds.includes(SELF_SERVE_CALENDAR_ID);
+        if (isSelfServe) console.log(`GHL lead ${contactId} detected as SELF-SERVE (source="${sourceRaw}", contactSource="${ghlContact?.source || ''}") — no setter DM, no claim card`);
 
         console.log('GHL parsed:', { fullName, email, phone, source, assignedTo: resolvedAssignedTo, contactId });
 
@@ -8724,13 +8779,45 @@ async function handleGHLWebhook(req, res) {
           return;
         }
 
+        const ghlCorr = newCorrelationId();
+
+        // Self-serve: the prospect already booked, so there is nothing to claim and
+        // no setter to brief. Announce it as a thread reply on the booking card.
+        if (isSelfServe) {
+          const fyiText = [
+            `🌱 *Self-serve (orgánico)* — ${fullName} agendó por su cuenta desde el VSL. Sin setter, no hay nada que reclamar.`,
+            email        ? `📧 ${email}` : null,
+            phoneDisplay ? `📱 ${phoneDisplay}` : null,
+            contactId    ? `🔗 ${ghlLink}` : null,
+          ].filter(Boolean).join('\n');
+          setTimeout(async () => {
+            try {
+              const ts = await postSelfServeLeadFyi({ text: fyiText, contactId, correlationId: ghlCorr });
+              if (contactId && ts) {
+                await supabase.from('lead_posts').upsert({
+                  contact_id: contactId,
+                  slack_message_ts: ts,
+                  slack_channel_id: LEAD_CHANNEL_ID,
+                  phone_last10: phoneLast10,
+                  email_lower: emailLower,
+                  source: source || null,
+                  full_name: fullName || null,
+                  name_prefix3: namePrefix3,
+                }, { onConflict: 'contact_id' });
+              }
+            } catch (fyiErr) {
+              console.error('self-serve FYI post failed:', fyiErr.message);
+            }
+          }, SELF_SERVE_FYI_DELAY_MS);
+          return;
+        }
+
         const setterSlackId = resolveSetterSlackId(resolvedAssignedTo);
         const contextLine = leadContext ? `\n- Context: ${leadContext}` : '';
         const actionGuidance = leadContext
           ? `Their first action should reflect the Context above (e.g. if it mentions booking friction, the setter should call/DM the lead now to unblock the booking, not just "reach out").`
           : `Their first action (reach out now, check GHL).`;
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}${contextLine}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. ${actionGuidance} Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
-        const ghlCorr = newCorrelationId();
         const tGhl = Date.now();
         const briefingResponse = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
         logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr);
