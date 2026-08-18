@@ -5770,6 +5770,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'get_revi_intelligence', description: "Query REVI (the sales-call coaching + leadership-initiative agent) data. Topics: 'coaching' = per-closer scores, outcomes, and latest coaching focus (query = optional closer name); 'initiatives' = open leadership initiatives from Win Da Week / Management Sync / Product Sync meetings, with owners, next steps, and days stalled; 'deals' = recent won/lost deals with loss reasons and pattern tags; 'prospect' = REVI's scored calls + buying signals for one prospect (query = email or name, required); 'scoreboard' = all-closer comparison. Use for any question about call coaching, closer performance quality, why deals are lost, or what initiatives are open/stalled. RON-ONLY — for team-accessible client call summaries use get_revi_client_context.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'coaching | initiatives | deals | prospect | scoreboard' }, query: { type: 'string', description: 'Prospect email/name (topic=prospect) or closer name (topic=coaching). Optional otherwise.' }, days: { type: 'number', description: 'Lookback window in days. Defaults: coaching 14, deals 30, scoreboard 7.' } }, required: ['topic'] } },
           { name: 'get_revi_client_context', description: "Query REVI's client-facing call intelligence — open to the whole team. Topics: 'calls' = quicksync + activation-call report summaries (what was reviewed, conclusions, risks, health status, session number, PDF + recording links), auto-ingested from Fathom recordings — use for 'what was discussed with client X', 'how did the last MINDLIFT quicksync go', 'when was client X's activation call reviewed'; 'roster' = REVI's client list with status. Coaching teardowns, call scores, deal transcripts, and leadership initiatives are NOT here — those are Ron-only via get_revi_intelligence.", input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'calls | roster' }, client: { type: 'string', description: 'Optional client-name fragment (aliases resolve automatically).' }, days: { type: 'number', description: 'topic=calls lookback window in days, default 60.' } }, required: ['topic'] } },
           { name: 'query_metric_history', description: 'Return the time series for a tracked metric so the user can see trend, baseline, and recent observations. Use when someone asks "show me CPL over the last 30 days" or "how has close rate trended?". Available metrics: meta_cpl_today, close_rate_yesterday, setter_calls_booked_yest, phase0_to_phase1_conv_7d, phase1_cycle_days_p50, phase2_cycle_days_p50, day7_at_risk_count, ghl_response_time_p50_min.', input_schema: { type: 'object', properties: { metric: { type: 'string', description: 'Exact metric name from the registry.' }, days: { type: 'number', description: 'Window of history to return, default 30, max 90.' } }, required: ['metric'] } },
+          { name: 'set_appointment_status', description: "Set a call's ATTENDANCE (Showed / No-Show / Cancelled) on the GHL appointment — this is Paso 1, separate from the deal outcome. Use ONLY when a human answers Max's '❔ did they show?' question, or states attendance in their own words ('she never showed', 'that one got cancelled'). Max normally sets Showed automatically from a REVI recording, so this tool exists for the calls REVI could not read. NEVER call it from your own inference. Setting the deal outcome (won/lost/no fit/open deal) is log_call_outcome instead — do not confuse the two.", input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Prospect email (preferred) or name fragment.' }, date: { type: 'string', description: 'Optional call date YYYY-MM-DD (CR time) to disambiguate multiple calls.' }, status: { type: 'string', enum: ['showed', 'noshow', 'cancelled'], description: 'The attendance the human stated.' } }, required: ['prospect', 'status'] } },
           { name: 'draft_outbound_email', description: "Use this when a setter/closer asks you to send a NEW email on their behalf to a client (proposals, follow-ups, scheduling). Conversationally collect to + subject + body first (cc optional). Do NOT call this tool until you have all three required fields. Once called, the draft is shown to the setter for review, then routed to Ron for final approval before sending from ronny.duarte@neurogrowth.io with Ron's signature. Always confirm field values back to the user before drafting so they can correct typos. Mirror the user's language (English/Spanish) in your conversation.", input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Recipient email address.' }, subject: { type: 'string', description: 'Email subject line.' }, body: { type: 'string', description: 'Email body in the language the setter dictated. Plaintext only — no markdown, no HTML.' }, cc: { type: 'string', description: 'Optional comma-separated cc recipients.' }, contact_name: { type: 'string', description: 'Optional contact display name for context.' } }, required: ['to','subject','body'] } },
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
           { name: 'make_list_dlqs', description: 'List the incomplete executions (DLQ) queued on a Make scenario: id, when it failed, and the error reason. Read-only. Use this before make_get_dlq. Incomplete executions are runs that errored and piled up while Make still reports the scenario as active.', input_schema: { type: 'object', properties: { scenario_id: { type: 'string', description: 'Make scenario id, e.g. 5148796' }, limit: { type: 'number', description: 'Default 10, max 25.' } }, required: ['scenario_id'] } },
@@ -5823,6 +5824,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'get_sales_intelligence') result = await getSalesIntelligence(toolUse.input.query);
         else if (toolUse.name === 'closer_monthly_scorecard') result = await getCloserMonthlyScorecard(toolUse.input.month, toolUse.input.closer);
         else if (toolUse.name === 'log_call_outcome')       result = await logCallOutcomeTool(toolUse.input);
+        else if (toolUse.name === 'set_appointment_status') result = await setAppointmentStatusTool(toolUse.input);
         else if (toolUse.name === 'create_notion_task')     result = await createNotionTask(toolUse.input.title, toolUse.input.taskType || 'operational', toolUse.input.priority || 'P2 - Growth & Scalability', toolUse.input.dueDate, toolUse.input.notes, toolUse.input.customer);
         else if (toolUse.name === 'create_scheduled_task')  result = await createScheduledTask(toolUse.input.name, toolUse.input.schedule, toolUse.input.prompt, toolUse.input.channel, userId);
         else if (toolUse.name === 'list_scheduled_tasks')   result = await listScheduledTasks();
@@ -7644,15 +7646,387 @@ function nextProspectStatusForOutcome(outcome, current) {
   return null;
 }
 
-// REVI deal_outcome → outcome Max may PROPOSE for one-tap confirmation.
-// `won` is deliberately absent: a verbal close is not a payment — the closer
-// must type `won <amount>` themselves. `pending` = REVI has no read.
-const REVI_PROPOSABLE = { stall: 'follow_up', lost: 'lost' };
-function proposalFromReviRead(dealOutcome) {
-  const d = String(dealOutcome || '').toLowerCase();
-  if (REVI_PROPOSABLE[d]) return { outcome: REVI_PROPOSABLE[d], wonHint: false };
-  if (d === 'won') return { outcome: null, wonHint: true };
-  return { outcome: null, wonHint: false };
+// ─── GHL VOCABULARY CONTRACT ─────────────────────────────────────────────────
+// Closers act on the GHL opportunity card, so Max must speak its stage names —
+// never the internal enum. The two pipelines are NOT symmetric: VSL merges
+// Lost and No Fit into one stage, so on a VSL call Max must not offer a
+// distinction the closer physically cannot set. Stage ids from
+// ghl_pipelines_list (verified 2026-08-18); the Appointment Setting ids are the
+// same ones already listed in APPT_PIPELINE_STAGE_LABELS.
+const GHL_PIPELINE = {
+  APPT_SETTING: 'KH1IQuaN8aNB1lfRpvP4',
+  VSL:          '7KU0NBdMhhVifszmT9jo',
+};
+const GHL_OUTCOME_STAGES = {
+  [GHL_PIPELINE.APPT_SETTING]: {
+    follow_up:    { id: '63d30181-4ec0-4daa-8832-a8eebe1afbeb', label: 'Open Deal' },
+    won:          { id: 'a6c8ecb1-a9b5-46a5-8683-f6a9720cfcc9', label: 'Closed' },
+    disqualified: { id: '49cd4227-204c-4052-af94-78b961e96fab', label: 'No Fit' },
+    lost:         { id: '8eff3fbb-3cc0-474f-bbe7-df4704e0a668', label: 'Lost' },
+    no_show:      { id: '6432cf1d-a07f-4276-8b85-77de2e57a512', label: 'No show / Rescheduling' },
+  },
+  [GHL_PIPELINE.VSL]: {
+    follow_up:    { id: '1134d60f-d2c3-43d1-81bd-6c113b46b693', label: 'Follow up - Open Deal' },
+    won:          { id: '8bf0b768-b9f8-481c-b423-48893976033c', label: 'Won / Closed' },
+    // Both map to the SAME stage — VSL has no Lost-vs-No-Fit distinction.
+    disqualified: { id: '2efc59ef-2fd2-4370-aed4-ed79480c07c6', label: 'Lost / No Fit' },
+    lost:         { id: '2efc59ef-2fd2-4370-aed4-ed79480c07c6', label: 'Lost / No Fit' },
+    no_show:      { id: 'd83e3213-e24b-40c4-b42c-7d0eb69ea37d', label: 'No-Show / Rescheduling' },
+  },
+};
+// The GHL stage for an outcome, or null when the pipeline is unknown (never
+// guess a stage id — a wrong PUT moves a real card).
+function outcomeStageFor(pipelineId, outcome) {
+  return (GHL_OUTCOME_STAGES[pipelineId] || {})[outcome] || null;
+}
+// Stages that represent a finished deal. A card a human already closed out is
+// never reopened by an automated move.
+const GHL_TERMINAL_STAGE_IDS = new Set(
+  Object.values(GHL_OUTCOME_STAGES).flatMap(s => [s.won.id, s.disqualified.id, s.lost.id]),
+);
+// The distinct actions a closer can be offered on this pipeline. On VSL,
+// lost and disqualified collapse to one button because they are one stage.
+// no_show is included: it is the one attendance answer Max cannot derive, and
+// folding it into the outcome card is what lets Paso 1 disappear entirely.
+function outcomeActionsFor(pipelineId) {
+  const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  const seen = new Set();
+  return ['follow_up', 'lost', 'disqualified', 'no_show'].filter((o) => {
+    const s = stages[o];
+    if (!s || seen.has(s.id)) return false;
+    seen.add(s.id);
+    return true;
+  }).map(o => ({ outcome: o, label: stages[o].label, say: OUTCOME_REPLY_TOKEN[o] }));
+}
+// What the closer types. Kept short and stable across pipelines — the stage
+// LABEL can be "No show / Rescheduling", which nobody is going to type.
+const OUTCOME_REPLY_TOKEN = {
+  follow_up: 'open deal', lost: 'lost', disqualified: 'no fit', no_show: 'no show', won: 'won',
+};
+
+// ─── REVI EVIDENCE → OUTCOME PROPOSAL ────────────────────────────────────────
+// REVI's `deal_outcome` column is 4-valued and 118 of 130 calls sit in two of
+// them (stall 91, pending 27), so reading it alone collapses ~70% of calls to
+// "follow up". The real signal is coaching_json.deal.status (alive/dead) plus
+// icp_fit, which is what separates a No Fit from a Lost.
+// prospect_signals is an object on 129 of 130 rows and a double-encoded JSON
+// string on one — parse defensively rather than silently rendering nothing.
+function parseReviSignals(raw) {
+  let v = raw;
+  for (let i = 0; i < 2 && typeof v === 'string'; i += 1) {
+    try { v = JSON.parse(v); } catch (_) { return {}; }
+  }
+  if (Array.isArray(v)) v = v[0];
+  return (v && typeof v === 'object') ? v : {};
+}
+
+const REVI_LOW_ICP = /^\s*(bajo|low)\b/i;
+
+// Tier 1 — the rule tier. Only these earn a one-tap ✅; everything softer is
+// shown as a read the closer must type. `won` is NEVER proposable: a verbal
+// close is not a payment, so the closer types `won <amount>` themselves.
+// Returns { outcome, confidence, wonHint, revenueHint, rule }.
+function computeOutcomeProposal(evidence = {}) {
+  const rec = evidence.recording;
+  const dealStatus = String(evidence.dealStatus || '').toLowerCase();
+  const dealOutcome = String(rec?.dealOutcome || '').toLowerCase();
+  const funnelClass = String(evidence.funnelClass || '').toLowerCase();
+  const cash = Number(evidence.cashCollected);
+  // GHL stage evidence stands on its own — the closer moved that card by hand,
+  // so it is worth reading even when REVI never saw the call.
+
+  // A close signal from ANY source is a hint, never a proposal.
+  if (dealOutcome === 'won' || funnelClass === 'won' || Number.isFinite(cash) && cash > 0) {
+    return {
+      outcome: null, confidence: 'high', wonHint: true,
+      revenueHint: Number.isFinite(cash) && cash > 0 ? cash : null,
+      rule: funnelClass === 'won' ? 'ghl_stage_won' : 'revi_won',
+    };
+  }
+  // GHL's own pipeline already says the deal died — the strongest evidence there is.
+  if (funnelClass === 'lost') {
+    return { outcome: 'lost', confidence: 'high', wonHint: false, revenueHint: null, rule: 'ghl_stage_lost' };
+  }
+  // The closer moved the card to "No show / Rescheduling" themselves — good
+  // evidence, but that stage deliberately merges two different answers, and a
+  // reschedule is NOT a no-show. Propose it, make them confirm by typing.
+  if (funnelClass === 'noshow') {
+    return { outcome: 'no_show', confidence: 'medium', wonHint: false, revenueHint: null, rule: 'ghl_stage_noshow' };
+  }
+  if (dealStatus === 'dead') {
+    return REVI_LOW_ICP.test(String(evidence.icpFit || ''))
+      ? { outcome: 'disqualified', confidence: 'high', wonHint: false, revenueHint: null, rule: 'revi_dead_low_icp' }
+      : { outcome: 'lost',         confidence: 'high', wonHint: false, revenueHint: null, rule: 'revi_dead' };
+  }
+  if (dealStatus === 'alive') {
+    // The safe outcome: non-terminal, and nextProspectStatusForOutcome refuses
+    // to regress or to leave a terminal status, so a wrong tap costs little.
+    return { outcome: 'follow_up', confidence: 'high', wonHint: false, revenueHint: null, rule: 'revi_alive' };
+  }
+  // A recording exists but REVI has no deal read — still worth a card, but the
+  // closer types the answer.
+  if (rec) return { outcome: null, confidence: 'low', wonHint: false, revenueHint: null, rule: 'recording_only' };
+  return { outcome: null, confidence: 'none', wonHint: false, revenueHint: null, rule: 'no_evidence' };
+}
+
+// Renders one outcome card. Pure — callers pass pre-formatted strings — so the
+// exact copy a closer sees is asserted in tests. `pipelineId` decides the
+// vocabulary: the card must never name a stage this prospect's card does not
+// have (VSL has no separate Lost vs No Fit).
+function buildOutcomeCardText({ prospectName, whenStr, heldDays, rec, proposal, funnel, pipelineId, nudgeCount }) {
+  const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  const lines = [`📋 *${prospectName}* — ${whenStr} CR — held ${heldDays}d ago${nudgeCount > 1 ? ` · nudged ${nudgeCount}×` : ''}`];
+
+  if (rec) {
+    const dur = rec.durationMin ? `${rec.durationMin} min` : 'recorded';
+    const score = rec.score != null ? `, score ${rec.score}/100` : '';
+    lines.push(`✅ Marked *Showed* automatically — REVI recorded ${dur}${score}${rec.url ? ` <${rec.url}|↗>` : ''}`);
+  } else {
+    lines.push('❔ No REVI recording found for this call.');
+  }
+
+  const sig = rec?.signals || {};
+  const evidence = [rec?.dealRecovery, sig.objection_type, sig.stated_timeline]
+    .map(s => String(s || '').trim()).filter(Boolean)[0];
+  if (evidence) lines.push(`🧠 ${truncateOneLine(evidence, 340)}`);
+  const sigBits = [
+    sig.buying_signal_strength && `buying signal: ${sig.buying_signal_strength}`,
+    rec?.icpFit && `ICP fit: ${truncateOneLine(rec.icpFit, 90)}`,
+  ].filter(Boolean);
+  if (sigBits.length) lines.push(`🔎 ${sigBits.join(' · ')}`);
+
+  if (funnel?.to_stage_name) {
+    lines.push(`📊 GHL: ${funnel.to_stage_name}${funnel.detected_on ? ` since ${funnel.detected_on}` : ''}`);
+  }
+
+  // Actions. `won` is never a reaction — the closer types the real amount.
+  const wonLabel = stages.won.label;
+  const alt = outcomeActionsFor(pipelineId)
+    .filter(a => a.outcome !== proposal.outcome)
+    .map(a => `\`${a.say}\``)
+    .join(' / ');
+  if (proposal.wonHint) {
+    const amt = proposal.revenueHint ? ` (REVI heard $${proposal.revenueHint})` : '';
+    lines.push('');
+    lines.push(`🎉 This sounded like a close${amt} — I never log *${wonLabel}* on my own.`);
+    lines.push(`→ Reply \`won <amount>\` once the money is real · or ${alt} if it landed differently.`);
+  } else if (proposal.outcome && proposal.confidence === 'high') {
+    const target = stages[proposal.outcome];
+    lines.push('');
+    lines.push(`→ ✅ move to *${target.label}* · ❌ dismiss · \`won <amount>\` · or ${alt}`);
+  } else if (proposal.outcome) {
+    // Good evidence, but not good enough for one tap — show the read and make
+    // the closer type it, so an ambiguous stage can't rubber-stamp a metric.
+    const target = stages[proposal.outcome];
+    lines.push('');
+    lines.push(`→ Looks like *${target.label}*, but I'm not certain enough to log it on a tap.`);
+    lines.push(`   Reply \`${OUTCOME_REPLY_TOKEN[proposal.outcome]}\` to confirm · \`won <amount>\` · or ${alt}`);
+  } else {
+    lines.push('');
+    lines.push(`→ I can't tell from here. Reply \`won <amount>\` · ${alt || `\`${OUTCOME_REPLY_TOKEN.follow_up}\``}`);
+  }
+  return lines.join('\n');
+}
+
+// Collapse a multi-line REVI narrative into one readable Slack line. REVI's
+// coaching_json survives a round of JSON escaping, so the text arrives with
+// LITERAL backslash-n sequences as well as real newlines — strip both, or the
+// card renders "...jueves.\n\nPlan de recuperación:" verbatim to the closer.
+function truncateOneLine(s, max) {
+  const flat = String(s || '')
+    .replace(/\\r\\n|\\n|\\r/g, ' ')
+    .replace(/\s*[\r\n]+\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+}
+
+// ─── REVI PROSPECT NOTE (GHL) ────────────────────────────────────────────────
+// The same read that powers the closer's outcome card, written as a note on
+// the GHL contact so the WHOLE sales team sees it where they already work —
+// setters place their pre-call notes on the same surface. Pure builder; the
+// sweep that posts it lives with the other crons. Spanish on purpose: REVI's
+// narratives are Spanish and so is the team.
+function buildReviProspectNote(rec, { callDateStr } = {}) {
+  if (!rec) return null;
+  const lines = ['🧠 REVI — lectura de la llamada'];
+  const meta = [
+    callDateStr && `📅 ${callDateStr}`,
+    rec.durationMin && `${rec.durationMin} min`,
+    rec.score != null && `score ${rec.score}/100`,
+  ].filter(Boolean).join(' · ');
+  if (meta) lines.push(meta);
+
+  const st = String(rec.dealStatus || '').toLowerCase();
+  if (st) lines.push(`Estado del deal: ${st === 'alive' ? 'VIVO' : st === 'dead' ? 'MUERTO' : st}`);
+
+  const sig = rec.signals || {};
+  if (sig.buying_signal_strength) lines.push(`Señal de compra: ${sig.buying_signal_strength}`);
+  if (sig.objection_type)      lines.push(`Objeción: ${truncateOneLine(sig.objection_type, 300)}`);
+  if (sig.stated_timeline)     lines.push(`Timeline: ${truncateOneLine(sig.stated_timeline, 200)}`);
+  if (sig.stated_budget_fit)   lines.push(`Presupuesto: ${truncateOneLine(sig.stated_budget_fit, 250)}`);
+  if (sig.decision_maker_status) lines.push(`Decisor: ${truncateOneLine(sig.decision_maker_status, 250)}`);
+  if (rec.icpFit)              lines.push(`ICP fit: ${truncateOneLine(rec.icpFit, 200)}`);
+  if (rec.dealRecovery)        lines.push(`\nPróximos pasos:\n${truncateOneLine(rec.dealRecovery, 900)}`);
+  if (rec.url)                 lines.push(`\n🎙 Grabación: ${rec.url}`);
+  lines.push('\n(Generado por REVI a partir de la grabación — verificar antes de citar al prospecto.)');
+  return lines.join('\n');
+}
+
+// Posts one REVI note per scored call, once ever (agent_knowledge
+// `revi-note:{fathom_recording_id}`). Sweeps recent closer_call_scores and
+// resolves the GHL contact via the portal prospect's email. Ships in dry-run:
+// REVI_NOTES_MODE=live arms it, and is the kill switch.
+async function runReviProspectNotesSync(_correlationId) {
+  const dryRun = process.env.REVI_NOTES_MODE !== 'live';
+  console.log(`Running REVI prospect-notes sync (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
+  const tally = { candidates: 0, posted: 0, noContact: 0, failed: 0 };
+  try {
+    const sinceIso = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const { data: scores } = await reviSupabase
+      .from('closer_call_scores')
+      .select('fathom_recording_id, prospect_email, prospect_name, call_date, duration_min, overall_score, recording_url, prospect_signals, coaching_json')
+      .gte('call_date', sinceIso);
+    const rows = (scores || []).filter(s => s.fathom_recording_id && s.prospect_email);
+    if (!rows.length) { console.log('REVI prospect-notes: nothing scored in window.'); return tally; }
+
+    for (const s of rows) {
+      const noteKey = `revi-note:${s.fathom_recording_id}`;
+      const { data: done } = await supabase.from('agent_knowledge').select('value').eq('key', noteKey).limit(1);
+      if (done && done.length) continue;
+      tally.candidates += 1;
+
+      const { data: prospects } = await portalSupabase
+        .from('revops_prospects')
+        .select('id, ghl_contact_id, full_name')
+        .ilike('email', s.prospect_email)
+        .limit(1);
+      const contactId = prospects?.[0]?.ghl_contact_id;
+      if (!contactId) {
+        tally.noContact += 1;
+        console.log(`REVI prospect-notes: no GHL contact for ${s.prospect_email} — skipped.`);
+        continue;
+      }
+
+      const coaching = s.coaching_json || {};
+      const deal = typeof coaching.deal === 'string'
+        ? (() => { try { return JSON.parse(coaching.deal); } catch (_) { return {}; } })()
+        : (coaching.deal || {});
+      const note = buildReviProspectNote({
+        durationMin: s.duration_min == null ? null : Math.round(Number(s.duration_min)),
+        score: s.overall_score == null ? null : Number(s.overall_score),
+        url: s.recording_url || null,
+        signals: parseReviSignals(s.prospect_signals),
+        dealStatus: deal.status || null,
+        dealRecovery: deal.recovery || null,
+        icpFit: coaching.icp_fit || null,
+      }, { callDateStr: formatICTime(s.call_date, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) });
+      if (!note) continue;
+
+      if (dryRun) {
+        console.log(`[dry-run] would post REVI note for ${s.prospect_name || s.prospect_email} (${note.length} chars) on contact ${contactId}`);
+        tally.posted += 1;
+        continue;
+      }
+      try {
+        const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: note }),
+        });
+        if (!res.ok) throw new Error(`note POST → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+        await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}`, 'revi-note');
+        tally.posted += 1;
+        console.log(`REVI note posted for ${s.prospect_name || s.prospect_email}`);
+      } catch (postErr) {
+        tally.failed += 1;
+        console.error(`REVI note for ${s.prospect_email} failed:`, postErr.message);
+      }
+    }
+    const verdict = tally.failed
+      ? `⚠️ ISSUES — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}, failures ${tally.failed}`
+      : `✅ ALL GREEN — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}`;
+    console.log(`REVI prospect-notes sync complete. ${verdict}`);
+    return tally;
+  } catch (err) {
+    console.error('REVI prospect-notes sync error:', err.message);
+    return tally;
+  }
+}
+
+// ─── APPOINTMENT STATUS (Paso 1) ─────────────────────────────────────────────
+// Show/no-show is a FACT, not a judgment, and closers were logging it ~2% of
+// the time (40 of 44 August appointments still sat at the default `confirmed`).
+// REVI knows the answer: a scored recording is positive proof the call happened.
+// The inverse does NOT hold — REVI can fail to join — so absence is never
+// treated as a no-show; it is the one case that reaches a human.
+// Measured over every post-cutover call a human judged (2026-08-18):
+//   REVI recording + held   = 16      REVI recording + no-show = 0
+//   no recording  + held    = 25      no recording  + no-show  = 2
+// So a recording PROVES a show — not one no-show has ever had one — but its
+// absence proves nothing: 25 of 27 recording-less calls were actually held.
+// REVI covers ~39% of held calls today. That asymmetry is the whole design:
+// write `showed` on proof, and never ask a separate "did they show?" question,
+// which would have fired on ~60% of calls and just recreated the SOP in Slack.
+// Attendance for the rest is DEFERRED to the outcome card — a closer who says
+// `lost` or `open deal` has told us the call happened, and `no show` sets both.
+//
+// Resolution cascade, in order. Pure: callers supply the evidence.
+// Returns { status, action, reason, conflict }.
+//   action 'skip'  — already dispositioned or not ours to answer
+//   action 'write' — Max PUTs this status to GHL
+//   action 'defer' — unknowable from data; the outcome card will settle it
+const APPT_TERMINAL_STATUSES = new Set(['showed', 'noshow', 'cancelled', 'invalid']);
+function resolveAppointmentStatus(evidence = {}) {
+  const current = String(evidence.ghlStatus || '').toLowerCase();
+  const hasRecording = !!evidence.recording;
+
+  if (APPT_TERMINAL_STATUSES.has(current)) {
+    // GHL REUSES the appointment row on reschedule, so an attendance answer
+    // set for an earlier booking rides along onto the new date. Attendance
+    // written BEFORE the call started cannot be describing that call — it is
+    // a leftover, not an answer, and must not count as dispositioned.
+    // (Cancelling before a call is normal, so `cancelled` is exempt.)
+    // Real case: Daniela Bruno — no-showed Jul 24, rebooked to Aug 4, the
+    // Jul 28 `noshow` followed her onto the Aug 4 row, and she then sat
+    // through a 74-minute recorded call. 3 of 16 post-cutover terminal
+    // statuses were stale this way, all of them rescheduled rows.
+    const staleAttendance = (current === 'showed' || current === 'noshow')
+      && Number.isFinite(evidence.statusWrittenAtMs)
+      && Number.isFinite(evidence.startMs)
+      && evidence.statusWrittenAtMs < evidence.startMs;
+
+    if (!staleAttendance) {
+      // A recording alongside a status a human set AFTER the call is a real
+      // disagreement. Never silently flip it.
+      if (hasRecording && (current === 'noshow' || current === 'cancelled')) {
+        return { status: null, action: 'skip', reason: 'conflict_recording_vs_status', conflict: true };
+      }
+      return { status: null, action: 'skip', reason: `already_${current}`, conflict: false };
+    }
+    // Stale: fall through and let the evidence below answer for the real call.
+    if (hasRecording) {
+      return { status: 'showed', action: 'write', reason: 'stale_status_superseded_by_recording', conflict: false };
+    }
+    return { status: null, action: 'defer', reason: 'stale_status_no_evidence', conflict: false };
+  }
+  // Cancelled / rescheduled are already answered upstream by the GHL
+  // "Outcome: Cancelled" workflow → dash chain. Consume it, never re-ask.
+  if (evidence.cancelled)   return { status: null, action: 'skip', reason: 'cancelled_upstream', conflict: false };
+  if (evidence.rescheduled) return { status: null, action: 'skip', reason: 'rescheduled', conflict: false };
+
+  if (hasRecording) return { status: 'showed', action: 'write', reason: 'revi_recording', conflict: false };
+
+  return { status: null, action: 'defer', reason: 'outcome_card_will_settle_it', conflict: false };
+}
+
+// Attendance implied by a deal outcome. Every outcome except no_show requires
+// the call to have happened — you cannot lose, disqualify or follow up on a
+// conversation nobody had. Mirrors classifyOutcome's attendance semantics, so
+// one answer from the closer settles Paso 1 and Paso 2 together.
+function appointmentStatusForOutcome(outcome) {
+  if (!outcome) return null;
+  return outcome === 'no_show' ? 'noshow' : 'showed';
 }
 
 // Nearest unmatched REVI recording for the same prospect email within the
@@ -7698,11 +8072,15 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
       return { ok: false, reason: 'exists', existing: rows[0] || null };
     }
     let statusChange = null;
+    let opportunityId = null;
+    let ghlAppointmentId = null;
     const { rows: prow } = await client.query(
-      `SELECT p.id, p.status FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      `SELECT p.id, p.status, p.ghl_opportunity_id, a.ghl_appointment_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
       [appointmentId]
     );
     if (prow.length) {
+      opportunityId = prow[0].ghl_opportunity_id || null;
+      ghlAppointmentId = prow[0].ghl_appointment_id || null;
       const next = nextProspectStatusForOutcome(outcome, prow[0].status);
       if (next) {
         await client.query('UPDATE revops_prospects SET status = $1, updated_at = now() WHERE id = $2', [next, prow[0].id]);
@@ -7710,7 +8088,41 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
       }
     }
     await client.query('COMMIT');
-    return { ok: true, outcomeId: ins.rows[0].id, statusChange };
+
+    // Portal first, GHL second, and deliberately OUTSIDE the transaction: the
+    // portal row is what every report reads, so a GHL failure must never roll
+    // back a logged outcome. Before this, "I'll log it for you" left the
+    // closer's opportunity card sitting in Call Booked forever.
+    let stageMove = null;
+    if (opportunityId) {
+      try {
+        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome);
+      } catch (moveErr) {
+        stageMove = { ok: false, message: moveErr.message };
+      }
+    } else {
+      stageMove = { ok: false, message: 'no ghl_opportunity_id on the prospect' };
+    }
+
+    // Paso 1 falls out of Paso 2 for free: an outcome implies attendance, so
+    // the closer never answers a separate "did they show?" question. Only
+    // fills a blank — a status a human already set is never overwritten.
+    let attendance = null;
+    const impliedStatus = appointmentStatusForOutcome(outcome);
+    if (impliedStatus && ghlAppointmentId && !String(ghlAppointmentId).startsWith('opp:')) {
+      try {
+        const cur = await ghlGetAppointmentStatus(ghlAppointmentId);
+        if (cur && APPT_TERMINAL_STATUSES.has(cur)) {
+          attendance = { ok: true, already: true, status: cur };
+        } else {
+          await ghlSetAppointmentStatus(ghlAppointmentId, impliedStatus);
+          attendance = { ok: true, status: impliedStatus };
+        }
+      } catch (attErr) {
+        attendance = { ok: false, message: attErr.message };
+      }
+    }
+    return { ok: true, outcomeId: ins.rows[0].id, statusChange, stageMove, attendance };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     return { ok: false, reason: 'error', message: err.message };
@@ -7766,13 +8178,201 @@ async function logCallOutcomeTool({ prospect, date, outcome, revenue, note }) {
   return `Logged ${outcome}${revenue ? ` ($${revenue})` : ''} for ${target.full_name} (${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call).${result.statusChange ? ` Prospect status: ${result.statusChange}.` : ''} Scorecard + portal reflect it immediately.`;
 }
 
+// Paso 1 by hand: set attendance on the GHL appointment itself. Only reached
+// for calls REVI could not read — Max sets `showed` automatically otherwise.
+// Writes to GHL only; dash's Outcome workflows carry it back into the portal's
+// `attended`, so this never writes revops directly and can't fight ingestion.
+async function setAppointmentStatusTool({ prospect, date, status }) {
+  if (!portalPg) return 'Portal read-only DB not configured. Set PORTAL_READONLY_DATABASE_URL in .env.';
+  const allowed = new Set(['showed', 'noshow', 'cancelled']);
+  if (!allowed.has(status)) return `status must be one of: ${[...allowed].join(', ')}`;
+  const frag = `%${String(prospect || '').trim().toLowerCase()}%`;
+  if (frag === '%%') return 'ERROR: prospect (name or email) is required.';
+  const { rows } = await portalPg.query(
+    `SELECT a.id, a.ghl_appointment_id, a.scheduled_start, p.full_name, p.email
+       FROM revops_appointments a
+       JOIN revops_prospects p ON p.id = a.prospect_id
+      WHERE (lower(coalesce(p.email,'')) LIKE $1 OR lower(p.full_name) LIKE $1)
+        AND ($2::date IS NULL OR (a.scheduled_start AT TIME ZONE 'America/Costa_Rica')::date = $2::date)
+        AND a.scheduled_start <= now()
+      ORDER BY a.scheduled_start DESC
+      LIMIT 5`,
+    [frag, date || null]
+  );
+  if (!rows.length) return `No past appointment found for "${prospect}"${date ? ` on ${date}` : ''}.`;
+  if (rows.length > 1 && !date) {
+    return `Ambiguous — ${rows.length} past appointments match "${prospect}". Tell me which date:\n`
+      + rows.map(r => `${r.full_name} — ${formatICTime(r.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} CR`).join('\n');
+  }
+  const target = rows[0];
+  if (!target.ghl_appointment_id || String(target.ghl_appointment_id).startsWith('opp:')) {
+    return `${target.full_name}'s call has no GHL appointment I can write to (pre-cutover or opportunity-only row) — set it in GHL by hand.`;
+  }
+  try {
+    await ghlSetAppointmentStatus(target.ghl_appointment_id, status);
+  } catch (err) {
+    return `Couldn't set it in GHL: ${err.message}. Set it on the appointment by hand.`;
+  }
+  await upsertKnowledge('process', `appt-status-ask:${target.id}`, `answered|${new Date().toISOString().slice(0, 10)}`, 'appt-status-ask');
+  return `Set ${target.full_name}'s ${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call to *${status}* in GHL.`;
+}
+
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
+// REVI recordings covering a set of call times — same 36h contract as the
+// scorecard overlay. Best-effort by design: a REVI outage degrades every
+// caller to "no read", never blocks the run.
+// coaching_json is the field that makes a real proposal possible: deal.status
+// (alive/dead) + icp_fit separate a No Fit from a Lost, which deal_outcome
+// alone cannot do (it reads `stall` on 91 of 130 calls).
+async function fetchReviRecordings(startTimesMs, label) {
+  const starts = (startTimesMs || []).filter(Number.isFinite);
+  if (!starts.length) return [];
+  try {
+    const lo = new Date(Math.min(...starts) - OUTCOME_MATCH_PAD_MS).toISOString();
+    const hi = new Date(Math.max(...starts) + OUTCOME_MATCH_PAD_MS).toISOString();
+    const [{ data: reviClosers }, { data: scores }] = await Promise.all([
+      reviSupabase.from('revi_closers').select('id, fathom_host_email'),
+      reviSupabase.from('closer_call_scores')
+        .select('closer_id, prospect_email, call_date, duration_min, overall_score, deal_outcome, recording_url, prospect_signals, coaching_json')
+        .gte('call_date', lo).lte('call_date', hi),
+    ]);
+    const closerByReviId = {};
+    for (const rc of (reviClosers || [])) {
+      if (rc.fathom_host_email) closerByReviId[rc.id] = rc.fathom_host_email.toLowerCase();
+    }
+    return (scores || [])
+      .filter(s => s.prospect_email && s.call_date)
+      .map((s) => {
+        const coaching = s.coaching_json || {};
+        const deal = typeof coaching.deal === 'string'
+          ? (() => { try { return JSON.parse(coaching.deal); } catch (_) { return {}; } })()
+          : (coaching.deal || {});
+        return {
+          email: s.prospect_email.toLowerCase(),
+          closer: closerByReviId[s.closer_id] || null,
+          at: new Date(s.call_date).getTime(),
+          durationMin: s.duration_min == null ? null : Math.round(Number(s.duration_min)),
+          score: s.overall_score == null ? null : Number(s.overall_score),
+          dealOutcome: s.deal_outcome || null,
+          url: s.recording_url || null,
+          signals: parseReviSignals(s.prospect_signals),
+          dealStatus: deal.status || null,
+          dealRecovery: deal.recovery || null,
+          icpFit: coaching.icp_fit || null,
+          cashCollected: coaching.cash_collected_usd == null ? null : Number(coaching.cash_collected_usd),
+          matched: false,
+        };
+      });
+  } catch (err) {
+    console.error(`${label}: REVI overlay unavailable, falling back to plain nudges:`, err.message);
+    return [];
+  }
+}
+
+// Latest GHL opportunity stage per prospect email, from the funnel-event stream
+// REVI already mirrors. This is a second, independent outcome signal: if the
+// card has already moved to a won/lost stage, nobody needs to be asked.
+async function fetchGhlFunnelStateByEmail(emails) {
+  const wanted = [...new Set((emails || []).map(e => String(e || '').toLowerCase()).filter(Boolean))];
+  if (!wanted.length) return {};
+  try {
+    const { data } = await reviSupabase
+      .from('funnel_events')
+      .select('contact_email, detected_on, to_class, to_stage_name, pipeline_id')
+      .in('contact_email', wanted)
+      .order('detected_on', { ascending: true });
+    const byEmail = {};
+    for (const r of (data || [])) {
+      const em = String(r.contact_email || '').toLowerCase();
+      if (em) byEmail[em] = r; // ordered ascending, so the last write wins
+    }
+    return byEmail;
+  } catch (err) {
+    console.error('GHL funnel state unavailable (degrading to REVI-only reads):', err.message);
+    return {};
+  }
+}
+
+// Shared by the outcome reminders (Paso 2) and the appointment-status sweep
+// (Paso 1): the set of past sales calls a human could actually act on.
+//
+// Only surface calls a closer can actually resolve. Outcomes are logged on the
+// GHL opportunity card, and the webhook attaches them to the prospect's LATEST
+// appointment — so two classes of row are permanently unfixable and must never
+// be nagged (chasing impossible items is how a reminder system gets ignored):
+//   1. Pre-cutover calls (before GHL went live) — pre-migration history.
+//      Self-expiring: they fall out of the window on their own.
+//   2. Orphaned rows — the prospect rebooked, so any outcome the closer logs
+//      lands on the newer appointment, never on this one.
+// NOTE: iClosed-BOOKED calls scheduled after the cutover ARE fulfillable —
+// the prospect has a live GHL opp card, so source is irrelevant here.
+const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
+async function fetchDueSalesCalls({ cutoffIso, sinceIso, label }) {
+  const floorIso = sinceIso > GHL_CUTOVER_ISO ? sinceIso : GHL_CUTOVER_ISO;
+
+  // `attended` is almost always null so it is NOT a gate; we exclude cancelled
+  // calls and require a call identity.
+  const { data: pastCalls } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, attended, qualification_snapshot, prospect:prospect_id(full_name, email, ghl_contact_id, ghl_opportunity_id)')
+    .lte('scheduled_start', cutoffIso)
+    .gte('scheduled_start', floorIso);
+
+  // Orphan detection: any later appointment for the same prospect means an
+  // outcome logged now attaches there, not here.
+  const prospectIds = [...new Set((pastCalls || []).map(a => a.prospect_id).filter(Boolean))];
+  const latestStartByProspect = {};
+  if (prospectIds.length) {
+    const { data: allAppts } = await portalSupabase
+      .from('revops_appointments')
+      .select('prospect_id, scheduled_start')
+      .in('prospect_id', prospectIds);
+    for (const r of (allAppts || [])) {
+      const cur = latestStartByProspect[r.prospect_id];
+      if (!cur || String(r.scheduled_start) > cur) latestStartByProspect[r.prospect_id] = String(r.scheduled_start);
+    }
+  }
+
+  // Flywheel-only: exclude partner-consulting 1:1s before any state tracking.
+  const excludeIds = await getNonFlywheelCallIds();
+  let orphanSkipped = 0;
+  const rescheduledIds = new Set();
+  const dueCalls = (pastCalls || []).filter((a) => {
+    if (!(a.iclosed_call_id || a.ghl_appointment_id)) return false;
+    if (isAppointmentCancelled(a)) return false;
+    if (excludeIds.has(a.iclosed_call_id)) return false;
+    const latest = a.prospect_id ? latestStartByProspect[a.prospect_id] : null;
+    if (latest && latest > String(a.scheduled_start)) {
+      orphanSkipped += 1;
+      rescheduledIds.add(a.id);
+      return false;
+    }
+    return true;
+  });
+  if (orphanSkipped) {
+    console.log(`${label}: skipped ${orphanSkipped} orphaned call(s) — prospect rebooked, outcome would attach to the newer appointment.`);
+  }
+  return { dueCalls, rescheduledIds, orphanSkipped };
+}
+
+// dash writes the GHL cancellation flag at the TOP level of
+// qualification_snapshot ({cancelled: true, reason: 'deleted_in_ghl'}), not
+// under .ghl — that sub-object only ever carries opportunity_source. The old
+// `qualification_snapshot.ghl.cancelled` check therefore never matched a single
+// row, so cancelled calls were still being nagged. Verified against the portal
+// 2026-08-18: 87 post-cutover rows, .ghl keys = {opportunity_source} only.
+function isAppointmentCancelled(appt) {
+  const qs = appt?.qualification_snapshot || {};
+  return qs.cancelled === true || qs.iclosed?.cancelled === true || qs.ghl?.cancelled === true;
+}
+
 // Fires 4 PM CR every day. DMs the owning closer for any call >24h old that
 // still has no outcome logged in GHL. Re-nudges daily (de-duped via
 // agent_knowledge) and escalates to Ron once unlogged 3+ days despite reminders.
-// Calls with a matching REVI recording get a PRE-FILLED proposal DM instead of
-// a generic nudge: ✅ logs REVI's read (source revi_confirmed), a text reply
-// corrects it. Facts auto-surface; judgments always get a human ✅.
+// Every unlogged call now gets its OWN card carrying Max's read of the REVI
+// evidence, phrased in the GHL stage names the closer would set by hand: ✅
+// logs the proposal and moves the opportunity, a text reply corrects it.
+// Facts auto-surface; judgments always get a human ✅.
 async function runUnloggedOutcomeReminders(_correlationId) {
   console.log('Running unlogged-outcome reminders...');
   try {
@@ -7780,59 +8380,9 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
     const cutoff = new Date(now - 24 * 60 * 60 * 1000).toISOString();      // >24h old
 
-    // Only nag on calls a closer can actually resolve. Outcomes are logged on the
-    // GHL opportunity card, and the webhook attaches them to the prospect's LATEST
-    // appointment — so two classes of row are permanently unfixable and must never
-    // be nagged (chasing impossible items is how a reminder system gets ignored):
-    //   1. Pre-cutover calls (before GHL went live) — pre-migration history.
-    //      Self-expiring: they fall out of the 14d window on their own.
-    //   2. Orphaned rows — the prospect rebooked, so any outcome the closer logs
-    //      lands on the newer appointment, never on this one.
-    // NOTE: iClosed-BOOKED calls scheduled after the cutover ARE fulfillable —
-    // the prospect has a live GHL opp card, so source is irrelevant here.
-    const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
-    const floorIso = since > GHL_CUTOVER_ISO ? since : GHL_CUTOVER_ISO;
-
-    // Past calls 24h–14d ago (never before the cutover). `attended` is almost
-    // always null so it is NOT a gate; we exclude cancelled calls
-    // (qualification_snapshot carries the flag under .iclosed for legacy rows and
-    // .ghl for GHL rows) and require a call identity.
-    const { data: pastCalls } = await portalSupabase
-      .from('revops_appointments')
-      .select('id, prospect_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id(full_name, email)')
-      .lte('scheduled_start', cutoff)
-      .gte('scheduled_start', floorIso);
-
-    // Orphan detection: any later appointment for the same prospect means an
-    // outcome logged now attaches there, not here.
-    const prospectIds = [...new Set((pastCalls || []).map(a => a.prospect_id).filter(Boolean))];
-    let latestStartByProspect = {};
-    if (prospectIds.length) {
-      const { data: allAppts } = await portalSupabase
-        .from('revops_appointments')
-        .select('prospect_id, scheduled_start')
-        .in('prospect_id', prospectIds);
-      for (const r of (allAppts || [])) {
-        const cur = latestStartByProspect[r.prospect_id];
-        if (!cur || String(r.scheduled_start) > cur) latestStartByProspect[r.prospect_id] = String(r.scheduled_start);
-      }
-    }
-
-    // Flywheel-only: exclude partner-consulting 1:1s before any dedup/state tracking.
-    const excludeIds = await getNonFlywheelCallIds();
-    let orphanSkipped = 0;
-    const dueCalls = (pastCalls || []).filter((a) => {
-      if (!(a.iclosed_call_id || a.ghl_appointment_id)) return false;
-      if (a.qualification_snapshot?.iclosed?.cancelled === true) return false;
-      if (a.qualification_snapshot?.ghl?.cancelled === true) return false;
-      if (excludeIds.has(a.iclosed_call_id)) return false;
-      const latest = a.prospect_id ? latestStartByProspect[a.prospect_id] : null;
-      if (latest && latest > String(a.scheduled_start)) { orphanSkipped += 1; return false; }
-      return true;
+    const { dueCalls } = await fetchDueSalesCalls({
+      cutoffIso: cutoff, sinceIso: since, label: 'Unlogged-outcome reminders',
     });
-    if (orphanSkipped) {
-      console.log(`Unlogged-outcome reminders: skipped ${orphanSkipped} orphaned call(s) — prospect rebooked, outcome would attach to the newer appointment.`);
-    }
 
     if (!dueCalls.length) {
       console.log('Unlogged-outcome reminders: no due calls in window.');
@@ -7886,42 +8436,13 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       }
     }
 
-    // REVI recordings for the unlogged window — same 36h contract as the
-    // scorecard overlay. Best-effort: a REVI outage degrades to the classic
-    // reminder, never blocks it.
-    let reviRecordings = [];
-    try {
-      const starts = unlogged.map(a => new Date(a.scheduled_start).getTime()).filter(Number.isFinite);
-      if (starts.length) {
-        const lo = new Date(Math.min(...starts) - OUTCOME_MATCH_PAD_MS).toISOString();
-        const hi = new Date(Math.max(...starts) + OUTCOME_MATCH_PAD_MS).toISOString();
-        const [{ data: reviClosers }, { data: scores }] = await Promise.all([
-          reviSupabase.from('revi_closers').select('id, fathom_host_email'),
-          reviSupabase.from('closer_call_scores')
-            .select('closer_id, prospect_email, call_date, duration_min, overall_score, deal_outcome, recording_url, prospect_signals')
-            .gte('call_date', lo).lte('call_date', hi),
-        ]);
-        const closerByReviId = {};
-        for (const rc of (reviClosers || [])) {
-          if (rc.fathom_host_email) closerByReviId[rc.id] = rc.fathom_host_email.toLowerCase();
-        }
-        reviRecordings = (scores || [])
-          .filter(s => s.prospect_email && s.call_date)
-          .map(s => ({
-            email: s.prospect_email.toLowerCase(),
-            closer: closerByReviId[s.closer_id] || null,
-            at: new Date(s.call_date).getTime(),
-            durationMin: s.duration_min == null ? null : Math.round(Number(s.duration_min)),
-            score: s.overall_score == null ? null : Number(s.overall_score),
-            dealOutcome: s.deal_outcome || null,
-            url: s.recording_url || null,
-            signals: s.prospect_signals || null,
-            matched: false,
-          }));
-      }
-    } catch (reviErr) {
-      console.error('Unlogged-outcome reminders: REVI overlay unavailable, falling back to plain nudges:', reviErr.message);
-    }
+    const reviRecordings = await fetchReviRecordings(
+      unlogged.map(a => new Date(a.scheduled_start).getTime()),
+      'Unlogged-outcome reminders',
+    );
+    const funnelByEmail = await fetchGhlFunnelStateByEmail(
+      unlogged.map(a => (a.prospect?.email || '')),
+    );
 
     // Feedback-loop lessons ───────────────────────────────────────────────────
     const lessons = await getReportLessons('unlogged-outcome-reminder');
@@ -7932,6 +8453,10 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     // DM each closer: pre-filled proposal per recording-verified call (capped),
     // then the classic aggregate list for the rest ────────────────────────────
     const PROPOSALS_PER_CLOSER_PER_RUN = 5;
+    // After this many days a card stops being bumped in-thread; Ron's 3-day
+    // escalation has already fired by then, so continuing to poke the closer
+    // adds noise without adding pressure.
+    const OUTCOME_CARD_MAX_BUMPS = 4;
     for (const [closerEmail, entries] of Object.entries(unloggedByCloser)) {
       const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
       if (!slackId) {
@@ -7950,60 +8475,82 @@ async function runUnloggedOutcomeReminders(_correlationId) {
         const pName = appt.prospect?.full_name || 'Unknown';
         const proposalKey = `outcome-proposal:${appt.id}`;
 
-        // One proposal DM per appointment, ever — after that it rides the
-        // aggregate list with a pointer back to the pending proposal.
+        // One card per appointment, ever. A still-open card gets BUMPED in its
+        // own thread rather than re-DM'd — a fresh DM every afternoon is how a
+        // reminder reaches "nudged 14×" and stops being read.
         const { data: sentBefore } = await supabase
           .from('agent_knowledge').select('value').eq('key', proposalKey).limit(1);
         if (sentBefore && sentBefore.length) {
-          aggregate.push({ ...entry, proposalPending: String(sentBefore[0].value || '').startsWith('proposed') });
+          const [state, , cardChannel, cardTs] = String(sentBefore[0].value || '').split('|');
+          const stillOpen = state === 'proposed';
+          if (stillOpen && cardChannel && cardTs && entry.count <= OUTCOME_CARD_MAX_BUMPS) {
+            try {
+              await slack.client.chat.postMessage({
+                channel: cardChannel,
+                thread_ts: cardTs,
+                text: `⏳ Still open — day ${entry.daysSinceFirst || 1}. Tap an action above and I'll log it plus move the GHL card.`,
+              });
+            } catch (bumpErr) {
+              console.error(`Outcome card bump for ${pName} failed:`, bumpErr.message);
+            }
+          } else if (stillOpen) {
+            aggregate.push({ ...entry, proposalPending: true });
+          }
           continue;
         }
 
-        const rec = proposalsSent < PROPOSALS_PER_CLOSER_PER_RUN
-          ? matchRecordingToCall(reviRecordings, email, new Date(appt.scheduled_start).getTime())
-          : null;
-        const { outcome: proposed, wonHint } = proposalFromReviRead(rec?.dealOutcome);
-        if (!rec || (!proposed && !wonHint)) {
+        // Every unlogged call earns a card now. Previously a card required a
+        // matched recording AND a deal_outcome in {stall, lost, won}, which is
+        // why calls like Aura Bonilla's (deal_outcome `pending`, deposit agreed
+        // on the call) only ever appeared as a bullet in a flat list.
+        if (proposalsSent >= PROPOSALS_PER_CLOSER_PER_RUN) {
           aggregate.push(entry);
           continue;
         }
 
+        const rec = matchRecordingToCall(reviRecordings, email, new Date(appt.scheduled_start).getTime());
+        const funnel = funnelByEmail[email] || null;
+        const pipelineId = funnel?.pipeline_id || GHL_PIPELINE.APPT_SETTING;
+        const proposal = computeOutcomeProposal({
+          recording: rec,
+          dealStatus: rec?.dealStatus,
+          icpFit: rec?.icpFit,
+          cashCollected: rec?.cashCollected,
+          funnelClass: funnel?.to_class,
+        });
+
         const dStr = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-        const durStr = rec.durationMin ? `${rec.durationMin} min` : 'recorded';
-        const scoreStr = rec.score != null ? ` · call score ${rec.score}/10` : '';
-        const sig = rec.signals || {};
-        const sigBits = [sig.buying_signal_strength && `buying signal: ${sig.buying_signal_strength}`, sig.objection_type && `objection: ${sig.objection_type}`, sig.stated_timeline && `timeline: ${sig.stated_timeline}`].filter(Boolean);
-        const sigLine = sigBits.length ? `\n🔎 ${sigBits.join(' · ')}` : '';
-        const lines = [`📋 Outcome check — *${pName}* — ${dStr} CR`];
-        lines.push(`🎙 Recording found (${durStr}${scoreStr}) — this call verifiably happened, but no outcome is logged yet.`);
-        if (wonHint) {
-          lines.push(`🤖 REVI heard a close on this call 🎉 — I never log *won* on my own. Reply \`won <amount>\` to log it once payment is real.${sigLine}`);
-          lines.push('');
-          lines.push('Or reply `follow up` / `lost` / `dq` / `no show` if it landed differently.');
-        } else {
-          lines.push(`🤖 REVI's read: *${proposed.replace('_', ' ')}*${sigLine}`);
-          lines.push('');
-          lines.push(`React ✅ to log *${proposed.replace('_', ' ')}* · ❌ to dismiss · or reply \`won <amount>\` / \`lost\` / \`dq\` / \`follow up\` / \`no show\` to correct.`);
-        }
+        const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
+        const cardText = buildOutcomeCardText({
+          prospectName: pName, whenStr: dStr, heldDays, rec, proposal, funnel, pipelineId,
+          nudgeCount: entry.count,
+        });
+
         try {
-          await slack.client.chat.postMessage({
+          const posted = await slack.client.chat.postMessage({
             channel: slackId,
-            text: lines.join('\n'),
+            text: cardText,
             metadata: {
               event_type: 'outcome_proposal',
               event_payload: {
                 appointment_id: appt.id,
                 prospect_name: pName,
-                proposed_outcome: proposed || '',
-                won_hint: !!wonHint,
+                proposed_outcome: proposal.outcome || '',
+                won_hint: !!proposal.wonHint,
+                confidence: proposal.confidence,
+                rule: proposal.rule,
+                pipeline_id: pipelineId,
                 closer_email: closerEmail,
               },
             },
           });
-          await upsertKnowledge('process', proposalKey, `proposed|${todayISO}`, 'outcome-proposal');
+          // Store where the card lives so tomorrow's nudge bumps THIS thread
+          // instead of opening a new DM — "reminded 14×" is what a re-DM loop
+          // looks like from the closer's side.
+          await upsertKnowledge('process', proposalKey, `proposed|${todayISO}|${slackId}|${posted.ts || ''}`, 'outcome-proposal');
           proposalsSent += 1;
         } catch (propErr) {
-          console.error(`Outcome proposal DM to ${closerName} failed:`, propErr.message);
+          console.error(`Outcome card DM to ${closerName} failed:`, propErr.message);
           aggregate.push(entry);
         }
       }
@@ -8051,6 +8598,179 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Unlogged-outcome reminder cron failed: ${err.message}` });
   }
 }
+
+// ─── PASO 1 SWEEP: APPOINTMENT STATUS FROM REVI ──────────────────────────────
+// The SOP asked closers to open every appointment in GHL and set Showed /
+// No-Show / Cancelled by hand. Compliance was ~2%: on 2026-08-18, 40 of 44
+// August appointments on the main sales calendar were still sitting at the
+// default `confirmed`. That is why revops_appointments.attended is null almost
+// everywhere and show rate has to be derived from outcomes instead of measured.
+//
+// A scored REVI recording is positive proof the call happened, so Max sets
+// `showed` himself. The inverse is NOT true — REVI can fail to join a call —
+// so a missing recording is never written as a no-show; it is the only case
+// that reaches a human, and only after cancellation and reschedule have been
+// ruled out from data that already exists.
+const GHL_SALES_CALENDAR_IDS = (process.env.GHL_SALES_CALENDAR_IDS
+  || 'fYQJCzbk4hvV0brpJqoE,HXLeEjxpa0gdiTPNiAzc,KRTGx8XteIJSCcKAShHS').split(',').map(s => s.trim()).filter(Boolean);
+
+// Current appointmentStatus for every sales-calendar event in a window, keyed
+// by GHL appointment id. Bulk by calendar (3 calls) rather than per contact.
+async function fetchGhlAppointmentStatuses(fromMs, toMs) {
+  const byId = {};
+  const locationId = process.env.GHL_LOCATION_ID;
+  for (const calendarId of GHL_SALES_CALENDAR_IDS) {
+    try {
+      const res = await fetch(
+        `https://services.leadconnectorhq.com/calendars/events?locationId=${locationId}`
+        + `&calendarId=${calendarId}&startTime=${fromMs}&endTime=${toMs}`,
+        { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+      );
+      if (!res.ok) {
+        console.warn(`Appointment-status sweep: calendar ${calendarId} → ${res.status}`);
+        continue;
+      }
+      const events = (await res.json()).events || [];
+      for (const e of events) {
+        if (e.deleted) continue;
+        byId[e.id] = {
+          status: String(e.appointmentStatus || e.appoinmentStatus || '').toLowerCase(),
+          contactId: e.contactId || null,
+          rescheduledAt: e.rescheduledAt || null,
+          // When the status was last written vs when the call actually starts —
+          // together these expose a status left over from an earlier booking of
+          // this same (reused) row.
+          statusWrittenAtMs: Date.parse(e.dateUpdated || '') || null,
+          startMs: Date.parse(e.startTime || '') || null,
+        };
+      }
+    } catch (err) {
+      console.warn(`Appointment-status sweep: calendar ${calendarId} fetch failed: ${err.message}`);
+    }
+  }
+  return byId;
+}
+
+// Current attendance on one appointment, or null if it can't be read. Used to
+// make the implied-attendance write fill-only — never clobber a human's answer.
+async function ghlGetAppointmentStatus(eventId) {
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const appt = body.appointment || body.event || body;
+    const st = appt.appointmentStatus || appt.appoinmentStatus;
+    return st ? String(st).toLowerCase() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function ghlSetAppointmentStatus(eventId, appointmentStatus) {
+  const res = await fetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+      'Version': '2021-07-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ appointmentStatus }),
+  });
+  if (!res.ok) throw new Error(`appt PUT ${eventId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+  return true;
+}
+
+async function runAppointmentStatusSync(_correlationId) {
+  const dryRun = process.env.APPT_STATUS_SYNC_MODE !== 'live';
+  console.log(`Running appointment-status sync (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
+  const tally = { considered: 0, showed: 0, skipped: 0, conflicts: 0, deferred: 0, failed: 0 };
+  try {
+    const now    = Date.now();
+    const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(now - 2 * 60 * 60 * 1000).toISOString(); // ended ≥2h ago
+
+    const { dueCalls } = await fetchDueSalesCalls({
+      cutoffIso: cutoff, sinceIso: since, label: 'Appointment-status sync',
+    });
+    if (!dueCalls.length) {
+      console.log('Appointment-status sync: no due calls in window.');
+      return tally;
+    }
+
+    const [statusById, reviRecordings] = await Promise.all([
+      fetchGhlAppointmentStatuses(Date.parse(since), now),
+      fetchReviRecordings(dueCalls.map(a => new Date(a.scheduled_start).getTime()), 'Appointment-status sync'),
+    ]);
+
+    const conflicts = [];
+
+    for (const appt of dueCalls) {
+      // Only GHL-native rows carry an event we can write to.
+      const eventId = appt.ghl_appointment_id;
+      if (!eventId || String(eventId).startsWith('opp:')) continue;
+      tally.considered += 1;
+
+      const ghl = statusById[eventId];
+      const rec = matchRecordingToCall(reviRecordings, (appt.prospect?.email || '').toLowerCase(), new Date(appt.scheduled_start).getTime());
+      const verdict = resolveAppointmentStatus({
+        ghlStatus: ghl?.status,
+        recording: rec,
+        cancelled: isAppointmentCancelled(appt),
+        rescheduled: false, // orphans are already dropped by fetchDueSalesCalls
+        statusWrittenAtMs: ghl?.statusWrittenAtMs,
+        startMs: ghl?.startMs ?? Date.parse(appt.scheduled_start),
+      });
+
+      if (verdict.conflict) {
+        tally.conflicts += 1;
+        conflicts.push({ appt, ghlStatus: ghl?.status, rec });
+        continue;
+      }
+      if (verdict.action === 'skip')  { tally.skipped += 1; continue; }
+      // Deferred, not asked: the outcome card already puts one question to the
+      // closer, and any answer it gets settles attendance too.
+      if (verdict.action === 'defer') { tally.deferred += 1; continue; }
+
+      if (dryRun) {
+        console.log(`[dry-run] would set ${eventId} (${appt.prospect?.full_name}) → showed (${verdict.reason})`);
+        tally.showed += 1;
+        continue;
+      }
+      try {
+        await ghlSetAppointmentStatus(eventId, 'showed');
+        tally.showed += 1;
+        console.log(`Appointment ${eventId} (${appt.prospect?.full_name}) → showed`);
+      } catch (writeErr) {
+        tally.failed += 1;
+        console.error(`Appointment-status write failed for ${eventId}:`, writeErr.message);
+      }
+    }
+
+    // A recording that contradicts a human's answer is never auto-resolved.
+    if (conflicts.length) {
+      const lines = ['⚠️ *Appointment status conflicts* — REVI recorded a call that GHL says did not happen:\n'];
+      conflicts.forEach(({ appt, ghlStatus, rec }) => {
+        lines.push(`• ${appt.prospect?.full_name || 'Unknown'} — ${formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric' })} — GHL: *${ghlStatus}*, REVI: ${rec?.durationMin || '?'} min recording`);
+      });
+      lines.push('');
+      lines.push('I did not change these. Someone should decide which is right.');
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') }).catch(() => {});
+    }
+
+    const verdict = tally.failed || tally.conflicts
+      ? `⚠️ ISSUES — considered ${tally.considered}, showed ${tally.showed}, conflicts ${tally.conflicts}, write failures ${tally.failed}, deferred ${tally.deferred}`
+      : `✅ ALL GREEN — considered ${tally.considered}, marked showed ${tally.showed}, skipped ${tally.skipped}, deferred to the outcome card ${tally.deferred}`;
+    console.log(`Appointment-status sync complete. ${verdict}`);
+    return tally;
+  } catch (err) {
+    console.error('Appointment-status sync error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Appointment-status sync failed: ${err.message}` }).catch(() => {});
+    return tally;
+  }
+}
+
 
 // ─── STALE UNCLAIMED LEADS ────────────────────────────────────────────────────
 // A lead posted to #ng-sales-goats with no time-based fallback if nobody reacts
@@ -8637,6 +9357,17 @@ cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { awa
 // "Logged?" is read directly from revops_sales_outcomes (by appointment_id) —
 // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19).
 cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
+
+// Appointment-status sweep (Paso 1) — 3 PM CR, one hour BEFORE the outcome
+// reminders so today's calls are already marked Showed by the time their
+// outcome card goes out. Ships in dry-run: set APPT_STATUS_SYNC_MODE=live to
+// let it write to GHL. Kill switch is that same env var.
+cron.schedule('0 15 * * *',   wrapCronJob('runAppointmentStatusSync', async (c) => { await runAppointmentStatusSync(c); }), { timezone: 'America/Costa_Rica' });
+
+// REVI prospect notes — 2 PM CR daily, before the status sweep and the cards,
+// so the note is already on the contact when a closer opens it from either.
+// Ships in dry-run: REVI_NOTES_MODE=live arms it (also the kill switch).
+cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) => { await runReviProspectNotesSync(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
 // the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours,
@@ -9962,7 +10693,7 @@ async function ghlFindConversationId(contactId) {
   return id;
 }
 
-async function ghlMoveOpportunityStage(oppId, stageId) {
+async function ghlMoveOpportunityStage(oppId, stageId, pipelineId = STRIKE_PIPELINE_ID) {
   const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
     method: 'PUT',
     headers: {
@@ -9970,10 +10701,32 @@ async function ghlMoveOpportunityStage(oppId, stageId) {
       'Version': '2021-07-28',
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ pipelineId: STRIKE_PIPELINE_ID, pipelineStageId: stageId }),
+    body: JSON.stringify({ pipelineId, pipelineStageId: stageId }),
   });
   if (!res.ok) throw new Error(`opp PUT ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
   return true;
+}
+
+// Move a sales opportunity to the stage that matches a logged outcome. Reads
+// the opp first so the move stays inside its OWN pipeline (Appointment Setting
+// and VSL have different stage ids for the same idea) and so an already-closed
+// card is left alone. Never guesses a stage id.
+async function ghlMoveOpportunityForOutcome(oppId, outcome) {
+  const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  });
+  if (!res.ok) return { ok: false, message: `opp GET ${oppId} → ${res.status}` };
+  const opp = (await res.json()).opportunity || {};
+  const pipelineId = opp.pipelineId;
+  const target = outcomeStageFor(pipelineId, outcome);
+  if (!target) return { ok: false, message: `no stage mapping for outcome "${outcome}" in pipeline ${pipelineId || '(unknown)'}` };
+  if (opp.pipelineStageId === target.id) return { ok: true, already: true, label: target.label };
+  // A card a human already closed out is not ours to reopen.
+  if (GHL_TERMINAL_STAGE_IDS.has(opp.pipelineStageId)) {
+    return { ok: false, terminal: true, message: `opportunity already in a closed stage (${APPT_PIPELINE_STAGE_LABELS[opp.pipelineStageId] || opp.pipelineStageId})` };
+  }
+  await ghlMoveOpportunityStage(oppId, target.id, pipelineId);
+  return { ok: true, label: target.label };
 }
 
 // Pure decision function — all the semantics live here and it does no I/O, so the
@@ -11518,25 +12271,44 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
   }
   if (!CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) return;
 
+  const stages = GHL_OUTCOME_STAGES[payload.pipeline_id] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  const altActions = outcomeActionsFor(payload.pipeline_id).map(a => `\`${a.say}\``).join(' / ');
+
   if (!payload.proposed_outcome) {
-    // won-hint (or read-less) proposal: ✅ is not enough on purpose.
+    // won-hint (or read-less) card: ✅ is not enough on purpose.
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: payload.won_hint
-      ? 'I never log *won* from a reaction — reply `won <amount>` to confirm it (amount = what was actually closed).'
-      : 'No REVI read to confirm here — reply `won <amount>` / `lost` / `dq` / `follow up` / `no show` and I\'ll log it.' });
+      ? `I never log *${stages.won.label}* from a reaction — reply \`won <amount>\` to confirm it (amount = what was actually closed).`
+      : `No confident read to confirm here — reply \`won <amount>\` / ${altActions} and I'll log it.` });
+    return;
+  }
+  // Confidence gate: only a fact-backed read is one-tap. Anything softer is
+  // shown on the card but must be typed, so a rubber-stamped guess can't land
+  // in the scorecard.
+  if (payload.confidence && payload.confidence !== 'high') {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `That read isn't confident enough for one tap (${payload.confidence}). Reply \`won <amount>\` / ${altActions} and I'll log it.` });
     return;
   }
 
   const result = await logOutcomeToPortal({
     appointmentId: payload.appointment_id,
     outcome: payload.proposed_outcome,
-    source: 'revi_confirmed',
-    notes: `REVI-proposed outcome confirmed via Slack by <@${event.user}> (prospect: ${payload.prospect_name})`,
+    source: payload.rule && payload.rule.startsWith('ghl_') ? 'ghl_confirmed' : 'revi_confirmed',
+    notes: `Max-proposed outcome (${payload.rule || 'revi'}) confirmed via Slack by <@${event.user}> (prospect: ${payload.prospect_name})`,
   });
   if (result.ok) {
     await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
     const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
-    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${payload.proposed_outcome.replace('_', ' ')}* for ${payload.prospect_name}.${statusNote} Portal + scorecard will pick it up immediately.` });
+    // The GHL move is best-effort and reported honestly — the portal row is
+    // already written either way, so a CRM hiccup never silently loses it.
+    const move = result.stageMove;
+    const moveNote = move?.ok
+      ? (move.already ? ` GHL card was already in *${move.label}*.` : ` Moved the GHL card to *${move.label}*.`)
+      : ` ⚠️ Logged in the portal, but I couldn't move the GHL card (${move?.message || 'unknown error'}) — please move it by hand.`;
+    const label = stages[payload.proposed_outcome]?.label || payload.proposed_outcome.replace('_', ' ');
+    const att = result.attendance;
+    const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}* — that's Paso 1 done too.` : '';
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}* for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}` });
   } else if (result.reason === 'exists') {
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.` });
