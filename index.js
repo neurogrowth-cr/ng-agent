@@ -2983,6 +2983,15 @@ function isUnresolvedSalesId(name) {
 // they are sales-only BY CONSTRUCTION: dash's webhook ingestion is gated on the
 // GHL_SALES_CALENDAR_IDS allowlist. If a non-sales calendar ever joins GHL,
 // gate it in dash — do NOT add a second allowlist here (it would drift).
+//
+// THE SAME FACT IS ALSO STATED IN REVI: revi.calendar_groups.track = 'sales'
+// (REVI migration 0014) mirrors the GHL calendar grouping and drives REVI's own
+// routing. dash's allowlist and REVI's taxonomy must agree; as of 2026-08-18
+// both mean {fYQJCzbk4hvV0brpJqoE (Appointment), 0qwExROqOMRBXVmY93i5
+// (Appointment - ONLY RON), HXLeEjxpa0gdiTPNiAzc (Self Serving),
+// KRTGx8XteIJSCcKAShHS (Intro)}. runReviCrossChecks DETECTS a disagreement
+// (Check 1c) via GHL_SALES_CALENDAR_IDS_EXPECTED — detection only; still no
+// second live allowlist here.
 const SALES_FLYWHEEL_SLUGS = new Set(['linkedin-flywheel', 'linkedin-flywheel-vsl', 'linkedin-flywheel-doc', 'estrategia-linkedin-flywheel-selfserving-ron']);
 // Permanent boot-time memo (was a 10-min TTL): iclosed_webhook_deliveries is
 // frozen since the 2026-07-23 cutover, so the answer can never change within a
@@ -4761,6 +4770,64 @@ async function _scrapeDay7AtRiskCount() {
 // coaching material — never route it to a closer-facing surface; closer-facing
 // surfaces use closer_draft_text (the coaching REVI already sent them).
 
+// ── The call ledger: what REVI did with each recording, and WHY ─────────────
+// revi.call_ledger (REVI migration 0015) holds one row per Fathom recording:
+// track, how it resolved, action, and a fixed `reason` slug. Before it existed
+// the reason lived only in REVI's control flow and its logs, so this health
+// check had to INFER three different states from a single heartbeat timestamp —
+// and inferred wrong on 2026-08-04, 08-13 and 08-18. `reason` is a cross-repo
+// contract; the vocabulary is documented in REVI's migration 0015 header.
+async function reviGetCallLedgerSince(sinceISO) {
+  const { data, error } = await reviSupabase
+    .from('call_ledger')
+    .select('fathom_recording_id, title, host_email, call_date, duration_min, ghl_appointment_id, calendar_id, track, report_kind, resolved_by, action, reason, detail, recording_url')
+    .gte('call_date', sinceISO)
+    .order('call_date', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+// Which GHL calendar means which track. REVI mirrors the GHL calendar grouping
+// (NG Sales / Fulfilment Ops) into revi.calendar_taxonomy nightly. A calendar's
+// own `track` overrides its group's — that is how the two mixed-use Internal 1:1
+// calendars stay out of the sales set.
+async function reviGetCalendarTaxonomy() {
+  const [{ data: tax, error: tErr }, { data: groups, error: gErr }] = await Promise.all([
+    reviSupabase.from('calendar_taxonomy').select('calendar_id, group_id, calendar_name, track, report_kind, is_active, synced_at'),
+    reviSupabase.from('calendar_groups').select('group_id, group_name, track'),
+  ]);
+  if (tErr) throw tErr;
+  if (gErr) throw gErr;
+  const groupTrack = Object.fromEntries((groups || []).map(g => [g.group_id, g.track]));
+  const byCalendar = new Map();
+  for (const t of tax || []) {
+    byCalendar.set(t.calendar_id, { ...t, track: t.track || groupTrack[t.group_id] || 'unknown' });
+  }
+  const salesCalendarIds = new Set([...byCalendar.values()]
+    .filter(c => c.track === 'sales' && c.is_active !== false)
+    .map(c => c.calendar_id));
+  const syncedAt = (tax || []).map(t => t.synced_at).filter(Boolean).sort().pop() || null;
+  return { byCalendar, salesCalendarIds, groups: groups || [], syncedAt };
+}
+
+// Sales-track appointments in a window — the input to the missing-recordings
+// check. Sourced from REVI's GHL mirror rather than portal.revops_appointments
+// because only the mirror carries the GHL appointment id the ledger joins on.
+async function reviGetSalesAppointmentsBetween(startISO, endISO, salesCalendarIds) {
+  const ids = [...(salesCalendarIds || [])];
+  if (!ids.length) return [];
+  const { data, error } = await reviSupabase
+    .from('calendar_appointments')
+    .select('ghl_appointment_id, calendar_id, title, contact_id, assigned_user_id, appointment_status, start_time, deleted')
+    .in('calendar_id', ids)
+    .eq('deleted', false)
+    .gte('start_time', startISO)
+    .lte('start_time', endISO)
+    .order('start_time', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
 async function reviFindCallsByProspect(emailOrName, limit = 3) {
   if (!emailOrName) return [];
   let q = reviSupabase
@@ -5112,9 +5179,41 @@ async function _countSalesCallsSince(sinceISO) {
   return filterFlywheelAppts(appts || [], excludeIds).length;
 }
 
+// Pure: decide which sales appointments are genuinely missing a recording, and
+// how confidently we can say the call actually happened.
+//
+// WARMUP is the whole reason this is a function rather than three inline lines.
+// revi.call_ledger starts EMPTY on the deploy that introduces it, so every
+// appointment older than the first ledger row would look "missing" — an 18-row
+// false alarm on the very first run. Only appointments from after REVI started
+// writing rows can be judged; an empty ledger yields no verdict at all.
+//
+// `confirmed` in this GHL location is the BOOKING status: the widget sets it at
+// book time and nobody updates it. So it CANNOT separate "call happened, the
+// recorder was off" from "unmarked no-show". A logged sales outcome can, and
+// `showed` can; everything else stays explicitly ambiguous.
+function classifyMissingRecordings({ held, ledgerRows, outcomeApptIds = [] }) {
+  const rows = ledgerRows || [];
+  const ledgerFrom = rows.map(r => r.call_date).filter(Boolean).sort()[0] || null;
+  if (!ledgerFrom) return { warmingUp: true, missing: [], happened: [], ambiguous: [] };
+
+  const seen = new Set(rows.map(r => r.ghl_appointment_id).filter(Boolean));
+  const withOutcome = new Set(outcomeApptIds || []);
+  const missing = (held || [])
+    .filter(a => a.start_time >= ledgerFrom)
+    .filter(a => !seen.has(a.ghl_appointment_id));
+
+  const happened = missing.filter(a => withOutcome.has(a.ghl_appointment_id)
+    || String(a.appointment_status || '').toLowerCase() === 'showed');
+  const ambiguous = missing.filter(a => !happened.includes(a));
+  return { warmingUp: false, missing, happened, ambiguous };
+}
+// END REVI CROSS-CHECK PURE HELPERS
+
 async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   const alerts = [];
   const alertKinds = [];
+  const missingApptIds = []; // feeds the dedup key — see the bottom of this function
 
   // REVI's poller heartbeat — single row, written every poll cycle (~12 min).
   // Absent until ng-revi's heartbeat deploy lands; treat any read failure the same.
@@ -5154,9 +5253,70 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
     const heldSince = await _countSalesCallsSince(sinceISO);
     if (heldSince > 0) {
       const lastScoredStr = lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never';
-      const seenCloserSince = hb && hb.last_closer_seen_at && new Date(hb.last_closer_seen_at).getTime() > sinceMs;
-      const seenAnySince = hb && hb.last_seen_at && new Date(hb.last_seen_at).getTime() > sinceMs;
-      if (!hb) {
+
+      // THE LEDGER, not inference. Until revi.call_ledger existed, this branch
+      // guessed three states from one heartbeat timestamp and guessed wrong on
+      // 2026-08-04, 08-13 and 08-18 — every time because REVI had CORRECTLY
+      // skipped everything it saw and had no way to say so. Now it says so.
+      let ledger = null;
+      try { ledger = await reviGetCallLedgerSince(sinceISO); }
+      catch (le) { console.warn('REVI call ledger read failed (falling back to heartbeat inference):', le.message); }
+
+      if (ledger) {
+        const sales = ledger.filter(r => r.track === 'sales');
+        const scored = sales.filter(r => r.action === 'processed');
+        const failed = ledger.filter(r => r.action === 'failed');
+
+        if (failed.length) {
+          // Never benign, whatever else is true.
+          alertKinds.push('scoring-errors');
+          alerts.push(
+            `🔴 *REVI threw on ${failed.length} recording(s).*\n` +
+            failed.slice(0, 5).map(r => `• \`${r.fathom_recording_id}\` ${String(r.title || '').slice(0, 48)} — ${r.detail || r.reason}`).join('\n')
+          );
+        }
+        if (scored.length) {
+          // Sales calls ARE being scored in the window — the premise of the old
+          // alert was simply false. Say nothing.
+          console.log(`REVI cross-checks: ${scored.length} sales call(s) scored since ${sinceISO.slice(0, 10)} — healthy.`);
+        } else if (sales.length) {
+          // Sales calls seen and ALL skipped. Name the actual reasons instead of
+          // telling Ron to go read the poll logs.
+          const byReason = {};
+          for (const r of sales) byReason[r.reason || 'unspecified'] = (byReason[r.reason || 'unspecified'] || 0) + 1;
+          const benign = sales.every(r => r.reason === 'under_min_minutes' || r.reason === 'already_processed');
+          const summary = Object.entries(byReason).sort((a, b) => b[1] - a[1])
+            .map(([reason, n]) => `${n}× \`${reason}\``).join(', ');
+          if (benign) {
+            console.log(`REVI cross-checks: ${sales.length} sales call(s) skipped, all benign (${summary}) — no alert.`);
+          } else {
+            alertKinds.push('sales-skipped');
+            alerts.push(
+              `🟡 *REVI saw ${sales.length} sales call(s) since ${sinceISO.slice(0, 10)} and scored none.* ` +
+              `Last scored call: ${lastScoredStr}.\nReasons: ${summary}\n` +
+              sales.slice(0, 5).map(r => `• \`${r.fathom_recording_id}\` ${String(r.title || '').slice(0, 48)} — ${r.reason}`).join('\n')
+            );
+          }
+        } else if (ledger.length) {
+          // Recordings flowing, none of them sales calls. This is the 2026-08-04
+          // shape — and now it is PROVEN rather than assumed, because every
+          // recording in the window has a row saying what it was.
+          const tracks = {};
+          for (const r of ledger) tracks[r.track || 'unknown'] = (tracks[r.track || 'unknown'] || 0) + 1;
+          console.log(
+            `REVI cross-checks: ${quietBizDays} quiet biz days, but all ${ledger.length} recording(s) in the window are non-sales ` +
+            `(${Object.entries(tracks).map(([t, n]) => `${n}× ${t}`).join(', ')}) — no stall.`
+          );
+        } else {
+          alertKinds.push('feed-dark');
+          alerts.push(
+            `🔇 *REVI's Fathom feed is dark.* ${heldSince} sales call(s) on the calendar since ${sinceISO.slice(0, 10)}, ` +
+            `the poller is running, but it has processed NO recordings at all in that window ` +
+            `(last scored call: ${lastScoredStr}).\n` +
+            `This is the Jul 16 signature — check the Fathom API key / team sharing first, then whether the team stopped recording.`
+          );
+        }
+      } else if (!hb) {
         // Legacy heuristic — appointments vs. scores is the only signal available.
         alertKinds.push('stall-legacy');
         alerts.push(
@@ -5166,30 +5326,133 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
           `Check: Fathom API key / team sharing (broke silently on Jul 16), the ng-sales-REVI Railway service, and REVI's poll logs. ` +
           `Caveat: GHL appointments can be activation calls REVI rightly skips (2026-08-04 false alarm) — check skip reasons in the poll logs first.`
         );
-      } else if (seenCloserSince) {
-        alertKinds.push('seen-unscored');
-        alerts.push(
-          `🟡 *REVI sees closer calls but isn't scoring them.* The poller has seen closer-hosted recordings since ${sinceISO.slice(0, 10)} ` +
-          `(newest: ${String(hb.last_closer_seen_at).slice(0, 10)}), yet nothing scored in ${quietBizDays} business days ` +
-          `(last scored call: ${lastScoredStr}).\n` +
-          `Check REVI's poll logs for skip reasons — all sub-10-min no-shows is benign; empty transcripts or scoring errors are not.`
-        );
-      } else if (seenAnySince) {
-        // Recordings are flowing but none are closer-hosted: closers genuinely held
-        // nothing scoreable (appointments were activation calls, no-shows, or
-        // misattributed in GHL). Exactly the 2026-08-04 false alarm — stay silent.
-        console.log(
-          `REVI cross-checks: ${quietBizDays} quiet biz days but the Fathom feed is alive with no closer-hosted recordings — no stall.`
-        );
       } else {
-        alertKinds.push('feed-dark');
-        alerts.push(
-          `🔇 *REVI's Fathom feed is dark.* ${heldSince} sales call(s) on the calendar since ${sinceISO.slice(0, 10)}, ` +
-          `the poller is running, but it has seen NO new recordings at all in that window ` +
-          `(last scored call: ${lastScoredStr}).\n` +
-          `This is the Jul 16 signature — check the Fathom API key / team sharing first, then whether the team stopped recording.`
-        );
+        // Heartbeat present but the ledger read failed — degrade to the old
+        // inference rather than going silent.
+        const seenAnySince = hb.last_seen_at && new Date(hb.last_seen_at).getTime() > sinceMs;
+        if (!seenAnySince) {
+          alertKinds.push('feed-dark');
+          alerts.push(
+            `🔇 *REVI's Fathom feed is dark.* ${heldSince} sales call(s) on the calendar since ${sinceISO.slice(0, 10)}, ` +
+            `the poller is running, but it has seen NO new recordings at all in that window ` +
+            `(last scored call: ${lastScoredStr}).`
+          );
+        }
       }
+    }
+  }
+
+  // Check 1b — sales appointments with NO recording at all.
+  //
+  // The gap nobody was watching: on 2026-08-17 closer Jose Carranza had 4
+  // confirmed sales appointments and Fathom recorded ZERO. Nothing compared
+  // bookings against recordings, so nothing fired. This is the divergence check
+  // for the sales feed — source of truth (GHL bookings) vs. what actually
+  // reached REVI.
+  //
+  // HONESTY: in this GHL location `confirmed` is the BOOKING status. The booking
+  // widget sets it at book time and nobody updates it afterwards (the 08-17
+  // Johan Solis appointment was still `confirmed` a day later). It therefore
+  // CANNOT distinguish "call happened, recorder was off" from "unmarked
+  // no-show". So the alert asks revops_sales_outcomes: an appointment with a
+  // logged outcome demonstrably happened, which makes its missing recording
+  // real. Without one it stays ambiguous, and the alert says so rather than
+  // asserting a cause.
+  let taxonomy = null;
+  try { taxonomy = await reviGetCalendarTaxonomy(); }
+  catch (te) { console.warn('REVI calendar taxonomy read failed (skipping missing-recordings check):', te.message); }
+
+  if (taxonomy && taxonomy.salesCalendarIds.size) {
+    try {
+      // 90 min of grace so a call that just ended isn't flagged before Fathom
+      // has published it.
+      const endISO = new Date(Date.now() - 90 * 60 * 1000).toISOString();
+      const startISO = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const appts = await reviGetSalesAppointmentsBetween(startISO, endISO, taxonomy.salesCalendarIds);
+      const held = appts.filter(a => ['confirmed', 'showed'].includes(String(a.appointment_status || '').toLowerCase()));
+
+      if (held.length) {
+        const ledger7 = await reviGetCallLedgerSince(startISO);
+        // WARMUP. The ledger starts empty on the deploy that introduces it, so
+        // every appointment older than the first ledger row would look
+        // "missing" and the first run would fire a huge false alarm. Only judge
+        // appointments from after REVI actually started writing rows; an empty
+        // ledger means the check has nothing to say yet.
+        // ANY ledger row counts as "REVI saw it" — a skipped-but-ledgered call is
+        // a different alert (Check 1), not a missing recording.
+        let { warmingUp, missing } = classifyMissingRecordings({ held, ledgerRows: ledger7 });
+        if (warmingUp) {
+          console.log('missing-recordings: call ledger is empty for this window — warming up, no verdict.');
+        }
+
+        if (missing.length) {
+          // Did the call demonstrably happen? portal keys outcomes on its own
+          // appointment id, so map GHL id -> portal id first.
+          let outcomeFor = new Set();
+          try {
+            const ghlIds = missing.map(a => a.ghl_appointment_id);
+            const { data: portalAppts } = await portalSupabase
+              .from('revops_appointments').select('id, ghl_appointment_id').in('ghl_appointment_id', ghlIds);
+            const portalIds = (portalAppts || []).map(a => a.id);
+            if (portalIds.length) {
+              const { data: outcomes } = await portalSupabase
+                .from('revops_sales_outcomes').select('appointment_id, outcome').in('appointment_id', portalIds);
+              const withOutcome = new Set((outcomes || []).map(o => o.appointment_id));
+              const backToGhl = Object.fromEntries((portalAppts || []).map(a => [a.id, a.ghl_appointment_id]));
+              outcomeFor = new Set([...withOutcome].map(id => backToGhl[id]).filter(Boolean));
+            }
+          } catch (oe) { console.warn('outcome enrichment failed (alert will stay ambiguous):', oe.message); }
+
+          const { happened: confirmedHappened, ambiguous } =
+            classifyMissingRecordings({ held, ledgerRows: ledger7, outcomeApptIds: [...outcomeFor] });
+
+          const byPerson = {};
+          for (const a of missing) {
+            const who = resolveSalesMember(a.assigned_user_id) || a.assigned_user_id || 'unassigned';
+            (byPerson[who] = byPerson[who] || []).push(a);
+          }
+          const lines = Object.entries(byPerson).map(([who, rows]) => {
+            const days = [...new Set(rows.map(r => String(r.start_time).slice(0, 10)))].sort().join(', ');
+            return `• *${who}* — ${rows.length} on ${days}`;
+          });
+
+          alertKinds.push('missing-recordings');
+          missingApptIds.push(...missing.map(a => a.ghl_appointment_id));
+          const parts = [`🎥 *${missing.length} sales appointment(s) have no Fathom recording.*`, lines.join('\n')];
+          if (confirmedHappened.length) {
+            parts.push(`${confirmedHappened.length} of these have a logged outcome (or are marked \`showed\`) — those calls demonstrably happened, so the recording is genuinely missing. Check whether the recorder joined.`);
+          }
+          if (ambiguous.length) {
+            parts.push(`${ambiguous.length} have no logged outcome. GHL still shows them \`confirmed\`, but in this location that is the BOOKING status — set at booking time and rarely updated — so it cannot tell an unrecorded call from an unmarked no-show. Logging the outcome resolves it either way.`);
+          }
+          alerts.push(parts.join('\n'));
+        }
+      }
+    } catch (me) { console.warn('missing-recordings check failed:', me.message); }
+  }
+
+  // Check 1c — taxonomy drift between REVI and dash.
+  //
+  // dash's GHL_SALES_CALENDAR_IDS gates what reaches portal.revops_appointments;
+  // revi.calendar_groups states the same fact for REVI's routing. They MUST
+  // agree. This DETECTS a disagreement without creating a third allowlist —
+  // deliberately, see the note above SALES_FLYWHEEL_SLUGS: a second live
+  // allowlist here would itself drift. Set GHL_SALES_CALENDAR_IDS_EXPECTED to
+  // mirror dash's value; unset disables the check.
+  if (taxonomy && process.env.GHL_SALES_CALENDAR_IDS_EXPECTED) {
+    const expected = new Set(process.env.GHL_SALES_CALENDAR_IDS_EXPECTED.split(',').map(x => x.trim()).filter(Boolean));
+    const actual = taxonomy.salesCalendarIds;
+    const onlyRevi = [...actual].filter(id => !expected.has(id));
+    const onlyDash = [...expected].filter(id => !actual.has(id));
+    if (onlyRevi.length || onlyDash.length) {
+      const name = id => (taxonomy.byCalendar.get(id) || {}).calendar_name || id;
+      alertKinds.push('taxonomy-drift');
+      alerts.push(
+        `🧭 *Sales-calendar drift between REVI and dash.*\n` +
+        (onlyRevi.length ? `REVI counts as sales, dash does not ingest: ${onlyRevi.map(name).join(', ')}\n` : '') +
+        (onlyDash.length ? `dash ingests as sales, REVI does not: ${onlyDash.map(name).join(', ')}\n` : '') +
+        `Fix in dash's GHL_SALES_CALENDAR_IDS or in \`revi.calendar_groups\` — they must state the same thing.`
+      );
     }
   }
 
@@ -5218,7 +5481,11 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   // alert that shares the same last-scored date.
   const stuckDates = (stuck || []).map(s => s.run_date).sort().join(',');
   const alertKind = alertKinds.join('+');
-  const dedupKey = `revi-health:${alertKind}:${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}:${stuckDates || 'none'}`;
+  // Missing appointments join the key so a NEW one re-alerts while the same set
+  // stays quiet — otherwise the first day's alert would suppress every later
+  // miss that happened to share a last-scored date.
+  const missingKey = missingApptIds.length ? missingApptIds.slice().sort().join(',') : 'none';
+  const dedupKey = `revi-health:${alertKind}:${lastScoredAt ? new Date(lastScoredAt).toISOString().slice(0, 10) : 'never'}:${stuckDates || 'none'}:${missingKey}`;
   const { data: already } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
   if (already && already.length) { console.log(`REVI cross-checks: alert already sent for ${dedupKey}.`); return { alerts, deduped: true }; }
 
