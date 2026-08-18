@@ -7841,6 +7841,119 @@ function truncateOneLine(s, max) {
   return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
 }
 
+// ─── REVI PROSPECT NOTE (GHL) ────────────────────────────────────────────────
+// The same read that powers the closer's outcome card, written as a note on
+// the GHL contact so the WHOLE sales team sees it where they already work —
+// setters place their pre-call notes on the same surface. Pure builder; the
+// sweep that posts it lives with the other crons. Spanish on purpose: REVI's
+// narratives are Spanish and so is the team.
+function buildReviProspectNote(rec, { callDateStr } = {}) {
+  if (!rec) return null;
+  const lines = ['🧠 REVI — lectura de la llamada'];
+  const meta = [
+    callDateStr && `📅 ${callDateStr}`,
+    rec.durationMin && `${rec.durationMin} min`,
+    rec.score != null && `score ${rec.score}/100`,
+  ].filter(Boolean).join(' · ');
+  if (meta) lines.push(meta);
+
+  const st = String(rec.dealStatus || '').toLowerCase();
+  if (st) lines.push(`Estado del deal: ${st === 'alive' ? 'VIVO' : st === 'dead' ? 'MUERTO' : st}`);
+
+  const sig = rec.signals || {};
+  if (sig.buying_signal_strength) lines.push(`Señal de compra: ${sig.buying_signal_strength}`);
+  if (sig.objection_type)      lines.push(`Objeción: ${truncateOneLine(sig.objection_type, 300)}`);
+  if (sig.stated_timeline)     lines.push(`Timeline: ${truncateOneLine(sig.stated_timeline, 200)}`);
+  if (sig.stated_budget_fit)   lines.push(`Presupuesto: ${truncateOneLine(sig.stated_budget_fit, 250)}`);
+  if (sig.decision_maker_status) lines.push(`Decisor: ${truncateOneLine(sig.decision_maker_status, 250)}`);
+  if (rec.icpFit)              lines.push(`ICP fit: ${truncateOneLine(rec.icpFit, 200)}`);
+  if (rec.dealRecovery)        lines.push(`\nPróximos pasos:\n${truncateOneLine(rec.dealRecovery, 900)}`);
+  if (rec.url)                 lines.push(`\n🎙 Grabación: ${rec.url}`);
+  lines.push('\n(Generado por REVI a partir de la grabación — verificar antes de citar al prospecto.)');
+  return lines.join('\n');
+}
+
+// Posts one REVI note per scored call, once ever (agent_knowledge
+// `revi-note:{fathom_recording_id}`). Sweeps recent closer_call_scores and
+// resolves the GHL contact via the portal prospect's email. Ships in dry-run:
+// REVI_NOTES_MODE=live arms it, and is the kill switch.
+async function runReviProspectNotesSync(_correlationId) {
+  const dryRun = process.env.REVI_NOTES_MODE !== 'live';
+  console.log(`Running REVI prospect-notes sync (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
+  const tally = { candidates: 0, posted: 0, noContact: 0, failed: 0 };
+  try {
+    const sinceIso = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const { data: scores } = await reviSupabase
+      .from('closer_call_scores')
+      .select('fathom_recording_id, prospect_email, prospect_name, call_date, duration_min, overall_score, recording_url, prospect_signals, coaching_json')
+      .gte('call_date', sinceIso);
+    const rows = (scores || []).filter(s => s.fathom_recording_id && s.prospect_email);
+    if (!rows.length) { console.log('REVI prospect-notes: nothing scored in window.'); return tally; }
+
+    for (const s of rows) {
+      const noteKey = `revi-note:${s.fathom_recording_id}`;
+      const { data: done } = await supabase.from('agent_knowledge').select('value').eq('key', noteKey).limit(1);
+      if (done && done.length) continue;
+      tally.candidates += 1;
+
+      const { data: prospects } = await portalSupabase
+        .from('revops_prospects')
+        .select('id, ghl_contact_id, full_name')
+        .ilike('email', s.prospect_email)
+        .limit(1);
+      const contactId = prospects?.[0]?.ghl_contact_id;
+      if (!contactId) {
+        tally.noContact += 1;
+        console.log(`REVI prospect-notes: no GHL contact for ${s.prospect_email} — skipped.`);
+        continue;
+      }
+
+      const coaching = s.coaching_json || {};
+      const deal = typeof coaching.deal === 'string'
+        ? (() => { try { return JSON.parse(coaching.deal); } catch (_) { return {}; } })()
+        : (coaching.deal || {});
+      const note = buildReviProspectNote({
+        durationMin: s.duration_min == null ? null : Math.round(Number(s.duration_min)),
+        score: s.overall_score == null ? null : Number(s.overall_score),
+        url: s.recording_url || null,
+        signals: parseReviSignals(s.prospect_signals),
+        dealStatus: deal.status || null,
+        dealRecovery: deal.recovery || null,
+        icpFit: coaching.icp_fit || null,
+      }, { callDateStr: formatICTime(s.call_date, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) });
+      if (!note) continue;
+
+      if (dryRun) {
+        console.log(`[dry-run] would post REVI note for ${s.prospect_name || s.prospect_email} (${note.length} chars) on contact ${contactId}`);
+        tally.posted += 1;
+        continue;
+      }
+      try {
+        const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: note }),
+        });
+        if (!res.ok) throw new Error(`note POST → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+        await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}`, 'revi-note');
+        tally.posted += 1;
+        console.log(`REVI note posted for ${s.prospect_name || s.prospect_email}`);
+      } catch (postErr) {
+        tally.failed += 1;
+        console.error(`REVI note for ${s.prospect_email} failed:`, postErr.message);
+      }
+    }
+    const verdict = tally.failed
+      ? `⚠️ ISSUES — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}, failures ${tally.failed}`
+      : `✅ ALL GREEN — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}`;
+    console.log(`REVI prospect-notes sync complete. ${verdict}`);
+    return tally;
+  } catch (err) {
+    console.error('REVI prospect-notes sync error:', err.message);
+    return tally;
+  }
+}
+
 // ─── APPOINTMENT STATUS (Paso 1) ─────────────────────────────────────────────
 // Show/no-show is a FACT, not a judgment, and closers were logging it ~2% of
 // the time (40 of 44 August appointments still sat at the default `confirmed`).
@@ -9250,6 +9363,11 @@ cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (
 // outcome card goes out. Ships in dry-run: set APPT_STATUS_SYNC_MODE=live to
 // let it write to GHL. Kill switch is that same env var.
 cron.schedule('0 15 * * *',   wrapCronJob('runAppointmentStatusSync', async (c) => { await runAppointmentStatusSync(c); }), { timezone: 'America/Costa_Rica' });
+
+// REVI prospect notes — 2 PM CR daily, before the status sweep and the cards,
+// so the note is already on the contact when a closer opens it from either.
+// Ships in dry-run: REVI_NOTES_MODE=live arms it (also the kill switch).
+cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) => { await runReviProspectNotesSync(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
 // the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours,

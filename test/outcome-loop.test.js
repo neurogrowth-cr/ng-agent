@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
+const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -211,6 +211,24 @@ check('and it tells the closer the short word to type', /Reply `no show` to conf
 const blindCard = g.buildOutcomeCardText({ ...cardBase, rec: null, proposal: { outcome: null, confidence: 'none', wonHint: false } });
 check('no recording is stated plainly', /No REVI recording found/.test(blindCard), true);
 check('and Max admits it cannot tell', /I can't tell from here/.test(blindCard), true);
+
+console.log('buildReviProspectNote — the read the whole team sees on the GHL contact');
+const noteRec = { durationMin: 74, score: 61, url: 'https://fathom.video/x',
+  dealStatus: 'alive', dealRecovery: 'Antes del jueves: Ron envía la propuesta.\n\nEl martes: llamada con Andrea.',
+  icpFit: 'Medio-Alto — estudio creativo B2B',
+  signals: { buying_signal_strength: 'high', objection_type: 'Presupuesto ($2,000 vs $3,500)', stated_timeline: 'Decisión esta semana', decision_maker_status: 'Andrea aprueba y no estuvo' } };
+const note = g.buildReviProspectNote(noteRec, { callDateStr: 'Aug 4, 02:00 PM' });
+check('opens with the REVI banner', /^🧠 REVI — lectura de la llamada/.test(note), true);
+check('states deal status in plain words', /Estado del deal: VIVO/.test(note), true);
+check('carries the blocker (decision maker)', /Decisor: Andrea aprueba y no estuvo/.test(note), true);
+check('carries next steps', /Próximos pasos:/.test(note), true);
+check('flattens escaped newlines from coaching_json', /\\n/.test(note), false);
+check('links the recording', /🎙 Grabación: https:\/\/fathom\.video\/x/.test(note), true);
+check('labels itself AI-generated so nobody quotes it as gospel', /Generado por REVI/.test(note), true);
+check('never renders undefined', /undefined/.test(note), false);
+check('no recording → no note at all', g.buildReviProspectNote(null), null);
+const thinNote = g.buildReviProspectNote({ durationMin: 12 }, { callDateStr: 'Aug 4' });
+check('a thin read still produces a valid note without empty labels', /Objeción:|Decisor:|Próximos pasos:/.test(thinNote), false);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nAll outcome-loop tests passed.');
