@@ -8188,6 +8188,19 @@ async function runReviProspectNotesSync(_correlationId) {
         continue;
       }
 
+      // Bind the note to the call it describes. GHL has no notes endpoint on
+      // opportunities (verified 404) — notes live on the contact and the
+      // opportunity view surfaces them — but a note CAN relate to an
+      // appointment, which is the shape GHL itself writes when someone adds a
+      // note from the appointment page. Best-effort: no appointment match still
+      // posts a contact-only note.
+      let apptId = null;
+      const { data: appts } = await portalSupabase
+        .from('revops_appointments')
+        .select('ghl_appointment_id, scheduled_start')
+        .eq('prospect_id', prospects[0].id);
+      apptId = nearestAppointmentToCall(appts, Date.parse(s.call_date));
+
       const coaching = s.coaching_json || {};
       const deal = typeof coaching.deal === 'string'
         ? (() => { try { return JSON.parse(coaching.deal); } catch (_) { return {}; } })()
@@ -8204,7 +8217,7 @@ async function runReviProspectNotesSync(_correlationId) {
       if (!note) continue;
 
       if (dryRun) {
-        console.log(`[dry-run] would post REVI note for ${s.prospect_name || s.prospect_email} (${note.length} chars) on contact ${contactId}`);
+        console.log(`[dry-run] would post REVI note for ${s.prospect_name || s.prospect_email} (${note.length} chars) on contact ${contactId}${apptId ? ` + appointment ${apptId}` : ' (no appointment match — contact only)'}`);
         tally.posted += 1;
         continue;
       }
@@ -8212,10 +8225,16 @@ async function runReviProspectNotesSync(_correlationId) {
         const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
-          body: JSON.stringify({ body: note }),
+          body: JSON.stringify({
+            body: note,
+            relations: [
+              ...(apptId ? [{ objectKey: 'appointment', recordId: apptId }] : []),
+              { objectKey: 'contact', recordId: contactId },
+            ],
+          }),
         });
         if (!res.ok) throw new Error(`note POST → ${res.status}: ${(await res.text()).slice(0, 150)}`);
-        await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}`, 'revi-note');
+        await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}${apptId ? `|${apptId}` : ''}`, 'revi-note');
         tally.posted += 1;
         console.log(`REVI note posted for ${s.prospect_name || s.prospect_email}`);
       } catch (postErr) {
@@ -8562,6 +8581,25 @@ function matchRecordingToCall(recordings, email, apptMs) {
   }
   if (best) best.matched = true;
   return best;
+}
+
+// The reverse of matchRecordingToCall: given a REVI call, which appointment was
+// it? Same 36h contract. Used to bind a REVI note to the specific call it
+// describes — without this, a prospect with three calls accumulates three notes
+// on one contact with nothing saying which call each is about.
+// Ignores rows with no writable GHL event (pre-cutover, or `opp:` synthetics).
+function nearestAppointmentToCall(appointments, callMs) {
+  if (!Number.isFinite(callMs)) return null;
+  let best = null;
+  for (const a of (appointments || [])) {
+    const gid = a.ghl_appointment_id;
+    if (!gid || String(gid).startsWith('opp:')) continue;
+    const at = Date.parse(a.scheduled_start || '');
+    if (!Number.isFinite(at)) continue;
+    if (Math.abs(at - callMs) > OUTCOME_MATCH_PAD_MS) continue;
+    if (!best || Math.abs(at - callMs) < Math.abs(Date.parse(best.scheduled_start) - callMs)) best = a;
+  }
+  return best ? best.ghl_appointment_id : null;
 }
 
 const VALID_LOGGABLE_OUTCOMES = new Set(['won', 'lost', 'follow_up', 'disqualified', 'no_show']);

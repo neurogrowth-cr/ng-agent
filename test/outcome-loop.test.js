@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
+const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -247,6 +247,31 @@ check('case and whitespace insensitive', g.parseOutcomeReply('  NO   SHOW '), { 
 check('conversation falls through to the LLM', g.parseOutcomeReply('hey can you check if she rebooked?'), null);
 check('a sentence containing "lost" is NOT a command', g.parseOutcomeReply('I think we lost her to a competitor honestly'), null);
 check('empty is null', g.parseOutcomeReply(''), null);
+
+console.log('nearestAppointmentToCall — bind a REVI note to the call it describes');
+const CT = Date.parse('2026-08-14T20:00:00Z');
+const HR = 3600e3;
+const appts = [
+  { ghl_appointment_id: 'far',   scheduled_start: new Date(CT - 40 * HR).toISOString() },
+  { ghl_appointment_id: 'near',  scheduled_start: new Date(CT + 2 * HR).toISOString() },
+  { ghl_appointment_id: 'mid',   scheduled_start: new Date(CT - 20 * HR).toISOString() },
+];
+check('picks the nearest appointment inside 36h', g.nearestAppointmentToCall(appts, CT), 'near');
+check('an appointment 40h away is out of contract', g.nearestAppointmentToCall([appts[0]], CT), null);
+check('no appointments at all → null', g.nearestAppointmentToCall([], CT), null);
+check('null list never throws', g.nearestAppointmentToCall(null, CT), null);
+check('bad call time → null', g.nearestAppointmentToCall(appts, NaN), null);
+// Rows with no writable GHL event must never be returned as a relation target.
+check('skips synthetic opp: rows',
+  g.nearestAppointmentToCall([{ ghl_appointment_id: 'opp:abc', scheduled_start: new Date(CT).toISOString() }], CT), null);
+check('skips rows with no ghl_appointment_id (pre-cutover)',
+  g.nearestAppointmentToCall([{ ghl_appointment_id: null, scheduled_start: new Date(CT).toISOString() }], CT), null);
+check('skips rows with an unparseable date',
+  g.nearestAppointmentToCall([{ ghl_appointment_id: 'x', scheduled_start: 'not a date' }], CT), null);
+check('a valid row still wins when a junk row sits closer',
+  g.nearestAppointmentToCall([{ ghl_appointment_id: 'opp:junk', scheduled_start: new Date(CT).toISOString() }, appts[1]], CT), 'near');
+check('exactly 36h is inside the window',
+  g.nearestAppointmentToCall([{ ghl_appointment_id: 'edge', scheduled_start: new Date(CT + g.OUTCOME_MATCH_PAD_MS).toISOString() }], CT), 'edge');
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nAll outcome-loop tests passed.');
