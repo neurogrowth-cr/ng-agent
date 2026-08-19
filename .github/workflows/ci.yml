@@ -30,6 +30,7 @@ jobs:
           node test/outcome-loop.test.js
           node test/appt-deletion-sweep.test.js
           node test/revi-missing-recordings.test.js
+          node test/ghl-retry.test.js
 
       # A "docs" branch that touches index.js is the 2026-05-26 failure mode:
       # a docs-only session committing a stale copy of the monolith.
