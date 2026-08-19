@@ -8157,23 +8157,52 @@ function buildReviProspectNote(rec, { callDateStr } = {}) {
 // `revi-note:{fathom_recording_id}`). Sweeps recent closer_call_scores and
 // resolves the GHL contact via the portal prospect's email. Ships in dry-run:
 // REVI_NOTES_MODE=live arms it, and is the kill switch.
+// GHL's own contact lookup by email. The portal's ghl_contact_id was only
+// backfilled for GHL-native prospects, so pre-cutover rows have a real GHL
+// contact that the portal simply doesn't know about. Returns null on anything
+// unexpected — a missing contact must skip, never guess.
+async function ghlFindContactByEmail(email) {
+  const em = String(email || '').trim();
+  if (!em) return null;
+  try {
+    const res = await fetch(
+      `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&email=${encodeURIComponent(em)}`,
+      { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+    );
+    if (!res.ok) return null;
+    return (await res.json())?.contact?.id || null;
+  } catch (_) { return null; }
+}
+
 async function runReviProspectNotesSync(_correlationId) {
   const dryRun = process.env.REVI_NOTES_MODE !== 'live';
   console.log(`Running REVI prospect-notes sync (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
-  const tally = { candidates: 0, posted: 0, noContact: 0, failed: 0 };
+  // Lookback is a knob so a BACKFILL is just a wider run of this same proven
+  // path — no second code path to get subtly different. Cap + throttle keep a
+  // wide run from hammering GHL; the dedup marker makes it resumable, so a
+  // capped run simply drains over the following days.
+  const lookbackDays = Math.max(1, Number(process.env.REVI_NOTES_LOOKBACK_DAYS) || 7);
+  const maxPerRun    = Math.max(1, Number(process.env.REVI_NOTES_MAX_PER_RUN) || 40);
+  const tally = { candidates: 0, posted: 0, noContact: 0, failed: 0, capped: 0 };
   try {
-    const sinceIso = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const sinceIso = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000).toISOString();
     const { data: scores } = await reviSupabase
       .from('closer_call_scores')
       .select('fathom_recording_id, prospect_email, prospect_name, call_date, duration_min, overall_score, recording_url, prospect_signals, coaching_json')
       .gte('call_date', sinceIso);
-    const rows = (scores || []).filter(s => s.fathom_recording_id && s.prospect_email);
+    // Newest first: on a capped backfill the most recent (most useful) calls
+    // land first rather than starting from April.
+    const rows = (scores || [])
+      .filter(s => s.fathom_recording_id && s.prospect_email)
+      .sort((a, b) => String(b.call_date).localeCompare(String(a.call_date)));
     if (!rows.length) { console.log('REVI prospect-notes: nothing scored in window.'); return tally; }
+    if (lookbackDays !== 7) console.log(`REVI prospect-notes: BACKFILL mode — ${lookbackDays}d lookback, ${rows.length} scored call(s), cap ${maxPerRun}/run.`);
 
     for (const s of rows) {
       const noteKey = `revi-note:${s.fathom_recording_id}`;
       const { data: done } = await supabase.from('agent_knowledge').select('value').eq('key', noteKey).limit(1);
       if (done && done.length) continue;
+      if (tally.posted >= maxPerRun) { tally.capped += 1; continue; }
       tally.candidates += 1;
 
       const { data: prospects } = await portalSupabase
@@ -8181,7 +8210,11 @@ async function runReviProspectNotesSync(_correlationId) {
         .select('id, ghl_contact_id, full_name')
         .ilike('email', s.prospect_email)
         .limit(1);
-      const contactId = prospects?.[0]?.ghl_contact_id;
+      // 92 of 127 pre-cutover prospects have no ghl_contact_id in the portal
+      // (it was only backfilled for GHL-native rows), but GHL itself can find
+      // them by email — so ask GHL rather than skipping a real contact.
+      let contactId = prospects?.[0]?.ghl_contact_id || null;
+      if (!contactId) contactId = await ghlFindContactByEmail(s.prospect_email);
       if (!contactId) {
         tally.noContact += 1;
         console.log(`REVI prospect-notes: no GHL contact for ${s.prospect_email} — skipped.`);
@@ -8195,11 +8228,13 @@ async function runReviProspectNotesSync(_correlationId) {
       // note from the appointment page. Best-effort: no appointment match still
       // posts a contact-only note.
       let apptId = null;
-      const { data: appts } = await portalSupabase
-        .from('revops_appointments')
-        .select('ghl_appointment_id, scheduled_start')
-        .eq('prospect_id', prospects[0].id);
-      apptId = nearestAppointmentToCall(appts, Date.parse(s.call_date));
+      if (prospects?.[0]?.id) {
+        const { data: appts } = await portalSupabase
+          .from('revops_appointments')
+          .select('ghl_appointment_id, scheduled_start')
+          .eq('prospect_id', prospects[0].id);
+        apptId = nearestAppointmentToCall(appts, Date.parse(s.call_date));
+      }
 
       const coaching = s.coaching_json || {};
       const deal = typeof coaching.deal === 'string'
@@ -8237,14 +8272,16 @@ async function runReviProspectNotesSync(_correlationId) {
         await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}${apptId ? `|${apptId}` : ''}`, 'revi-note');
         tally.posted += 1;
         console.log(`REVI note posted for ${s.prospect_name || s.prospect_email}`);
+        await new Promise(r => setTimeout(r, 250)); // be kind to GHL on a wide backfill
       } catch (postErr) {
         tally.failed += 1;
         console.error(`REVI note for ${s.prospect_email} failed:`, postErr.message);
       }
     }
+    const capNote = tally.capped ? ` — ${tally.capped} left for the next run (cap ${maxPerRun})` : '';
     const verdict = tally.failed
-      ? `⚠️ ISSUES — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}, failures ${tally.failed}`
-      : `✅ ALL GREEN — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}`;
+      ? `⚠️ ISSUES — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}, failures ${tally.failed}${capNote}`
+      : `✅ ALL GREEN — candidates ${tally.candidates}, posted ${tally.posted}, no-contact ${tally.noContact}${capNote}`;
     console.log(`REVI prospect-notes sync complete. ${verdict}`);
     return tally;
   } catch (err) {
