@@ -34,6 +34,7 @@ jobs:
           node test/strike-failure-thresholds.test.js
           node test/day-anchor.test.js
           node test/won-handoff-notes.test.js
+          node test/gmail-alert-quality.test.js
 
       # A "docs" branch that touches index.js is the 2026-05-26 failure mode:
       # a docs-only session committing a stale copy of the monolith.
