@@ -55,7 +55,7 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
   };
   const factory = new Function(
     'slack', 'portalSupabase', 'postMakeHealthAlert', 'logActivity', 'RON_SLACK_ID', 'console',
-    `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor };`
+    `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor, shouldReportSkipOnly };`
   );
   const api = factory(
     slackStub, portalStub,
@@ -132,7 +132,11 @@ const PROSP_ISSUE = `:rotating_light: *Issues with Prosp Campaign*
 *Subject:* Campaign paused
 *Date:* Mon, 18 Aug 2026 09:00:00 -0600`;
 
-const { evaluateAlertCard, cardExistsFor } = build();
+const { evaluateAlertCard, cardExistsFor, shouldReportSkipOnly } = build();
+
+// 09:00 and 10:00 CR — the daily skip-only slot and an ordinary hour.
+const AT_9AM_CR  = Date.parse('2026-08-19T15:00:00Z');
+const AT_10AM_CR = Date.parse('2026-08-19T16:00:00Z');
 
 // ── 1. The pure contract ──
 check('1a good closer card passes',        evaluateAlertCard(GOOD_CLOSER).ok, true);
@@ -265,7 +269,7 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
     historyErr: { C0A7X9G6S78: 'channel_not_found' },
     clients: [],
   });
-  await checkGmailAlertQuality('c');
+  await checkGmailAlertQuality('c', AT_9AM_CR);
   check('12a unreadable channel still posts',   posted.length, 1);
   check('12b it is reported as skipped, not green', posted[0].includes('Skipped'), true);
   check('12c divergence is suppressed when the channel is unreadable',
@@ -286,7 +290,7 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
     history: { C0A7X9G6S78: [] },
     clients: [{ client_name: 'Kty Araya', email: 'kty@tropikasa.com', created_at: '2026-08-19T10:00:00Z' }],
   });
-  await checkGmailAlertQuality('c');
+  await checkGmailAlertQuality('c', AT_10AM_CR);
   check('12f a skip elsewhere does not suppress the divergence finding',
         posted[0].includes('Kty Araya'), true);
   check('12g and the unreadable channel is still named',
@@ -299,9 +303,47 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
     history: { C0A7X9G6S78: [GOOD_NEW_CLIENT] },
     clientErr: { message: 'permission denied' },
   });
-  await checkGmailAlertQuality('c');
+  await checkGmailAlertQuality('c', AT_9AM_CR);
   check('13a table error is reported', posted[0].includes('Skipped'), true);
   check('13b no phantom missing customers', posted[0].includes('no alert card'), false);
+})
+
+// ── 14. The hourly skip DM: a standing blind spot is a daily note, not an alarm ──
+// Max is not in #ng-newclient-onboarding-tracking, so this skip repeats on every
+// single run. Before this, that was 24 identical DMs a day with nothing to act on.
+.then(async () => {
+  check('14a the 09:00 CR run is the daily slot', shouldReportSkipOnly(AT_9AM_CR), true);
+  check('14b 10:00 CR is not',                    shouldReportSkipOnly(AT_10AM_CR), false);
+  // Midnight CR must read as hour 0, not 24 — an h12/h24 formatting quirk here would
+  // silently move the daily note or delete it.
+  check('14c midnight CR is hour 0, not 24',
+        shouldReportSkipOnly(Date.parse('2026-08-19T06:10:00Z')), false);
+
+  const off = build({ historyErr: { C0A70J9638R: 'channel_not_found' }, history: { C0A7X9G6S78: [] }, clients: [] });
+  await off.checkGmailAlertQuality('c', AT_10AM_CR);
+  check('14d a skip-only run outside the slot posts nothing', off.posted.length, 0);
+  check('14e and logs nothing, so the row still means "a DM went out"', off.logged.length, 0);
+
+  const on = build({ historyErr: { C0A70J9638R: 'channel_not_found' }, history: { C0A7X9G6S78: [] }, clients: [] });
+  await on.checkGmailAlertQuality('c', AT_9AM_CR);
+  check('14f the same run inside the slot posts',   on.posted.length, 1);
+  check('14g the daily note says the rest was clean',
+        on.posted[0].includes('No bad cards and no uncovered customers'), true);
+  check('14h and still names the unreadable channel',
+        on.posted[0].includes('<#C0A70J9638R>'), true);
+
+  // The suppression must never reach a run that found something. A missing customer
+  // at 03:00 is the case this whole check exists for.
+  const real = build({
+    historyErr: { C0A70J9638R: 'channel_not_found' },
+    history: { C0A7X9G6S78: [] },
+    clients: [{ client_name: 'Kty Araya', email: 'kty@tropikasa.com', created_at: '2026-08-19T10:00:00Z' }],
+  });
+  await real.checkGmailAlertQuality('c', Date.parse('2026-08-19T09:00:00Z'));
+  check('14i a real finding still alerts at any hour', real.posted.length, 1);
+  check('14j and carries the skip footer with it',     real.posted[0].includes('Skipped'), true);
+  check('14k without the clean-run line',
+        real.posted[0].includes('No bad cards and no uncovered customers'), false);
 })
 
 .then(() => {

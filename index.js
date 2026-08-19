@@ -13149,14 +13149,44 @@ function cardExistsFor(client, cards) {
   return cards.some(card => tokens.every(tok => card.includes(tok)));
 }
 
+// A skip is a standing condition, not an event.
+//
+// #ng-newclient-onboarding-tracking has been unreadable since this recipe shipped —
+// Max is not a member of it, so the fix is a Slack invite, not a deploy. The hourly
+// cron therefore had 24 chances a day to say so, and on 2026-08-19 it took every one
+// of them: identical DMs on the hour carrying nothing to act on. That is precisely
+// how an alerting channel gets muted, and a muted channel hides the real gap too —
+// the failure this whole check exists to prevent.
+//
+// So a run that found NOTHING WRONG — no bad card, no uncovered customer, only skips
+// — reports once a day, in the 09:00 CR run, and stays quiet the other 23 hours. The
+// verdict is unchanged: a skip is still never green, and it is still attached to any
+// run that DID find something. Only its cadence changed.
+//
+// Stateless on purpose. A "have I already said this today" memo lives in process
+// memory and resets on every deploy — 2026-08-19 shipped six deploys inside forty
+// minutes, and that memo would have sent six DMs. The clock reads the same after a
+// restart as before one.
+const SKIP_ONLY_REPORT_HOUR_CR = 9;
+
+// Pure, so the test drives it directly rather than mocking a clock.
+function shouldReportSkipOnly(nowMs) {
+  const hour = Number(new Date(nowMs).toLocaleString('en-US', {
+    timeZone: 'America/Costa_Rica', hour: '2-digit', hourCycle: 'h23',
+  }));
+  return hour === SKIP_ONLY_REPORT_HOUR_CR;
+}
+
 const gmailAlertAlerted = new Set();
 const GMAIL_ALERT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 // The dash webhook fires within seconds, but Make's Gmail trigger polls every 20
 // min. A customer created 25 min ago is in flight, not missing.
 const GMAIL_ALERT_GRACE_MS = 30 * 60 * 1000;
 
-async function checkGmailAlertQuality(correlationId) {
-  const now = Date.now();
+// nowMs is injectable so the test can drive both sides of the daily skip-only
+// window without mocking the global clock. The cron passes only correlationId.
+async function checkGmailAlertQuality(correlationId, nowMs = Date.now()) {
+  const now = nowMs;
   const since = now - GMAIL_ALERT_LOOKBACK_MS;
   const problems = [];
   const skipped = [];
@@ -13243,7 +13273,12 @@ async function checkGmailAlertQuality(correlationId) {
   }
 
   console.log(`Gmail alert quality: ${problems.length} bad card(s), ${missing.length} customer(s) with no alert, ${skipped.length} check(s) skipped.`);
-  if (!problems.length && !missing.length && !skipped.length) return;
+  const nothingWrong = !problems.length && !missing.length;
+  if (nothingWrong && !skipped.length) return;
+  if (nothingWrong && !shouldReportSkipOnly(now)) {
+    console.log(`Gmail alert quality: nothing wrong — holding ${skipped.length} skip(s) for the ${SKIP_ONLY_REPORT_HOUR_CR}:00 CR daily note.`);
+    return;
+  }
 
   // A skipped check can never read as green — it degrades the verdict to ⚠️.
   const parts = [`⚠️ <@${RON_SLACK_ID}> *Customer alert fan-out — quality check*`];
@@ -13253,6 +13288,9 @@ async function checkGmailAlertQuality(correlationId) {
       missing.slice(0, 10).map(c => `• ${c.client_name} <${c.email}> — created ${new Date(c.created_at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`).join('\n') +
       `\nThe row is in \`client_dashboards\` but nothing reached <#${GMAIL_NEW_CLIENT_CHANNEL_ID}>. Do NOT re-post by hand before checking whether the dash webhook fired — a duplicate card is worse than a late one.`);
   }
+  // Say so out loud on the daily note, or a DM whose only content is a skip line
+  // reads like a truncated alert rather than a clean run with one blind spot.
+  if (nothingWrong) parts.push(`\nNo bad cards and no uncovered customers in the last 24h. Daily note that one check still cannot run:`);
   if (skipped.length) parts.push(`\n_Skipped (not green, just unread): ${skipped.join(', ')}_`);
 
   await postMakeHealthAlert(parts.join('\n'));
