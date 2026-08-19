@@ -422,3 +422,23 @@ missing. That second data point is the only reason the real cause was found.
   alerts with nothing actionable are how a channel gets muted, and a muted channel
   hides the real gap too. Suppress on the clock (stateless), not in a memo that
   resets on every deploy.
+
+## 2026-08-19 — Won-handoff notes: reusing a join contract for the wrong question
+- **The same two records can be joined for different questions, and the right
+  rule differs per question.** The 36h appointment↔recording join exists to
+  PROVE a call happened (attendance). Reusing it to FETCH that call's context
+  looked like reuse and was a bug: dash attaches a won outcome to the prospect's
+  LATEST appointment, so the appointment date is not when the closing call
+  happened. Fernando Corella won Aug 6 against an Aug 12 appointment with the
+  real call on Aug 4 — missed by 8 days. Ron's framing is the rule: "sometimes
+  the prospect does not close the deal right there in the call, but later on
+  follow up — however, we need the context of the call anyways." Before reusing
+  a matcher, restate the question it was built to answer.
+- **A dry run must never write state.** The no-recording path wrote its
+  `gave_up`/`no_recording` markers regardless of mode, and `gave_up` is
+  terminal — so merely PREVIEWING sealed 3 deals out of the first live sweep
+  (confirmed: 3 markers written 15:00Z, deleted by hand afterwards). If a mode
+  is called dry-run, gate every write behind it, not just the obvious one.
+- **"Ambiguity skips" was the wrong default for multi-call sales.** The opp-row
+  fallback refused to pick when a prospect had >1 recording. Multi-call sales
+  are normal; the LAST call before the win is the answer, not a reason to bail.
