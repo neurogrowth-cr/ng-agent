@@ -3874,12 +3874,13 @@ async function createSlackReminder(target, message, postAt) {
 async function runWeeklyPortalTrends(_correlationId) {
   console.log('Running weekly portal trend analysis...');
   try {
-    const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, customer_status, customer_type, created_at').eq('is_active', true);
+    const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true);
     const { data: templates }  = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
     const tMap = {};
     (templates || []).forEach(t => { tMap[t.id] = t.title; });
     const { data: allActs } = await portalSupabase.from('customer_activities').select('customer_id, template_id, status, assigned_to, completed_at');
     if (!dashboards || !allActs) return;
+    const activationFor = await loadActivationDates();
 
     const phaseCounts = dashboards.reduce((acc, d) => { acc[d.customer_status] = (acc[d.customer_status]||0)+1; return acc; }, {});
     const blockedByActivity = {};
@@ -3888,12 +3889,32 @@ async function runWeeklyPortalTrends(_correlationId) {
     const pendingByAssignee = {};
     allActs.filter(a => a.status === 'phase_1' || a.status === 'phase_2').forEach(a => { const e = (a.assigned_to||'unassigned').split('@')[0]; pendingByAssignee[e] = (pendingByAssignee[e]||0)+1; });
     const workload = Object.entries(pendingByAssignee).sort((a,b) => b[1]-a[1]).map(([e,c]) => `${e}: ${c} pending`).join(' | ');
-    const liveClients   = dashboards.filter(d => d.customer_status === 'live' && d.created_at);
-    const avgDaysToLive = liveClients.length > 0 ? Math.round(liveClients.reduce((sum,d) => sum + Math.floor((Date.now()-new Date(d.created_at).getTime())/(1000*60*60*24)),0)/liveClients.length) : null;
+    const liveClients   = dashboards.filter(d => d.customer_status === 'live');
+    // Days-to-live is a Build & Release number, so it counts from the activation
+    // call — the same anchor the 14-day window uses. It used to count from
+    // client_dashboards.created_at, which is when the portal row appeared, and was
+    // labelled "days since onboarding"; that mixed pre-activation waiting time into
+    // a delivery metric and the result was written into the knowledge base weekly,
+    // where Max would later quote it as fact.
+    //
+    // Averaged ONLY over clients with a real activation date, and the sample size is
+    // reported — a mean silently mixing two different anchors is worse than a mean
+    // over fewer clients, and hiding how few clients it covers is how a soft number
+    // gets treated as solid.
+    const liveWithAnchor = liveClients
+      .map(d => ({ d, anchor: activationFor(d) }))
+      .filter(x => x.anchor);
+    const avgDaysToLive = liveWithAnchor.length
+      ? Math.round(liveWithAnchor.reduce((sum, x) =>
+          sum + Math.floor((Date.now() - new Date(x.anchor).getTime()) / (1000 * 60 * 60 * 24)), 0) / liveWithAnchor.length)
+      : null;
+    const avgDaysToLiveLine = avgDaysToLive
+      ? `Avg days since activation call for live clients: ${avgDaysToLive} days (${liveWithAnchor.length} of ${liveClients.length} live clients have a recorded call date)`
+      : liveClients.length ? `Avg days since activation call: not computed — none of the ${liveClients.length} live clients has a recorded activation call date` : '';
     const fwCount = dashboards.filter(d => d.customer_type === 'flywheel-ai').length;
     const fsCount = dashboards.filter(d => d.customer_type === 'full-service').length;
     const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
-    const trendReport = [`Week ending ${today}:`, `Phase distribution: ${Object.entries(phaseCounts).map(([k,v])=>`${k}:${v}`).join(', ')}`, `Client mix: ${fwCount} Flywheel AI, ${fsCount} Full Service`, topBlocked ? `Top blocked activities: ${topBlocked}` : 'No blocked activities this week.', workload ? `Team workload: ${workload}` : '', avgDaysToLive ? `Avg days since onboarding for live clients: ${avgDaysToLive} days` : ''].filter(Boolean).join(' | ');
+    const trendReport = [`Week ending ${today}:`, `Phase distribution: ${Object.entries(phaseCounts).map(([k,v])=>`${k}:${v}`).join(', ')}`, `Client mix: ${fwCount} Flywheel AI, ${fsCount} Full Service`, topBlocked ? `Top blocked activities: ${topBlocked}` : 'No blocked activities this week.', workload ? `Team workload: ${workload}` : '', avgDaysToLiveLine].filter(Boolean).join(' | ');
     await upsertKnowledge('intel', `weekly-trends-${new Date().toISOString().slice(0,10)}`, trendReport, 'weekly-cron');
     if (topBlocked) await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Josue and Felipe.`, 'weekly-cron');
     if (workload)   await upsertKnowledge('team', 'current-workload', `As of ${today}: ${workload}`, 'weekly-cron');
@@ -4285,7 +4306,15 @@ async function runProactiveDMs(_correlationId) {
       return;
     }
 
+    const activationFor = await loadActivationDates();
     const now = Date.now();
+    // Same anchor as the classification loop below. Display and classification MUST
+    // read the same source — a DM that says "Day 5" while the client was selected
+    // for a Day-14 warning is worse than no DM.
+    const dayNFor = (d) => {
+      const iso = activationFor(d) || d.created_at;
+      return iso ? Math.floor((now - new Date(iso).getTime()) / (1000 * 60 * 60 * 24)) : '?';
+    };
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     const tomorrowStr = tomorrow.toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
@@ -4296,9 +4325,21 @@ async function runProactiveDMs(_correlationId) {
     const stalledPhase1       = []; // Stuck in phase_1 for 4+ days
     const stalledPhase2       = []; // Stuck in phase_2 for 4+ days
 
+    // Day N counts from the activation call — this job exists to warn on the 14-day
+    // Build & Release window, so it must use the same anchor the window is defined
+    // by. It previously counted from client_dashboards.created_at (when the portal
+    // row appeared), which includes pre-activation waiting time and drifts from the
+    // real deadline by however long onboarding took. created_at remains only as a
+    // last-resort proxy for clients with no recorded call date.
+    //
+    // NOTE (pre-existing, deliberately not changed here): the thresholds below are
+    // exact equality, so a day this job does not run is a warning nobody ever gets.
+    // Worth converting to a "crossed the threshold and not yet notified" check
+    // before this cron is re-enabled.
     for (const dash of dashboards) {
-      if (!dash.created_at) continue;
-      const daysSince = Math.floor((now - new Date(dash.created_at).getTime()) / (1000 * 60 * 60 * 24));
+      const anchorISO = activationFor(dash) || dash.created_at;
+      if (!anchorISO) continue;
+      const daysSince = Math.floor((now - new Date(anchorISO).getTime()) / (1000 * 60 * 60 * 24));
 
       if (daysSince === 13) hitting14Tomorrow.push(dash);
       else if (daysSince === 6) hitting7Tomorrow.push(dash);
@@ -4329,7 +4370,7 @@ async function runProactiveDMs(_correlationId) {
 
     // ── DM Valeria: clients stalled in phase_1 ──
     if (stalledPhase1.length > 0) {
-      const names = stalledPhase1.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
+      const names = stalledPhase1.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `These clients are still in Phase 1 and have been for a while: ${names}. If any delivery documents are pending on your end, this is the priority. Let Josue know if you're blocked on anything.`;
       for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
@@ -4339,7 +4380,7 @@ async function runProactiveDMs(_correlationId) {
 
     // ── DM Felipe: clients stalled in phase_2 ──
     if (stalledPhase2.length > 0) {
-      const names = stalledPhase2.map(d => `${d.client_name} (Day ${Math.floor((now - new Date(d.created_at).getTime()) / (1000*60*60*24))})`).join(', ');
+      const names = stalledPhase2.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag Josue if anything is blocked.`;
       for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
