@@ -8105,6 +8105,243 @@ async function runReviProspectNotesSync(_correlationId) {
   }
 }
 
+// ─── WON HANDOFF NOTES (fulfillment CRM) ─────────────────────────────────────
+// When a deal is WON, fulfillment onboards the client with zero context from
+// the closing call. REVI already scored that call (coaching_json); this sweep
+// condenses it into a Spanish handoff note and lands it in the portal CRM via
+// ONE guarded RPC (ng_apply_won_handoff_note): the outcome row's notes, an
+// append-only closing_call_summary activity, and — once fulfillment provisions
+// the client — customer_closing_data.internal_notes, the field they already
+// read during onboarding. Keys off revops_sales_outcomes rather than the
+// moment of logging, so it catches wons from BOTH writers (closer-typed via
+// Max and GHL webhook via dash). Ships in dry-run: WON_HANDOFF_MODE=live arms
+// it (also the kill switch).
+
+const WON_HANDOFF_MARKER = 'RESUMEN LLAMADA DE CIERRE (REVI';
+const WON_HANDOFF_WINDOW_DAYS = 30;        // wons older than this age out of the sweep
+const WON_HANDOFF_RECORDING_WAIT_DAYS = 7; // stop waiting for a REVI recording after this
+
+// Pure step decision over the agent_knowledge marker `won-handoff:{appointment_id}`.
+// States: placed / already_placed / gave_up are terminal; prospect_only means
+// the note exists but the client record didn't yet; anything else re-attempts
+// the recording match.
+function decideWonHandoffStep(markerValue) {
+  const state = String(markerValue || '').split('|')[0];
+  if (state === 'placed' || state === 'already_placed' || state === 'gave_up') return 'skip';
+  if (state === 'prospect_only') return 'retry_placement';
+  return 'match';
+}
+
+// Assembles the final CRM note. The header doubles as the idempotency marker
+// the RPC checks before appending to the shared internal_notes field — every
+// note MUST contain WON_HANDOFF_MARKER or the RPC rejects it.
+function buildWonHandoffNote({ summaryText, callDateStr, closerName, recordingUrl }) {
+  const body = String(summaryText || '').trim();
+  if (!body) return null;
+  const lines = [
+    '--- ' + WON_HANDOFF_MARKER + ' · Max) — ' + (callDateStr || 'fecha desconocida') + ' · closer ' + (closerName || 'desconocido') + ' ---',
+    body,
+  ];
+  if (recordingUrl) lines.push('🎙 Grabación: ' + recordingUrl);
+  return lines.join('\n');
+}
+
+// One-shot condensation of REVI's coaching_json into a fulfillment-voice
+// executive summary. Deliberately excludes coaching critique, scores, and
+// money (source sensitivity ≤ surface audience: this lands on a team-visible
+// CRM field; payment figures already live in closing-data columns).
+async function generateWonHandoffSummary({ prospectName, coaching }) {
+  const material = {
+    prospect_name: coaching.prospect_name || prospectName || null,
+    company: coaching.company || null,
+    icp_fit: coaching.icp_fit || null,
+    context: coaching.context || null,
+    general_read: coaching.general_read || null,
+    deal: coaching.deal || null,
+    opportunities: coaching.opportunities || null,
+  };
+  const prompt = [
+    'You prepare internal handoff notes for the fulfillment team at NeuroGrowth (B2B LinkedIn organic growth agency).',
+    'A deal just closed. Below is the structured analysis of the closing sales call. Write the executive summary the onboarding team needs to serve this client well.',
+    '',
+    'Rules:',
+    '- Write in Spanish (the analysis and the team are Spanish-speaking).',
+    '- 6 to 10 short lines, each starting with "• ". Plain text only, no markdown.',
+    '- Cover, in this order when the material allows: who the client is and what their business does; why they bought / the goal they stated; pains discussed on the call; promises or expectations set on the call; risks or watch-outs for fulfillment; agreed next steps.',
+    '- NEVER include: coaching feedback about the closer, call scores, money amounts, or anything phrased as advice to the sales team. This note is about the CLIENT.',
+    '- If a section has no material, skip it silently. Never invent facts.',
+    '',
+    'CALL ANALYSIS JSON:',
+    JSON.stringify(material),
+  ].join('\n');
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 700,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const text = (response.content?.[0]?.text || '').trim();
+  if (!text) throw new Error('empty summary from model');
+  return text;
+}
+
+// Synthetic `opp:` outcome rows carry no appointment time, so the 36h contract
+// can't anchor. Fallback: recordings for the same email within ±14d of the
+// outcome log date — exactly one candidate or nothing (a wrong closing summary
+// is worse than none, so ambiguity skips).
+async function findOppRowRecording(email, outcomeAtMs, label) {
+  if (!email) return null;
+  try {
+    const lo = new Date(outcomeAtMs - 14 * 86400000).toISOString();
+    const hi = new Date(outcomeAtMs + 14 * 86400000).toISOString();
+    const { data: scores } = await reviSupabase
+      .from('closer_call_scores')
+      .select('prospect_email, call_date, recording_url, coaching_json')
+      .ilike('prospect_email', email)
+      .gte('call_date', lo)
+      .lte('call_date', hi);
+    const rows = (scores || []).filter(s => s.coaching_json);
+    if (rows.length !== 1) {
+      if (rows.length > 1) console.log(`${label}: ${rows.length} recordings match ${email} around the log date — ambiguous, skipping.`);
+      return null;
+    }
+    return { url: rows[0].recording_url || null, coaching: rows[0].coaching_json || {} };
+  } catch (err) {
+    console.error(`${label}: opp-row recording lookup failed:`, err.message);
+    return null;
+  }
+}
+
+async function applyWonHandoffNote(appointmentId, note) {
+  const { rows } = await portalWriterPg.query(
+    'SELECT public.ng_apply_won_handoff_note($1, $2) AS result',
+    [appointmentId, note]
+  );
+  return rows?.[0]?.result || 'error';
+}
+
+async function runWonHandoffNotes(_correlationId, { windowDays = WON_HANDOFF_WINDOW_DAYS } = {}) {
+  const dryRun = process.env.WON_HANDOFF_MODE !== 'live';
+  console.log(`Running won-handoff notes sweep (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
+  const tally = { wons: 0, generated: 0, placed: 0, prospectOnly: 0, noRecording: 0, gaveUp: 0, failed: 0 };
+  try {
+    if (!portalPg) { console.log('Won-handoff notes: portal read pool not configured, skipping.'); return tally; }
+    if (!dryRun && !portalWriterPg) { console.log('Won-handoff notes: PORTAL_WRITER_DATABASE_URL not set, skipping.'); return tally; }
+    const now = Date.now();
+    const sinceIso = new Date(now - windowDays * 86400000).toISOString();
+    const { rows: wons } = await portalPg.query(
+      `SELECT o.appointment_id, o.created_at AS outcome_at,
+              a.scheduled_start, a.closer_id,
+              p.full_name, lower(coalesce(p.email, '')) AS email
+         FROM revops_sales_outcomes o
+         JOIN revops_appointments a ON a.id = o.appointment_id
+         JOIN revops_prospects p ON p.id = a.prospect_id
+        WHERE o.outcome = 'won' AND o.created_at >= $1
+        ORDER BY o.created_at ASC`,
+      [sinceIso]
+    );
+    if (!wons.length) { console.log('Won-handoff notes: no won deals in window.'); return tally; }
+    tally.wons = wons.length;
+
+    // One REVI window covers every call with a real scheduled_start; the
+    // matcher owns 36h + one-recording-vouches-once. Synthetic opp: rows
+    // (no appointment time) fall back to findOppRowRecording per row.
+    const realStarts = wons.filter(w => w.scheduled_start).map(w => new Date(w.scheduled_start).getTime());
+    const reviRecordings = realStarts.length ? await fetchReviRecordings(realStarts, 'Won-handoff notes') : [];
+    const todayISO = new Date().toISOString().slice(0, 10);
+
+    for (const won of wons) {
+      const apptId = won.appointment_id;
+      const markerKey = `won-handoff:${apptId}`;
+      const { data: markerRows } = await supabase.from('agent_knowledge').select('value').eq('key', markerKey).limit(1);
+      const markerValue = markerRows?.[0]?.value || '';
+      const step = decideWonHandoffStep(markerValue);
+      if (step === 'skip') continue;
+
+      try {
+        if (step === 'retry_placement') {
+          if (dryRun) { console.log(`[dry-run] would retry closing-data placement for ${won.full_name}`); tally.prospectOnly += 1; continue; }
+          const result = await applyWonHandoffNote(apptId, null);
+          if (result === 'placed' || result === 'already_placed') {
+            await upsertKnowledge('process', markerKey, `${result}|${todayISO}`, 'won-handoff');
+            tally.placed += 1;
+            console.log(`Won-handoff note placed for ${won.full_name} (${result}).`);
+          } else {
+            tally.prospectOnly += 1; // client record still doesn't exist — keep waiting
+          }
+          continue;
+        }
+
+        // step === 'match' — find the closing-call recording
+        const outcomeAtMs = new Date(won.outcome_at).getTime();
+        const rec = won.scheduled_start
+          ? matchRecordingToCall(reviRecordings, won.email, new Date(won.scheduled_start).getTime())
+          : await findOppRowRecording(won.email, outcomeAtMs, 'Won-handoff notes');
+        if (!rec || !rec.coaching || !Object.keys(rec.coaching).length) {
+          if ((now - outcomeAtMs) > WON_HANDOFF_RECORDING_WAIT_DAYS * 86400000) {
+            await upsertKnowledge('process', markerKey, `gave_up|${todayISO}`, 'won-handoff');
+            tally.gaveUp += 1;
+            console.log(`Won-handoff notes: no REVI recording for ${won.full_name} after ${WON_HANDOFF_RECORDING_WAIT_DAYS}d — giving up.`);
+          } else {
+            const prevCount = parseInt(String(markerValue).split('|')[1], 10) || 0;
+            await upsertKnowledge('process', markerKey, `no_recording|${prevCount + 1}`, 'won-handoff');
+            tally.noRecording += 1;
+          }
+          continue;
+        }
+
+        const summary = await generateWonHandoffSummary({ prospectName: won.full_name, coaching: rec.coaching });
+        const note = buildWonHandoffNote({
+          summaryText: summary,
+          callDateStr: formatICTime(won.scheduled_start || won.outcome_at, { month: 'short', day: 'numeric', year: 'numeric' }),
+          closerName: resolveSalesMember(won.closer_id),
+          recordingUrl: rec.url,
+        });
+        if (!note) { tally.failed += 1; continue; }
+        tally.generated += 1;
+        if (dryRun) {
+          console.log(`[dry-run] would apply won-handoff note for ${won.full_name} (${note.length} chars):\n${note}`);
+          continue;
+        }
+        const result = await applyWonHandoffNote(apptId, note);
+        if (result === 'placed' || result === 'already_placed') {
+          await upsertKnowledge('process', markerKey, `${result}|${todayISO}`, 'won-handoff');
+          tally.placed += 1;
+        } else if (result === 'prospect_only') {
+          await upsertKnowledge('process', markerKey, `prospect_only|${todayISO}`, 'won-handoff');
+          tally.prospectOnly += 1;
+        } else {
+          tally.failed += 1;
+          console.error(`Won-handoff note for ${won.full_name}: RPC returned ${result}`);
+        }
+      } catch (oneErr) {
+        tally.failed += 1;
+        console.error(`Won-handoff note for ${won.full_name} failed:`, oneErr.message);
+      }
+    }
+
+    // Never a silent zero: skips are counted and the summary line names them.
+    const parts = [];
+    if (tally.generated) parts.push(`${tally.generated} ${tally.generated === 1 ? 'summary' : 'summaries'} generated`);
+    if (tally.placed) parts.push(`${tally.placed} placed in closing data`);
+    if (tally.prospectOnly) parts.push(`${tally.prospectOnly} waiting for the client record`);
+    if (tally.noRecording) parts.push(`${tally.noRecording} waiting on a REVI recording`);
+    if (tally.gaveUp) parts.push(`${tally.gaveUp} had no recording after ${WON_HANDOFF_RECORDING_WAIT_DAYS}d — no note`);
+    if (tally.failed) parts.push(`${tally.failed} FAILED`);
+    if (parts.length) {
+      const line = `📋 Won-handoff notes${dryRun ? ' (dry-run)' : ''}: ${parts.join(' · ')}.`;
+      console.log(line);
+      if (!dryRun || tally.failed) await postToSlack('#ng-pm-agent', line);
+    } else {
+      console.log('Won-handoff notes: nothing to do.');
+    }
+    return tally;
+  } catch (err) {
+    console.error('Won-handoff notes sweep error:', err.message);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Won-handoff notes cron failed: ${err.message}` }).catch(() => {});
+    return tally;
+  }
+}
+
 // ─── APPOINTMENT STATUS (Paso 1) ─────────────────────────────────────────────
 // Show/no-show is a FACT, not a judgment, and closers were logging it ~2% of
 // the time (40 of 44 August appointments still sat at the default `confirmed`).
@@ -8419,6 +8656,9 @@ async function fetchReviRecordings(startTimesMs, label) {
           dealRecovery: deal.recovery || null,
           icpFit: coaching.icp_fit || null,
           cashCollected: coaching.cash_collected_usd == null ? null : Number(coaching.cash_collected_usd),
+          // Raw blob for consumers that need more than the flattened fields
+          // (the won-handoff sweep condenses it into a fulfillment note).
+          coaching,
           matched: false,
         };
       });
@@ -9527,6 +9767,14 @@ cron.schedule('0 15 * * *',   wrapCronJob('runAppointmentStatusSync', async (c) 
 // so the note is already on the contact when a closer opens it from either.
 // Ships in dry-run: REVI_NOTES_MODE=live arms it (also the kill switch).
 cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) => { await runReviProspectNotesSync(c); }), { timezone: 'America/Costa_Rica' });
+
+// Won-deal handoff notes — 9 AM + 5 PM CR daily. Condenses the REVI read of a
+// won closing call into a Spanish executive summary for fulfillment onboarding
+// and lands it in the portal CRM via the ng_apply_won_handoff_note RPC
+// (outcome row + prospect activity + customer_closing_data.internal_notes once
+// the client exists). Ships in dry-run: WON_HANDOFF_MODE=live arms it (also
+// the kill switch).
+cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { await runWonHandoffNotes(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
 // the #ng-sales-goats thread, tagging @setters, once a lead has sat unclaimed 2+ hours,
