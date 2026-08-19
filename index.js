@@ -9381,6 +9381,62 @@ async function runAppointmentStatusSync(_correlationId) {
 // Adrian RM / excelenciaenbombas@hotmail.com). These two jobs close that gap:
 // a 2h in-thread nag, and a daily digest to Ron of everything still open.
 
+// A lead whose GHL contact already carries a terminal disposition was worked —
+// it just never got a ✋ in Slack, because claiming is only needed for leads
+// nobody has picked up yet. SANTIAGO LONDONO U (no-fit + cancelled, self-booked
+// with Jose on 2026-07-28) sat in the daily sweep for 22 straight days as a
+// result. That is worse than useless: a sweep that cries wolf trains the reader
+// to scroll past it, which is exactly how the original 11-day Adrian RM lead was
+// missed. Tag names verified against the live location tag list on 2026-08-19 —
+// `cancelled` is deliberately NOT terminal on its own (a cancelled call still
+// deserves a human), it only lands here alongside `no-fit`.
+const TERMINAL_LEAD_TAGS = new Set(
+  (process.env.STALE_LEAD_TERMINAL_TAGS || 'won-deal,no-fit,generic-lost,activation-done,call-showed')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+);
+
+function hasTerminalLeadTag(contact) {
+  if (!contact || !Array.isArray(contact.tags)) return false;
+  return contact.tags.some(t => TERMINAL_LEAD_TAGS.has(String(t).trim().toLowerCase()));
+}
+
+// One GHL read per unclaimed lead, capped so a broken claim flow (which would
+// leave hundreds unclaimed) cannot turn a daily cron into hundreds of GHL calls
+// and trip the rate limiter. Leads are checked oldest-first; anything past the
+// cap is still REPORTED, just not tag-checked, and the skip is logged rather
+// than swallowed.
+const TERMINAL_TAG_LOOKUP_CAP = 50;
+
+async function dropDispositionedLeads(unclaimed) {
+  const kept = [];
+  let looked = 0, hidden = 0, failed = 0;
+  for (const lead of unclaimed) {
+    if (!lead.contactId || looked >= TERMINAL_TAG_LOOKUP_CAP) { kept.push(lead); continue; }
+    looked += 1;
+    let contact = null;
+    try {
+      contact = await ghlGetContact(lead.contactId);
+    } catch (err) {
+      // Fail SAFE, in the direction of noise: a GHL outage must never be able to
+      // hide a genuinely unclaimed lead. Keep it and say why.
+      failed += 1;
+      console.error(`Stale-lead tag check: GHL lookup threw for ${lead.contactId} (${err.message}) — keeping the lead.`);
+      kept.push(lead);
+      continue;
+    }
+    if (!contact) { failed += 1; kept.push(lead); continue; }
+    if (hasTerminalLeadTag(contact)) { hidden += 1; continue; }
+    kept.push(lead);
+  }
+  if (unclaimed.length > TERMINAL_TAG_LOOKUP_CAP) {
+    console.log(`Stale-lead tag filter: ${unclaimed.length - TERMINAL_TAG_LOOKUP_CAP} lead(s) past the ${TERMINAL_TAG_LOOKUP_CAP}-lookup cap were NOT tag-checked — still reported.`);
+  }
+  if (hidden || failed) {
+    console.log(`Stale-lead tag filter: ${hidden} already-dispositioned lead(s) filtered out, ${failed} lookup failure(s) kept.`);
+  }
+  return kept;
+}
+
 // Shared query: leads posted since `sinceMs` with no matching setter_claims row.
 // Mirrors the leads-today report's join pattern (two queries + diff in JS —
 // supabase-js has no LEFT JOIN, and nothing else in this file uses raw SQL for it).
@@ -9447,7 +9503,9 @@ async function getUnclaimedLeads(sinceMs) {
     });
   }
   unclaimed.sort((a, b) => new Date(a.postedAt) - new Date(b.postedAt));
-  return unclaimed;
+  // Oldest-first before the tag filter, so the lookup cap spends its budget on
+  // the leads that have been sitting longest.
+  return await dropDispositionedLeads(unclaimed);
 }
 
 // Resolves the @setters Slack user group to its mention string at runtime
