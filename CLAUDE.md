@@ -28,6 +28,17 @@ suggestions.
   they carry `merge=union`, so parallel appends merge cleanly but edits to
   existing lines can silently duplicate.
 - A `docs/*` branch must not touch `index.js` (CI enforces this).
+- **Keep `tasks/*.md` appends OUT of code PRs** — land them in a follow-up `docs/*`
+  PR. `merge=union` is honoured by git but **not by GitHub**, which does not apply
+  gitattributes merge drivers. So as soon as another session appends to the same
+  file, GitHub marks your PR `CONFLICTING` — and a conflicted PR **stops running CI
+  altogether**, showing `no checks reported` rather than a failure. PR #59 sat a day
+  like that, untested, with nothing actually wrong with it. CI warns when a PR
+  changes both.
+- **When GitHub says a PR conflicts and you believe it should not, ask git:**
+  `git merge-tree $(git merge-base origin/main HEAD) origin/main HEAD | grep -c '^<<<<<<<'`
+  Zero hunks means git can merge it and GitHub is wrong about a union-merged file.
+  Also check `gh pr checks` — "conflicted" quietly implies "never tested".
 - Entries older than ~60 days move to `tasks/archive/`.
 
 ## Before marking done
