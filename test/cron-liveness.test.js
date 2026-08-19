@@ -45,7 +45,13 @@ check('1h  20 7-19/3 spans a 12h night',            expectedMaxGapHours('20 7-19
 check('1i  weekdays 9am spans a 72h weekend',       expectedMaxGapHours('0 9 * * 1-5') > 72, true);
 check('1j  hourly on weekdays also spans the weekend', expectedMaxGapHours('0 * * * 1-5') > 72, true);
 check('1k  Tue-Sat spans a 72h gap',                expectedMaxGapHours('30 6 * * 2-6') > 72, true);
-check('1l  weekly (single day) allows 8 days',      expectedMaxGapHours('0 17 * * 5'), 192);
+check('1l  weekly (single day) allows a full week + margin', expectedMaxGapHours('0 17 * * 5') > 168, true);
+// The flat 76h rule cried wolf on both of these. Mon/Wed has a real 5-day Wed→Mon
+// gap; Tue/Sat has a real 4-day Tue→Sat gap. Both are healthy schedules.
+check('1p  Mon/Wed tolerates its real 5-day gap',  expectedMaxGapHours('0 18 * * 1,3') > 120, true);
+check('1q  Tue/Sat tolerates its real 4-day gap',  expectedMaxGapHours('0 7 * * 2,6') > 96, true);
+check('1r  but Mon/Wed is not absurdly lenient',   expectedMaxGapHours('0 18 * * 1,3') < 168, true);
+check('1s  a contiguous weekday range is unchanged at 76h', expectedMaxGapHours('0 9 * * 1-5'), 76);
 check('1m  monthly allows 32 days',                 expectedMaxGapHours('0 7 15 * *'), 768);
 
 // Every declared schedule must produce a finite, positive tolerance. A typo that

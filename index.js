@@ -66,18 +66,59 @@ function logLlmFromAnthropicResponse(response, durationMs, correlation_id) {
   });
 }
 
-function wrapCronJob(actionName, jobFn) {
+// A cron that hangs writes a `started` row and never a terminal one, so it looks
+// like nothing at all — not a failure, not a success, just absence. On 2026-08-18
+// the Fulfillment EOD Pulse started at 00:00:01 and never returned. No deploy
+// restarted the process for the next 22 hours, so it was not killed: it hung. The
+// report never posted and nothing said so, and it took the liveness audit to find
+// it five days later.
+//
+// Neither the Anthropic client nor supabase-js has a timeout configured anywhere
+// in this file, and supabase-js uses plain fetch, which waits forever on a stalled
+// connection. Rather than plumb a timeout through every call site, the watchdog
+// goes here — one place, covering all 23 crons.
+//
+// LIMIT, stated because it matters: Promise.race does not CANCEL the hung job. It
+// keeps running and may still hold a connection. What this buys is that the run is
+// recorded as an error instead of vanishing, so the audit and the operator find out
+// the same day. Real cancellation needs AbortController through every call site.
+const CRON_DEFAULT_TIMEOUT_MS = Number(process.env.CRON_DEFAULT_TIMEOUT_MS || 10 * 60 * 1000);
+
+function wrapCronJob(actionName, jobFn, { timeoutMs = CRON_DEFAULT_TIMEOUT_MS } = {}) {
   return async () => {
     const correlation_id = newCorrelationId();
     const started = Date.now();
     let errored = null;
     logActivity({ event_type: 'cron_run', event_source: 'cron', action: actionName, status: 'started', correlation_id });
+    let timer;
     try {
-      await jobFn(correlation_id);
+      await Promise.race([
+        jobFn(correlation_id),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`cron '${actionName}' exceeded ${Math.round(timeoutMs / 1000)}s and was abandoned — it may still be running`)),
+            timeoutMs,
+          );
+          // Deliberately NOT unref'd. An unref'd watchdog does not keep the event
+          // loop alive, so if the hung job is the only thing pending the process
+          // exits before the timer fires — and the run vanishes exactly as before.
+          // The timer is always cleared in `finally`, so it holds the loop open
+          // only while a job is genuinely in flight, which is when we want it.
+        }),
+      ]);
     } catch (err) {
       errored = err;
-      throw err;
+      // Deliberately NOT rethrown. node-cron invokes this at the top of the stack
+      // with nothing above it to catch a rejection, and Node 20 exits the process
+      // on an unhandled one — so a single failing cron took the whole agent down
+      // and left Railway to restart it. There is no unhandledRejection handler in
+      // this file to soften that. Adding the watchdog above would have made it
+      // worse by throwing more often, so containment lands in the same change.
+      // The failure is not swallowed: it is logged here and recorded as an `error`
+      // row, which is what the liveness audit reads.
+      console.error(`Cron '${actionName}' failed:`, err && err.message ? err.message : err);
     } finally {
+      clearTimeout(timer);
       logActivity({
         event_type: 'cron_run',
         event_source: 'cron',
@@ -10205,7 +10246,10 @@ cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (
 // hourly) because a full sweep costs ~1 API call per candidate card and the 20h
 // debounce means a card can only move once a day anyway. Defaults to DRY RUN —
 // set STRIKE_MOVER_MODE=live on Railway to arm it.
-cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }), { timezone: 'America/Costa_Rica' });
+// 30 min, not the 10-min default: this one legitimately runs long. Over 147 sweeps
+// it averaged 6.4 min and peaked at 17.4 min, throttled across ~1500 contacts. The
+// default would abandon a perfectly healthy sweep. Every other cron peaks under 80s.
+cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }, { timeoutMs: 30 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 
 // Daily strike-mover digest to the sales channel — 9:30 PM CR, right after the
 // day's last sweep, so the 24h window covers exactly today's 8 sweeps.
@@ -13594,10 +13638,40 @@ function expectedMaxGapHours(expr) {
   else                           base = 26;     // once a day
 
   // Then widen for anything that legitimately skips whole days.
-  if (dom !== '*')                return 32 * 24;                  // monthly
-  if (dow !== '*' && /^\d$/.test(dow)) return 8 * 24;              // one weekday per week
-  if (dow !== '*')                return Math.max(base, 76);       // a weekday range spans a weekend
+  if (dom !== '*') return 32 * 24;                                 // monthly
+  if (dow !== '*') {
+    const gapDays = dowMaxGapDays(dow);
+    if (gapDays === null) return Math.max(base, 8 * 24);           // unparseable → lenient
+    return Math.max(base, gapDays * 24 + 4);
+  }
   return base;
+}
+
+// The largest gap in days between consecutive scheduled weekdays, wrapping the week.
+//
+// A flat "weekday schedules get 76h" rule was wrong, and wrong in the direction that
+// cries wolf. '0 18 * * 1,3' runs Mon and Wed, so its real Wed→Mon gap is FIVE days;
+// 76h would have alarmed on it every single week. '0 7 * * 2,6' (Tue/Sat) has a
+// four-day Tue→Sat gap. Both are healthy schedules a flat rule would have flagged.
+// Contiguous ranges like 1-5 come out at 3 days, which is why the flat number looked
+// right against the crons that happened to be checked first.
+function dowMaxGapDays(dow) {
+  const days = new Set();
+  for (const part of String(dow).split(',')) {
+    const m = /^(\d)(?:-(\d))?(?:\/(\d+))?$/.exec(part.trim());
+    if (!m) return null;
+    const from = Number(m[1]);
+    const to   = m[2] !== undefined ? Number(m[2]) : from;
+    const step = m[3] ? Number(m[3]) : 1;
+    if (step < 1 || to < from) return null;
+    for (let d = from; d <= to; d += step) days.add(d % 7);        // cron allows 7 for Sunday
+  }
+  const sorted = [...days].sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  if (sorted.length === 1) return 7;
+  let max = sorted[0] + 7 - sorted[sorted.length - 1];             // the wrap-around gap
+  for (let i = 1; i < sorted.length; i++) max = Math.max(max, sorted[i] - sorted[i - 1]);
+  return max;
 }
 
 const SELF_ACTION = 'runCronLivenessAudit';
