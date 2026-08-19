@@ -380,3 +380,45 @@ wearing an auth mask either. It is GHL's auth layer blinking, ~1 per sweep.
 - **This only became answerable because failures were stored as structured metadata.**
   The same investigation against `console.error` output would have been guesswork. Store
   the failure, not just the log line.
+
+## 2026-08-19 — Slack returns the message source, not the render; and fixtures copied off the screen agree with the bug
+
+**Symptom.** The customer alert fan-out quality check reported a new customer as
+having no alert card while the card sat in `#ng-new-client-alerts`, posted in the
+same minute. It repeated hourly, to `#ng-fullfillment-ops`, in front of the whole
+fulfillment team.
+
+**Root cause.** `GMAIL_ALERT_HEADERS` held the rendered glyphs — `🔔🔔 NEW FLYWHEEL
+AI CUSTOMER 🔔🔔`. `conversations.history` returns the message **source**, where
+Slack stores emoji as `:bell::bell:`. The filter matched nothing, in every route.
+So the content contract evaluated **zero cards** while reporting `0 bad card(s)`,
+and no card ever reached the coverage set, so **every** new customer read as
+uncovered. The first customer created after the check shipped was the false alarm.
+
+The first fix attempt (#78) read the same symptom as a name-ordering problem —
+`client_dashboards` said "Aura Bonilla - Cacao Legal", the card said "Cacao Legal -
+Aura Bonilla" — and switched to matching on email. True, necessary, and not the
+cause. The next hourly run on the deployed fix still reported the same customer
+missing. That second data point is the only reason the real cause was found.
+
+**Takeaways.**
+- **Read the wire, not the screen.** Anything a rendering layer touches — emoji,
+  `<mailto:a@b|a@b>` link wrapping, `&amp;`, user mentions — differs between what
+  a human sees and what the API returns. Pull one real message and look at it
+  before writing a matcher against it.
+- **Test fixtures transcribed from a screenshot encode the same misreading as the
+  code.** 47 checks were green against hand-written glyph fixtures. Copy fixtures
+  from an API read, and say in the file where they came from.
+- **A filter that matches nothing looks exactly like a clean system.** `0 bad
+  cards` was true and meaningless. When a check can report "nothing wrong," it
+  needs a path that proves it actually examined something — a positive-control
+  fixture in the test is the cheap version.
+- **Verify a fix against the next live run, not against the test suite.** #78's
+  tests were green and its reasoning was correct; production said otherwise one
+  hour later.
+- **A standing condition is a daily note, not an hourly alarm.** The same check
+  posted every hour because a channel it could not read counted as something to
+  say — and the remediation was a Slack invite, not a deploy. Identical hourly
+  alerts with nothing actionable are how a channel gets muted, and a muted channel
+  hides the real gap too. Suppress on the clock (stateless), not in a memo that
+  resets on every deploy.
