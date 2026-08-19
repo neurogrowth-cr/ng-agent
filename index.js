@@ -13041,12 +13041,25 @@ const GMAIL_NEW_CLIENT_CHANNEL_ID = 'C0A7X9G6S78';
 
 // Only cards this recipe produces. Matching on the header rather than on bot_id
 // keeps the check working if the Make connection is ever re-authed under a new app.
+// EMOJI-FREE ON PURPOSE. The Make blueprint sends a literal "⏱️ ACTIVITY TRACKING ⏱️",
+// but conversations.history returns ":stopwatch: ACTIVITY TRACKING :stopwatch:" —
+// Slack stores emoji as shortcodes. Matching on the literal emoji meant
+// text.includes(header) was false for EVERY card from the moment this shipped, so
+// the content contract examined nothing and reported "0 bad cards" for it, and
+// seenCards stayed empty so the divergence check called every customer missing.
+//
+// The tests did not catch it because the fixtures were built from the blueprint —
+// what Make SENDS — instead of from conversations.history — what this code READS.
+// A fixture is only as good as the source it was copied from.
+//
+// Match the text between the emoji: it is unique per route and identical in both
+// representations.
 const GMAIL_ALERT_HEADERS = [
-  '⏱️ ACTIVITY TRACKING ⏱️',
-  '⏱️ CLOSER REQUIRED ⏱️',
-  '⏱️ ONBOARDING COMPLETED ⏱️',
-  '⏱️ SETTER REQUIRED ⏱️',
-  '🔔🔔 NEW FLYWHEEL AI CUSTOMER 🔔🔔',
+  'ACTIVITY TRACKING',
+  'CLOSER REQUIRED',
+  'ONBOARDING COMPLETED',
+  'SETTER REQUIRED',
+  'NEW FLYWHEEL AI CUSTOMER',
   'Issues with Prosp Campaign',
 ];
 

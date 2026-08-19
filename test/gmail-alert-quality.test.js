@@ -5,9 +5,11 @@
 // test can never drift from shipped behaviour (same approach as make-watchdog and
 // strike-rules — index.js boots the Slack app on require).
 //
-// Card shapes are taken verbatim from the live blueprints checked in at
-// ~/automations/ops/make-blueprints/ (4356754 modules 3/13/15/17/18, and 5975679
-// module 2), captured 2026-08-18.
+// Card shapes are taken verbatim from conversations.history — what this code READS —
+// NOT from the Make blueprint, which is what Make SENDS. Those differ: Make emits a
+// literal "⏱️" and Slack stores ":stopwatch:". Building fixtures from the blueprint
+// is what let the emoji-shortcode bug ship green on 2026-08-19; every card silently
+// failed the header match, so the contract examined nothing.
 const fs   = require('fs');
 const path = require('path');
 
@@ -66,60 +68,60 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
 }
 
 // ── Card fixtures, verbatim shapes from the blueprints ──
-const GOOD_CLOSER = `⏱️ CLOSER REQUIRED ⏱️
+const GOOD_CLOSER = `:stopwatch: CLOSER REQUIRED :stopwatch:
 *Customer/Company Name:* Tropikasa
 Closer Required - Tropikasa - Flywheel AI Account
 2026-08-18`;
 
-const GOOD_ACTIVITY = `⏱️ ACTIVITY TRACKING ⏱️
+const GOOD_ACTIVITY = `:stopwatch: ACTIVITY TRACKING :stopwatch:
 *Customer/Company Name:* Acme Corp
 *Customer Email:* ops@acme.com
 Activity completed for Acme Corp
 2026-08-18`;
 
-const GOOD_NEW_CLIENT = `🔔🔔 NEW FLYWHEEL AI CUSTOMER 🔔🔔
+const GOOD_NEW_CLIENT = `:bell::bell: NEW FLYWHEEL AI CUSTOMER :bell::bell:
 Customer/Company Name: Tropikasa
-Customer Email: kty@tropikasa.com
+Customer Email: <mailto:kty@tropikasa.com|kty@tropikasa.com>
 Start Date: 2026-08-18
 Customer-ID: tropikasa`;
 
 // The Aug 13–17 outage shape: split() found no anchor, name renders blank.
-const BLANK_NAME = `⏱️ CLOSER REQUIRED ⏱️
+const BLANK_NAME = `:stopwatch: CLOSER REQUIRED :stopwatch:
 *Customer/Company Name:*
 Closer Required - Tropikasa - Flywheel AI Account
 2026-08-18`;
 
 // The gap the 2026-08-17 rewrite left open: subject prefix renamed, replace() is a
 // no-op, so the whole raw subject lands in the name slot.
-const RAW_SUBJECT_LEAK = `⏱️ SETTER REQUIRED ⏱️
+const RAW_SUBJECT_LEAK = `:stopwatch: SETTER REQUIRED :stopwatch:
 *Customer/Company Name:* Setter Needed - Tropikasa
 Setter Needed - Tropikasa
 2026-08-18`;
 
 // Old prefix survives because only part of the subject changed.
-const RESIDUE_LEAK = `⏱️ CLOSER REQUIRED ⏱️
+const RESIDUE_LEAK = `:stopwatch: CLOSER REQUIRED :stopwatch:
 *Customer/Company Name:* Closer Required - Tropikasa
 Closer Required - Tropikasa — Flywheel AI Account
 2026-08-18`;
 
-const OBJECT_DUMP = `⏱️ ONBOARDING COMPLETED ⏱️
+const OBJECT_DUMP = `:stopwatch: ONBOARDING COMPLETED :stopwatch:
 *Customer/Company Name:* [object Object]
 Flywheel onboarding form completed – Tropikasa
 2026-08-18`;
 
-const BAD_EMAIL = `⏱️ ACTIVITY TRACKING ⏱️
+const BAD_EMAIL = `:stopwatch: ACTIVITY TRACKING :stopwatch:
 *Customer/Company Name:* Acme Corp
 *Customer Email:*
 Activity completed
 2026-08-18`;
 
 // Module 3's fallback is legitimate on ACTIVITY TRACKING only.
-const FALLBACK_OK = `⏱️ ACTIVITY TRACKING ⏱️
+const FALLBACK_OK = `:stopwatch: ACTIVITY TRACKING :stopwatch:
 *Customer/Company Name:* — not included in this email —
 *Customer Email:* ops@acme.com
 Activity completed
 2026-08-18`;
-const FALLBACK_MISPLACED = `⏱️ SETTER REQUIRED ⏱️
+const FALLBACK_MISPLACED = `:stopwatch: SETTER REQUIRED :stopwatch:
 *Customer/Company Name:* — not included in this email —
 Setter Required - Tropikasa - Flywheel AI Account
 2026-08-18`;
@@ -152,9 +154,9 @@ check('7a misplaced fallback is caught',   evaluateAlertCard(FALLBACK_MISPLACED)
 // ── 7b. Card matching — the regression from the first live run ──
 // 2026-08-19 15:00 CR: the check flagged a customer whose card had been posted in
 // the same minute, because the two systems order the name components differently.
-const AURA_CARD = `🔔🔔 NEW FLYWHEEL AI CUSTOMER 🔔🔔
+const AURA_CARD = `:bell::bell: NEW FLYWHEEL AI CUSTOMER :bell::bell:
 Customer/Company Name: Cacao Legal - Aura Bonilla
-Customer Email: abonillabravo@gmail.com
+Customer Email: <mailto:abonillabravo@gmail.com|abonillabravo@gmail.com>
 Start Date: 2026-08-18
 Customer-ID: cacao-legal-aura-bonilla`.toLowerCase();
 
@@ -165,7 +167,7 @@ check('7b1 reversed name components still match (the live false positive)',
 check('7b2 match survives with no email on the row (token fallback)',
       cardExistsFor({ client_name: 'Aura Bonilla - Cacao Legal', email: '' }, [AURA_CARD]), true);
 check('7b3 match survives when the card carries no email line',
-      cardExistsFor(AURA_ROW, [`🔔🔔 new flywheel ai customer 🔔🔔
+      cardExistsFor(AURA_ROW, [`:bell::bell: new flywheel ai customer :bell::bell:
 customer/company name: cacao legal - aura bonilla
 start date: 2026-08-18`]), true);
 check('7b4 a genuinely absent customer is still reported',
@@ -184,15 +186,46 @@ check('7b6 email match wins even when the name is written differently',
 check('7b7 a row with neither email nor usable name is not silently cleared',
       cardExistsFor({ client_name: '', email: '' }, [AURA_CARD]), false);
 
-// ── 8. End to end: a clean window posts nothing ──
+// ── 7c. Emoji representation — the 2026-08-19 production regression ──
+// Make sends a literal "🔔🔔"; conversations.history returns ":bell::bell:". Matching
+// headers on the literal emoji made text.includes(header) false for every card, so
+// the contract examined nothing, reported "0 bad cards", and left seenCards empty —
+// which made the divergence check call every customer missing. Both forms must work:
+// this code reads Slack today, but nothing guarantees Slack keeps normalising.
+const SHORTCODE_CARD = `:bell::bell: NEW FLYWHEEL AI CUSTOMER :bell::bell:
+Customer/Company Name: Cacao Legal - Aura Bonilla
+Customer Email: <mailto:abonillabravo@gmail.com|abonillabravo@gmail.com>
+Start Date: 2026-08-18
+Customer-ID: cacao-legal-aura-bonilla`;
+
+const LITERAL_EMOJI_CARD = SHORTCODE_CARD.replace(/:bell::bell:/g, '🔔🔔');
+
+check('7c1 a shortcode card passes the contract',  evaluateAlertCard(SHORTCODE_CARD).ok, true);
+check('7c2 a literal-emoji card passes too',       evaluateAlertCard(LITERAL_EMOJI_CARD).ok, true);
+check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_CARD).problems.length, 0);
+
+// ── 7d. End to end: the exact production case that stayed broken ──
+// A real customer, a real card posted in the same minute, in real Slack wire format.
+// Before this fix the header never matched, so this reported her as missing.
 (async () => {
+  const { checkGmailAlertQuality, posted } = build({
+    history: { C0A7X9G6S78: [SHORTCODE_CARD] },
+    clients: [{ client_name: 'Aura Bonilla - Cacao Legal ', email: 'abonillabravo@gmail.com',
+                created_at: '2026-08-18T20:47:37Z' }],
+  });
+  await checkGmailAlertQuality('c');
+  check('7d  a shortcode card counts as coverage (the live false positive)', posted.length, 0);
+})()
+
+// ── 8. End to end: a clean window posts nothing ──
+.then(async () => {
   const { checkGmailAlertQuality, posted } = build({
     history: { C0A9NH9PZ7C: [GOOD_CLOSER], C0A7X9G6S78: [GOOD_NEW_CLIENT] },
     clients: [{ client_name: 'Tropikasa', email: 'kty@tropikasa.com', created_at: '2026-08-18T10:00:00Z' }],
   });
   await checkGmailAlertQuality('c');
   check('8  clean window posts nothing', posted.length, 0);
-})()
+})
 
 // ── 9. A bad card alerts once, and not again ──
 .then(async () => {
