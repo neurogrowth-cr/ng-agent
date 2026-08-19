@@ -271,6 +271,8 @@ CRITICAL BEHAVIOR RULES:
 
    If ALL sources return nothing, say so immediately in one message: "Andres Chavez not found in GHL, sales intelligence, or knowledge base. He may not have been logged yet."
 
+6. THE THREAD IS THE QUESTION — When the message carries a THREAD CONTEXT block, the person is replying inside a Slack thread and that thread is what they are asking about. It outranks the recent conversation history, which is a separate conversation that happened somewhere else. Answer about the thread. If the thread is a list or report you posted earlier and they ask whether it is "still true" or "still pending", re-check the underlying data for the items in THAT thread — do not answer about whatever you were last discussing elsewhere. If the thread does not contain what they are asking about, say so plainly and ask which thread they mean; never quietly substitute the other conversation.
+
    The rule is: think with tools, speak with results. Never speak while thinking.
 
    SILENCE IS NEVER ACCEPTABLE — whether the result is a success, a failure, an error, or empty data, Max must always send a final reply. If every tool returns nothing, say so. If a tool errors, report it. If the answer is incomplete, say what was found and what was not. The only wrong answer is no answer.
@@ -6750,17 +6752,163 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
 
 // ─── SLACK HANDLERS ───────────────────────────────────────────────────────────
 
+// ─── THREAD AWARENESS ─────────────────────────────────────────────────────────
+// Max used to be blind to Slack threads unless he was @mentioned: the DM handler
+// ignored thread_ts entirely, so a reply inside a thread got answered from the
+// flat DM history and posted at channel level. On 2026-08-19 Ron asked "is this
+// still true?" inside the outcome-escalation thread and got an answer about an
+// unrelated conversation happening in the main DM.
+//
+// These helpers are the one shared thread path used by the DM, channel and
+// @mention handlers. The pure ones sit together in this block so
+// test/thread-context.test.js can slice them out of the monolith.
+
+const THREAD_ROOT_LIMIT  = 1200;  // the root is usually a Max report — don't gut it
+const THREAD_REPLY_LIMIT = 300;
+const THREAD_FETCH_LIMIT = 50;
+const EVENT_CLAIM_TTL_MS = 60_000;
+
+// A message is Max's if Slack tagged it as a bot post or it came from his user.
+function isMaxMessage(m, botUserId) {
+  return Boolean(m && (m.bot_id || (botUserId && m.user === botUserId)));
+}
+
+// True when Max is already part of a thread — he posted the root or replied in
+// it. This is the gate for channels he does not otherwise answer in: he carries
+// on his own conversations, he does not barge into other people's.
+function isMaxThread(messages, botUserId) {
+  return (messages || []).some(m => isMaxMessage(m, botUserId));
+}
+
+// Renders a thread as a readable transcript. Senders resolve through the roster
+// via `nameFor` — the old inline version printed `user:U0AM…` for everyone
+// except the person tagging, which is a large part of why Max could not follow
+// a thread with more than two people in it. The root gets a bigger budget than
+// the replies because it is normally the report being asked about.
+function formatThreadTranscript(messages, opts = {}) {
+  const { botUserId, nameFor, rootLimit = THREAD_ROOT_LIMIT, replyLimit = THREAD_REPLY_LIMIT } = opts;
+  const label = (id) => (nameFor ? nameFor(id) : `user:${id}`);
+  return (messages || []).map((m, i) => {
+    const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const sender = isMaxMessage(m, botUserId) ? 'Max' : label(m.user);
+    const limit  = i === 0 ? rootLimit : replyLimit;
+    const text   = (m.text || '').replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${label(id)}`);
+    return `[${time}] ${sender}: ${text.length > limit ? `${text.slice(0, limit)}…` : text}`;
+  }).join('\n');
+}
+
+// Decides whether a non-DM message is Max's to answer. #ng-pm-agent is his
+// channel and behaves as before. Anywhere else he only answers inside a thread
+// he is already part of — top-level channel chatter stays none of his business.
+function shouldAnswerChannelMessage({ channelName, isThreadReply, maxIsInThread }) {
+  if ((channelName || '').includes('ng-pm-agent')) return true;
+  return Boolean(isThreadReply && maxIsInThread);
+}
+
+// One-reply-per-Slack-event guard. Answering thread replies in every channel
+// means an @mention inside a thread now matches both `app_mention` and
+// `slack.message`; whichever lands first claims the event and the other becomes
+// a no-op. Both produce the same thread-aware in-thread answer, so either
+// winning the race is correct.
+const _claimedEvents = new Map();
+function claimEvent(channel, ts, now = Date.now()) {
+  for (const [k, expiry] of _claimedEvents) if (expiry <= now) _claimedEvents.delete(k);
+  const key = `${channel}:${ts}`;
+  if (_claimedEvents.has(key)) return false;
+  _claimedEvents.set(key, now + EVENT_CLAIM_TTL_MS);
+  return true;
+}
+// ─── end pure thread helpers (test/thread-context.test.js slices to here) ─────
+
+// Fetches a thread and builds the context block Max reads before answering.
+// `tagged` (an @mention) additionally runs the learning side effects that used
+// to live inline in the @mention handler — knowledge save, report-lesson
+// extraction, correction capture, client-context extraction. Those stay tied to
+// an explicit tag on purpose: two of them are LLM calls, and firing them on
+// every thread reply everywhere would multiply cost and manufacture "lessons"
+// out of ordinary follow-up questions.
+async function buildThreadContext({ channel, threadTs, excludeTs, userId, userText = '', tagged = false, knownChannelName }) {
+  const empty = { context: '', maxIsInThread: false, channelName: null, messages: [] };
+  if (!threadTs) return empty;
+  try {
+    const threadResult = await slack.client.conversations.replies({ channel, ts: threadTs, limit: THREAD_FETCH_LIMIT });
+    const messages = (threadResult.messages || []).filter(m => m.ts !== excludeTs);
+    if (messages.length === 0) return empty;
+
+    const botUserId   = process.env.SLACK_BOT_USER_ID;
+    const channelInfo = knownChannelName === undefined
+      ? await slack.client.conversations.info({ channel }).catch(() => null)
+      : null;
+    const channelName = knownChannelName !== undefined ? (knownChannelName || null) : (channelInfo?.channel?.name || null);
+    const where       = channelName ? `#${channelName}` : 'this DM';
+    const nameFor     = (id) => (id && id === botUserId ? 'Max' : getMemberContext(id).displayName);
+    const maxIsInThread = isMaxThread(messages, botUserId);
+
+    let context = `\n\nTHREAD CONTEXT — you are replying inside a Slack thread in ${where}. This thread is the subject of the question and OUTRANKS the recent conversation history, which is a different conversation that happened elsewhere. Answer about this thread. If the thread does not contain what was asked, say so plainly — do not answer from the other conversation.\n${formatThreadTranscript(messages, { botUserId, nameFor })}`;
+
+    if (tagged) {
+      const rootMessage = messages[0];
+      await upsertKnowledge('process', `thread:${channel}:${threadTs}`,
+        `Thread tagged for Max on ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica' })} in #${channelName || 'unknown'}. Last action: "${userText.substring(0, 200)}"`,
+        'thread-mention'
+      );
+
+      // If the thread root was posted by Max (a report), extract the lesson from
+      // the user's feedback before responding — so Max can acknowledge it.
+      const isMaxBotPost = rootMessage && !rootMessage.user && rootMessage.bot_id;
+      if (isMaxBotPost) {
+        try {
+          const lesson = await extractAndSaveReportLesson(rootMessage.text || '', userText, channelName || 'unknown channel', userId, newCorrelationId());
+          if (lesson) {
+            context += `\n\nIMPORTANT: This person is giving feedback on a report Max posted. A lesson has been extracted and saved: "${lesson}". Acknowledge this in your reply — confirm what you learned and that you will apply it to future reports for this channel. Keep it to 1-2 sentences, plain text.`;
+          }
+        } catch (lessonErr) {
+          console.error('Lesson extraction error:', lessonErr.message);
+        }
+      } else {
+        // Thread not rooted in a Max report, but Max may have spoken earlier in
+        // it — if this mention corrects him, capture the lesson too.
+        const lastMaxMsg = [...messages].reverse().find(m => m.bot_id);
+        if (lastMaxMsg) detectAndSaveCorrection(userText, lastMaxMsg.text || '', userId).catch(() => {});
+      }
+
+      // Client-specific context from any tagged thread (not just Max bot posts)
+      try {
+        const clientCtx = await extractClientContext(messages, userText, channelName || 'unknown channel', userId);
+        if (clientCtx) {
+          const key = `client:${clientCtx.client.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}:${new Date().toISOString().slice(0, 10)}`;
+          await upsertKnowledge('client', key, clientCtx.context, 'thread-context', userId, 'shared');
+          console.log(`Client context saved for "${clientCtx.client}" from #${channelName || 'unknown'}`);
+        }
+      } catch (ctxErr) {
+        console.error('Client context extraction error:', ctxErr.message);
+      }
+    }
+
+    return { context, maxIsInThread, channelName, messages };
+  } catch (err) {
+    console.error('Thread context fetch error:', err.message);
+    return empty;
+  }
+}
+
 // DM handler
 slack.message(async ({ message, say }) => {
   if (message.bot_id) return;
   if (message.channel_type !== 'im') return;
+  // A DM inside a thread is answered *in that thread*. Top-level DMs stay
+  // top-level — replying with a thread_ts there would start a thread nobody
+  // asked for.
+  const dmThreadTs = (message.thread_ts && message.thread_ts !== message.ts) ? message.thread_ts : null;
+  const dmSay = (text) => (dmThreadTs ? say({ text, thread_ts: dmThreadTs }) : say(text));
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
-  if (!isRosterMember(userId)) { await say("You're not on Max's roster yet — ping Ron and he'll add you."); return; }
-  if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, false); return; }
+  if (!isRosterMember(userId)) { await dmSay("You're not on Max's roster yet — ping Ron and he'll add you."); return; }
+  if (!claimEvent(message.channel, message.ts)) return;  // app_mention got there first
+  if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, Boolean(dmThreadTs)); return; }
   if (message.subtype) return;
-  if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
+  if (isRateLimited(userId)) { await dmSay('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
 
   // ── Outcome-card thread replies (deterministic — the card knows its call) ──
   let cardThreadHint = '';
@@ -6858,7 +7006,11 @@ slack.message(async ({ message, say }) => {
   const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
   detectAndSaveCorrection(message.text, typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', userId).catch(() => {});
   const threadHint = await getActiveThreadHint(userId);
-  history.push({ role: 'user', content: (message.text || '') + cardThreadHint + threadHint });
+  const dmThread = await buildThreadContext({ channel: message.channel, threadTs: dmThreadTs, excludeTs: message.ts, userId, userText: message.text || '' });
+  const dmHints = cardThreadHint + threadHint;
+  history.push({ role: 'user', content: dmThread.context
+    ? `${dmThread.context}\n\nMY TASK (what they just asked me, inside that thread): ${message.text || ''}${dmHints}`
+    : (message.text || '') + dmHints });
   try {
     let reply = await callClaude(history, 3, userId, correlation_id);
     if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
@@ -6866,9 +7018,9 @@ slack.message(async ({ message, say }) => {
     if (handleDraftReply(reply, userId, say, correlation_id)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
-    await say(reply);
-    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts, output: { text: String(reply).slice(0, 2000) }, correlation_id });
-  } catch (err) { console.error('Claude API error (DM):', err); await say('Got turned around for a second — go ahead and ask again.'); }
+    await dmSay(reply);
+    logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: dmThreadTs, output: { text: String(reply).slice(0, 2000) }, correlation_id });
+  } catch (err) { console.error('Claude API error (DM):', err); await dmSay('Got turned around for a second — go ahead and ask again.'); }
 });
 
 // (The iClosed booking relay that lived here — threaded setter reveals on
@@ -6884,75 +7036,18 @@ slack.event('app_mention', async ({ event, say }) => {
   const userId = event.user;
   if (!isRosterMember(userId)) { await say({ text: "You're not on Max's roster yet — ping Ron and he'll add you.", thread_ts: event.thread_ts || event.ts }); return; }
 
-  // If this mention is inside a thread, fetch the full thread context first
-  let threadContext = '';
-  if (event.thread_ts && event.thread_ts !== event.ts) {
-    try {
-      const threadResult = await slack.client.conversations.replies({
-        channel: event.channel,
-        ts: event.thread_ts,
-        limit: 50,
-      });
-      const threadMessages = (threadResult.messages || []).filter(m => m.ts !== event.ts);
-      if (threadMessages.length > 0) {
-        const channelInfo = await slack.client.conversations.info({ channel: event.channel }).catch(() => null);
-        const channelName = channelInfo?.channel?.name || 'unknown channel';
-        threadContext = `\n\nTHREAD CONTEXT from #${channelName} (read this before responding — this is what was discussed before you were tagged):\n` +
-          threadMessages.map(m => {
-            const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-            const sender = m.bot_id ? 'Max' : (m.user === event.user ? 'Ron' : `user:${m.user}`);
-            return `[${time}] ${sender}: ${(m.text || '').substring(0, 300)}`;
-          }).join('\n');
+  if (!claimEvent(event.channel, event.ts)) return;
 
-        // Save this thread to knowledge base so Max remembers it
-        const threadSummaryKey = `thread:${event.channel}:${event.thread_ts}`;
-        await upsertKnowledge('process', threadSummaryKey,
-          `Thread tagged for Max on ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica' })} in #${channelInfo?.channel?.name || 'unknown'}. Last action: "${cleanText.substring(0, 200)}"`,
-          'thread-mention'
-        );
-
-        // If the thread root was posted by Max (a report), extract the lesson from
-        // the user's feedback before responding — so Max can acknowledge it.
-        const rootMessage = threadMessages[0];
-        const isMaxBotPost = rootMessage && !rootMessage.user && rootMessage.bot_id;
-        if (isMaxBotPost) {
-          try {
-            const lesson = await extractAndSaveReportLesson(
-              rootMessage.text || '',
-              cleanText,
-              channelName,
-              userId,
-              newCorrelationId()
-            );
-            if (lesson) {
-              threadContext += `\n\nIMPORTANT: This person is giving feedback on a report Max posted. A lesson has been extracted and saved: "${lesson}". Acknowledge this in your reply — confirm what you learned and that you will apply it to future reports for this channel. Keep it to 1-2 sentences, plain text.`;
-            }
-          } catch (lessonErr) {
-            console.error('Lesson extraction error:', lessonErr.message);
-          }
-        } else {
-          // Thread not rooted in a Max report, but Max may have spoken earlier
-          // in it — if this mention corrects him, capture the lesson too.
-          const lastMaxMsg = [...threadMessages].reverse().find(m => m.bot_id);
-          if (lastMaxMsg) detectAndSaveCorrection(cleanText, lastMaxMsg.text || '', userId).catch(() => {});
-        }
-
-        // Extract and store client-specific context from any thread (not just Max bot posts)
-        try {
-          const clientCtx = await extractClientContext(threadMessages, cleanText, channelName, userId);
-          if (clientCtx) {
-            const key = `client:${clientCtx.client.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}:${new Date().toISOString().slice(0, 10)}`;
-            await upsertKnowledge('client', key, clientCtx.context, 'thread-context', userId, 'shared');
-            console.log(`Client context saved for "${clientCtx.client}" from #${channelName}`);
-          }
-        } catch (ctxErr) {
-          console.error('Client context extraction error:', ctxErr.message);
-        }
-      }
-    } catch (threadErr) {
-      console.error('Thread context fetch error:', threadErr.message);
-    }
-  }
+  // If this mention is inside a thread, read the whole thread first.
+  const mentionThread = await buildThreadContext({
+    channel: event.channel,
+    threadTs: (event.thread_ts && event.thread_ts !== event.ts) ? event.thread_ts : null,
+    excludeTs: event.ts,
+    userId,
+    userText: cleanText,
+    tagged: true,
+  });
+  const threadContext = mentionThread.context;
 
   const history = await loadHistory(userId);
   const fullMessage = threadContext ? `${threadContext}\n\nMY TASK (what I was just tagged to do): ${cleanText}` : cleanText;
@@ -6984,14 +7079,26 @@ slack.event('app_mention', async ({ event, say }) => {
   } catch (err) { console.error('Claude API error (mention):', err); await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts }); }
 });
 
-// #ng-pm-agent channel handler
+// Channel handler — #ng-pm-agent, plus thread replies anywhere else Max is
+// already in the thread (public, private, group DM).
 slack.message(async ({ message, say }) => {
   if (message.subtype || message.bot_id) return;
   if (message.channel_type === 'im') return;
+  const isThreadReply = Boolean(message.thread_ts && message.thread_ts !== message.ts);
   let channelInfo;
   try { channelInfo = await slack.client.conversations.info({ channel: message.channel }); } catch { return; }
   const channelName = channelInfo.channel?.name || '';
-  if (!channelName.includes('ng-pm-agent')) return;
+  const inMaxChannel = channelName.includes('ng-pm-agent');
+  // Top-level chatter outside his own channel is still none of Max's business —
+  // only a thread he is already part of pulls him in.
+  if (!inMaxChannel && !isThreadReply) return;
+
+  // Read the thread before deciding anything: outside #ng-pm-agent, Max only
+  // answers threads he is already in. This gate must come before checkApproval
+  // and the roster rejection so neither fires in a channel he stays out of.
+  const chThread = await buildThreadContext({ channel: message.channel, threadTs: isThreadReply ? message.thread_ts : null, excludeTs: message.ts, userId: message.user, userText: message.text || '', knownChannelName: channelName });
+  if (!shouldAnswerChannelMessage({ channelName, isThreadReply, maxIsInThread: chThread.maxIsInThread })) return;
+
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
@@ -6999,6 +7106,8 @@ slack.message(async ({ message, say }) => {
   if (message.subtype === 'file_share' && message.files?.length > 0) { await handleFileMessage(message, say, userId, true); return; }
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say({ text: 'Slow down a bit — too many messages at once. Give me a moment.', thread_ts: message.thread_ts || message.ts }); return; }
+
+  if (!claimEvent(message.channel, message.ts)) return;
   const chCid = newCorrelationId();
   const chCtx = getMemberContext(userId);
   logActivity({
@@ -7014,7 +7123,9 @@ slack.message(async ({ message, say }) => {
     correlation_id: chCid,
   });
   const history = await loadHistory(userId);
-  history.push({ role: 'user', content: message.text });
+  history.push({ role: 'user', content: chThread.context
+    ? `${chThread.context}\n\nMY TASK (what they just asked me, inside that thread): ${message.text || ''}`
+    : message.text });
   try {
     let reply = await callClaude(history, 3, userId, chCid);
     if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId, chCid); }
