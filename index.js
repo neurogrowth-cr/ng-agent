@@ -12847,6 +12847,209 @@ async function checkBookingAlertDivergence(correlationId) {
 cron.schedule('*/30 * * * *', wrapCronJob('checkBookingAlertDivergence', async (c) => { await checkBookingAlertDivergence(c); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: booking → alert divergence check (*/30 * * * *)');
 
+// ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
+// The customer lifecycle alerts (Make 4356754 + 5975679) had no criteria at all.
+// See ~/automations/ops/recipes/customer-alert-fanout.md.
+//
+// Two failure modes, and they need two different checks:
+//
+//  1. The card is posted but WRONG. On 2026-08-13 a React Email <Preview> block
+//     pushed the greeting past Gmail's ~200-char snippet; Make's split() returns
+//     empty rather than erroring, so the scenario reported SUCCESS while posting
+//     blank cards for four days. The 2026-08-17 rewrite moved routes 15/17/18 onto
+//     the subject — but with a bare replace() and no ifempty(). replace() returns
+//     its input unchanged when the pattern is absent, so a subject-prefix rename
+//     now yields a card whose name IS the whole raw subject. That is worse than
+//     blank: it looks right and survives any non-empty check. Hence the explicit
+//     prefix-residue assertion below.
+//
+//  2. The card is never posted at all. On 2026-08-06 a real customer produced no
+//     card and nothing noticed. No content check can see a message that does not
+//     exist, so that needs a divergence check against client_dashboards.
+const GMAIL_ALERT_CHANNELS = {
+  C0A70J9638R: 'activity tracking / onboarding completed',
+  C0A9NH9PZ7C: 'closer + setter required',
+  C09TS6DUTU2: 'prosp campaign issues',
+  C0A7X9G6S78: 'new flywheel ai customer',
+};
+// The ID, not the #name in NEW_CLIENT_CHANNEL above — conversations.history is
+// keyed by ID and will not resolve a name.
+const GMAIL_NEW_CLIENT_CHANNEL_ID = 'C0A7X9G6S78';
+
+// Only cards this recipe produces. Matching on the header rather than on bot_id
+// keeps the check working if the Make connection is ever re-authed under a new app.
+const GMAIL_ALERT_HEADERS = [
+  '⏱️ ACTIVITY TRACKING ⏱️',
+  '⏱️ CLOSER REQUIRED ⏱️',
+  '⏱️ ONBOARDING COMPLETED ⏱️',
+  '⏱️ SETTER REQUIRED ⏱️',
+  '🔔🔔 NEW FLYWHEEL AI CUSTOMER 🔔🔔',
+  'Issues with Prosp Campaign',
+];
+
+// Fragments the template strips. If one survives into the name, replace() did not
+// fire — the subject was renamed and the card is carrying the raw subject.
+const GMAIL_SUBJECT_RESIDUE = [
+  'Closer Required - ', 'Closer requerido - ',
+  'Setter Required - ', 'Setter requerido - ',
+  ' - Flywheel AI Account', ' - Cuenta Flywheel AI',
+  'Flywheel onboarding form completed', 'Formulario de incorporación Flywheel completado',
+];
+const GMAIL_JUNK_TOKENS = ['[object Object]', 'Collection', 'undefined', 'null', 'NaN', 'Invalid Date'];
+// Legitimate ONLY on module 3 (activity tracking), the one route with a fallback.
+const GMAIL_MODULE3_FALLBACK = '— not included in this email —';
+
+// Pure. Exported shape: { ok, problems: [] }. Kept side-effect free so the test can
+// drive it directly, same as evaluateStrikeMove.
+function evaluateAlertCard(text) {
+  const problems = [];
+  const t = String(text || '');
+  const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+
+  for (const junk of GMAIL_JUNK_TOKENS) {
+    if (t.includes(junk)) problems.push(`contains ${junk}`);
+  }
+
+  const nameMatch = t.match(/^\*?Customer\/Company Name:\*?[ \t]*(.*?)[ \t]*$/m);
+  if (nameMatch) {
+    const name = nameMatch[1];
+    if (!name) {
+      problems.push('empty customer name');
+    } else {
+      for (const frag of GMAIL_SUBJECT_RESIDUE) {
+        if (name.includes(frag)) { problems.push(`raw subject leaked into name (residue "${frag.trim()}")`); break; }
+      }
+      // Generic leak: the name is byte-identical to another line of the card. Routes
+      // 15/17/18 print {{1.subject}} on its own line and derive the name from it by
+      // stripping a prefix, so name === subject means nothing was stripped at all.
+      //
+      // LIMIT, stated rather than hidden: this catches a TOTAL strip failure. A
+      // partial one — a renamed prefix where the suffix replace still fires — leaves
+      // a name that is neither empty nor equal to the subject, and slips past both
+      // this and the residue list above. Closing that needs the template to emit a
+      // sentinel, which is the Make-side fix recommended in the recipe spec.
+      if (lines.some(l => l === name)) {
+        problems.push('name is identical to another line of the card (raw subject leak)');
+      }
+      if (name === GMAIL_MODULE3_FALLBACK && !t.includes('ACTIVITY TRACKING')) {
+        problems.push('module-3 fallback text on a route that has no fallback');
+      }
+    }
+  }
+
+  const emailMatch = t.match(/^\*?Customer Email:\*?[ \t]*(.*?)[ \t]*$/m);
+  if (emailMatch && !emailMatch[1].includes('@')) {
+    problems.push(emailMatch[1] ? 'customer email is not an address' : 'empty customer email');
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+const gmailAlertAlerted = new Set();
+const GMAIL_ALERT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+// The dash webhook fires within seconds, but Make's Gmail trigger polls every 20
+// min. A customer created 25 min ago is in flight, not missing.
+const GMAIL_ALERT_GRACE_MS = 30 * 60 * 1000;
+
+async function checkGmailAlertQuality(correlationId) {
+  const now = Date.now();
+  const since = now - GMAIL_ALERT_LOOKBACK_MS;
+  const problems = [];
+  const skipped = [];
+  const seenNames = [];
+
+  // ── 1. Content contract on every card in the window ──
+  for (const [channel, label] of Object.entries(GMAIL_ALERT_CHANNELS)) {
+    let msgs;
+    try {
+      const hist = await slack.client.conversations.history({
+        channel, limit: 200, oldest: String(Math.floor(since / 1000)),
+      });
+      msgs = hist.messages || [];
+    } catch (err) {
+      // FAIL CLOSED. An unreadable channel must not read as "no problems here".
+      skipped.push(`${label} (${err.data?.error || err.message})`);
+      continue;
+    }
+    for (const m of msgs) {
+      const text = m.text || '';
+      if (!GMAIL_ALERT_HEADERS.some(h => text.includes(h))) continue;
+      // Only new-customer cards count as coverage for the divergence check. A
+      // "closer required" card for the same person is a different event and must
+      // not mask a missing new-customer alert.
+      if (channel === GMAIL_NEW_CLIENT_CHANNEL_ID && text.includes('NEW FLYWHEEL AI CUSTOMER')) {
+        const n = text.match(/^\*?Customer\/Company Name:\*?[ \t]*(.*?)[ \t]*$/m);
+        if (n && n[1]) seenNames.push(n[1].toLowerCase().trim());
+      }
+      const verdict = evaluateAlertCard(text);
+      if (!verdict.ok) {
+        const key = `${channel}:${m.ts}`;
+        if (!gmailAlertAlerted.has(key)) {
+          problems.push(`• \`${label}\` — ${verdict.problems.join('; ')}\n  ${text.split('\n')[0].slice(0, 80)}`);
+        }
+        gmailAlertAlerted.add(key);
+      }
+    }
+  }
+
+  // ── 2. Divergence: a customer exists but no card was ever posted ──
+  // Only possible for the new-customer path; client_dashboards is the sole
+  // queryable source of truth. The lifecycle routes originate as emails with no
+  // table behind them — that hole is named in the recipe spec, not papered over.
+  let missing = [];
+  const { data: clients, error: clientErr } = await portalSupabase
+    .from('client_dashboards')
+    .select('client_name, email, created_at')
+    .gte('created_at', new Date(since).toISOString())
+    .lte('created_at', new Date(now - GMAIL_ALERT_GRACE_MS).toISOString())
+    .limit(100);
+  if (clientErr) {
+    skipped.push(`client_dashboards divergence (${clientErr.message})`);
+  } else if (skipped.some(s => s.startsWith('new flywheel ai customer'))) {
+    // Could not read the channel, so absence of a card proves nothing.
+    skipped.push('client_dashboards divergence (new-client channel unreadable)');
+  } else {
+    missing = (clients || []).filter(c => {
+      const name = String(c.client_name || '').toLowerCase().trim();
+      if (!name) return false;
+      return !seenNames.some(sn => sn.includes(name) || name.includes(sn));
+    }).filter(c => !gmailAlertAlerted.has(`missing:${c.email}`));
+    for (const c of missing) gmailAlertAlerted.add(`missing:${c.email}`);
+  }
+
+  // Bound the memo so a long-running process cannot grow it without limit.
+  if (gmailAlertAlerted.size > 500) {
+    for (const k of [...gmailAlertAlerted].slice(0, gmailAlertAlerted.size - 500)) gmailAlertAlerted.delete(k);
+  }
+
+  console.log(`Gmail alert quality: ${problems.length} bad card(s), ${missing.length} customer(s) with no alert, ${skipped.length} check(s) skipped.`);
+  if (!problems.length && !missing.length && !skipped.length) return;
+
+  // A skipped check can never read as green — it degrades the verdict to ⚠️.
+  const parts = [`⚠️ <@${RON_SLACK_ID}> *Customer alert fan-out — quality check*`];
+  if (problems.length) parts.push(`\n*${problems.length} card(s) posted with a bad field* in the last 24h:\n${problems.slice(0, 10).join('\n')}`);
+  if (missing.length) {
+    parts.push(`\n*${missing.length} new customer(s) with no alert card:*\n` +
+      missing.slice(0, 10).map(c => `• ${c.client_name} <${c.email}> — created ${new Date(c.created_at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`).join('\n') +
+      `\nThe row is in \`client_dashboards\` but nothing reached <#${GMAIL_NEW_CLIENT_CHANNEL_ID}>. Do NOT re-post by hand before checking whether the dash webhook fired — a duplicate card is worse than a late one.`);
+  }
+  if (skipped.length) parts.push(`\n_Skipped (not green, just unread): ${skipped.join(', ')}_`);
+
+  await postMakeHealthAlert(parts.join('\n'));
+  logActivity({
+    event_type: 'alert', event_source: 'cron', action: 'gmail_alert_quality',
+    status: problems.length || missing.length ? 'gap' : 'degraded',
+    output: { bad_cards: problems.length, missing_alerts: missing.map(c => c.client_name), skipped },
+    correlation_id: correlationId,
+  });
+}
+
+// Hourly. The fan-out polls every 20 min, so this is 3 polls behind at worst —
+// fast enough to catch a broken template the same morning, cheap enough that it
+// costs four Slack reads and one Supabase read per run.
+cron.schedule('0 * * * *', wrapCronJob('checkGmailAlertQuality', async (c) => { await checkGmailAlertQuality(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: gmail fan-out alert quality check (0 * * * *)');
+
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
   try {
