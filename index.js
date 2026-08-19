@@ -1159,6 +1159,37 @@ function stripApprovalSentinel(text) {
   return text.split('|').slice(5).join('|').trim();
 }
 
+// ─── PREAMBLE GUARD ──────────────────────────────────────────────────────────
+// A scheduled task's reply is posted to the channel VERBATIM, so any narration
+// the model writes before the deliverable is published to the team. On
+// 2026-08-18 the nightly closer nudge posted as:
+//   "6 calls today. Alberto García is already marked no-show… The remaining 5
+//    still show as scheduled.\n\nHere is the final reminder text:\n\n---\n\n
+//    <!subteam^…> Quick reminder before you sign off — …"
+// The prompt already said "return ONLY the final reminder text"; the model
+// complied and then framed it anyway. Prose instructions are probabilistic, so
+// the fix is machine-checked: a task whose deliverable has a known FIRST token
+// declares it here, and everything before that token is cut.
+//
+// Whitelist by design (the TASK_HEADERS lesson at :1421): "starts with X" has
+// one shape, "does not contain any of these framing phrases" has infinite gaps.
+const TASK_LEAD_ANCHOR = {
+  'Daily Closer Outcome Reminder': '<!subteam^',
+  'Daily Sales Call Roster':       '<!subteam^',
+};
+
+// Cut anything before the anchor. Returns the text unchanged when the task
+// declares no anchor, or when the anchor is absent — an absent anchor is a
+// different failure (the reply isn't the deliverable at all) and belongs to
+// validateFinalReport, which re-prompts for it.
+function trimToLeadAnchor(text, taskName) {
+  const anchor = TASK_LEAD_ANCHOR[taskName];
+  if (!anchor || !text) return text;
+  const i = text.indexOf(anchor);
+  if (i <= 0) return text; // 0 = already clean, -1 = absent
+  return text.slice(i).trim();
+}
+
 function registerDynamicCron(task) {
   try {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
@@ -1408,7 +1439,7 @@ function registerDynamicCron(task) {
 
       if (!reply || !reply.trim()) return;
 
-      reply = stripApprovalSentinel(reply);
+      reply = trimToLeadAnchor(stripApprovalSentinel(reply), task.name);
 
       // ── STRUCTURAL WHITELIST GUARD ───────────────────────────────────────────
       // Rejects any reply that doesn't contain the expected section headers.
@@ -1436,7 +1467,10 @@ function registerDynamicCron(task) {
         'Cancellation Rate Alert':          [], // conditional — may legitimately be empty
         'Phase 0 Aging Alert':              [], // conditional — may legitimately be empty
         'Daily Sales Call Roster':          [], // short on quiet days
-        'Daily Closer Attendance & Outcome Reminder': [], // short nightly nudge — no fixed headers
+        // Renamed 2026-08-18 (attendance is Max's job now). A stale key here is
+        // invisible: the lookup returns undefined and the task silently falls
+        // through to the unknown-task 300-char branch instead of its own rule.
+        'Daily Closer Outcome Reminder': [], // short nightly nudge — no fixed headers
       };
 
       function validateFinalReport(text, taskName) {
@@ -1490,11 +1524,11 @@ function registerDynamicCron(task) {
       if (!firstCheck.ok) {
         console.log(`Cron "${task.name}": output failed structural validation — ${firstCheck.reason}. Re-prompting...`);
         try {
-          const finalReply = stripApprovalSentinel(await callClaude([
+          const finalReply = trimToLeadAnchor(stripApprovalSentinel(await callClaude([
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
             { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
-          ], 3, null, correlation_id));
+          ], 3, null, correlation_id)), task.name);
           const secondCheck = validateFinalReport(finalReply, task.name);
           if (finalReply && secondCheck.ok) {
             reply = finalReply;
