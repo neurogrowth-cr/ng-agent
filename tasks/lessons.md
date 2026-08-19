@@ -286,3 +286,97 @@ Both were swallowed by `catch (err) { console.error(...) }`.
 - **Read the whole call before diagnosing it — options objects live at the closing paren.** A grep that caught `cron.schedule(task.cron_expression, async () => {` but not the `}, { timezone: 'America/Costa_Rica' })` 400 lines down produced a confident, tabulated, completely false "every dynamic cron fires 6h early" diagnosis — nearly a pointless "fix" that would have ACTUALLY shifted 10 production reports. For any long callback, grep the region between the call's open and close (or the function's tail) before claiming an option is absent.
 - **If the reply IS the artifact, "return only the artifact" is a wish, not a guarantee.** The nightly closer nudge's prompt already said "Return ONLY the final reminder text" — the model complied *and then framed it anyway* ("Here is the final reminder text: ---"), and the whole sales team saw the scaffolding. Any cron whose output posts verbatim needs a machine-checked cut, not a politely-worded instruction. The cheap form is a whitelist anchor: declare the deliverable's known FIRST token and slice everything before it (`TASK_LEAD_ANCHOR` / `trimToLeadAnchor`). Note the guard must pass through a reply with no anchor at all — that is a *different* failure (the model produced no deliverable) and belongs to the re-prompt path, not to a silent blanking.
 - **Renaming a scheduled task silently unhooks every map keyed by its name.** Renaming "Daily Closer Attendance & Outcome Reminder" → "Daily Closer Outcome Reminder" left a stale `TASK_HEADERS` key, so the task stopped matching its own (short-nudge) validation rule and fell through to the unknown-task 300-char branch. Nothing errored; the rule just quietly stopped applying. Grep the old name across `index.js` before renaming anything in `scheduled_tasks`.
+
+## 2026-08-17 — Max rate-limited himself and dropped a setter's lead claim
+
+**Symptom.** Oscar reacted ✅ on a lead in `#ng-sales-goats`; Max replied
+"tried to claim, but GHL update failed: GHL PUT /contacts/faew9KFlhcL4TC0ECiAq →
+429: Too Many Requests. Reach out to Ron." The lead stayed unassigned in GHL.
+
+**Root cause.** Not a GHL outage — Max starving himself. The Railway logs line up
+exactly: `runAutoStrikeMover starting (mode=LIVE)` at 20:00:02Z, the failed claim at
+20:00:24Z, and a *different* claim succeeding at 20:01:04Z once the sweep had moved
+on. The sweep pages every card across four stages back-to-back with no delay, then
+reads a conversation per card; a human's claim landing inside that window loses the
+race for the per-location burst budget. Every GHL call in `index.js` was a bare
+`fetch` that threw on the first non-ok status, so one transient 429 killed the write
+permanently.
+
+**Takeaways.**
+- **A third-party client with no retry is a bug, not a simplification.** 429 and 5xx
+  are normal operating conditions, not exceptions. Retry those (backoff, honour
+  `Retry-After`).
+- ~~never retry 401/404 — they will not come good~~ — **half of this was wrong, see
+  the 2026-08-19 entry below.** 404 stands. For GHL, 401 does come good: 18 of 19
+  contacts that 401'd did so exactly once in 95 sweeps. It is now retried once.
+- **Background sweeps must yield to interactive paths.** A cron that bursts an API
+  is invisible until it collides with a human action, and then the human eats the
+  failure. Throttle the sweep's *paging* loop, not just its per-item loop.
+- **When an action fails recoverably, say the recovery, not "reach out to Ron."**
+  The claim emoji is the idempotency anchor and it was never added, so re-reacting
+  was always a clean retry — nobody knew.
+- **A failure that only `console.error`s cannot be measured.** The dropped-claim path
+  now writes a `ghl_lead_claim_failed` row to `agent_activity`, so "how often does
+  this happen?" is a query instead of a log scrape.
+
+## 2026-08-19 — GitHub ignores `merge=union`, so a fine PR reads as conflicted and silently skips CI
+
+**Symptom.** PR #59 sat a full day showing `CONFLICTING` / `DIRTY`, and
+`gh pr checks` said **"no checks reported"** — CI had never run on it at all.
+
+**Root cause.** `.gitattributes` marks `tasks/lessons.md`, `tasks/todo.md` and
+`tasks/project-state.md` as `merge=union` so parallel sessions can both append.
+Git honours that; **GitHub's merge engine does not honour gitattributes merge
+drivers**. Another session appended to `lessons.md`, GitHub saw two edits to the same
+region, called it a conflict — and a conflicted PR does not run checks. `git merge-tree`
+reported **0 conflict hunks** for the same merge, which is the tell: when git and
+GitHub disagree about a union-merged file, git is right.
+
+**Takeaways.**
+- **Trust `git merge-tree`, not the GitHub badge, for repos using `merge=union`.**
+  `git merge-tree $(git merge-base A B) A B | grep -c '^<<<<<<<'` gives the real answer
+  in one command.
+- **`CONFLICTING` silently implies `no CI`.** The dangerous part is not the red label,
+  it is that nothing ran. Always check `gh pr checks` separately — a PR can look merely
+  stale while being completely untested.
+- **Keep `tasks/*.md` appends out of code PRs.** The repo already forbids the inverse
+  (a `docs/*` branch must not touch `index.js`); the same separation protects code PRs
+  from a docs append making them un-mergeable. Land the docs in a follow-up.
+- **Rebasing is a treadmill in an active repo.** `main` took 6 merges from parallel
+  sessions during one fix; the first rebase went stale mid-flight. Rebase, verify, push
+  and merge in one tight pass, or enable auto-merge and stop chasing.
+- **Check `gh pr list` before building anything.** A parallel session had already
+  shipped the retry fix; the near-duplicate was caught only because the PR list was
+  read first. Four separate collisions happened this session, and one PR merged
+  cleanly *because paths differed* — GitHub reported it MERGEABLE while it would have
+  created a second, duplicate route rather than a conflict. **Git will not protect you
+  from duplicated parallel work.**
+
+## 2026-08-19 — A correct general rule can be wrong for one vendor; measure before adopting it
+
+**Symptom.** The GHL retry wrapper deliberately excluded 401 on the reasoning that
+"a 401 will never come good." Sound advice in general — and wrong here, leaving ~20
+recoverable failures per month unretried.
+
+**Root cause.** The rule was adopted from first principles rather than from this
+system's data. 30 days of `strike_sweep` metadata says the opposite: 401s hit 19
+distinct contacts and **18 of them 401'd exactly once** across ~95 sweeps. A genuine
+permission or token failure would have failed that same contact every sweep. They were
+also load-independent — **0 of 95 sweeps** saw a 401 and a 429 together, and `scanned`
+averaged 1528 on sweeps with a 401 vs 1549 without — so it was not the burst limit
+wearing an auth mask either. It is GHL's auth layer blinking, ~1 per sweep.
+
+**Takeaways.**
+- **Distinguish "this error class is permanent" from "this error class is permanent
+  *here*."** The generic rule is a prior, not evidence. One query against stored failure
+  metadata settled it.
+- **The shape of a failure identifies its cause better than its count.** 20 × 429 and
+  20 × 401 looked identical as totals. Bursty-vs-spread told them apart: the 429s landed
+  in 2 sweeps, the 401s trickled across 17. That single distinction drove both the retry
+  design and the per-status alert thresholds.
+- **Retrying a "permanent" error is safe only when bounded.** One retry absorbs a blink;
+  a dead token still fails in 2 calls instead of 1, and is caught by a failure-spike
+  threshold instead — a real auth outage produces hundreds of 401s, not one.
+- **This only became answerable because failures were stored as structured metadata.**
+  The same investigation against `console.error` output would have been guesswork. Store
+  the failure, not just the log line.
