@@ -8369,29 +8369,56 @@ async function generateWonHandoffSummary({ prospectName, coaching }) {
   return text;
 }
 
-// Synthetic `opp:` outcome rows carry no appointment time, so the 36h contract
-// can't anchor. Fallback: recordings for the same email within ±14d of the
-// outcome log date — exactly one candidate or nothing (a wrong closing summary
-// is worse than none, so ambiguity skips).
-async function findOppRowRecording(email, outcomeAtMs, label) {
+// The closing context lives on the LAST real call before the win — NOT on the
+// call the outcome row happens to point at. Deals routinely close on a
+// follow-up days after the call that did the actual selling, and dash attaches
+// an outcome to the prospect's LATEST appointment, so the appointment's date is
+// not evidence of when the closing call happened. Live proof: Fernando Corella
+// won on 2026-08-06 against an appointment dated 2026-08-12, while the call
+// carrying the context was 2026-08-04. The 36h appointment join (right for
+// proving attendance) therefore threw that context away.
+//
+// So: scope by prospect, order by recency, take the newest call at or before
+// the win. Same rule covers same-day closes, follow-up closes weeks later, and
+// synthetic `opp:` rows with no appointment time — no special cases.
+const WON_HANDOFF_LOOKBACK_DAYS = 60;
+// A close is sometimes logged hours before the call wraps or gets scored, so a
+// small forward pad keeps that call eligible without letting a LATER,
+// post-sale call (onboarding, quicksync) masquerade as the closing call.
+const WON_HANDOFF_FORWARD_PAD_MS = 2 * 86400000;
+
+// Pure picker so the selection rule is testable without touching REVI.
+function pickClosingCall(rows, outcomeAtMs) {
+  const usable = (rows || []).filter(r =>
+    r && r.call_date && r.coaching_json && Object.keys(r.coaching_json).length);
+  if (!usable.length) return null;
+  const cutoff = outcomeAtMs + WON_HANDOFF_FORWARD_PAD_MS;
+  const eligible = usable.filter(r => new Date(r.call_date).getTime() <= cutoff);
+  if (!eligible.length) return null;
+  eligible.sort((a, b) => new Date(b.call_date).getTime() - new Date(a.call_date).getTime());
+  return eligible[0];
+}
+
+async function findClosingCallRecording(email, outcomeAtMs, label) {
   if (!email) return null;
   try {
-    const lo = new Date(outcomeAtMs - 14 * 86400000).toISOString();
-    const hi = new Date(outcomeAtMs + 14 * 86400000).toISOString();
+    const lo = new Date(outcomeAtMs - WON_HANDOFF_LOOKBACK_DAYS * 86400000).toISOString();
+    const hi = new Date(outcomeAtMs + WON_HANDOFF_FORWARD_PAD_MS).toISOString();
     const { data: scores } = await reviSupabase
       .from('closer_call_scores')
       .select('prospect_email, call_date, recording_url, coaching_json')
       .ilike('prospect_email', email)
       .gte('call_date', lo)
       .lte('call_date', hi);
-    const rows = (scores || []).filter(s => s.coaching_json);
-    if (rows.length !== 1) {
-      if (rows.length > 1) console.log(`${label}: ${rows.length} recordings match ${email} around the log date — ambiguous, skipping.`);
-      return null;
+    const pick = pickClosingCall(scores, outcomeAtMs);
+    if (!pick) return null;
+    const total = (scores || []).length;
+    if (total > 1) {
+      console.log(`${label}: ${total} scored calls for ${email} — using the latest before the win (${pick.call_date}) as the closing call.`);
     }
-    return { url: rows[0].recording_url || null, coaching: rows[0].coaching_json || {} };
+    return { url: pick.recording_url || null, coaching: pick.coaching_json || {}, callDate: pick.call_date };
   } catch (err) {
-    console.error(`${label}: opp-row recording lookup failed:`, err.message);
+    console.error(`${label}: closing-call lookup failed:`, err.message);
     return null;
   }
 }
@@ -8427,11 +8454,6 @@ async function runWonHandoffNotes(_correlationId, { windowDays = WON_HANDOFF_WIN
     if (!wons.length) { console.log('Won-handoff notes: no won deals in window.'); return tally; }
     tally.wons = wons.length;
 
-    // One REVI window covers every call with a real scheduled_start; the
-    // matcher owns 36h + one-recording-vouches-once. Synthetic opp: rows
-    // (no appointment time) fall back to findOppRowRecording per row.
-    const realStarts = wons.filter(w => w.scheduled_start).map(w => new Date(w.scheduled_start).getTime());
-    const reviRecordings = realStarts.length ? await fetchReviRecordings(realStarts, 'Won-handoff notes') : [];
     const todayISO = new Date().toISOString().slice(0, 10);
 
     for (const won of wons) {
@@ -8456,19 +8478,20 @@ async function runWonHandoffNotes(_correlationId, { windowDays = WON_HANDOFF_WIN
           continue;
         }
 
-        // step === 'match' — find the closing-call recording
+        // step === 'match' — find the call that carries the closing context
         const outcomeAtMs = new Date(won.outcome_at).getTime();
-        const rec = won.scheduled_start
-          ? matchRecordingToCall(reviRecordings, won.email, new Date(won.scheduled_start).getTime())
-          : await findOppRowRecording(won.email, outcomeAtMs, 'Won-handoff notes');
+        const rec = await findClosingCallRecording(won.email, outcomeAtMs, 'Won-handoff notes');
         if (!rec || !rec.coaching || !Object.keys(rec.coaching).length) {
+          // A dry run must never decide a deal is permanently hopeless: these
+          // markers are terminal, so writing them without a live run would
+          // silently seal deals out of the first real sweep.
           if ((now - outcomeAtMs) > WON_HANDOFF_RECORDING_WAIT_DAYS * 86400000) {
-            await upsertKnowledge('process', markerKey, `gave_up|${todayISO}`, 'won-handoff');
+            if (!dryRun) await upsertKnowledge('process', markerKey, `gave_up|${todayISO}`, 'won-handoff');
             tally.gaveUp += 1;
             console.log(`Won-handoff notes: no REVI recording for ${won.full_name} after ${WON_HANDOFF_RECORDING_WAIT_DAYS}d — giving up.`);
           } else {
             const prevCount = parseInt(String(markerValue).split('|')[1], 10) || 0;
-            await upsertKnowledge('process', markerKey, `no_recording|${prevCount + 1}`, 'won-handoff');
+            if (!dryRun) await upsertKnowledge('process', markerKey, `no_recording|${prevCount + 1}`, 'won-handoff');
             tally.noRecording += 1;
           }
           continue;
@@ -8477,7 +8500,10 @@ async function runWonHandoffNotes(_correlationId, { windowDays = WON_HANDOFF_WIN
         const summary = await generateWonHandoffSummary({ prospectName: won.full_name, coaching: rec.coaching });
         const note = buildWonHandoffNote({
           summaryText: summary,
-          callDateStr: formatICTime(won.scheduled_start || won.outcome_at, { month: 'short', day: 'numeric', year: 'numeric' }),
+          // The RECORDING's date — the appointment's may belong to a later
+          // follow-up, and a header dated Aug 12 over an Aug 4 call is a lie
+          // to whoever reads the note.
+          callDateStr: formatICTime(rec.callDate || won.scheduled_start || won.outcome_at, { month: 'short', day: 'numeric', year: 'numeric' }),
           closerName: resolveSalesMember(won.closer_id),
           recordingUrl: rec.url,
         });
@@ -8860,9 +8886,6 @@ async function fetchReviRecordings(startTimesMs, label) {
           dealRecovery: deal.recovery || null,
           icpFit: coaching.icp_fit || null,
           cashCollected: coaching.cash_collected_usd == null ? null : Number(coaching.cash_collected_usd),
-          // Raw blob for consumers that need more than the flattened fields
-          // (the won-handoff sweep condenses it into a fulfillment note).
-          coaching,
           matched: false,
         };
       });
