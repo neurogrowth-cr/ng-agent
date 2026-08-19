@@ -237,6 +237,27 @@ check('7b7 a row with neither email nor usable name is not silently cleared',
   check('12b it is reported as skipped, not green', posted[0].includes('Skipped'), true);
   check('12c divergence is suppressed when the channel is unreadable',
         posted[0].includes('no alert card'), false);
+  // The first live skip named the route content but not the channel, so it said what
+  // was unchecked without saying where to go. An alert you cannot act on is decoration.
+  check('12d the skip names the actual channel',
+        posted[0].includes('<#C0A7X9G6S78>'), true);
+  check('12e channel_not_found carries the remediation',
+        posted[0].includes('invite Max to that channel'), true);
+})
+
+// ── 12f. A non-membership error on a NON-new-client channel must not suppress
+// divergence — only the new-client channel being unreadable does that.
+.then(async () => {
+  const { checkGmailAlertQuality, posted } = build({
+    historyErr: { C0A70J9638R: 'channel_not_found' },
+    history: { C0A7X9G6S78: [] },
+    clients: [{ client_name: 'Kty Araya', email: 'kty@tropikasa.com', created_at: '2026-08-19T10:00:00Z' }],
+  });
+  await checkGmailAlertQuality('c');
+  check('12f a skip elsewhere does not suppress the divergence finding',
+        posted[0].includes('Kty Araya'), true);
+  check('12g and the unreadable channel is still named',
+        posted[0].includes('<#C0A70J9638R>'), true);
 })
 
 // ── 13. Fail closed: an unreadable client table never invents missing customers ──
