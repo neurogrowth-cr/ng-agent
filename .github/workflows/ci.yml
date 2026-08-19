@@ -20,22 +20,31 @@ jobs:
       - name: Syntax check
         run: node --check index.js
 
+      # Globbed on purpose. This was a hand-maintained list of `node test/x.test.js`
+      # lines, which failed twice over:
+      #   1. A test file nobody remembered to add here never ran. Silent, and the
+      #      file looks like coverage while asserting nothing in CI.
+      #   2. It serialised every parallel session — two sessions each appending a
+      #      test file conflict on this exact block, and in a repo where tasks/*.md
+      #      is merge=union that is enough to make GitHub call a PR conflicted and
+      #      skip CI entirely.
+      # Fails closed if the glob matches nothing, since "no tests ran" and "all
+      # tests passed" are otherwise indistinguishable in a green check.
       - name: Tests (no install needed — plain node)
         run: |
-          node test/strike-rules.test.js
-          node test/make-watchdog.test.js
-          node test/make-triage.test.js
-          node test/channel-post.test.js
-          node test/booking-gates.test.js
-          node test/outcome-loop.test.js
-          node test/appt-deletion-sweep.test.js
-          node test/revi-missing-recordings.test.js
-          node test/ghl-retry.test.js
-          node test/strike-failure-thresholds.test.js
-          node test/day-anchor.test.js
-          node test/cron-preamble.test.js
-          node test/won-handoff-notes.test.js
-          node test/gmail-alert-quality.test.js
+          shopt -s nullglob
+          files=(test/*.test.js)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No test files matched test/*.test.js — the suite did not run."
+            exit 1
+          fi
+          echo "Running ${#files[@]} test file(s)"
+          failed=0
+          for f in "${files[@]}"; do
+            echo "── $f"
+            node "$f" || { echo "::error file=$f::$f failed"; failed=1; }
+          done
+          exit $failed
 
       # A "docs" branch that touches index.js is the 2026-05-26 failure mode:
       # a docs-only session committing a stale copy of the monolith.
@@ -50,6 +59,28 @@ jobs:
           if { [[ "$BRANCH" == docs/* ]] || [[ "$TITLE" == docs:* ]]; } && echo "$CHANGED" | grep -qx 'index.js'; then
             echo "::error::A docs branch modifies index.js — likely a stale working copy. Split the code change into its own branch."
             exit 1
+          fi
+
+      # tasks/*.md carries merge=union so parallel sessions can both append. Git
+      # honours that; GitHub's merge engine does NOT honour gitattributes merge
+      # drivers. So the moment another session appends to the same file, GitHub
+      # calls this PR CONFLICTING — and a conflicted PR does not run checks at all.
+      # PR #59 sat a full day that way, showing "no checks reported", entirely
+      # untested, while nothing was actually wrong with it.
+      #
+      # A warning, not a failure: updating tasks/project-state.md alongside an
+      # infrastructure change is the documented convention, and blocking it would
+      # fight that. The point is that the author knows the trade before it bites.
+      - name: Docs-append-in-code-PR notice
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD")
+          CODE=$(echo "$CHANGED" | grep -E '^(index\.js|lib/|test/)' || true)
+          DOCS=$(echo "$CHANGED" | grep -E '^tasks/.*\.md$' || true)
+          if [ -n "$CODE" ] && [ -n "$DOCS" ]; then
+            echo "::warning::This PR changes code AND tasks/*.md. Those files are merge=union, which git honours but GitHub does not — if another session appends to the same file before this merges, GitHub will mark this PR CONFLICTING and silently stop running CI on it. If that happens: 'git merge-tree' shows the real conflict count, and moving the docs into a follow-up docs/* PR unblocks it. Files: $(echo $DOCS | tr '\n' ' ')"
           fi
 
       # Large deletions from the monolith usually mean a stale copy is reverting
