@@ -13063,6 +13063,18 @@ const GMAIL_ALERT_HEADERS = [
   'Issues with Prosp Campaign',
 ];
 
+// The header must OPEN the first line, once the decoration is stripped. A card always
+// leads with its header; "did the CLOSER REQUIRED alert ever fire?" is a teammate
+// talking in the same channel, and a looser contains() would drag that into the
+// content contract and report it as a malformed card.
+function isAlertCard(text) {
+  const head = String(text || '').split('\n')[0]
+    .replace(/:[a-z0-9_+-]+:/gi, '')                      // :bell::bell:
+    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '')    // and the rendered glyph
+    .replace(/^[\s*_~]+/, '');
+  return GMAIL_ALERT_HEADERS.some(h => head.startsWith(h));
+}
+
 // Fragments the template strips. If one survives into the name, replace() did not
 // fire — the subject was renamed and the card is carrying the raw subject.
 const GMAIL_SUBJECT_RESIDUE = [
@@ -13091,6 +13103,11 @@ function evaluateAlertCard(text) {
     const name = nameMatch[1];
     if (!name) {
       problems.push('empty customer name');
+    } else if (!/[\p{L}\p{N}]/u.test(name)) {
+      // The live 2026-08-12 CLOSER REQUIRED card rendered its name as "," — the
+      // template's split found no anchor and emitted the separator alone. Non-empty,
+      // so the blank check passes it, and it looks like a populated field.
+      problems.push('customer name is punctuation only (template produced no name)');
     } else {
       for (const frag of GMAIL_SUBJECT_RESIDUE) {
         if (name.includes(frag)) { problems.push(`raw subject leaked into name (residue "${frag.trim()}")`); break; }
@@ -13218,7 +13235,7 @@ async function checkGmailAlertQuality(correlationId, nowMs = Date.now()) {
     }
     for (const m of msgs) {
       const text = m.text || '';
-      if (!GMAIL_ALERT_HEADERS.some(h => text.includes(h))) continue;
+      if (!isAlertCard(text)) continue;
       // Only new-customer cards count as coverage for the divergence check. A
       // "closer required" card for the same person is a different event and must
       // not mask a missing new-customer alert.

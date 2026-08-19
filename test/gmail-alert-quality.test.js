@@ -21,6 +21,14 @@ const block = SRC.slice(
 if (!block) { console.error('FAIL: could not extract the gmail alert block from index.js'); process.exit(1); }
 
 let failures = 0;
+// One section throwing must not cancel the rest of the chain. Before this, a single
+// bad assertion took out every later section and CI reported the survivors as
+// "not run" rather than as failures — a mutation check on the header matcher looked
+// like it changed nothing when it had in fact broken an earlier section.
+const guard = fn => async () => {
+  try { await fn(); } catch (e) { failures++; console.error(`FAIL (threw) ${e && e.message}`); }
+};
+
 function check(label, actual, expected) {
   const ok = JSON.stringify(actual) === JSON.stringify(expected);
   if (!ok) { failures++; console.error(`FAIL ${label}\n  expected: ${JSON.stringify(expected)}\n  actual:   ${JSON.stringify(actual)}`); }
@@ -55,7 +63,7 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
   };
   const factory = new Function(
     'slack', 'portalSupabase', 'postMakeHealthAlert', 'logActivity', 'RON_SLACK_ID', 'console',
-    `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor, shouldReportSkipOnly };`
+    `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor, shouldReportSkipOnly, isAlertCard };`
   );
   const api = factory(
     slackStub, portalStub,
@@ -67,7 +75,11 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
   return { ...api, posted, logged };
 }
 
-// ── Card fixtures, verbatim shapes from the blueprints ──
+// ── Card fixtures ──
+// Emoji are :shortcodes:, because that is what conversations.history returns — these
+// are copied off the wire (slack_read_channel on C0A7X9G6S78 / C0A70J9638R /
+// C0A9NH9PZ7C, 2026-08-19), not off the rendered screen. The old fixtures used the
+// rendered glyphs and so agreed with the bug.
 const GOOD_CLOSER = `:stopwatch: CLOSER REQUIRED :stopwatch:
 *Customer/Company Name:* Tropikasa
 Closer Required - Tropikasa - Flywheel AI Account
@@ -132,7 +144,23 @@ const PROSP_ISSUE = `:rotating_light: *Issues with Prosp Campaign*
 *Subject:* Campaign paused
 *Date:* Mon, 18 Aug 2026 09:00:00 -0600`;
 
-const { evaluateAlertCard, cardExistsFor, shouldReportSkipOnly } = build();
+// Verbatim from #ng-new-client-alerts, ts 1787086060.100649. Note the mailto wrap
+// Slack puts around an address, and that the name components are reversed relative
+// to client_dashboards.
+const LIVE_AURA_CARD = `:bell::bell: NEW FLYWHEEL AI CUSTOMER :bell::bell:
+Customer/Company Name: Cacao Legal - Aura Bonilla 
+Customer Email: <mailto:abonillabravo@gmail.com|abonillabravo@gmail.com>
+Start Date: 2026-08-18
+Customer-ID: cacao-legal-aura-bonilla`;
+const LIVE_AURA_ROW = { client_name: 'Aura Bonilla - Cacao Legal', email: 'abonillabravo@gmail.com', created_at: '2026-08-18T20:47:37Z' };
+
+// Live 2026-08-12 card: the template emitted the separator and nothing else.
+const PUNCTUATION_NAME = `:stopwatch: CLOSER REQUIRED :stopwatch:
+*Customer/Company Name:* ,
+Closer Required - Maryia Proskouriakov - Flywheel AI Account
+2026-08-12`;
+
+const { evaluateAlertCard, cardExistsFor, shouldReportSkipOnly, isAlertCard } = build();
 
 // 09:00 and 10:00 CR — the daily skip-only slot and an ordinary hour.
 const AT_9AM_CR  = Date.parse('2026-08-19T15:00:00Z');
@@ -232,17 +260,17 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
 })
 
 // ── 9. A bad card alerts once, and not again ──
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({ history: { C0A9NH9PZ7C: [BLANK_NAME] } });
   await checkGmailAlertQuality('c');
   check('9a bad card alerts',            posted.length, 1);
   check('9b alert tags Ron',             posted[0].includes('<@U05HXGX18H3>'), true);
   await checkGmailAlertQuality('c');
   check('9c no duplicate alert on rerun', posted.length, 1);
-})
+}))
 
 // ── 10. The divergence case: the customer exists, no card was ever posted ──
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({
     history: { C0A7X9G6S78: [] },
     clients: [{ client_name: 'Kty Araya', email: 'kty@tropikasa.com', created_at: '2026-08-06T10:00:00Z' }],
@@ -251,20 +279,20 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
   check('10a missing alert is caught',       posted.length, 1);
   check('10b alert names the customer',      posted[0].includes('Kty Araya'), true);
   check('10c alert warns against re-posting', posted[0].includes('duplicate card is worse'), true);
-})
+}))
 
 // ── 11. A closer card must NOT count as new-customer coverage ──
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({
     history: { C0A9NH9PZ7C: [GOOD_CLOSER], C0A7X9G6S78: [] },
     clients: [{ client_name: 'Tropikasa', email: 'kty@tropikasa.com', created_at: '2026-08-18T10:00:00Z' }],
   });
   await checkGmailAlertQuality('c');
   check('11  a different event type does not mask a missing new-customer card', posted.length, 1);
-})
+}))
 
 // ── 12. Fail closed: an unreadable channel degrades the verdict, never greens it ──
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({
     historyErr: { C0A7X9G6S78: 'channel_not_found' },
     clients: [],
@@ -280,11 +308,11 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
         posted[0].includes('<#C0A7X9G6S78>'), true);
   check('12e channel_not_found carries the remediation',
         posted[0].includes('invite Max to that channel'), true);
-})
+}))
 
 // ── 12f. A non-membership error on a NON-new-client channel must not suppress
 // divergence — only the new-client channel being unreadable does that.
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({
     historyErr: { C0A70J9638R: 'channel_not_found' },
     history: { C0A7X9G6S78: [] },
@@ -295,10 +323,10 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
         posted[0].includes('Kty Araya'), true);
   check('12g and the unreadable channel is still named',
         posted[0].includes('<#C0A70J9638R>'), true);
-})
+}))
 
 // ── 13. Fail closed: an unreadable client table never invents missing customers ──
-.then(async () => {
+.then(guard(async () => {
   const { checkGmailAlertQuality, posted } = build({
     history: { C0A7X9G6S78: [GOOD_NEW_CLIENT] },
     clientErr: { message: 'permission denied' },
@@ -306,12 +334,47 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
   await checkGmailAlertQuality('c', AT_9AM_CR);
   check('13a table error is reported', posted[0].includes('Skipped'), true);
   check('13b no phantom missing customers', posted[0].includes('no alert card'), false);
-})
+}))
+
+// ── 15. Emoji shortcodes: the live text, not the rendered text ──
+// Slack stores emoji as :shortcode:. Matching rendered glyphs matched nothing, so
+// every card fell through the filter and every new customer read as uncovered.
+.then(guard(async () => {
+  check('15a a live shortcode card is recognised', isAlertCard(LIVE_AURA_CARD), true);
+  check('15b so is a rendered-glyph card, if the template ever changes',
+        isAlertCard('\u23f1\ufe0f CLOSER REQUIRED \u23f1\ufe0f\nCustomer/Company Name: X'), true);
+  check('15c a header phrase in the BODY is not a card',
+        isAlertCard('hey, did the CLOSER REQUIRED alert ever fire?'), false);
+  check('15d the prosp route still matches',
+        isAlertCard(':rotating_light: *Issues with Prosp Campaign*'), true);
+
+  // The live regression, end to end: her card was in the channel the whole time.
+  const { checkGmailAlertQuality, posted } = build({
+    history: { C0A7X9G6S78: [LIVE_AURA_CARD] },
+    clients: [LIVE_AURA_ROW],
+  });
+  await checkGmailAlertQuality('c', AT_9AM_CR);
+  check('15e the live card covers the live customer', posted.length, 0);
+
+  // And the same row with the card absent must still be reported — the fix must not
+  // have been "stop looking".
+  const gone = build({ history: { C0A7X9G6S78: [] }, clients: [LIVE_AURA_ROW] });
+  await gone.checkGmailAlertQuality('c', AT_9AM_CR);
+  check('15f a genuinely absent card is still reported', gone.posted.length, 1);
+}))
+
+// ── 16. A name that is punctuation only is not a populated field ──
+.then(guard(async () => {
+  check('16a punctuation-only name is caught', evaluateAlertCard(PUNCTUATION_NAME).ok, false);
+  check('16b and named as such',
+        evaluateAlertCard(PUNCTUATION_NAME).problems.some(p => p.includes('punctuation only')), true);
+  check('16c a real name is untouched', evaluateAlertCard(GOOD_CLOSER).ok, true);
+}))
 
 // ── 14. The hourly skip DM: a standing blind spot is a daily note, not an alarm ──
 // Max is not in #ng-newclient-onboarding-tracking, so this skip repeats on every
 // single run. Before this, that was 24 identical DMs a day with nothing to act on.
-.then(async () => {
+.then(guard(async () => {
   check('14a the 09:00 CR run is the daily slot', shouldReportSkipOnly(AT_9AM_CR), true);
   check('14b 10:00 CR is not',                    shouldReportSkipOnly(AT_10AM_CR), false);
   // Midnight CR must read as hour 0, not 24 — an h12/h24 formatting quirk here would
@@ -344,7 +407,7 @@ check('7c3 a mailto-wrapped email is not flagged', evaluateAlertCard(SHORTCODE_C
   check('14j and carries the skip footer with it',     real.posted[0].includes('Skipped'), true);
   check('14k without the clean-run line',
         real.posted[0].includes('No bad cards and no uncovered customers'), false);
-})
+}))
 
 .then(() => {
   console.log(failures ? `\n${failures} check(s) failed.` : '\nAll checks passed.');
