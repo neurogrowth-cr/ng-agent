@@ -8276,9 +8276,10 @@ async function ghlFindContactByEmail(email) {
   const em = String(email || '').trim();
   if (!em) return null;
   try {
-    const res = await fetch(
+    const res = await ghlFetch(
       `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&email=${encodeURIComponent(em)}`,
       { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+      { label: 'contact-by-email' },
     );
     if (!res.ok) return null;
     return (await res.json())?.contact?.id || null;
@@ -8368,7 +8369,7 @@ async function runReviProspectNotesSync(_correlationId) {
         continue;
       }
       try {
-        const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+        const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -8378,7 +8379,7 @@ async function runReviProspectNotesSync(_correlationId) {
               { objectKey: 'contact', recordId: contactId },
             ],
           }),
-        });
+        }, { label: `note ${contactId}` });
         if (!res.ok) throw new Error(`note POST → ${res.status}: ${(await res.text()).slice(0, 150)}`);
         await upsertKnowledge('process', noteKey, `posted|${new Date().toISOString().slice(0, 10)}|${contactId}${apptId ? `|${apptId}` : ''}`, 'revi-note');
         tally.posted += 1;
@@ -9358,10 +9359,11 @@ async function fetchGhlAppointmentStatuses(fromMs, toMs) {
   const locationId = process.env.GHL_LOCATION_ID;
   for (const calendarId of GHL_SALES_CALENDAR_IDS) {
     try {
-      const res = await fetch(
+      const res = await ghlFetch(
         `https://services.leadconnectorhq.com/calendars/events?locationId=${locationId}`
         + `&calendarId=${calendarId}&startTime=${fromMs}&endTime=${toMs}`,
         { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+        { label: `calendar ${calendarId}` },
       );
       if (!res.ok) {
         console.warn(`Appointment-status sweep: calendar ${calendarId} → ${res.status}`);
@@ -9392,9 +9394,9 @@ async function fetchGhlAppointmentStatuses(fromMs, toMs) {
 // make the implied-attendance write fill-only — never clobber a human's answer.
 async function ghlGetAppointmentStatus(eventId) {
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
+    const res = await ghlFetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
       headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
-    });
+    }, { label: `appt-read ${eventId}` });
     if (!res.ok) return null;
     const body = await res.json();
     const appt = body.appointment || body.event || body;
@@ -9406,7 +9408,7 @@ async function ghlGetAppointmentStatus(eventId) {
 }
 
 async function ghlSetAppointmentStatus(eventId, appointmentStatus) {
-  const res = await fetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/calendars/events/appointments/${eventId}`, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
@@ -9414,7 +9416,7 @@ async function ghlSetAppointmentStatus(eventId, appointmentStatus) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ appointmentStatus }),
-  });
+  }, { label: `appt-status ${eventId}` });
   if (!res.ok) throw new Error(`appt PUT ${eventId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
   return true;
 }
@@ -9500,6 +9502,17 @@ async function runAppointmentStatusSync(_correlationId) {
       ? `⚠️ ISSUES — considered ${tally.considered}, showed ${tally.showed}, conflicts ${tally.conflicts}, write failures ${tally.failed}, deferred ${tally.deferred}`
       : `✅ ALL GREEN — considered ${tally.considered}, marked showed ${tally.showed}, skipped ${tally.skipped}, deferred to the outcome card ${tally.deferred}`;
     console.log(`Appointment-status sync complete. ${verdict}`);
+
+    // On 2026-08-19 the first live run wrote 0 of 6 (a GHL auth blink) and said
+    // so only in a log line nobody reads — the exact silent-failure shape this
+    // repo keeps re-learning. A run that writes NOTHING while having work to do
+    // now reaches a human. Threshold, not >0, so one transient blink stays quiet.
+    if (tally.failed >= 3 || (tally.failed > 0 && tally.showed === 0)) {
+      await slack.client.chat.postMessage({
+        channel: RON_SLACK_ID,
+        text: `⚠️ Appointment-status sync: ${tally.failed} write(s) failed, ${tally.showed} succeeded (of ${tally.considered} considered).\nAttendance was NOT marked for those calls. Check the Railway logs for the status code — a GHL 401 blink is retried once and usually clears; a persistent one means the token lost its calendar scope.`,
+      }).catch(() => {});
+    }
     return tally;
   } catch (err) {
     console.error('Appointment-status sync error:', err.message);
@@ -11574,9 +11587,10 @@ async function ghlMoveOpportunityStage(oppId, stageId, pipelineId = STRIKE_PIPEL
 // Scoped to the two known sales pipelines; prefers an open card, then newest.
 async function ghlFindSalesOpportunityByContact(contactId) {
   try {
-    const res = await fetch(
+    const res = await ghlFetch(
       `https://services.leadconnectorhq.com/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&contact_id=${contactId}`,
       { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+      { label: `opp-by-contact ${contactId}` },
     );
     if (!res.ok) return null;
     const opps = ((await res.json()).opportunities || [])
@@ -11592,9 +11606,9 @@ async function ghlFindSalesOpportunityByContact(contactId) {
 }
 
 async function ghlMoveOpportunityForOutcome(oppId, outcome) {
-  const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
-  });
+  }, { label: `opp-read ${oppId}` });
   if (!res.ok) return { ok: false, message: `opp GET ${oppId} → ${res.status}` };
   const opp = (await res.json()).opportunity || {};
   const pipelineId = opp.pipelineId;
