@@ -92,17 +92,39 @@ const URL = 'https://services.leadconnectorhq.com/contacts/faew9KFlhcL4TC0ECiAq'
 
   console.log('ghlFetch — permanent failures are not retried');
 
-  // A bad token or a deleted contact will never come good; retrying just burns
-  // budget and delays the error the caller needs to see.
+  // A deleted contact will never come good; retrying just burns budget and delays
+  // the error the caller needs to see.
   {
     const { ghlFetch, calls } = build([resp(404)]);
     const res = await ghlFetch(URL, {});
     check('404 returns immediately', [res.status, calls.length], [404, 1]);
   }
+
+  // 401 IS retried, exactly once. This reverses the original "a 401 will never come
+  // good" assumption on evidence: across 30 days / 95 strike sweeps, 401s hit 19
+  // distinct contacts and 18 of them 401'd exactly ONCE — a real permission or token
+  // failure would have failed that same contact every sweep. They are also
+  // load-independent (never co-occurring with a 429). It is GHL's auth layer blinking.
+  //
+  // Bounded at one retry so a genuinely dead token still fails fast; the
+  // failure-spike thresholds (test/strike-failure-thresholds.test.js) are what catch
+  // that case, since a dead token produces hundreds of 401s rather than one.
   {
-    const { ghlFetch, calls } = build([resp(401)]);
-    await ghlFetch(URL, {});
-    check('401 is not retried', calls.length, 1);
+    const { ghlFetch, calls } = build([resp(401), resp(200)]);
+    const res = await ghlFetch(URL, {});
+    check('401 is retried once and recovers', [res.status, calls.length], [200, 2]);
+  }
+  {
+    const { ghlFetch, calls } = build([resp(401), resp(401)]);
+    const res = await ghlFetch(URL, {});
+    check('a persistent 401 gives up after one retry', [res.status, calls.length], [401, 2]);
+  }
+  {
+    // The 401 retry must not eat the 429/5xx budget — a 401 followed by real rate
+    // limiting should still get the full ladder.
+    const { ghlFetch, calls } = build([resp(401), resp(429), resp(429), resp(429), resp(200)]);
+    const res = await ghlFetch(URL, {});
+    check('401 retry does not consume the 429 budget', [res.status, calls.length], [200, 5]);
   }
   {
     const { ghlFetch, calls } = build([resp(200)]);

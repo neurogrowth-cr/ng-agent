@@ -31,6 +31,7 @@ jobs:
           node test/appt-deletion-sweep.test.js
           node test/revi-missing-recordings.test.js
           node test/ghl-retry.test.js
+          node test/strike-failure-thresholds.test.js
           node test/day-anchor.test.js
           node test/won-handoff-notes.test.js
 
