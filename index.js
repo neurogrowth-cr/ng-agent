@@ -233,7 +233,7 @@ TOOL LIMITATION — search_portal_schema matches TABLE and COLUMN NAMES ONLY. Bu
 OPS MASTER TRACKER (Google Sheet the ops team maintains by hand — query via get_ops_tracker, open to everyone):
 - tab=infrastructure — per-client setup state: Sales Navigator, Prosp license, webhook, Prosp tag, NG dashboard active, plus free-text Notas. Source of truth for "is client X's Prosp/SN/webhook set up".
 - tab=change_requests — client change-request log: priority, date, description, owner, updates history, QA, completion, status (Done / In progress / Blocked). Defaults to OPEN items; pass include_done or a client filter for history.
-- tab=launch_history — activation date, QA date, launch date, days-to-launch per client, as recorded by the ops team (complements the portal launch recipe above).
+- tab=launch_history — activation date, QA date, launch date, days-to-launch per client, as recorded BY HAND by the ops team. PRECEDENCE: for the activation call date and any day count derived from it, the dashboard CRM (the recipe above) WINS — this sheet is typed by a person, is not written by any automation, and drifts. Use it for what only the ops team records (QA date, launch date, notes) and as a cross-check. If the sheet and the CRM disagree on a client's activation date, report BOTH, say which is which, and treat the CRM as the number — never silently pick one. MEASURED 2026-08-19: they disagree for 14 of 19 clients, median 11 days, max 40, and the sheet is LATER every single time — its Fecha de Activacion matches the portal's activation checkbox, not the call. So the sheet's own 'Dias para Lanzar' understates time-to-launch (mean 15.5d reported vs 25.6d actual across 13 launched clients, and 6 of those 13 look inside the 14-day promise but are not). Never quote 'Dias para Lanzar' as time-to-launch without saying it is measured from the ops sheet's activation tick, not the call.
 Client names in the sheet are messy ("Factory - Will", "Sastrería Triana - Carlos Castillo") — the client filter is fuzzy; use a short fragment.
 
 REVI (client-call intelligence, revi schema in Max's own Supabase):
@@ -4326,6 +4326,25 @@ async function runProactiveAlerts(correlationId) {
 // ─── PROACTIVE TEAM DMs ───────────────────────────────────────────────────────
 // Runs nightly. Checks portal for clients hitting critical milestones tomorrow
 // and DMs the responsible team member before they even have to ask.
+// BEGIN PROACTIVE-DM PURE HELPERS
+// Which launch-window warning, if any, is owed for a client right now.
+//
+// Thresholds are "crossed and not yet notified", never an exact day number. Exact
+// equality (daysSince === 13) meant any day the job did not run — a deploy, an
+// outage, a weekend, the cron sitting disabled — was a warning nobody ever got,
+// with no way to tell a missed warning from a client who never needed one.
+//
+// Day 14 is the deadline, so its warning is owed from Day 13 onward and wins over
+// Day 7: a client who crossed both while the job was down should get the urgent
+// one, not two DMs about the same client on the same run.
+function proactiveMilestoneDue(daysSince, day14Notified, day7Notified) {
+  if (!Number.isFinite(daysSince)) return null;
+  if (daysSince >= 13) return day14Notified ? null : 'day14';
+  if (daysSince >= 6)  return day7Notified  ? null : 'day7';
+  return null;
+}
+// END PROACTIVE-DM PURE HELPERS
+
 async function runProactiveDMs(_correlationId) {
   console.log('Running proactive team DMs...');
   try {
@@ -4366,17 +4385,45 @@ async function runProactiveDMs(_correlationId) {
     // real deadline by however long onboarding took. created_at remains only as a
     // last-resort proxy for clients with no recorded call date.
     //
-    // NOTE (pre-existing, deliberately not changed here): the thresholds below are
-    // exact equality, so a day this job does not run is a warning nobody ever gets.
-    // Worth converting to a "crossed the threshold and not yet notified" check
-    // before this cron is re-enabled.
+    // Milestones fire on "crossed the threshold and not yet notified", NOT on an
+    // exact day number. Exact equality (daysSince === 13) means any day this job
+    // does not run — a deploy, an outage, a weekend gap, the cron being disabled
+    // as it is today — is a warning nobody ever receives, silently, with no way to
+    // tell a missed warning from a client who never needed one.
+    //
+    // The notified-key includes the anchor DATE, so a rescheduled activation call
+    // re-arms both milestones: a new call date is a new 14-day window and deserves
+    // its own warnings. Same agent_knowledge idiom as outcome-proposal.
+    const notifiedKeys = new Set();
+    {
+      const { data: sent } = await supabase
+        .from('agent_knowledge')
+        .select('key')
+        .like('key', 'proactive-dm:%');
+      for (const r of sent || []) notifiedKeys.add(r.key);
+    }
+    const milestoneKey = (dash, milestone, anchorISO) =>
+      `proactive-dm:${dash.id}:${milestone}:${new Date(anchorISO).toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' })}`;
+    const firedThisRun = [];
+
     for (const dash of dashboards) {
       const anchorISO = activationFor(dash) || dash.created_at;
       if (!anchorISO) continue;
       const daysSince = Math.floor((now - new Date(anchorISO).getTime()) / (1000 * 60 * 60 * 24));
 
-      if (daysSince === 13) hitting14Tomorrow.push(dash);
-      else if (daysSince === 6) hitting7Tomorrow.push(dash);
+      // Day 14 is the deadline, so the warning is due from Day 13 onward. Checked
+      // before Day 7 and with `else` so a client who crossed both while the job was
+      // down gets the more urgent one, not two DMs about the same client.
+      const key14 = milestoneKey(dash, 'day14', anchorISO);
+      const key7  = milestoneKey(dash, 'day7',  anchorISO);
+      const due = proactiveMilestoneDue(daysSince, notifiedKeys.has(key14), notifiedKeys.has(key7));
+      if (due === 'day14') {
+        hitting14Tomorrow.push(dash);
+        firedThisRun.push([key14, `day14|${daysSince}`]);
+      } else if (due === 'day7') {
+        hitting7Tomorrow.push(dash);
+        firedThisRun.push([key7, `day7|${daysSince}`]);
+      }
       if (dash.customer_status === 'blocked') blocked.push(dash);
       if (dash.customer_status === 'phase_1' && daysSince >= 4) stalledPhase1.push(dash);
       if (dash.customer_status === 'phase_2' && daysSince >= 4) stalledPhase2.push(dash);
@@ -4384,8 +4431,8 @@ async function runProactiveDMs(_correlationId) {
 
     // ── DM Josue: clients hitting Day 14 today ──
     if (hitting14Tomorrow.length > 0) {
-      const names = hitting14Tomorrow.map(d => `${d.client_name} (Day 13)`).join(', ');
-      const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} their 14-day launch deadline today: ${names}. If campaigns are not live by end of day, we miss the SLA. What needs to happen right now to make sure they launch on time?`;
+      const names = hitting14Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
+      const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client is' : 'these clients are'} at or past the 14-day launch deadline: ${names}. If campaigns are not live, we have missed the SLA. What needs to happen right now to get them launched?`;
       for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
@@ -4394,12 +4441,19 @@ async function runProactiveDMs(_correlationId) {
 
     // ── DM Josue: clients hitting at-risk threshold today ──
     if (hitting7Tomorrow.length > 0) {
-      const names = hitting7Tomorrow.map(d => `${d.client_name} (Day 6)`).join(', ');
-      const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client hits' : 'these clients hit'} Day 7 today, which is the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling next week.`;
+      const names = hitting7Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
+      const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client has' : 'these clients have'} passed Day 7, the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling later.`;
       for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) hitting Day 7 today`);
+      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) past Day 7`);
+    }
+
+    // Record the milestones ONLY now, after the DMs actually went out. Marking them
+    // notified before sending would turn any Slack failure into a warning that is
+    // permanently suppressed — the exact silent-miss this change exists to remove.
+    for (const [key, value] of firedThisRun) {
+      await upsertKnowledge('process', key, `${value}|${new Date().toISOString().slice(0, 10)}`, 'proactive-dm');
     }
 
     // ── DM Valeria: clients stalled in phase_1 ──
@@ -5926,7 +5980,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'get_calendar_events',  description: 'Get calendar events. daysFromNow: 0=today, 1=tomorrow, -1=yesterday. daysRange: 1=day, 7=week, 14=two weeks.', input_schema: { type: 'object', properties: { daysFromNow: { type: 'number' }, daysRange: { type: 'number' } } } },
           { name: 'search_drive',         description: "Search Ron's Google Drive for files and documents",                                      input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
           { name: 'read_google_sheet',    description: 'Read the actual cell data from a Google Sheet. Accepts a Google Sheets URL or file ID. Optionally specify a range. For the Ops Master Tracker, use get_ops_tracker instead — it handles that sheet properly.',                                                input_schema: { type: 'object', properties: { spreadsheetId: { type: 'string', description: 'Google Sheets URL or spreadsheet ID' }, range: { type: 'string', description: 'Optional range e.g. Sheet1!A1:Z100' } }, required: ['spreadsheetId'] } },
-          { name: 'get_ops_tracker',      description: "Read the Ops Master Tracker (the fulfillment team's hand-maintained Google Sheet). Tabs: 'infrastructure' = per-client setup state (Sales Navigator, Prosp license, webhook, Prosp tag, NG dashboard, notes); 'change_requests' = client change-request log with priority/owner/status (defaults to OPEN items — pass include_done for history); 'launch_history' = activation/QA/launch dates and days-to-launch per client. Use for any question about a client's Prosp/SN/webhook setup, pending or past change requests, or ops-recorded launch dates. Client filter is fuzzy — use a short name fragment.", input_schema: { type: 'object', properties: { tab: { type: 'string', description: 'infrastructure | change_requests | launch_history' }, client: { type: 'string', description: 'Optional client-name fragment to filter rows.' }, include_done: { type: 'boolean', description: 'change_requests only: include Done items (default false).' } }, required: ['tab'] } },
+          { name: 'get_ops_tracker',      description: "Read the Ops Master Tracker (the fulfillment team's hand-maintained Google Sheet). Tabs: 'infrastructure' = per-client setup state (Sales Navigator, Prosp license, webhook, Prosp tag, NG dashboard, notes); 'change_requests' = client change-request log with priority/owner/status (defaults to OPEN items — pass include_done for history); 'launch_history' = activation/QA/launch dates and days-to-launch per client, TYPED BY HAND by the ops team. For the activation call date and any day count derived from it the dashboard CRM wins — this sheet is not written by any automation and drifts; use it for QA/launch dates and notes, and as a cross-check. If it disagrees with the CRM on an activation date, report both and treat the CRM as the number. Use for any question about a client's Prosp/SN/webhook setup, pending or past change requests, or ops-recorded launch dates. Client filter is fuzzy — use a short name fragment.", input_schema: { type: 'object', properties: { tab: { type: 'string', description: 'infrastructure | change_requests | launch_history' }, client: { type: 'string', description: 'Optional client-name fragment to filter rows.' }, include_done: { type: 'boolean', description: 'change_requests only: include Done items (default false).' } }, required: ['tab'] } },
           { name: 'read_google_doc',      description: 'Read the text content of a Google Doc. Accepts a Google Docs URL or document ID.',      input_schema: { type: 'object', properties: { documentId: { type: 'string', description: 'Google Docs URL or document ID' } }, required: ['documentId'] } },
           { name: 'read_slack_channel',   description: 'Read recent messages from a NeuroGrowth Slack channel. Always use this tool when asked about channel activity — never answer from memory.', input_schema: { type: 'object', properties: { channelName: { type: 'string', description: 'Channel name e.g. ng-fullfillment-ops, ng-sales-goats, ng-ops-management, ng-new-client-alerts, ng-app-and-systems-improvents' }, messageCount: { type: 'number', description: 'Messages to pull, max 20' } }, required: ['channelName'] } },
           { name: 'draft_channel_post',   description: "Prepare a Slack channel post for approval before sending. By default the approval goes back to the person who asked. Set escalate_to_ron=true when the draft matches the escalation criteria (client-facing commitments, pricing, public comms, reputational risk, hiring/firing).", input_schema: { type: 'object', properties: { channelName: { type: 'string' }, message: { type: 'string' }, escalate_to_ron: { type: 'boolean', description: 'Route approval to Ron instead of the originator. Default false. Use true only when escalation criteria apply.' }, escalation_reason: { type: 'string', description: 'Short reason for routing to Ron (only used when escalate_to_ron is true).' } }, required: ['channelName','message'] } },
