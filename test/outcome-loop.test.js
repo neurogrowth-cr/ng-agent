@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
+const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -229,6 +229,24 @@ check('never renders undefined', /undefined/.test(note), false);
 check('no recording → no note at all', g.buildReviProspectNote(null), null);
 const thinNote = g.buildReviProspectNote({ durationMin: 12 }, { callDateStr: 'Aug 4' });
 check('a thin read still produces a valid note without empty labels', /Objeción:|Decisor:|Próximos pasos:/.test(thinNote), false);
+
+console.log('parseOutcomeReply — a thread reply on a card is an answer, not a conversation');
+check('no show', g.parseOutcomeReply('no show'), { outcome: 'no_show', revenue: null });
+check('noshow / no-show variants', [g.parseOutcomeReply('noshow'), g.parseOutcomeReply('No-Show')].map(x=>x?.outcome), ['no_show','no_show']);
+check('won 3500', g.parseOutcomeReply('won 3500'), { outcome: 'won', revenue: 3500 });
+check('won $3,500', g.parseOutcomeReply('won $3,500'), { outcome: 'won', revenue: 3500 });
+check('won 3.5k', g.parseOutcomeReply('won 3.5k'), { outcome: 'won', revenue: 3500 });
+check('bare won → outcome without amount (caller asks for it)', g.parseOutcomeReply('won'), { outcome: 'won', revenue: null });
+check('open deal', g.parseOutcomeReply('open deal'), { outcome: 'follow_up', revenue: null });
+check('follow up alias still works', g.parseOutcomeReply('follow up'), { outcome: 'follow_up', revenue: null });
+check('no fit', g.parseOutcomeReply('no fit'), { outcome: 'disqualified', revenue: null });
+check('dq alias', g.parseOutcomeReply('dq'), { outcome: 'disqualified', revenue: null });
+check('VSL merged label types as lost/no fit', g.parseOutcomeReply('lost / no fit'), { outcome: 'disqualified', revenue: null });
+check('lost', g.parseOutcomeReply('lost'), { outcome: 'lost', revenue: null });
+check('case and whitespace insensitive', g.parseOutcomeReply('  NO   SHOW '), { outcome: 'no_show', revenue: null });
+check('conversation falls through to the LLM', g.parseOutcomeReply('hey can you check if she rebooked?'), null);
+check('a sentence containing "lost" is NOT a command', g.parseOutcomeReply('I think we lost her to a competitor honestly'), null);
+check('empty is null', g.parseOutcomeReply(''), null);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nAll outcome-loop tests passed.');

@@ -6547,6 +6547,14 @@ slack.message(async ({ message, say }) => {
   if (message.subtype) return;
   if (isRateLimited(userId)) { await say('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
 
+  // ── Outcome-card thread replies (deterministic — the card knows its call) ──
+  let cardThreadHint = '';
+  if (message.thread_ts && message.thread_ts !== message.ts) {
+    const cardHandled = await handleOutcomeCardThreadReply(message, say);
+    if (cardHandled === true) return;
+    if (typeof cardHandled === 'string') cardThreadHint = cardHandled;
+  }
+
   // ── Campaign DM commands (deterministic, Ron-only — no LLM needed) ─────────
   if (userId === RON_SLACK_ID && typeof message.text === 'string') {
     const campaignMatch = message.text.match(/^campaign\s*:?\s*(.+)$/i);
@@ -6635,7 +6643,7 @@ slack.message(async ({ message, say }) => {
   const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
   detectAndSaveCorrection(message.text, typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', userId).catch(() => {});
   const threadHint = await getActiveThreadHint(userId);
-  history.push({ role: 'user', content: (message.text || '') + threadHint });
+  history.push({ role: 'user', content: (message.text || '') + cardThreadHint + threadHint });
   try {
     let reply = await callClaude(history, 3, userId, correlation_id);
     if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
@@ -7735,6 +7743,31 @@ const OUTCOME_REPLY_TOKEN = {
   follow_up: 'open deal', lost: 'lost', disqualified: 'no fit', no_show: 'no show', won: 'won',
 };
 
+// Parse a closer's typed reply on an outcome card into {outcome, revenue}.
+// Deterministic on purpose: a reply in a card's thread is an answer to THAT
+// card, so no LLM should be guessing which prospect it is about. Accepts the
+// GHL words the card offers plus the legacy aliases. Returns null when the
+// text is conversational (falls through to the LLM with the card as context).
+function parseOutcomeReply(text) {
+  const t = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 80) return null; // long texts are conversation, not commands
+  const won = t.match(/^won\b[\s:$]*([\d.,]+)?\s*(k)?\s*$/i);
+  if (won) {
+    let revenue = null;
+    if (won[1]) {
+      revenue = Number(won[1].replace(/,/g, ''));
+      if (won[2]) revenue *= 1000;
+      if (!Number.isFinite(revenue) || revenue <= 0) revenue = null;
+    }
+    return { outcome: 'won', revenue };
+  }
+  if (/^(open deal|follow ?up|nurture)$/.test(t))            return { outcome: 'follow_up', revenue: null };
+  if (/^(no ?fit|dq|disqualified?|lost ?\/ ?no ?fit)$/.test(t)) return { outcome: 'disqualified', revenue: null };
+  if (/^(no ?-?show(ed)?)$/.test(t))                          return { outcome: 'no_show', revenue: null };
+  if (/^lost$/.test(t))                                       return { outcome: 'lost', revenue: null };
+  return null;
+}
+
 // ─── REVI EVIDENCE → OUTCOME PROPOSAL ────────────────────────────────────────
 // REVI's `deal_outcome` column is 4-valued and 118 of 130 calls sit in two of
 // them (stall 91, pending 27), so reading it alone collapses ~70% of calls to
@@ -8104,13 +8137,15 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
     }
     let statusChange = null;
     let opportunityId = null;
+    let ghlContactId = null;
     let ghlAppointmentId = null;
     const { rows: prow } = await client.query(
-      `SELECT p.id, p.status, p.ghl_opportunity_id, a.ghl_appointment_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id, a.ghl_appointment_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
       [appointmentId]
     );
     if (prow.length) {
       opportunityId = prow[0].ghl_opportunity_id || null;
+      ghlContactId = prow[0].ghl_contact_id || null;
       ghlAppointmentId = prow[0].ghl_appointment_id || null;
       const next = nextProspectStatusForOutcome(outcome, prow[0].status);
       if (next) {
@@ -8125,6 +8160,12 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
     // back a logged outcome. Before this, "I'll log it for you" left the
     // closer's opportunity card sitting in Call Booked forever.
     let stageMove = null;
+    // dash only populates ghl_opportunity_id on ~half of prospects (58 of 111
+    // post-cutover on 2026-08-18 — Aura Bonilla's Open-Deal ✅ hit this), but
+    // nearly all carry ghl_contact_id, and GHL can find the opp from that.
+    if (!opportunityId && ghlContactId) {
+      opportunityId = await ghlFindSalesOpportunityByContact(ghlContactId);
+    }
     if (opportunityId) {
       try {
         stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome);
@@ -8132,7 +8173,7 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
         stageMove = { ok: false, message: moveErr.message };
       }
     } else {
-      stageMove = { ok: false, message: 'no ghl_opportunity_id on the prospect' };
+      stageMove = { ok: false, message: 'no GHL opportunity found for the prospect' };
     }
 
     // Paso 1 falls out of Paso 2 for free: an outcome implies attendance, so
@@ -10742,6 +10783,27 @@ async function ghlMoveOpportunityStage(oppId, stageId, pipelineId = STRIKE_PIPEL
 // the opp first so the move stays inside its OWN pipeline (Appointment Setting
 // and VSL have different stage ids for the same idea) and so an already-closed
 // card is left alone. Never guesses a stage id.
+// Find the prospect's sales opportunity when the portal row lacks the id.
+// Scoped to the two known sales pipelines; prefers an open card, then newest.
+async function ghlFindSalesOpportunityByContact(contactId) {
+  try {
+    const res = await fetch(
+      `https://services.leadconnectorhq.com/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&contact_id=${contactId}`,
+      { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+    );
+    if (!res.ok) return null;
+    const opps = ((await res.json()).opportunities || [])
+      .filter(o => GHL_OUTCOME_STAGES[o.pipelineId]);
+    if (!opps.length) return null;
+    opps.sort((a, b) => {
+      const ao = a.status === 'open' ? 0 : 1, bo = b.status === 'open' ? 0 : 1;
+      if (ao !== bo) return ao - bo;
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    });
+    return opps[0].id;
+  } catch (_) { return null; }
+}
+
 async function ghlMoveOpportunityForOutcome(oppId, outcome) {
   const res = await fetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
@@ -12278,6 +12340,71 @@ const CAMPAIGN_SKIP_EMOJIS    = new Set(['x', 'no_entry', 'no_entry_sign', 'nega
 // ✅/❌ on an outcome-proposal DM. Ownership is structural — the DM channel is
 // private to the closer it was sent to — but we still verify the reactor is
 // that closer (or Ron) against the message metadata before writing anything.
+// A typed reply in an outcome card's thread. The card's metadata carries the
+// appointment, so a bare `no show` or `won 3500` is unambiguous — resolved
+// deterministically, never via the LLM (which, with no thread context, was
+// asking closers "which prospect?" right under the card that says which).
+// Returns true when fully handled; a context STRING when the parent is a card
+// but the text is conversational (the DM flow hands that to the LLM as a
+// hint); false when the parent is not an outcome card at all.
+async function handleOutcomeCardThreadReply(message, say) {
+  let parent = null;
+  try {
+    const hist = await slack.client.conversations.history({
+      channel: message.channel, latest: message.thread_ts, limit: 1, inclusive: true, include_all_metadata: true,
+    });
+    parent = hist.messages && hist.messages[0];
+  } catch (err) {
+    console.log('outcome-card thread lookup failed (falling back to LLM):', err.message);
+    return false;
+  }
+  if (parent?.metadata?.event_type !== 'outcome_proposal' || !parent.metadata.event_payload) return false;
+  const payload = parent.metadata.event_payload;
+
+  const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
+  if (message.user !== RON_SLACK_ID && message.user !== expectedSlackId) {
+    return `[CONTEXT: reply in the outcome-card thread for prospect ${payload.prospect_name}, but the sender is not the owning closer — do not log an outcome from this.]`;
+  }
+
+  const parsed = parseOutcomeReply(message.text);
+  if (!parsed) {
+    return `[CONTEXT: this message is a reply in the outcome-card thread for prospect ${payload.prospect_name} (appointment_id ${payload.appointment_id}). If the user is stating that call's outcome in their own words, log it with log_call_outcome for THIS prospect — never ask which prospect they mean.]`;
+  }
+  if (parsed.outcome === 'won' && !parsed.revenue) {
+    await say({ text: 'Almost — logging won needs the real amount: `won 3500`.', thread_ts: message.thread_ts });
+    return true;
+  }
+
+  const result = await logOutcomeToPortal({
+    appointmentId: payload.appointment_id,
+    outcome: parsed.outcome,
+    source: 'closer',
+    notes: `Typed on the outcome card by <@${message.user}> (prospect: ${payload.prospect_name})`,
+    closedRevenue: parsed.revenue,
+  });
+  const stages = GHL_OUTCOME_STAGES[payload.pipeline_id] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  if (result.ok) {
+    await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
+    await slack.client.reactions.add({ channel: message.channel, timestamp: message.thread_ts, name: 'white_check_mark' }).catch(() => {});
+    const label = stages[parsed.outcome]?.label || parsed.outcome.replace('_', ' ');
+    const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
+    const move = result.stageMove;
+    const moveNote = move?.ok
+      ? (move.already ? ` GHL card was already in *${move.label}*.` : ` Moved the GHL card to *${move.label}*.`)
+      : ` ⚠️ Logged in the portal, but I couldn't move the GHL card (${move?.message || 'unknown error'}) — please move it by hand.`;
+    const att = result.attendance;
+    const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}*.` : '';
+    await say({ text: `Logged *${label}*${parsed.revenue ? ` ($${parsed.revenue})` : ''} for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}`, thread_ts: message.thread_ts });
+  } else if (result.reason === 'exists') {
+    await say({ text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.`, thread_ts: message.thread_ts });
+  } else if (result.reason === 'won_needs_revenue') {
+    await say({ text: 'Logging won needs the amount — `won 3500`.', thread_ts: message.thread_ts });
+  } else {
+    await say({ text: `Couldn't log it: ${result.message || result.reason}. Log it in GHL directly, or tell Ron the write path is down.`, thread_ts: message.thread_ts });
+  }
+  return true;
+}
+
 async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
   const channel = event.item.channel;
   const ts = event.item.ts;
@@ -12377,7 +12504,13 @@ slack.event('reaction_added', async ({ event }) => {
           return;
         }
       } catch (opErr) {
-        console.error('outcome-proposal reaction pre-route error:', opErr.message);
+        // channel_not_found = a DM this bot cannot read (not one of its own
+        // card DMs) — benign, and 3 of these in a row once paged as errors.
+        if (opErr.message && opErr.message.includes('channel_not_found')) {
+          console.log('outcome-proposal pre-route: unreadable DM, falling through');
+        } else {
+          console.error('outcome-proposal reaction pre-route error:', opErr.message);
+        }
         // fall through — campaign route may still own this reaction
       }
     }
