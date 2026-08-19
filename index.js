@@ -13073,6 +13073,7 @@ async function checkGmailAlertQuality(correlationId) {
   const problems = [];
   const skipped = [];
   const seenCards = [];
+  let newClientChannelRead = false;
 
   // ── 1. Content contract on every card in the window ──
   for (const [channel, label] of Object.entries(GMAIL_ALERT_CHANNELS)) {
@@ -13082,9 +13083,19 @@ async function checkGmailAlertQuality(correlationId) {
         channel, limit: 200, oldest: String(Math.floor(since / 1000)),
       });
       msgs = hist.messages || [];
+      if (channel === GMAIL_NEW_CLIENT_CHANNEL_ID) newClientChannelRead = true;
     } catch (err) {
       // FAIL CLOSED. An unreadable channel must not read as "no problems here".
-      skipped.push(`${label} (${err.data?.error || err.message})`);
+      // Name the CHANNEL, not just the route content. The first live skip read
+      // "activity tracking / onboarding completed (channel_not_found)", which says
+      // what is unchecked but not where to go and fix it. <#ID> renders as the real
+      // channel name in Slack and survives a rename. channel_not_found from a bot
+      // that is not a member of a private channel is the common cause, so say so.
+      const code = err.data?.error || err.message;
+      const hint = code === 'channel_not_found' || code === 'not_in_channel'
+        ? ' — invite Max to that channel'
+        : '';
+      skipped.push(`${label} <#${channel}> (${code})${hint}`);
       continue;
     }
     for (const m of msgs) {
@@ -13126,9 +13137,12 @@ async function checkGmailAlertQuality(correlationId) {
     .limit(100);
   if (clientErr) {
     skipped.push(`client_dashboards divergence (${clientErr.message})`);
-  } else if (skipped.some(s => s.startsWith('new flywheel ai customer'))) {
-    // Could not read the channel, so absence of a card proves nothing.
-    skipped.push('client_dashboards divergence (new-client channel unreadable)');
+  } else if (!newClientChannelRead) {
+    // Could not read the channel, so absence of a card proves nothing. Tracked as an
+    // explicit flag rather than by prefix-matching the skip strings: that coupled the
+    // suppression rule to a human-readable label, so renaming the label would have
+    // silently turned a fail-closed path into a false-alarm generator.
+    skipped.push(`client_dashboards divergence (<#${GMAIL_NEW_CLIENT_CHANNEL_ID}> unreadable)`);
   } else {
     missing = (clients || []).filter(c => !cardExistsFor(c, seenCards))
       .filter(c => !gmailAlertAlerted.has(`missing:${c.email}`));
