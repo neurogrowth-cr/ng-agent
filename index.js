@@ -13517,6 +13517,210 @@ async function checkGmailAlertQuality(correlationId, nowMs = Date.now()) {
 cron.schedule('0 * * * *', wrapCronJob('checkGmailAlertQuality', async (c) => { await checkGmailAlertQuality(c); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: gmail fan-out alert quality check (0 * * * *)');
 
+// ─── CRON LIVENESS AUDIT ────────────────────────────────────────────────────
+// Who watches the watchers. Nothing did, from 2026-07-29 — when the mcp
+// scheduled-task audit fleet self-disabled via a hardcoded expiry date and took
+// the "should we keep a lighter audit?" decision with it — until this shipped.
+//
+// It is a cron in Max rather than an agent task ON PURPOSE. The fleet that died
+// was LLM-judged, untestable, and carried its own kill switch. This is
+// deterministic SQL over agent_activity, has a test file, and has no expiry
+// clause: it can report that a check looks retired, but only Ron can retire it.
+//
+// wrapCronJob already writes every run to agent_activity as a `started` row and a
+// terminal `ok`/`error` row sharing a correlation_id. That record was complete and
+// entirely unread — 4 vanished runs were sitting in it, including a Fulfillment
+// EOD Pulse that started 2026-08-18 and never finished, last success 5 days prior.
+const STATIC_CRON_SCHEDULES = {
+  checkBookingAlertDivergence:  '*/30 * * * *',
+  checkGmailAlertQuality:       '0 * * * *',
+  checkMakeScenarioHealth:      '*/10 * * * *',
+  runAppointmentStatusSync:     '0 15 * * *',
+  runApptDeletionSweep:         '20 7-19/3 * * *',
+  runAutoStrikeMover:           '0 7-21/2 * * *',
+  // The audit declares itself, so a run where it dies shows up as stale on the
+  // next one that survives. It cannot detect its own total death — nothing
+  // in-process can — which is the standing limitation noted in the spec.
+  runCronLivenessAudit:         '30 7 * * *',
+  runEmailReplyPoller:          '0 8-20 * * 1-5',
+  runFulfillmentStandup:        '0 9 * * 1-5',
+  runMondayGapDetection:        '0 14 * * 1',
+  runNightlyLearning:           '30 5 * * *',
+  runReviCrossChecks:           '30 6 * * 2-6',
+  runReviProspectNotesSync:     '0 14 * * *',
+  runSalesCallPrep:             '0 * * * 1-5',
+  runSalesStandup:              '0 9 * * 1-5',
+  runStaleLeadDailySweep:       '0 18 * * *',
+  runStaleLeadNagCheck:         '*/30 7-20 * * *',
+  runStalledProspectFollowups:  '0 11 * * 1-5',
+  runStrikeSalesDigest:         '30 21 * * *',
+  runUnloggedOutcomeReminders:  '0 16 * * *',
+  runWeeklyPortalTrends:        '30 22 * * 5',
+  runWeeklySalesMarketingRecap: '0 17 * * 5',
+  runWonHandoffNotes:           '0 9,17 * * *',
+};
+
+// How long may pass with no successful run before something is wrong?
+//
+// Deliberately LENIENT. A cron-liveness alarm that cries wolf gets muted, and a
+// muted audit is worse than none — it looks like coverage. Every rule here rounds
+// in favour of silence; the job is to catch a cron that STOPPED, not to measure
+// punctuality. No cron-expression parser is used, and no dependency added: these
+// five shapes cover everything Max actually registers.
+function expectedMaxGapHours(expr) {
+  const [min = '*', hour = '*', dom = '*', , dow = '*'] = String(expr || '').trim().split(/\s+/);
+
+  // Intra-day tolerance first.
+  let base;
+  const stepMatch = /^\*\/(\d+)$/.exec(min);
+  const hourIsWindowed = hour !== '*' && /[,\-/]/.test(hour);
+  if (stepMatch && hour === '*') base = Math.max((Number(stepMatch[1]) * 3) / 60, 1.5);
+  else if (hour === '*')         base = 3;      // hourly
+  else if (hourIsWindowed)       base = 20;     // e.g. '0 9,17' has a real 16h overnight gap
+  else                           base = 26;     // once a day
+
+  // Then widen for anything that legitimately skips whole days.
+  if (dom !== '*')                return 32 * 24;                  // monthly
+  if (dow !== '*' && /^\d$/.test(dow)) return 8 * 24;              // one weekday per week
+  if (dow !== '*')                return Math.max(base, 76);       // a weekday range spans a weekend
+  return base;
+}
+
+const SELF_ACTION = 'runCronLivenessAudit';
+
+// Pure. Returns the four ways a scheduled job can be wrong, which are genuinely
+// different failures and want different reactions.
+function evaluateCronLiveness({ expectations, lastOkByAction, recentRuns, now }) {
+  const stale = [], vanished = [], drifted = [], silent = [];
+
+  for (const [action, expr] of Object.entries(expectations)) {
+    const maxGapHours = expectedMaxGapHours(expr);
+    const lastOk = lastOkByAction[action];
+    if (!lastOk) {
+      // The audit has no successful run of its own until it finishes this one, so
+      // on first deploy it would otherwise open by reporting itself as broken.
+      // Skipping it here costs nothing: once it has run once it is subject to the
+      // ordinary staleness rule like everything else.
+      if (action !== SELF_ACTION) silent.push({ action, expr });
+      continue;
+    }
+    const gapHours = (now - new Date(lastOk).getTime()) / 3600000;
+    if (gapHours > maxGapHours) {
+      stale.push({ action, expr, gapHours: Math.round(gapHours), maxGapHours: Math.round(maxGapHours), lastOk });
+    }
+  }
+
+  // A run that started and never reached a terminal status. The process died
+  // mid-job, or the job hung. Either way nobody was told.
+  const byCorrelation = new Map();
+  for (const r of recentRuns) {
+    if (!r.correlation_id) continue;
+    const e = byCorrelation.get(r.correlation_id) || { action: r.action, started: false, finished: false, at: r.created_at };
+    if (r.status === 'started') { e.started = true; e.at = r.created_at; }
+    if (r.status === 'ok' || r.status === 'error') e.finished = true;
+    byCorrelation.set(r.correlation_id, e);
+  }
+  for (const e of byCorrelation.values()) {
+    if (e.started && !e.finished) vanished.push({ action: e.action, at: e.at });
+  }
+
+  // A cron that logs but nobody declared — the registry drifted. This is how five
+  // new crons appeared in a day without the inventory noticing.
+  const declared = new Set(Object.keys(expectations));
+  for (const a of new Set(recentRuns.map(r => r.action))) {
+    if (!declared.has(a)) drifted.push(a);
+  }
+
+  return { stale, vanished, drifted: drifted.sort(), silent };
+}
+
+const VANISHED_LOOKBACK_MS = 48 * 60 * 60 * 1000;
+// A run in flight right now is not a vanished run.
+const VANISHED_GRACE_MS = 20 * 60 * 1000;
+
+async function runCronLivenessAudit(correlationId) {
+  const now = Date.now();
+
+  // Dynamic tasks are declared in the DB, so read them rather than hardcoding —
+  // a task added through Max is then watched automatically, with no code change.
+  const expectations = { ...STATIC_CRON_SCHEDULES };
+  let dynamicNote = '';
+  const { data: dynTasks, error: dynErr } = await supabase
+    .from('scheduled_tasks').select('name, cron_expression').eq('active', true);
+  if (dynErr) dynamicNote = `could not read scheduled_tasks (${dynErr.message}) — dynamic tasks unchecked this run`;
+  else for (const t of dynTasks || []) expectations[`dynamic_cron:${t.name}`] = t.cron_expression;
+
+  // Last success per action, one bounded query each. Cheap at daily cadence, and
+  // it handles a monthly cron correctly without pulling 40 days of rows.
+  const lastOkByAction = {};
+  for (const action of Object.keys(expectations)) {
+    const { data } = await portalSupabase
+      .from('agent_activity')
+      .select('created_at')
+      .eq('event_type', 'cron_run').eq('action', action).eq('status', 'ok')
+      .order('created_at', { ascending: false }).limit(1);
+    if (data && data.length) lastOkByAction[action] = data[0].created_at;
+  }
+
+  const { data: recentRuns, error: runsErr } = await portalSupabase
+    .from('agent_activity')
+    .select('action, status, created_at, correlation_id')
+    .eq('event_type', 'cron_run')
+    .gte('created_at', new Date(now - VANISHED_LOOKBACK_MS).toISOString())
+    .lte('created_at', new Date(now - VANISHED_GRACE_MS).toISOString())
+    .limit(2000);
+  // FAIL CLOSED. Unreadable history means "unknown", never "healthy".
+  if (runsErr) {
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `⚠️ *Cron liveness audit could not run* — agent_activity unreadable: ${runsErr.message}\nThis is not an all-clear. Nothing was checked.`,
+    });
+    logActivity({ event_type: 'alert', event_source: 'cron', action: 'cron_liveness_audit', status: 'degraded', correlation_id: correlationId });
+    return;
+  }
+
+  const result = evaluateCronLiveness({ expectations, lastOkByAction, recentRuns: recentRuns || [], now });
+  const { stale, vanished, drifted, silent } = result;
+  const total = stale.length + vanished.length + drifted.length + silent.length;
+
+  console.log(`Cron liveness: ${Object.keys(expectations).length} declared, ${stale.length} stale, ${vanished.length} vanished, ${drifted.length} undeclared, ${silent.length} never logged.`);
+  logActivity({
+    event_type: 'audit', event_source: 'cron', action: 'cron_liveness_audit',
+    status: total ? 'gap' : 'ok',
+    output: { declared: Object.keys(expectations).length, stale: stale.map(s => s.action), vanished: vanished.map(v => v.action), drifted, silent: silent.map(s => s.action) },
+    correlation_id: correlationId,
+  });
+
+  // Quiet when healthy. An audit that posts every day teaches you to skim it.
+  if (!total && !dynamicNote) return;
+
+  const lines = [`⚠️ *Cron liveness audit* — ${Object.keys(expectations).length} scheduled jobs declared`];
+  if (stale.length) lines.push(`\n*${stale.length} stale* — no successful run inside the expected window:\n` +
+    stale.map(s => `• \`${s.action}\` (\`${s.expr}\`) — last ok ${s.gapHours}h ago, tolerance ${s.maxGapHours}h`).join('\n'));
+  if (vanished.length) lines.push(`\n*${vanished.length} vanished* — started and never reached a terminal status, so the process died mid-run or the job hung:\n` +
+    vanished.slice(0, 10).map(v => `• \`${v.action}\` — started ${new Date(v.at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`).join('\n'));
+  if (silent.length) lines.push(`\n*${silent.length} never logged* — declared but no successful run on record. Either it has never fired, or it is not wrapped in \`wrapCronJob\` and is invisible:\n` +
+    silent.map(s => `• \`${s.action}\` (\`${s.expr}\`)`).join('\n'));
+  if (drifted.length) lines.push(`\n*${drifted.length} undeclared* — logging but absent from \`STATIC_CRON_SCHEDULES\`, so the registry has drifted:\n` +
+    drifted.map(a => `• \`${a}\``).join('\n'));
+  if (dynamicNote) lines.push(`\n_${dynamicNote}_`);
+
+  // Liveness, never an expiry. This audit reports that it is alive and when it
+  // runs next; it has no mechanism to disable itself. If a check here becomes
+  // permanently noisy, Ron retires it in chat — the previous fleet is gone
+  // precisely because it could make that decision on its own.
+  lines.push(`\n_Audit alive · next run tomorrow 07:30 CR. This job has no expiry and cannot disable itself._`);
+
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
+}
+
+// 07:30 CR daily — after the 05:30 nightly learning and before the 09:00
+// standups, so a job that died overnight is known before the day depends on it.
+// Daily, not weekly: a daily report that stops would otherwise wait up to seven
+// days to be noticed, and this costs ~30 bounded queries.
+cron.schedule('30 7 * * *', wrapCronJob('runCronLivenessAudit', async (c) => { await runCronLivenessAudit(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: cron liveness audit (30 7 * * *)');
+
 // ─── START ────────────────────────────────────────────────────────────────────
 (async () => {
   try {
