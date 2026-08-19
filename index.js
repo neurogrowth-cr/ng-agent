@@ -12979,6 +12979,34 @@ function evaluateAlertCard(text) {
   return { ok: problems.length === 0, problems };
 }
 
+// Does any posted new-customer card correspond to this client_dashboards row?
+//
+// Pure, so the test drives it directly. The first live run (2026-08-19 15:00 CR)
+// flagged a customer whose card had been posted in the same minute, because the two
+// systems order the name components differently:
+//
+//   client_dashboards : "Aura Bonilla - Cacao Legal"
+//   posted card       : "Cacao Legal - Aura Bonilla"
+//
+// Neither string contains the other, so containment said "missing". A false alarm on
+// a divergence check is worse than useless — it is how a channel gets muted, and
+// then the real gap goes unseen too.
+//
+// Email is the stable key: both sides carry it and neither reorders it. The token
+// fallback covers rows or cards with no email, and requires EVERY significant token
+// to be present, so "Acme" does not match a card for "Acme Holdings International".
+function cardExistsFor(client, cards) {
+  const email = String(client.email || '').toLowerCase().trim();
+  if (email && cards.some(card => card.includes(email))) return true;
+
+  const tokens = String(client.client_name || '')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(tok => tok.length >= 3);
+  if (!tokens.length) return false;
+  return cards.some(card => tokens.every(tok => card.includes(tok)));
+}
+
 const gmailAlertAlerted = new Set();
 const GMAIL_ALERT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 // The dash webhook fires within seconds, but Make's Gmail trigger polls every 20
@@ -12990,7 +13018,7 @@ async function checkGmailAlertQuality(correlationId) {
   const since = now - GMAIL_ALERT_LOOKBACK_MS;
   const problems = [];
   const skipped = [];
-  const seenNames = [];
+  const seenCards = [];
 
   // ── 1. Content contract on every card in the window ──
   for (const [channel, label] of Object.entries(GMAIL_ALERT_CHANNELS)) {
@@ -13012,8 +13040,13 @@ async function checkGmailAlertQuality(correlationId) {
       // "closer required" card for the same person is a different event and must
       // not mask a missing new-customer alert.
       if (channel === GMAIL_NEW_CLIENT_CHANNEL_ID && text.includes('NEW FLYWHEEL AI CUSTOMER')) {
-        const n = text.match(/^\*?Customer\/Company Name:\*?[ \t]*(.*?)[ \t]*$/m);
-        if (n && n[1]) seenNames.push(n[1].toLowerCase().trim());
+        // Keep the WHOLE card, not just the parsed name. The dash record and the
+        // webhook payload do not agree on component order — client_dashboards held
+        // "Aura Bonilla - Cacao Legal" while the posted card read "Cacao Legal -
+        // Aura Bonilla" — so substring containment on the composite name reported a
+        // card that was sitting right there as missing. Matching happens below,
+        // against the full text.
+        seenCards.push(text.toLowerCase());
       }
       const verdict = evaluateAlertCard(text);
       if (!verdict.ok) {
@@ -13043,11 +13076,8 @@ async function checkGmailAlertQuality(correlationId) {
     // Could not read the channel, so absence of a card proves nothing.
     skipped.push('client_dashboards divergence (new-client channel unreadable)');
   } else {
-    missing = (clients || []).filter(c => {
-      const name = String(c.client_name || '').toLowerCase().trim();
-      if (!name) return false;
-      return !seenNames.some(sn => sn.includes(name) || name.includes(sn));
-    }).filter(c => !gmailAlertAlerted.has(`missing:${c.email}`));
+    missing = (clients || []).filter(c => !cardExistsFor(c, seenCards))
+      .filter(c => !gmailAlertAlerted.has(`missing:${c.email}`));
     for (const c of missing) gmailAlertAlerted.add(`missing:${c.email}`);
   }
 
