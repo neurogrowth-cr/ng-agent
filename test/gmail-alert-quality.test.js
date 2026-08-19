@@ -53,7 +53,7 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
   };
   const factory = new Function(
     'slack', 'portalSupabase', 'postMakeHealthAlert', 'logActivity', 'RON_SLACK_ID', 'console',
-    `${block}; return { checkGmailAlertQuality, evaluateAlertCard };`
+    `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor };`
   );
   const api = factory(
     slackStub, portalStub,
@@ -130,7 +130,7 @@ const PROSP_ISSUE = `:rotating_light: *Issues with Prosp Campaign*
 *Subject:* Campaign paused
 *Date:* Mon, 18 Aug 2026 09:00:00 -0600`;
 
-const { evaluateAlertCard } = build();
+const { evaluateAlertCard, cardExistsFor } = build();
 
 // ── 1. The pure contract ──
 check('1a good closer card passes',        evaluateAlertCard(GOOD_CLOSER).ok, true);
@@ -148,6 +148,41 @@ check('4b residue leak names the fragment', evaluateAlertCard(RESIDUE_LEAK).prob
 check('5a object dump is caught',          evaluateAlertCard(OBJECT_DUMP).ok, false);
 check('6a empty email is caught',          evaluateAlertCard(BAD_EMAIL).ok, false);
 check('7a misplaced fallback is caught',   evaluateAlertCard(FALLBACK_MISPLACED).ok, false);
+
+// ── 7b. Card matching — the regression from the first live run ──
+// 2026-08-19 15:00 CR: the check flagged a customer whose card had been posted in
+// the same minute, because the two systems order the name components differently.
+const AURA_CARD = `🔔🔔 NEW FLYWHEEL AI CUSTOMER 🔔🔔
+Customer/Company Name: Cacao Legal - Aura Bonilla
+Customer Email: abonillabravo@gmail.com
+Start Date: 2026-08-18
+Customer-ID: cacao-legal-aura-bonilla`.toLowerCase();
+
+const AURA_ROW = { client_name: 'Aura Bonilla - Cacao Legal ', email: 'abonillabravo@gmail.com' };
+
+check('7b1 reversed name components still match (the live false positive)',
+      cardExistsFor(AURA_ROW, [AURA_CARD]), true);
+check('7b2 match survives with no email on the row (token fallback)',
+      cardExistsFor({ client_name: 'Aura Bonilla - Cacao Legal', email: '' }, [AURA_CARD]), true);
+check('7b3 match survives when the card carries no email line',
+      cardExistsFor(AURA_ROW, [`🔔🔔 new flywheel ai customer 🔔🔔
+customer/company name: cacao legal - aura bonilla
+start date: 2026-08-18`]), true);
+check('7b4 a genuinely absent customer is still reported',
+      cardExistsFor({ client_name: 'Kty Araya - Tropikasa', email: 'kty@tropikasa.com' }, [AURA_CARD]), false);
+// A one-token dashboard name against a longer card name is genuinely ambiguous, and
+// the tie is broken deliberately in favour of "covered". Treating it as missing
+// reintroduces exactly the false-alarm class this fix exists to remove, and a
+// divergence check nobody trusts catches nothing at all. Documented in the spec.
+check('7b5 a shorter dashboard name is treated as covered by a longer card name',
+      cardExistsFor({ client_name: 'Acme', email: '' }, ['customer/company name: acme holdings international']), true);
+// The reverse is NOT true — a card that omits part of the dashboard name is a miss.
+check('7b5b a card missing part of the dashboard name is still reported',
+      cardExistsFor({ client_name: 'Acme Holdings International', email: '' }, ['customer/company name: acme']), false);
+check('7b6 email match wins even when the name is written differently',
+      cardExistsFor({ client_name: 'Totally Different Ltd', email: 'abonillabravo@gmail.com' }, [AURA_CARD]), true);
+check('7b7 a row with neither email nor usable name is not silently cleared',
+      cardExistsFor({ client_name: '', email: '' }, [AURA_CARD]), false);
 
 // ── 8. End to end: a clean window posts nothing ──
 (async () => {
