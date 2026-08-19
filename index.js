@@ -4159,7 +4159,7 @@ async function runNightlyLearning(correlationId) {
 
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), a spike in failures, or unusually high move volume (intel). A routine day (sweeps ran, few or no moves, transient failures) needs NO entry\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${digest}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
@@ -10465,12 +10465,36 @@ function hasOptOutSignal(messages) {
 // claim 40s later went through untouched — purely transient).
 //
 // Everything on the claim path and the sweep path goes through here now. Returns the
-// Response unchanged so callers keep their own error handling; only 429/5xx are
-// retried, since a 401/404 will never come good.
+// Response unchanged so callers keep their own error handling; 429/5xx are retried on
+// the full ladder, and 401 gets exactly ONE retry — see below.
 const GHL_RETRY_DELAYS_MS = [1000, 3000, 8000];
+
+// A 401 "will never come good" is the right default for an auth error, and it is what
+// this wrapper originally assumed. The strike_sweep history says otherwise for GHL:
+// over 30 days / 95 sweeps, 401s hit 19 distinct contacts and **18 of them 401'd
+// exactly once** — a genuine permission or token problem would have failed that same
+// contact on all ~95 sweeps. They are also load-independent (never once co-occurring
+// with a 429, and `scanned` averaged 1528 on sweeps with a 401 vs 1549 without), so
+// they are not the burst limit wearing an auth mask either. It is GHL's auth layer
+// blinking, ~1 per sweep, and it clears by itself.
+//
+// So: one retry, one second, and only one — enough to absorb a blink. A genuinely dead
+// token still fails fast (2 calls instead of 1) and is caught by the failure-spike
+// thresholds instead, which is where a real auth outage belongs: STRIKE_FAILURE_LIMITS
+// alerts at 5 401s in a sweep, and a dead token produces hundreds.
+const GHL_UNAUTH_RETRY_DELAY_MS = 1000;
+
 async function ghlFetch(url, init = {}, { retries = GHL_RETRY_DELAYS_MS.length, label = '' } = {}) {
+  let unauthRetried = false;
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, init);
+    if (res.status === 401 && !unauthRetried) {
+      unauthRetried = true;
+      console.warn(`GHL 401${label ? ` on ${label}` : ''} — single retry in ${GHL_UNAUTH_RETRY_DELAY_MS}ms (transient auth blink; a dead token will trip the failure-spike alert)`);
+      await new Promise(r => setTimeout(r, GHL_UNAUTH_RETRY_DELAY_MS));
+      attempt--; // the 401 retry is not part of the 429/5xx budget
+      continue;
+    }
     if (!(res.status === 429 || res.status >= 500) || attempt >= retries) return res;
     // GHL usually omits Retry-After; honour it when present so we back off by their
     // clock rather than ours, but never park a Slack reaction handler for minutes.
@@ -11321,6 +11345,98 @@ async function runAutoStrikeMover(correlationId) {
 // Reads agent_activity through the anon key — needs the scoped select policy
 // from migrations/012_strike_sweep_read.sql. Zero sweeps is itself a signal
 // (cron dead) and still returns content rather than null.
+// ─── FAILURE-SPIKE THRESHOLDS ────────────────────────────────────────────────
+// The nightly prompt used to ask the model to flag "a spike in failures" with no
+// number attached, which means the bar moves every night. These are the numbers.
+//
+// Per-status, not a single total, because the classes have genuinely different
+// shapes in 30 days of strike_sweep history (95 sweeps, pre-retry):
+//
+//   429  max 10/sweep, 10/day — BURSTY. All 20 events landed in just 2 sweeps.
+//                               Load-driven; a burst is one event, not ten.
+//   401  max  2/sweep,  4/day — a steady ~1-per-sweep trickle across 17 sweeps,
+//                               never once co-occurring with a 429. Auth blink.
+//   5xx  max  3/sweep,  5/day — GHL degraded, sporadic.
+//
+// A single "failures > N" rule would either cry wolf at a normal 429 burst or sleep
+// through a dead token. Limits sit ~2-4x the observed per-status maximum so a real
+// regression trips them and known-normal noise does not. They are also deliberately
+// generous now that ghlFetch retries 429/5xx and blinks a 401 once: these count
+// SURVIVORS, so post-retry the expected steady-state is ~0 and anything reaching
+// these numbers is a genuine change in behaviour.
+const STRIKE_FAILURE_LIMITS = {
+  '401': { perSweep: 5,  perDay: 10, meaning: 'auth — token may be dead or rotating' },
+  '429': { perSweep: 8,  perDay: 20, meaning: 'rate limit — throttle is not keeping up' },
+  '5xx': { perSweep: 8,  perDay: 20, meaning: 'GHL degraded' },
+};
+// Below this many sweeps in the window we do not judge at all. A cold start, a
+// redeploy, or a half-day of history is not evidence of a spike (recipe standard:
+// every numeric threshold carries a warmup).
+const STRIKE_FAILURE_WARMUP_SWEEPS = 7;
+
+/**
+ * "Ana Lopez: GHL messages fetch 429" → "429". Returns null when unparseable.
+ *
+ * Failures are stored as `${contactName}: ${err.message}`, and the message puts the
+ * status in three different places depending on which call threw:
+ *   "GHL messages fetch 429"                 → trailing
+ *   "GHL 401 on conversations/search"        → mid-string
+ *   "opp PUT abc123 → 429: Too Many Requests" → after an arrow
+ * So drop the name prefix, then take the first 4xx/5xx in what remains. Matching only
+ * a trailing number silently bucketed every conversations/search 401 as "other", which
+ * would have kept a dead token from ever reaching the 401 threshold.
+ */
+function strikeFailureStatus(msg) {
+  const s = String(msg || '');
+  const body = s.includes(': ') ? s.slice(s.indexOf(': ') + 2) : s;
+  const m = body.match(/\b([45]\d{2})\b/);
+  return m ? m[1] : null;
+}
+
+/** Bucket raw failure strings into the classes STRIKE_FAILURE_LIMITS is keyed by. */
+function strikeBucketFailures(failures = []) {
+  const counts = { '401': 0, '429': 0, '5xx': 0, other: 0 };
+  for (const f of failures) {
+    const s = strikeFailureStatus(f);
+    if (s === '401') counts['401']++;
+    else if (s === '429') counts['429']++;
+    else if (s && /^5\d\d$/.test(s)) counts['5xx']++;
+    else counts.other++;
+  }
+  return counts;
+}
+
+/**
+ * Machine-checked verdict on a window of sweeps.
+ *
+ * `perSweepMax` counts the worst SINGLE sweep, not the window total — 10 429s in one
+ * sweep is a burst worth naming, while 10 spread over a week is background noise, and
+ * summing them would erase exactly that difference.
+ */
+function strikeAssessFailures(sweeps = []) {
+  const windowTotals = { '401': 0, '429': 0, '5xx': 0, other: 0 };
+  const perSweepMax  = { '401': 0, '429': 0, '5xx': 0, other: 0 };
+  for (const s of sweeps) {
+    const c = strikeBucketFailures((s.metadata || {}).failures || []);
+    for (const k of Object.keys(windowTotals)) {
+      windowTotals[k] += c[k];
+      if (c[k] > perSweepMax[k]) perSweepMax[k] = c[k];
+    }
+  }
+  if (sweeps.length < STRIKE_FAILURE_WARMUP_SWEEPS) {
+    return { level: 'warmup', reasons: [], windowTotals, perSweepMax, sweeps: sweeps.length };
+  }
+  const reasons = [];
+  for (const [status, limit] of Object.entries(STRIKE_FAILURE_LIMITS)) {
+    if (perSweepMax[status] >= limit.perSweep) {
+      reasons.push(`${perSweepMax[status]} × ${status} in a single sweep (limit ${limit.perSweep}) — ${limit.meaning}`);
+    } else if (windowTotals[status] >= limit.perDay) {
+      reasons.push(`${windowTotals[status]} × ${status} across the window (limit ${limit.perDay}) — ${limit.meaning}`);
+    }
+  }
+  return { level: reasons.length ? 'alert' : 'ok', reasons, windowTotals, perSweepMax, sweeps: sweeps.length };
+}
+
 async function strikeBuildDailyDigest(hours = 24) {
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
   const { data: sweeps, error } = await portalSupabase.from('agent_activity')
@@ -11359,8 +11475,21 @@ async function strikeBuildDailyDigest(hours = 24) {
   const skipBreakdown = Object.entries(skipTotals).sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `${k}=${v}`).join(', ');
   if (skipBreakdown) lines.push(`Skip totals across sweeps (same card counted each sweep): ${skipBreakdown}`);
+  // Deterministic verdict — the model is told the answer rather than asked to eyeball
+  // "is this a spike?". Failures reaching here have already survived ghlFetch's retries.
+  const failureVerdict = strikeAssessFailures(sweeps);
   if (allFailures.length) {
-    lines.push(`${allFailures.length} transient failure(s) (self-healing, card retried next sweep): ${allFailures.slice(0, 5).join(' | ')}`);
+    const b = failureVerdict.windowTotals;
+    const shape = [['401', b['401']], ['429', b['429']], ['5xx', b['5xx']], ['other', b.other]]
+      .filter(([, n]) => n > 0).map(([k, n]) => `${k}×${n}`).join(', ');
+    lines.push(`${allFailures.length} failure(s) after retries [${shape}]: ${allFailures.slice(0, 5).join(' | ')}`);
+  }
+  if (failureVerdict.level === 'alert') {
+    lines.push(`⚠️ FAILURE SPIKE — ${failureVerdict.reasons.join('; ')}. Report this as an alert.`);
+  } else if (failureVerdict.level === 'ok' && allFailures.length) {
+    lines.push(`Failure levels are within normal limits — do NOT report these as an anomaly.`);
+  } else if (failureVerdict.level === 'warmup') {
+    lines.push(`Only ${failureVerdict.sweeps} sweep(s) in window (warmup needs ${STRIKE_FAILURE_WARMUP_SWEEPS}) — not judging failure levels.`);
   }
   // Sales-facing variant: plain language, no skip-key jargon, no sweep mechanics.
   const transitionTallies = {};
