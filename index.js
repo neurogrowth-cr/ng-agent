@@ -9028,6 +9028,146 @@ async function setAppointmentStatusTool({ prospect, date, status }) {
   return `Set ${target.full_name}'s ${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call to *${status}* in GHL.`;
 }
 
+
+// ─── PROVISIONING LAG CHECK (weekly, Mon 8:30 AM CR) ─────────────────────────
+// A deal marked `won` should become a client dashboard within days. Nothing
+// watched that handoff: Josstinne ($3.5k, Jul 22) sat unprovisioned for weeks
+// and nobody noticed until the 2026-07-27 leaderboard audit stumbled on it.
+// Source of truth is revops_sales_outcomes (outcome=won) vs the sales→client
+// bridge (revops_prospects.client_dashboard_id, written by dash's auto-link +
+// Revenue Handoff since 2026-08-18). Wins BEFORE the bridge went live are the
+// Phase B review sheet's problem, not lag — hence the cutoff, without which the
+// first run would nag about ~20 historical wins forever.
+// Recipe spec: ~/automations/ops/recipes/provisioning-lag-nag.md
+const PROVISIONING_BRIDGE_LIVE_AT = '2026-08-18T00:00:00Z';
+const PROVISIONING_LAG_DAYS = 7;
+// Fail-closed bound: more lagging rows than this means the query or cutoff is
+// broken (there are only ~1-3 wins/week) — say THAT instead of spamming names.
+const PROVISIONING_LAG_SANITY_MAX = 15;
+
+// Pure classifier. rows: [{ prospect_id, full_name, email, closer, won_at,
+// linked, dashboard_exists }] — `linked` = prospect has client_dashboard_id or
+// a conversion row; `dashboard_exists` = a client_dashboards row shares the
+// prospect's email (case-insensitive) even though no link was recorded.
+function classifyProvisioningLag(rows, now = Date.now()) {
+  const lagging = [];
+  const unlinked = [];
+  let fresh = 0;
+  for (const r of rows || []) {
+    const wonMs = new Date(r.won_at).getTime();
+    if (!Number.isFinite(wonMs)) continue;
+    const days = Math.floor((now - wonMs) / 86400000);
+    if (r.linked) continue;
+    if (days < PROVISIONING_LAG_DAYS) { fresh++; continue; }
+    const display = (r.full_name || '').trim() || (r.email || '').trim() || 'Unknown prospect';
+    const entry = { display, days, wonDate: new Date(wonMs).toISOString().slice(0, 10), closer: (r.closer || '').trim() || 'unassigned' };
+    (r.dashboard_exists ? unlinked : lagging).push(entry);
+  }
+  lagging.sort((a, b) => b.days - a.days);
+  unlinked.sort((a, b) => b.days - a.days);
+  return { lagging, unlinked, fresh };
+}
+
+// Renders the DM, or null when there is nothing to say. Structural contract
+// (asserted by test/provisioning-lag.test.js): headers are literal, every
+// bullet matches /^• .+ — won \d{4}-\d{2}-\d{2} \(\d+d ago\) — closer .+$/,
+// and the strings 'undefined' and 'null' never appear.
+function formatProvisioningLagMessage({ lagging, unlinked }) {
+  if (!lagging.length && !unlinked.length) return null;
+  if (lagging.length > PROVISIONING_LAG_SANITY_MAX) {
+    return `*PROVISIONING LAG*\n\n⚠️ SANITY BOUND EXCEEDED — ${lagging.length} won deals appear unprovisioned, which is more than plausible. The check's query or its ${PROVISIONING_BRIDGE_LIVE_AT.slice(0, 10)} cutoff is likely broken; not listing names. Check runProvisioningLagCheck in index.js.`;
+  }
+  const lines = [];
+  if (lagging.length) {
+    lines.push(`*PROVISIONING LAG — won deals with no client dashboard*`);
+    for (const e of lagging) lines.push(`• ${e.display} — won ${e.wonDate} (${e.days}d ago) — closer ${e.closer}`);
+  }
+  if (unlinked.length) {
+    if (lines.length) lines.push('');
+    lines.push(`*BRIDGE MISS — dashboard exists but was never linked to the sale*`);
+    for (const e of unlinked) lines.push(`• ${e.display} — won ${e.wonDate} (${e.days}d ago) — closer ${e.closer}`);
+    lines.push('_A dashboard was created through a path the auto-link does not cover — worth telling the session that built the bridge._');
+  }
+  lines.push('');
+  lines.push('Provision via the portal (Revenue Handoff on the admin page links the sale automatically).');
+  return lines.join('\n');
+}
+// ─── end provisioning-lag pure block ─────────────────────────────────────────
+
+async function runProvisioningLagCheck(_correlationId) {
+  // Won outcomes since the bridge went live, old enough to be overdue.
+  const { data: wonRows, error: wErr } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('appointment_id, created_at')
+    .eq('outcome', 'won')
+    .gte('created_at', PROVISIONING_BRIDGE_LIVE_AT);
+  if (wErr) throw wErr; // wrapCronJob logs the error row; the liveness audit reads it.
+  if (!wonRows || !wonRows.length) { console.log('Provisioning lag: no post-bridge won outcomes yet.'); return; }
+
+  const apptIds = [...new Set(wonRows.map(r => r.appointment_id).filter(Boolean))];
+  const { data: appts, error: aErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, prospect_id, closer_id')
+    .in('id', apptIds);
+  if (aErr) throw aErr;
+  const apptById = Object.fromEntries((appts || []).map(a => [a.id, a]));
+
+  const prospectIds = [...new Set((appts || []).map(a => a.prospect_id).filter(Boolean))];
+  if (!prospectIds.length) { console.log('Provisioning lag: won outcomes carry no prospects.'); return; }
+  const { data: prospects, error: pErr } = await portalSupabase
+    .from('revops_prospects')
+    .select('id, full_name, email, client_dashboard_id')
+    .in('id', prospectIds);
+  if (pErr) throw pErr;
+  const { data: convs } = await portalSupabase
+    .from('revops_prospect_client_conversions')
+    .select('prospect_id')
+    .in('prospect_id', prospectIds);
+  const convSet = new Set((convs || []).map(c => c.prospect_id));
+  const prospById = Object.fromEntries((prospects || []).map(p => [p.id, p]));
+
+  // Unlinked prospects only: does a dashboard already exist under their email?
+  const unlinkedEmails = (prospects || [])
+    .filter(p => !p.client_dashboard_id && !convSet.has(p.id))
+    .map(p => (p.email || '').trim().toLowerCase())
+    .filter(Boolean);
+  let dashEmailSet = new Set();
+  if (unlinkedEmails.length) {
+    const { data: dashRows } = await portalSupabase
+      .from('client_dashboards')
+      .select('email')
+      .in('email', unlinkedEmails); // exact-lowercase; provisioning emails vary in case rarely
+    dashEmailSet = new Set((dashRows || []).map(d => (d.email || '').trim().toLowerCase()));
+  }
+
+  // One row per prospect, keeping the OLDEST win (days-overdue escalates from it).
+  const byProspect = {};
+  for (const w of wonRows) {
+    const appt = apptById[w.appointment_id];
+    const p = appt ? prospById[appt.prospect_id] : null;
+    if (!p) continue;
+    if (byProspect[p.id] && byProspect[p.id].won_at <= w.created_at) continue;
+    byProspect[p.id] = {
+      prospect_id: p.id,
+      full_name: p.full_name,
+      email: p.email,
+      closer: resolveSalesMember(appt.closer_id),
+      won_at: w.created_at,
+      linked: Boolean(p.client_dashboard_id) || convSet.has(p.id),
+      dashboard_exists: dashEmailSet.has((p.email || '').trim().toLowerCase()),
+    };
+  }
+
+  const buckets = classifyProvisioningLag(Object.values(byProspect));
+  const message = formatProvisioningLagMessage(buckets);
+  if (!message) {
+    console.log(`Provisioning lag: healthy — ${Object.keys(byProspect).length} post-bridge win(s), 0 overdue, ${buckets.fresh} within the ${PROVISIONING_LAG_DAYS}d window.`);
+    return;
+  }
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
+  console.log(`Provisioning lag: DMed Ron — ${buckets.lagging.length} lagging, ${buckets.unlinked.length} bridge-miss.`);
+}
+
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
 // REVI recordings covering a set of call times — same 36h contract as the
 // scorecard overlay. Best-effort by design: a REVI outage degrades every
@@ -10289,6 +10429,8 @@ cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) 
 // (outcome row + prospect activity + customer_closing_data.internal_notes once
 // the client exists). Ships in dry-run: WON_HANDOFF_MODE=live arms it (also
 // the kill switch).
+// Weekly provisioning-lag nag — Mon 8:30 AM CR, after the 7 AM leaderboard.
+cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => { await runProvisioningLagCheck(c); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { await runWonHandoffNotes(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
@@ -13669,6 +13811,7 @@ const STATIC_CRON_SCHEDULES = {
   runFulfillmentStandup:        '0 9 * * 1-5',
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
+  runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
   runSalesCallPrep:             '0 * * * 1-5',
