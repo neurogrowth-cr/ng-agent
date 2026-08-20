@@ -8103,12 +8103,30 @@ function outcomeActionsFor(pipelineId) {
     if (!s || seen.has(s.id)) return false;
     seen.add(s.id);
     return true;
-  }).map(o => ({ outcome: o, label: stages[o].label, say: OUTCOME_REPLY_TOKEN[o] }));
+  }).map(o => ({ outcome: o, label: stages[o].label, say: OUTCOME_REPLY_TOKEN[o], emoji: OUTCOME_EMOJI[o].char, emojiName: OUTCOME_EMOJI[o].name }));
 }
 // What the closer types. Kept short and stable across pipelines — the stage
 // LABEL can be "No show / Rescheduling", which nobody is going to type.
 const OUTCOME_REPLY_TOKEN = {
   follow_up: 'open deal', lost: 'lost', disqualified: 'no fit', no_show: 'no show', won: 'won',
+};
+// One-tap vocabulary: each answerable outcome is one emoji, pre-seeded on the
+// card so answering is a single tap on an existing reaction. These are the
+// CLOSER's own answer (source 'closer'), the tap twin of typing the token —
+// so unlike ✅ they carry no confidence gate. `won` is deliberately absent:
+// money is always typed. Names must never collide with the ✅/❌ families
+// above (`no_entry_sign` is a skip emoji, which is why No Fit is 🙅 not 🚫).
+const OUTCOME_EMOJI = {
+  follow_up:    { name: 'telephone_receiver', char: '📞' },
+  lost:         { name: '-1',                 char: '👎' },
+  disqualified: { name: 'no_good',            char: '🙅' },
+  no_show:      { name: 'ghost',              char: '👻' },
+};
+const EMOJI_TO_OUTCOME = {
+  telephone_receiver: 'follow_up',
+  '-1': 'lost', thumbsdown: 'lost',
+  no_good: 'disqualified',
+  ghost: 'no_show',
 };
 
 // Parse a closer's typed reply on an outcome card into {outcome, revenue}.
@@ -8231,31 +8249,34 @@ function buildOutcomeCardText({ prospectName, whenStr, heldDays, rec, proposal, 
     lines.push(`📊 GHL: ${funnel.to_stage_name}${funnel.detected_on ? ` since ${funnel.detected_on}` : ''}`);
   }
 
-  // Actions. `won` is never a reaction — the closer types the real amount.
+  // Actions. `won` is never a tap — the closer types the real amount. Every
+  // other outcome is one pre-seeded reaction away: ✅ still confirms MAX's
+  // read (high confidence only), while a per-outcome emoji is the CLOSER's
+  // own answer and needs no confidence at all — the tap twin of typing the
+  // token. Typed replies keep working on every card.
   const wonLabel = stages.won.label;
-  const alt = outcomeActionsFor(pipelineId)
-    .filter(a => a.outcome !== proposal.outcome)
-    .map(a => `\`${a.say}\``)
-    .join(' / ');
+  const acts = outcomeActionsFor(pipelineId);
+  const tapList = (xs) => xs.map(a => `${a.emoji} *${a.label}*`).join(' · ');
   if (proposal.wonHint) {
     const amt = proposal.revenueHint ? ` (REVI heard $${proposal.revenueHint})` : '';
     lines.push('');
     lines.push(`🎉 This sounded like a close${amt} — I never log *${wonLabel}* on my own.`);
-    lines.push(`→ Reply \`won <amount>\` once the money is real · or ${alt} if it landed differently.`);
+    lines.push(`→ Reply \`won <amount>\` once the money is real · or tap ${tapList(acts)} if it landed differently.`);
   } else if (proposal.outcome && proposal.confidence === 'high') {
     const target = stages[proposal.outcome];
     lines.push('');
-    lines.push(`→ ✅ move to *${target.label}* · ❌ dismiss · \`won <amount>\` · or ${alt}`);
+    lines.push(`→ ✅ move to *${target.label}* · ❌ dismiss · \`won <amount>\` · or tap ${tapList(acts.filter(a => a.outcome !== proposal.outcome))}`);
   } else if (proposal.outcome) {
-    // Good evidence, but not good enough for one tap — show the read and make
-    // the closer type it, so an ambiguous stage can't rubber-stamp a metric.
+    // Max's read isn't strong enough for a ✅ rubber-stamp, but the closer
+    // answering for themselves is: the outcome's own emoji logs it directly.
     const target = stages[proposal.outcome];
+    const own = acts.find(a => a.outcome === proposal.outcome);
     lines.push('');
-    lines.push(`→ Looks like *${target.label}*, but I'm not certain enough to log it on a tap.`);
-    lines.push(`   Reply \`${OUTCOME_REPLY_TOKEN[proposal.outcome]}\` to confirm · \`won <amount>\` · or ${alt}`);
+    lines.push(`→ Looks like *${target.label}* — tap ${own ? own.emoji : `\`${OUTCOME_REPLY_TOKEN[proposal.outcome]}\``} to confirm.`);
+    lines.push(`   Or ${tapList(acts.filter(a => a.outcome !== proposal.outcome))} · \`won <amount>\`.`);
   } else {
     lines.push('');
-    lines.push(`→ I can't tell from here. Reply \`won <amount>\` · ${alt || `\`${OUTCOME_REPLY_TOKEN.follow_up}\``}`);
+    lines.push(`→ I can't tell from here — tap ${tapList(acts)} · or reply \`won <amount>\`.`);
   }
   return lines.join('\n');
 }
@@ -9499,6 +9520,18 @@ async function runUnloggedOutcomeReminders(_correlationId) {
           // instead of opening a new DM — "reminded 14×" is what a re-DM loop
           // looks like from the closer's side.
           await upsertKnowledge('process', proposalKey, `proposed|${todayISO}|${slackId}|${posted.ts || ''}`, 'outcome-proposal');
+          // Pre-seed one reaction per outcome so answering is a single tap on
+          // an existing emoji, not a trip through the emoji picker. Won-hint
+          // cards stay unseeded — the only right answer there is a typed
+          // amount. Best-effort: an unseeded card still takes typed replies
+          // and manually added reactions. posted.channel is the D-channel id
+          // (chat.postMessage was addressed to the user id, which
+          // reactions.add does not accept).
+          if (!proposal.wonHint && posted.ts) {
+            for (const a of outcomeActionsFor(pipelineId)) {
+              await slack.client.reactions.add({ channel: posted.channel || slackId, timestamp: posted.ts, name: a.emojiName }).catch(() => {});
+            }
+          }
           proposalsSent += 1;
         } catch (propErr) {
           console.error(`Outcome card DM to ${closerName} failed:`, propErr.message);
@@ -14112,6 +14145,38 @@ async function handleOutcomeCardThreadReply(message, say) {
   return true;
 }
 
+// Shared tail of every reaction-driven outcome log: mark the card actioned,
+// stamp it, and report what happened in its thread — including the honest
+// ⚠️ when the portal row landed but the GHL move did not. `outcome` is what
+// was written (or attempted); `revenue` only ever arrives from typed wins.
+async function reportOutcomeCardResult({ channel, ts, payload, result, outcome }) {
+  const stages = GHL_OUTCOME_STAGES[payload.pipeline_id] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  if (result.ok) {
+    await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
+    // The GHL move is best-effort and reported honestly — the portal row is
+    // already written either way, so a CRM hiccup never silently loses it.
+    const move = result.stageMove;
+    const moveNote = move?.ok
+      ? (move.already ? ` GHL card was already in *${move.label}*.` : ` Moved the GHL card to *${move.label}*.`)
+      : ` ⚠️ Logged in the portal, but I couldn't move the GHL card (${move?.message || 'unknown error'}) — please move it by hand.`;
+    const label = stages[outcome]?.label || String(outcome).replace('_', ' ');
+    const att = result.attendance;
+    const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}* — that's Paso 1 done too.` : '';
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}* for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}` });
+  } else if (result.reason === 'exists') {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.` });
+  } else {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Couldn't log it: ${result.message || result.reason}. Log it in GHL directly, or tell Ron the outcome write path is down.` });
+    if (result.reason === 'not_configured') {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: '⚠️ Outcome card write failed: PORTAL_WRITER_DATABASE_URL is not set on ng-pm-MAX, so one-tap outcome logging is dead. The proposal DMs are still going out.' }).catch(() => {});
+    }
+  }
+}
+
 async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
   const channel = event.item.channel;
   const ts = event.item.ts;
@@ -14125,6 +14190,23 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
     ['white_check_mark', 'no_entry', 'warning'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
   if (actioned) {
     console.log(`outcome-proposal ${payload.appointment_id} already actioned, ignoring`);
+    return;
+  }
+
+  // A per-outcome tap is the closer's own answer — the reaction twin of
+  // typing the token — so it carries source 'closer' and no confidence gate.
+  // ✅ below stays what it always was: confirming MAX's read, gated on high
+  // confidence. (Max's own pre-seeded reactions never land here: the outer
+  // handler drops events from the bot user before routing.)
+  const tappedOutcome = EMOJI_TO_OUTCOME[baseEmoji];
+  if (tappedOutcome) {
+    const result = await logOutcomeToPortal({
+      appointmentId: payload.appointment_id,
+      outcome: tappedOutcome,
+      source: 'closer',
+      notes: `One-tap ${OUTCOME_EMOJI[tappedOutcome].char} on the outcome card by <@${event.user}> (prospect: ${payload.prospect_name})`,
+    });
+    await reportOutcomeCardResult({ channel, ts, payload, result, outcome: tappedOutcome });
     return;
   }
 
@@ -14143,14 +14225,15 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
     // won-hint (or read-less) card: ✅ is not enough on purpose.
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: payload.won_hint
       ? `I never log *${stages.won.label}* from a reaction — reply \`won <amount>\` to confirm it (amount = what was actually closed).`
-      : `No confident read to confirm here — reply \`won <amount>\` / ${altActions} and I'll log it.` });
+      : `No confident read to confirm here — tap one of the outcome reactions on the card, or reply \`won <amount>\` / ${altActions} and I'll log it.` });
     return;
   }
-  // Confidence gate: only a fact-backed read is one-tap. Anything softer is
-  // shown on the card but must be typed, so a rubber-stamped guess can't land
-  // in the scorecard.
+  // Confidence gate: only a fact-backed read earns the ✅ shortcut. Anything
+  // softer needs the closer to answer for themselves — a tap on the outcome's
+  // own emoji, or the typed token — so a rubber-stamped guess can't land in
+  // the scorecard.
   if (payload.confidence && payload.confidence !== 'high') {
-    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `That read isn't confident enough for one tap (${payload.confidence}). Reply \`won <amount>\` / ${altActions} and I'll log it.` });
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `That read isn't confident enough for a ✅ (${payload.confidence}). Tap the outcome's own reaction on the card, or reply \`won <amount>\` / ${altActions} and I'll log it.` });
     return;
   }
 
@@ -14160,30 +14243,7 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
     source: payload.rule && payload.rule.startsWith('ghl_') ? 'ghl_confirmed' : 'revi_confirmed',
     notes: `Max-proposed outcome (${payload.rule || 'revi'}) confirmed via Slack by <@${event.user}> (prospect: ${payload.prospect_name})`,
   });
-  if (result.ok) {
-    await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
-    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
-    const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
-    // The GHL move is best-effort and reported honestly — the portal row is
-    // already written either way, so a CRM hiccup never silently loses it.
-    const move = result.stageMove;
-    const moveNote = move?.ok
-      ? (move.already ? ` GHL card was already in *${move.label}*.` : ` Moved the GHL card to *${move.label}*.`)
-      : ` ⚠️ Logged in the portal, but I couldn't move the GHL card (${move?.message || 'unknown error'}) — please move it by hand.`;
-    const label = stages[payload.proposed_outcome]?.label || payload.proposed_outcome.replace('_', ' ');
-    const att = result.attendance;
-    const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}* — that's Paso 1 done too.` : '';
-    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}* for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}` });
-  } else if (result.reason === 'exists') {
-    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
-    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.` });
-  } else {
-    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
-    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Couldn't log it: ${result.message || result.reason}. Log it in GHL directly, or tell Ron the outcome write path is down.` });
-    if (result.reason === 'not_configured') {
-      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: '⚠️ Outcome proposal ✅ failed: PORTAL_WRITER_DATABASE_URL is not set on ng-pm-MAX, so one-tap outcome logging is dead. The proposal DMs are still going out.' }).catch(() => {});
-    }
-  }
+  await reportOutcomeCardResult({ channel, ts, payload, result, outcome: payload.proposed_outcome });
 }
 
 slack.event('reaction_added', async ({ event }) => {
@@ -14200,7 +14260,7 @@ slack.event('reaction_added', async ({ event }) => {
     // Only intercepts messages whose metadata says outcome_proposal; every
     // other DM reaction falls through to Route 1 untouched.
     if (String(event.item.channel || '').startsWith('D') &&
-        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji))) {
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji) || EMOJI_TO_OUTCOME[baseEmoji])) {
       try {
         const hist = await slack.client.conversations.history({
           channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,

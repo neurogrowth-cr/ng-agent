@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS };`)();
+const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS, OUTCOME_EMOJI, EMOJI_TO_OUTCOME };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -96,6 +96,16 @@ check('VSL merges them into ONE stage id',
 check('so VSL offers 3 actions, not 4', g.outcomeActionsFor(VSL).map(a => a.label), ['Follow up - Open Deal', 'Lost / No Fit', 'No-Show / Rescheduling']);
 check('Appointment Setting offers all 4', g.outcomeActionsFor(APPT).map(a => a.label), ['Open Deal', 'Lost', 'No Fit', 'No show / Rescheduling']);
 check('closers type a short token, never the long stage label', g.outcomeActionsFor(APPT).map(a => a.say), ['open deal', 'lost', 'no fit', 'no show']);
+
+console.log('one-tap emoji — the reaction twin of the typed token');
+check('each action carries its seed emoji', g.outcomeActionsFor(APPT).map(a => a.emojiName), ['telephone_receiver', '-1', 'no_good', 'ghost']);
+check('VSL seeds collapse with its stages (no separate No Fit tap)', g.outcomeActionsFor(VSL).map(a => a.emojiName), ['telephone_receiver', '-1', 'ghost']);
+check('emoji round-trip to outcomes (incl. the thumbsdown alias)',
+  ['telephone_receiver', '-1', 'thumbsdown', 'no_good', 'ghost'].map(e => g.EMOJI_TO_OUTCOME[e]),
+  ['follow_up', 'lost', 'lost', 'disqualified', 'no_show']);
+check('won has no emoji — money is always typed', g.OUTCOME_EMOJI.won, undefined);
+check('no tap emoji collides with the ✅/❌ reaction families',
+  Object.keys(g.EMOJI_TO_OUTCOME).filter(e => ['white_check_mark', 'heavy_check_mark', 'check', 'ballot_box_with_check', 'x', 'no_entry', 'no_entry_sign', 'negative_squared_cross_mark'].includes(e)), []);
 check('an unknown pipeline never guesses a stage id', g.outcomeStageFor('not-a-pipeline', 'lost'), null);
 
 console.log('resolveAppointmentStatus — REVI proves a show; absence never proves a no-show');
@@ -191,26 +201,32 @@ check('and the text still reads as one sentence', /Estado actual: alive\. Plan: 
 check('shows the current GHL stage', /📊 GHL: Call Booked since 2026-08-12/.test(aliveCard), true);
 check('never renders [object Object]', /\[object Object\]/.test(aliveCard), false);
 check('never renders a bare undefined', /undefined/.test(aliveCard), false);
+check('alternatives are taps, minus the proposed outcome', /or tap 👎 \*Lost\* · 🙅 \*No Fit\* · 👻 \*No show \/ Rescheduling\*/.test(aliveCard), true);
+check('the proposed outcome is not doubled as a tap', /📞/.test(aliveCard), false);
 
 const wonCard = g.buildOutcomeCardText({ ...cardBase, proposal: { outcome: null, confidence: 'high', wonHint: true, revenueHint: 3500 } });
 check('a close asks for a typed amount, never a ✅', /Reply `won <amount>`/.test(wonCard), true);
 check('and offers no ✅ move at all', /✅ move to/.test(wonCard), false);
 check('surfaces the amount REVI heard', /REVI heard \$3500/.test(wonCard), true);
+check('a close still offers the taps in case it landed differently', /or tap 📞 \*Open Deal\*/.test(wonCard), true);
 
 const vslCard = g.buildOutcomeCardText({ ...cardBase, pipelineId: VSL, proposal: { outcome: 'follow_up', confidence: 'high', wonHint: false } });
 check('VSL card names the VSL stage', /✅ move to \*Follow up - Open Deal\*/.test(vslCard), true);
-check('VSL card never offers a bare "no fit" the card cannot express', /`no fit`/.test(vslCard), false);
-check('VSL card offers the merged action instead', /`lost`/.test(vslCard), true);
-check('every card offers no-show, so attendance is never a separate DM', /`no show`/.test(vslCard), true);
+check('VSL card never offers a No Fit tap its pipeline cannot express', /🙅/.test(vslCard), false);
+check('VSL card offers the merged tap instead', /👎 \*Lost \/ No Fit\*/.test(vslCard), true);
+check('every card offers no-show, so attendance is never a separate DM', /👻/.test(vslCard), true);
 
 const medCard = g.buildOutcomeCardText({ ...cardBase, rec: null, proposal: { outcome: 'no_show', confidence: 'medium', wonHint: false } });
 check('a medium read is shown, not hidden behind "I can\'t tell"', /Looks like \*No show \/ Rescheduling\*/.test(medCard), true);
-check('but it is never one-tap', /✅ move to/.test(medCard), false);
-check('and it tells the closer the short word to type', /Reply `no show` to confirm/.test(medCard), true);
+check('but ✅ never rubber-stamps it', /✅ move to/.test(medCard), false);
+check('the closer confirms by tapping the outcome\'s own emoji', /tap 👻 to confirm/.test(medCard), true);
+check('the other outcomes stay one tap away too', /Or 📞 \*Open Deal\* · 👎 \*Lost\* · 🙅 \*No Fit\*/.test(medCard), true);
 
 const blindCard = g.buildOutcomeCardText({ ...cardBase, rec: null, proposal: { outcome: null, confidence: 'none', wonHint: false } });
 check('no recording is stated plainly', /No REVI recording found/.test(blindCard), true);
 check('and Max admits it cannot tell', /I can't tell from here/.test(blindCard), true);
+check('but every outcome is still one tap away', /tap 📞 \*Open Deal\* · 👎 \*Lost\* · 🙅 \*No Fit\* · 👻 \*No show \/ Rescheduling\*/.test(blindCard), true);
+check('won stays typed even on a blind card', /reply `won <amount>`/.test(blindCard), true);
 
 console.log('buildReviProspectNote — the read the whole team sees on the GHL contact');
 const noteRec = { durationMin: 74, score: 61, url: 'https://fathom.video/x',
