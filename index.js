@@ -8484,34 +8484,66 @@ function buildWonHandoffNote({ summaryText, callDateStr, closerName, recordingUr
   return lines.join('\n');
 }
 
-// One-shot condensation of REVI's coaching_json into a fulfillment-voice
-// executive summary. Deliberately excludes coaching critique, scores, and
-// money (source sensitivity ≤ surface audience: this lands on a team-visible
-// CRM field; payment figures already live in closing-data columns).
-async function generateWonHandoffSummary({ prospectName, coaching }) {
+// The prompt is a pure function of its own so its rules can be asserted in
+// test/won-handoff-notes.test.js. A prompt reachable only through a live API
+// call is a prompt that drifts silently — the first live run (2026-08-19)
+// broke two rules at once and nothing caught it but a human reading the notes.
+//
+// Two things the first run got wrong, both encoded below:
+//
+// 1. TENSE. REVI scored 3 of the 4 matched calls as `stall`, because the sale
+//    usually closes on a later follow-up REVI never recorded. The summaries
+//    faithfully described the call — "decisión aún no tomada", "el deal está
+//    vivo pero en pausa", "riesgo: la competencia puede ganarlo" — about
+//    clients who had already paid. Fulfillment could not tell client from
+//    prospect. The analysed call is the call that SOLD the deal, not the
+//    moment of the close, and the model has to be told so.
+//
+// 2. MONEY. The blanket "no money amounts" rule was too blunt to hold: it let
+//    "depósito de 500 USD" (our revenue, on a team-visible field) through
+//    while the client's own ticket range and MRR goal — real onboarding
+//    context — were banned by the same clause. Split it: our deal economics
+//    never, the client's business figures always.
+//
+// Still excluded, unchanged: coaching critique and call scores (source
+// sensitivity ≤ surface audience — this lands on a team-visible CRM field).
+function buildWonHandoffPrompt({ prospectName, coaching }) {
+  const c = coaching || {};
   const material = {
-    prospect_name: coaching.prospect_name || prospectName || null,
-    company: coaching.company || null,
-    icp_fit: coaching.icp_fit || null,
-    context: coaching.context || null,
-    general_read: coaching.general_read || null,
-    deal: coaching.deal || null,
-    opportunities: coaching.opportunities || null,
+    prospect_name: c.prospect_name || prospectName || null,
+    company: c.company || null,
+    icp_fit: c.icp_fit || null,
+    context: c.context || null,
+    general_read: c.general_read || null,
+    deal: c.deal || null,
+    opportunities: c.opportunities || null,
   };
-  const prompt = [
+  return [
     'You prepare internal handoff notes for the fulfillment team at NeuroGrowth (B2B LinkedIn organic growth agency).',
-    'A deal just closed. Below is the structured analysis of the closing sales call. Write the executive summary the onboarding team needs to serve this client well.',
+    'This client HAS ALREADY BOUGHT. The deal is won and onboarding is starting — that is settled fact, not something the note may question.',
+    'Below is the analysis of the sales call. That call is the conversation that SOLD the deal, not the moment of the close: deals here routinely close on a later follow-up that was never recorded. So the analysis may still describe the prospect as undecided, the payment as pending, or the deal as at risk of being lost. All of that is HISTORY and has since been resolved. Write the executive summary the onboarding team needs to serve this client well.',
     '',
     'Rules:',
     '- Write in Spanish (the analysis and the team are Spanish-speaking).',
     '- 6 to 10 short lines, each starting with "• ". Plain text only, no markdown.',
     '- Cover, in this order when the material allows: who the client is and what their business does; why they bought / the goal they stated; pains discussed on the call; promises or expectations set on the call; risks or watch-outs for fulfillment; agreed next steps.',
-    '- NEVER include: coaching feedback about the closer, call scores, money amounts, or anything phrased as advice to the sales team. This note is about the CLIENT.',
+    '- NEVER cast doubt on whether the client bought. No "decisión pendiente", no "el deal está en pausa", no "el pago no se procesó", no "pendiente de confirmación", no competitor threats, no urgency about closing. Write about a client, never about a prospect.',
+    '- "Risks" means risks to DELIVERING for this client: expectations that will be hard to meet, a promise made on the call, a partner or spouse who joins onboarding without having heard the pitch. Never the risk of losing the sale — that risk is gone.',
+    '- "Next steps" means what ONBOARDING does next. Drop the closer\'s follow-up actions (send the proposal, collect the balance, call on Wednesday); they are done or they belong to sales.',
+    '- NEVER include money we are paid: deposits, balances, contract value, payment amounts or dates, discounts, commissions. Those live in the closing-data columns and this note is team-visible.',
+    '- DO include the CLIENT\'s own business figures when they describe the business — their offer or ticket price, their revenue or MRR goal, client counts, sales per month. That is context fulfillment needs.',
+    '- NEVER include coaching feedback about the closer, call scores, or anything phrased as advice to the sales team. This note is about the CLIENT.',
     '- If a section has no material, skip it silently. Never invent facts.',
     '',
     'CALL ANALYSIS JSON:',
     JSON.stringify(material),
   ].join('\n');
+}
+
+// One-shot condensation of REVI's coaching_json into a fulfillment-voice
+// executive summary.
+async function generateWonHandoffSummary({ prospectName, coaching }) {
+  const prompt = buildWonHandoffPrompt({ prospectName, coaching });
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 700,

@@ -22,8 +22,8 @@ function check(label, actual, expected) {
   else console.log(`ok   ${label}`);
 }
 
-const { WON_HANDOFF_MARKER, decideWonHandoffStep, buildWonHandoffNote, pickClosingCall } = new Function(
-  `${block}; return { WON_HANDOFF_MARKER, decideWonHandoffStep, buildWonHandoffNote, pickClosingCall };`
+const { WON_HANDOFF_MARKER, decideWonHandoffStep, buildWonHandoffNote, pickClosingCall, buildWonHandoffPrompt } = new Function(
+  `${block}; return { WON_HANDOFF_MARKER, decideWonHandoffStep, buildWonHandoffNote, pickClosingCall, buildWonHandoffPrompt };`
 )();
 
 const COACHING = { icp_fit: 'x' };
@@ -103,6 +103,61 @@ check('only post-win calls → null (never summarize a call that came after)',
 
 // ── Marker constant is what the portal RPC greps for ────────────────────────
 check('marker matches the SQL-side constant', WON_HANDOFF_MARKER, 'RESUMEN LLAMADA DE CIERRE (REVI');
+
+// ── Summary prompt rules ────────────────────────────────────────────────────
+// The first live run (2026-08-19) broke two rules at once and only a human
+// reading the notes caught it. The prompt is pure so the rules are assertable.
+//
+// Real material from that run: REVI scored Fernando Corella's call as a stall
+// (the deal closed on an unrecorded follow-up two days later), and the note
+// came back hedging on whether he had bought.
+const STALL_COACHING = {
+  prospect_name: 'Fernando Corella',
+  company: 'Kryptomite',
+  context: 'Mentoría en finanzas personales, ticket de $1,000–$3,000.',
+  deal: { status: 'stall', recovery: 'Prometió respuesta el miércoles. Tiene llamadas con otros proveedores.' },
+  general_read: 'Alta intención pero decisión aún no tomada.',
+};
+const prompt = buildWonHandoffPrompt({ prospectName: 'Fernando Corella', coaching: STALL_COACHING });
+
+check('prompt states the deal is already won', /ALREADY BOUGHT/.test(prompt), true);
+check('prompt says the analysed call sold the deal, it is not the close',
+  /not the moment of the close/.test(prompt), true);
+check('prompt marks undecided/pending material as resolved history',
+  /HISTORY and has since been resolved/.test(prompt), true);
+check('prompt forbids casting doubt on the purchase', /NEVER cast doubt on whether the client bought/.test(prompt), true);
+check('prompt names the exact hedges the first run emitted',
+  ['decisión pendiente', 'el deal está en pausa', 'el pago no se procesó', 'pendiente de confirmación']
+    .every((s) => prompt.includes(s)), true);
+check('prompt redefines risk as delivery risk, not deal risk',
+  /Never the risk of losing the sale/.test(prompt), true);
+check('prompt scopes next steps to onboarding, not closer follow-ups',
+  /"Next steps" means what ONBOARDING does next/.test(prompt), true);
+
+// Money: ours never, theirs always. The blanket ban leaked "depósito de 500
+// USD" while banning the client's own ticket range — so the split is the rule.
+check('prompt bans money WE are paid', /NEVER include money we are paid/.test(prompt), true);
+check('prompt names our deal economics explicitly',
+  ['deposits', 'balances', 'contract value', 'discounts', 'commissions'].every((s) => prompt.includes(s)), true);
+check('prompt allows the CLIENT\'s own business figures',
+  /DO include the CLIENT's own business figures/.test(prompt), true);
+check('prompt keeps banning coaching and scores',
+  /NEVER include coaching feedback about the closer, call scores/.test(prompt), true);
+
+// Unchanged contract: Spanish, bullet shape, no invention.
+check('prompt still demands Spanish', /Write in Spanish/.test(prompt), true);
+check('prompt still bounds length at 6-10 bullets', /6 to 10 short lines/.test(prompt), true);
+check('prompt still forbids inventing facts', /Never invent facts/.test(prompt), true);
+
+// The material actually reaches the model, and only the whitelisted keys do.
+check('coaching material is embedded for the model', prompt.includes('Kryptomite'), true);
+check('prospect name falls back when coaching omits it',
+  buildWonHandoffPrompt({ prospectName: 'Ana Solís', coaching: { icp_fit: 'x' } }).includes('Ana Solís'), true);
+check('scores are never forwarded as material',
+  buildWonHandoffPrompt({ prospectName: 'X', coaching: { overall_score: 44, criteria_results: ['bad discovery'] } })
+    .includes('criteria_results'), false);
+check('missing coaching degrades to a prompt, not a crash',
+  typeof buildWonHandoffPrompt({ prospectName: 'X' }), 'string');
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nAll won-handoff-note tests passed.');
