@@ -9494,6 +9494,28 @@ async function ghlSetAppointmentStatus(eventId, appointmentStatus) {
   return true;
 }
 
+// Two failures that look identical in a tally need different answers from the
+// human reading the DM. GHL's transient auth blink is real (95 strike sweeps,
+// 18 of 19 contacts 401'd exactly once) — but a token that genuinely lacks a
+// scope 401s the same way, forever. The run itself already holds the evidence
+// that separates them: reads succeeding alongside writes that ALL come back
+// "not authorized for this scope" is a permission fact, not a blink.
+//
+// On 2026-08-20 the sweep 401'd on 4 of 4 writes and the alert sent Ron to the
+// Railway logs hunting a blink that was never there. The token was missing
+// calendars/events.write — which an earlier run had already reported before
+// that diagnosis was retracted on the strength of a by-hand 200 nobody could
+// reproduce. Adding the scope in GHL turned the identical PUT into a 422.
+const GHL_SCOPE_401 = /not authorized for this scope/i;
+function buildApptWriteFailureAlert({ considered = 0, showed = 0, failed = 0, failures = [], readsOk = false } = {}) {
+  const head = `⚠️ Appointment-status sync: ${failed} write(s) failed, ${showed} succeeded (of ${considered} considered).\nAttendance was NOT marked for those calls.`;
+  const allScope = failures.length > 0 && failures.every(m => GHL_SCOPE_401.test(String(m)));
+  if (readsOk && allScope) {
+    return `${head}\nThis is NOT the transient 401 blink — the calendar reads in this same run succeeded, and every write came back "not authorized for this scope". The GHL private integration is missing *calendars/events.write*: GHL → Settings → Private Integrations → ng-pm-agent → Scopes → "Edit Calendar Events - calendars/events.write". The scope takes a few minutes to reach the token; no redeploy is needed unless GHL issues a new token, in which case it goes in Railway GHL_API_KEY too.`;
+  }
+  return `${head}\nCheck the Railway logs for the status code — a GHL 401 blink is retried once and usually clears; a persistent one means the token lost its calendar scope.`;
+}
+
 async function runAppointmentStatusSync(_correlationId) {
   const dryRun = process.env.APPT_STATUS_SYNC_MODE !== 'live';
   console.log(`Running appointment-status sync (${dryRun ? 'DRY RUN' : 'LIVE'})...`);
@@ -9517,6 +9539,7 @@ async function runAppointmentStatusSync(_correlationId) {
     ]);
 
     const conflicts = [];
+    const writeFailures = [];
 
     for (const appt of dueCalls) {
       // Only GHL-native rows carry an event we can write to.
@@ -9556,6 +9579,7 @@ async function runAppointmentStatusSync(_correlationId) {
         console.log(`Appointment ${eventId} (${appt.prospect?.full_name}) → showed`);
       } catch (writeErr) {
         tally.failed += 1;
+        writeFailures.push(writeErr.message);
         console.error(`Appointment-status write failed for ${eventId}:`, writeErr.message);
       }
     }
@@ -9576,14 +9600,23 @@ async function runAppointmentStatusSync(_correlationId) {
       : `✅ ALL GREEN — considered ${tally.considered}, marked showed ${tally.showed}, skipped ${tally.skipped}, deferred to the outcome card ${tally.deferred}`;
     console.log(`Appointment-status sync complete. ${verdict}`);
 
-    // On 2026-08-19 the first live run wrote 0 of 6 (a GHL auth blink) and said
-    // so only in a log line nobody reads — the exact silent-failure shape this
-    // repo keeps re-learning. A run that writes NOTHING while having work to do
-    // now reaches a human. Threshold, not >0, so one transient blink stays quiet.
+    // On 2026-08-19 the first live run wrote 0 of 6 and said so only in a log
+    // line nobody reads — the exact silent-failure shape this repo keeps
+    // re-learning. A run that writes NOTHING while having work to do now reaches
+    // a human. Threshold, not >0, so one transient blink stays quiet.
     if (tally.failed >= 3 || (tally.failed > 0 && tally.showed === 0)) {
       await slack.client.chat.postMessage({
         channel: RON_SLACK_ID,
-        text: `⚠️ Appointment-status sync: ${tally.failed} write(s) failed, ${tally.showed} succeeded (of ${tally.considered} considered).\nAttendance was NOT marked for those calls. Check the Railway logs for the status code — a GHL 401 blink is retried once and usually clears; a persistent one means the token lost its calendar scope.`,
+        // Reads populate statusById; an empty map means the sweep could not read
+        // the calendar either, which is a different (and louder) problem than a
+        // write-only scope gap.
+        text: buildApptWriteFailureAlert({
+          considered: tally.considered,
+          showed: tally.showed,
+          failed: tally.failed,
+          failures: writeFailures,
+          readsOk: Object.keys(statusById).length > 0,
+        }),
       }).catch(() => {});
     }
     return tally;
