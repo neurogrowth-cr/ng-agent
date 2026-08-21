@@ -9863,6 +9863,24 @@ async function dropDispositionedLeads(unclaimed) {
   return kept;
 }
 
+// Test/QA leads must never drive the unclaimed-lead machinery. On 2026-08-21
+// two QA leads ("QA RaceTest BORRAR", "QA NoEmail BORRAR") nagged
+// #ng-sales-goats every hour for a full day, and Ron asked in-thread for
+// suppression. Matching is by WHOLE word (qa/test/borrar/prueba), never
+// substring — a substring match on "qa"/"test" would silently hide real
+// people ("Baqai", "Testa"), and this filter fails in the direction of
+// hiding leads, so it must stay narrow. "QA RaceTest BORRAR" still matches
+// via its freestanding "QA" and "BORRAR" words.
+const TEST_LEAD_NAME_WORDS = new Set(
+  (process.env.STALE_LEAD_TEST_NAME_WORDS || 'qa,test,testing,borrar,prueba')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+);
+
+function isTestLeadName(fullName) {
+  return String(fullName || '').toLowerCase().split(/[^a-z0-9]+/)
+    .some(word => word && TEST_LEAD_NAME_WORDS.has(word));
+}
+
 // Shared query: leads posted since `sinceMs` with no matching setter_claims row.
 // Mirrors the leads-today report's join pattern (two queries + diff in JS —
 // supabase-js has no LEFT JOIN, and nothing else in this file uses raw SQL for it).
@@ -9929,9 +9947,17 @@ async function getUnclaimedLeads(sinceMs) {
     });
   }
   unclaimed.sort((a, b) => new Date(a.postedAt) - new Date(b.postedAt));
+  const testLeads = unclaimed.filter(l => isTestLeadName(l.fullName));
+  if (testLeads.length) {
+    // Log the suppression — a filter that hides leads silently is how the
+    // original 11-day Adrian RM blind spot happened.
+    console.log(`Stale-lead test filter: ${testLeads.length} test lead(s) suppressed: ${testLeads.map(l => l.fullName).join(', ')}.`);
+  }
+  const realLeads = unclaimed.filter(l => !isTestLeadName(l.fullName));
   // Oldest-first before the tag filter, so the lookup cap spends its budget on
-  // the leads that have been sitting longest.
-  return await dropDispositionedLeads(unclaimed);
+  // the leads that have been sitting longest. Test leads are dropped BEFORE
+  // the GHL lookups so they cannot eat into the 50-lookup cap.
+  return await dropDispositionedLeads(realLeads);
 }
 
 // Resolves the @setters Slack user group to its mention string at runtime

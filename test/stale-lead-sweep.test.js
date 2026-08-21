@@ -167,6 +167,46 @@ const names = (rows) => rows.map(r => r.fullName);
     check('10a STALE_LEAD_TERMINAL_TAGS overrides the default set', names(await fn(Date.now() - 30 * DAY)), []);
   }
 
+  // 11. The live 2026-08-21 case: QA test leads are suppressed everywhere the
+  //     shared query feeds (hourly nag + daily sweep), and cost zero GHL
+  //     lookups — they drop before the tag-check budget is spent.
+  {
+    const { fn, lookups } = build({
+      leads: [
+        lead('1755781200.000100', 'qaRace01', 'QA RaceTest BORRAR'),
+        lead('1755781200.000200', 'qaNoEm02', 'QA NoEmail BORRAR'),
+        lead('1755781200.000300', 'real0001', 'Francisco Reyes'),
+      ],
+    });
+    const out = await fn(Date.now() - 30 * DAY);
+    check('11a QA test leads are suppressed, real lead survives', names(out), ['Francisco Reyes']);
+    check('11b suppressed test leads cost no GHL lookups', lookups, ['real0001']);
+  }
+
+  // 12. Whole-word matching only: real names that merely CONTAIN qa/test as a
+  //     substring must never be hidden — this filter fails toward hiding leads.
+  {
+    const { fn } = build({
+      leads: [
+        lead('1.2', 'c1', 'Ahmed Baqai'),
+        lead('1.3', 'c2', 'Teresa Testa'),
+        lead('1.4', 'c3', 'Prueba Uno'),
+      ],
+    });
+    check('12a substring lookalikes survive, whole-word "Prueba" drops',
+      names(await fn(Date.now() - 30 * DAY)), ['Ahmed Baqai', 'Teresa Testa']);
+  }
+
+  // 13. The word list is env-overridable without a code change.
+  {
+    const { fn } = build({
+      leads: [lead('1.5', 'c1', 'Demo Lead'), lead('1.6', 'c2', 'QA Check')],
+      env: { STALE_LEAD_TEST_NAME_WORDS: 'demo' },
+    });
+    check('13a STALE_LEAD_TEST_NAME_WORDS overrides the default word set',
+      names(await fn(Date.now() - 30 * DAY)), ['QA Check']);
+  }
+
   console.log(failures ? `\n${failures} FAILURE(S)` : '\nAll stale-lead sweep checks passed.');
   process.exit(failures ? 1 : 0);
 })();
