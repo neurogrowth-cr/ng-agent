@@ -8992,6 +8992,24 @@ async function logCallOutcomeTool({ prospect, date, outcome, revenue, note }) {
     }
   }
   if (target.existing_outcome) {
+    // follow_up → terminal is the one promotion a human may state through Max
+    // (the open-deal path); everything else stays a deliberate-fix refusal.
+    if (target.existing_outcome === 'follow_up' && OPEN_DEAL_PROMOTABLE.has(outcome)) {
+      const promo = await promoteOpenDealOutcome({
+        appointmentId: target.id,
+        outcome,
+        source: 'closer',
+        notes: note ? `Promoted from follow_up via Max: ${note}` : 'Promoted from follow_up via Max on explicit closer/Ron instruction',
+        closedRevenue: revenue,
+      });
+      if (!promo.ok) {
+        if (promo.reason === 'won_needs_revenue') return 'Promoting to won needs the amount — e.g. revenue: 3500.';
+        if (promo.reason === 'not_promotable') return `Already ${promo.existing?.outcome || 'resolved'} — no change (someone beat us to it).`;
+        if (promo.reason === 'not_configured') return 'Outcome write path not configured (PORTAL_WRITER_DATABASE_URL missing on ng-pm-MAX). Log it in GHL instead and tell Ron.';
+        return `Promotion failed: ${promo.message || promo.reason}`;
+      }
+      return `Promoted ${target.full_name} from follow_up to ${outcome}${revenue ? ` ($${revenue})` : ''}.${promo.statusChange ? ` Prospect status: ${promo.statusChange}.` : ''}${promo.stageMove?.ok ? ` GHL card → ${promo.stageMove.label}.` : ' ⚠️ GHL card move failed — move it by hand.'} Scorecard + portal reflect it immediately.`;
+    }
     return `That call already has an outcome: ${target.existing_outcome} (source: ${target.existing_source}). I never overwrite outcomes — if it's wrong, tell Ron; a correction needs a deliberate fix, not a silent replace.`;
   }
   const result = await logOutcomeToPortal({
@@ -9187,6 +9205,666 @@ async function runProvisioningLagCheck(_correlationId) {
   }
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
   console.log(`Provisioning lag: DMed Ron — ${buckets.lagging.length} lagging, ${buckets.unlinked.length} bridge-miss.`);
+}
+
+// ─── OPEN-DEAL FOLLOW-UP SWEEP ───────────────────────────────────────────────
+// A deal logged `follow_up` moves to the GHL Open Deal stage — and, until this
+// sweep, vanished from every nag surface: the strike mover excludes closer
+// stages by design, the outcome reminders only chase UNLOGGED calls, and the
+// stalled-prospect cron is setter-only. Open deals rotted on closer memory.
+// This sweep makes the system own the follow-up cadence instead: card the
+// owning closer once a deal has sat 3 days, bump every 4 days, let a 💤 tap
+// snooze it a week, and surface zombies to Ron every Monday. Max NEVER writes
+// a terminal outcome on his own — every promotion below traces to a human tap
+// or typed reply.
+// Recipe spec: ~/automations/ops/recipes/open-deal-followup.md
+// ─── open-deal followup pure block ───────────────────────────────────────────
+const OPEN_DEAL_FIRST_NUDGE_DAYS = 3;   // deal must sit this long before the first card
+const OPEN_DEAL_RENUDGE_DAYS     = 4;   // thread-bump cadence once a card exists
+const OPEN_DEAL_SNOOZE_DAYS      = 7;   // one "still working it" buys this long
+const OPEN_DEAL_ZOMBIE_AGE_DAYS  = 21;  // age alone puts a deal in Ron's digest
+const OPEN_DEAL_ZOMBIE_NUDGES    = 3;   // ...as do this many ignored nudges
+const OPEN_DEAL_DIGEST_ONLY_DAYS = 60;  // cold-start guard: too old for a card, digest-only
+const OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN = 3; // backlog drains gradually, never DM-bombs
+const OPEN_DEAL_SANITY_MAX       = 40;  // more zombies than this means the QUERY is broken
+const OPEN_DEAL_LIST_CAP         = 10;  // digest names at most this many per bucket
+// 💤 — verified against every other reaction route: absent from the campaign
+// approve/skip sets, EMOJI_TO_OUTCOME, and the lead-claim emojis. (⏳ was
+// rejected — it is already the remediation claim-lock in ops channels.)
+const OPEN_DEAL_SNOOZE_EMOJI     = 'zzz';
+// The only transition Max will write: a non-terminal follow_up promoted to a
+// terminal answer. no_show/follow_up are refused — the first is nonsense on a
+// deal that already held, the second is where the row already sits.
+const OPEN_DEAL_PROMOTABLE = new Set(['won', 'lost', 'disqualified']);
+
+// Durable per-deal nudge state, one agent_knowledge value per appointment.
+// Versioned pipe encoding so a malformed or legacy value parses to null
+// instead of corrupting cadence math.
+function encodeOpenDealNudgeState(s = {}) {
+  return ['v1', s.firstNudgedISO || '', String(s.nudgeCount || 0), s.lastNudgedISO || '',
+    s.snoozeUntilISO || '', String(s.snoozeCount || 0), s.cardChannel || '', s.cardTs || '',
+    s.driftISO || ''].join('|');
+}
+function parseOpenDealNudgeState(value) {
+  const parts = String(value || '').split('|');
+  if (parts[0] !== 'v1' || parts.length < 8) return null;
+  return {
+    firstNudgedISO: parts[1] || null,
+    nudgeCount:     parseInt(parts[2], 10) || 0,
+    lastNudgedISO:  parts[3] || null,
+    snoozeUntilISO: parts[4] || null,
+    snoozeCount:    parseInt(parts[5], 10) || 0,
+    cardChannel:    parts[6] || null,
+    cardTs:         parts[7] || null,
+    driftISO:       parts[8] || null,
+  };
+}
+
+// The cadence rules, and nothing else — the evaluateStrikeMove twin. All
+// semantics live here with zero I/O so they can be tested as a table.
+function evaluateOpenDealNudge({ ageDays, state, ghlStageTerminal }, now = Date.now()) {
+  if (ghlStageTerminal) return { skip: 'ghl_drift' };
+  if (!state || !state.firstNudgedISO) {
+    if (ageDays >= OPEN_DEAL_DIGEST_ONLY_DAYS) return { skip: 'digest_only' };
+    if (ageDays < OPEN_DEAL_FIRST_NUDGE_DAYS)  return { skip: 'too_fresh' };
+    return { act: 'first_nudge' };
+  }
+  const snoozeUntil = state.snoozeUntilISO ? Date.parse(state.snoozeUntilISO) : 0;
+  if (snoozeUntil && now < snoozeUntil) return { skip: 'snoozed' };
+  const lastNudged = state.lastNudgedISO ? Date.parse(state.lastNudgedISO) : 0;
+  if (lastNudged && now - lastNudged < OPEN_DEAL_RENUDGE_DAYS * 86400000) return { skip: 'renudge_gap' };
+  return { act: 'renudge' };
+}
+
+// Guard for the promotion write. The SQL WHERE clause is the real enforcement
+// (race-safe); this makes the transition rules testable without a database.
+function evaluateOutcomePromotion(currentOutcome, newOutcome, revenue) {
+  if (currentOutcome !== 'follow_up')            return { ok: false, reason: 'not_follow_up' };
+  if (!OPEN_DEAL_PROMOTABLE.has(newOutcome))     return { ok: false, reason: 'not_terminal' };
+  if (newOutcome === 'won' && !(Number(revenue) > 0)) return { ok: false, reason: 'won_needs_revenue' };
+  return { ok: true };
+}
+
+// Typed replies on an open-deal card. Mirrors parseOutcomeReply's shapes for
+// won/lost/no-fit (duplicated here so the pure block stays self-contained) and
+// adds the snooze tokens. `no show` and `open deal` parse to null on purpose —
+// neither is an answer this card can accept — so they fall through to the LLM
+// with the card as context.
+function parseOpenDealReply(text) {
+  const t = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 80) return null; // long texts are conversation, not commands
+  if (/^(snooze[dn]?|still working( on)?( it)?|sigo( en ello| con el| trabajando)?|later|next week)$/.test(t)) return { snooze: true };
+  const won = t.match(/^won\b[\s:$]*([\d.,]+)?\s*(k)?\s*$/i);
+  if (won) {
+    let revenue = null;
+    if (won[1]) {
+      revenue = Number(won[1].replace(/,/g, ''));
+      if (won[2]) revenue *= 1000;
+      if (!Number.isFinite(revenue) || revenue <= 0) revenue = null;
+    }
+    return { outcome: 'won', revenue };
+  }
+  if (/^(no ?fit|dq|disqualified?|lost ?\/ ?no ?fit)$/.test(t)) return { outcome: 'disqualified', revenue: null };
+  if (/^lost$/.test(t))                                        return { outcome: 'lost', revenue: null };
+  return null;
+}
+
+// Buckets the open-deal book for Ron's Monday digest. A snoozed deal still
+// zombie-qualifies by age — the snooze mutes the closer's nudges, never Ron's
+// visibility (the snoozeCount is surfaced so serial snoozers are legible).
+// Rows with unparseable dates are dropped, never NaN'd into the report.
+function classifyOpenDeals(deals, now = Date.now()) {
+  const zombies = [], drift = [];
+  let active = 0, fresh = 0;
+  for (const d of deals || []) {
+    const openedMs = Date.parse(d.openedAt || '');
+    if (!Number.isFinite(openedMs)) continue;
+    const ageDays = Math.floor((now - openedMs) / 86400000);
+    const entry = {
+      display: (d.display || '').trim() || 'Unknown prospect',
+      closer: (d.closer || '').trim() || 'unassigned',
+      ageDays,
+      nudgeCount: d.nudgeCount || 0,
+      snoozeCount: d.snoozeCount || 0,
+    };
+    if (d.driftISO) { drift.push({ ...entry, driftDate: String(d.driftISO).slice(0, 10) }); continue; }
+    if (ageDays >= OPEN_DEAL_ZOMBIE_AGE_DAYS || entry.nudgeCount >= OPEN_DEAL_ZOMBIE_NUDGES) zombies.push(entry);
+    else if (ageDays < OPEN_DEAL_FIRST_NUDGE_DAYS) fresh++;
+    else active++;
+  }
+  zombies.sort((a, b) => b.ageDays - a.ageDays);
+  drift.sort((a, b) => b.ageDays - a.ageDays);
+  return { zombies, drift, active, fresh };
+}
+
+// Renders one open-deal card. Pure — callers pass the pipeline's own action
+// vocabulary — so the exact copy a closer sees is asserted in tests. `won` is
+// never a tap: money is always typed, same convention as the outcome cards.
+function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount, callDateStr, acts, wonLabel }) {
+  const meta = [];
+  if (nudgeCount > 0) meta.push(`nudged ${nudgeCount}×`);
+  if (snoozeCount > 0) meta.push(`snoozed ${snoozeCount}×`);
+  const tapList = (acts || []).map(a => `${a.emoji} *${a.label}*`).join(' · ');
+  return [
+    `🕰️ *${prospectName}* — sitting in *Open Deal* for ${ageDays} days${meta.length ? ` · ${meta.join(' · ')}` : ''}`,
+    `${callDateStr ? `Call was ${callDateStr} CR. ` : ''}This deal is still open — is it going anywhere?`,
+    '',
+    `→ 💤 *Still working it* (snoozes me ${OPEN_DEAL_SNOOZE_DAYS} days — or type \`snooze\`) · ${tapList}`,
+    `→ Closed it? Reply \`won <amount>\` and I'll log *${wonLabel}* — money is always typed, never tapped.`,
+  ].join('\n');
+}
+
+// Renders Ron's Monday digest, or null when there is nothing to say
+// (silent-when-healthy). Fails closed: an implausible zombie count reports the
+// CHECK as broken instead of spamming names.
+function formatOpenDealZombieDigest({ zombies, drift, unmatchedGhl, ghlCheckFailed }) {
+  const z = zombies || [], dr = drift || [];
+  if (!z.length && !dr.length && !(unmatchedGhl > 0)) return null;
+  if (z.length > OPEN_DEAL_SANITY_MAX) {
+    return `*OPEN DEAL ZOMBIES*\n\n⚠️ SANITY BOUND EXCEEDED — ${z.length} open deals qualify as zombies, which is more than plausible. The sweep's query or its state keys are likely broken; not listing names. Check runOpenDealZombieDigest in index.js.`;
+  }
+  const lines = [];
+  if (z.length) {
+    lines.push('*OPEN DEAL ZOMBIES — deals nobody is closing*');
+    for (const e of z.slice(0, OPEN_DEAL_LIST_CAP)) {
+      lines.push(`• ${e.display} — open ${e.ageDays}d — closer ${e.closer} — nudged ${e.nudgeCount}× · snoozed ${e.snoozeCount}×`);
+    }
+    if (z.length > OPEN_DEAL_LIST_CAP) lines.push(`…and ${z.length - OPEN_DEAL_LIST_CAP} more.`);
+  }
+  if (dr.length) {
+    if (lines.length) lines.push('');
+    lines.push('*PORTAL/GHL DRIFT — portal says open deal, GHL card already closed*');
+    for (const e of dr.slice(0, OPEN_DEAL_LIST_CAP)) {
+      lines.push(`• ${e.display} — open ${e.ageDays}d — closer ${e.closer} — GHL closed since ${e.driftDate}`);
+    }
+    if (dr.length > OPEN_DEAL_LIST_CAP) lines.push(`…and ${dr.length - OPEN_DEAL_LIST_CAP} more.`);
+    lines.push('_The portal row still counts these as open — the closer should log the real outcome so the scorecard stops carrying dead deals._');
+  }
+  if (unmatchedGhl > 0) {
+    if (lines.length) lines.push('');
+    lines.push(`📎 ${unmatchedGhl} GHL Open-Deal card(s) have no portal follow-up row — logged outside Max. Ask the closer, or log them through the card flow.`);
+  }
+  if (ghlCheckFailed) {
+    if (lines.length) lines.push('');
+    lines.push('_(GHL cross-check unavailable this run — the 📎 count may be incomplete.)_');
+  }
+  lines.push('');
+  lines.push('Each zombie is one decision: push it to close, or call it lost. The closer can answer right on their card DM.');
+  return lines.join('\n');
+}
+// ─── end open-deal followup pure block ───────────────────────────────────────
+
+// Every open deal, straight from the source of truth: an outcome row still
+// sitting at follow_up. `opened_at` is when that outcome was logged — the
+// moment the deal entered Open Deal. Returns null (not []) when the read-only
+// portal DB is not configured, so callers can tell "no access" from "none".
+async function fetchOpenDeals() {
+  if (!portalPg) return null;
+  const { rows } = await portalPg.query(
+    `SELECT o.appointment_id, o.created_at AS opened_at,
+            a.closer_id, a.scheduled_start,
+            p.id AS prospect_id, p.full_name, p.email,
+            p.ghl_opportunity_id, p.ghl_contact_id
+       FROM revops_sales_outcomes o
+       JOIN revops_appointments a ON a.id = o.appointment_id
+       JOIN revops_prospects p    ON p.id = a.prospect_id
+      WHERE o.outcome = 'follow_up'
+      ORDER BY o.created_at ASC`
+  );
+  return rows;
+}
+
+// Read-only stage lookup for the drift guard. Null on any failure — the caller
+// treats "can't read" as "no drift evidence", never as proof either way.
+async function ghlGetOpportunityStage(oppId) {
+  try {
+    const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+    }, { label: `opp-stage ${oppId}` });
+    if (!res.ok) return null;
+    const opp = (await res.json()).opportunity || {};
+    return { pipelineId: opp.pipelineId || null, pipelineStageId: opp.pipelineStageId || null };
+  } catch (_) { return null; }
+}
+
+// The deliberate second-writer path that logOutcomeToPortal refuses to be.
+// Promotes an existing follow_up row to the terminal outcome a HUMAN stated.
+// The WHERE clause's outcome='follow_up' is the whole safety story: a
+// concurrent promotion (or a dash-side change) zeroes rowCount and nothing is
+// touched. Notes are APPENDED, never replaced — the original follow_up note is
+// audit history. Mirrors logOutcomeToPortal's shape: portal in one
+// transaction, GHL after, honestly reported. Never called by a cron — every
+// caller traces to a tap or a typed reply.
+async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, closedRevenue }) {
+  if (!portalWriterPg) return { ok: false, reason: 'not_configured', message: 'PORTAL_WRITER_DATABASE_URL not set.' };
+  const guard = evaluateOutcomePromotion('follow_up', outcome, closedRevenue);
+  if (!guard.ok) return { ok: false, reason: guard.reason };
+  const client = await portalWriterPg.connect();
+  try {
+    await client.query('BEGIN');
+    const upd = await client.query(
+      `UPDATE revops_sales_outcomes
+          SET outcome = $2, source = $3,
+              notes = trim(both E'\\n' from coalesce(notes, '') || E'\\n' || $4),
+              closed_revenue = COALESCE($5, closed_revenue),
+              close_date = CASE WHEN $2 = 'won' THEN (now() AT TIME ZONE 'America/Costa_Rica')::date ELSE close_date END
+        WHERE appointment_id = $1 AND outcome = 'follow_up'
+        RETURNING id`,
+      [appointmentId, outcome, notes || '', closedRevenue == null ? null : Number(closedRevenue)]
+    );
+    if (!upd.rowCount) {
+      await client.query('ROLLBACK');
+      const { rows } = await client.query('SELECT outcome, source FROM revops_sales_outcomes WHERE appointment_id = $1', [appointmentId]);
+      return { ok: false, reason: 'not_promotable', existing: rows[0] || null };
+    }
+    let statusChange = null;
+    let opportunityId = null;
+    let ghlContactId = null;
+    const { rows: prow } = await client.query(
+      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      [appointmentId]
+    );
+    if (prow.length) {
+      opportunityId = prow[0].ghl_opportunity_id || null;
+      ghlContactId = prow[0].ghl_contact_id || null;
+      const next = nextProspectStatusForOutcome(outcome, prow[0].status);
+      if (next) {
+        await client.query('UPDATE revops_prospects SET status = $1, updated_at = now() WHERE id = $2', [next, prow[0].id]);
+        statusChange = `${prow[0].status} → ${next}`;
+      }
+    }
+    await client.query('COMMIT');
+
+    // Portal first, GHL second, outside the transaction — same reasoning as
+    // logOutcomeToPortal: the portal row is what every report reads, so a GHL
+    // hiccup must never roll back a promotion. No attendance write here — it
+    // was already set when follow_up was first logged.
+    let stageMove = null;
+    if (!opportunityId && ghlContactId) {
+      opportunityId = await ghlFindSalesOpportunityByContact(ghlContactId);
+    }
+    if (opportunityId) {
+      try {
+        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome);
+      } catch (moveErr) {
+        stageMove = { ok: false, message: moveErr.message };
+      }
+    } else {
+      stageMove = { ok: false, message: 'no GHL opportunity found for the prospect' };
+    }
+    return { ok: true, outcomeId: upd.rows[0].id, statusChange, stageMove };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    return { ok: false, reason: 'error', message: err.message };
+  } finally {
+    client.release();
+  }
+}
+
+// One snooze: push snoozeUntil out, count it, confirm in-thread. Shared by the
+// 💤 tap and the typed `snooze` token. The reaction cycle at the end is
+// best-effort — reaction_added only fires on ADD, so Max re-seeds his own 💤;
+// the typed token is the always-works retap path (and the card says so).
+async function applyOpenDealSnooze({ payload, channel, cardTs, threadTs }) {
+  const key = `open-deal-nudge:${payload.appointment_id}`;
+  const { data: existing } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
+  const state = parseOpenDealNudgeState(existing && existing[0] && existing[0].value) || {};
+  const until = new Date(Date.now() + OPEN_DEAL_SNOOZE_DAYS * 86400000);
+  state.snoozeUntilISO = until.toISOString();
+  state.snoozeCount = (state.snoozeCount || 0) + 1;
+  state.cardChannel = state.cardChannel || channel;
+  state.cardTs = state.cardTs || cardTs;
+  await upsertKnowledge('process', key, encodeOpenDealNudgeState(state), 'open-deal-nudge');
+  const untilStr = until.toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric' });
+  await slack.client.chat.postMessage({
+    channel, thread_ts: threadTs,
+    text: `😴 Snoozed until ${untilStr} (snooze #${state.snoozeCount} — Ron sees the count). Reply \`won <amount>\` / \`lost\` / \`no fit\` anytime to close it out.`,
+  });
+  await slack.client.reactions.remove({ channel, timestamp: cardTs, name: OPEN_DEAL_SNOOZE_EMOJI }).catch(() => {});
+  await slack.client.reactions.add({ channel, timestamp: cardTs, name: OPEN_DEAL_SNOOZE_EMOJI }).catch(() => {});
+}
+
+// Shared tail of every open-deal promotion: mark the card resolved, stamp it,
+// and report honestly — including the ⚠️ when the portal row promoted but the
+// GHL move did not. The reportOutcomeCardResult sibling, speaking promotion
+// vocabulary (`not_promotable` instead of `exists`).
+async function reportOpenDealCardResult({ channel, ts, payload, result, outcome, revenue }) {
+  const stages = GHL_OUTCOME_STAGES[payload.pipeline_id] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+  const label = stages[outcome]?.label || String(outcome).replace('_', ' ');
+  const todayISO = new Date().toISOString().slice(0, 10);
+  if (result.ok) {
+    await upsertKnowledge('process', `open-deal-nudge:${payload.appointment_id}`, `resolved|${todayISO}|${outcome}`, 'open-deal-nudge');
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
+    const move = result.stageMove;
+    const moveNote = move?.ok
+      ? (move.already ? ` GHL card was already in *${move.label}*.` : ` Moved the GHL card to *${move.label}*.`)
+      : ` ⚠️ Logged in the portal, but I couldn't move the GHL card (${move?.message || 'unknown error'}) — please move it by hand.`;
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}*${revenue ? ` ($${revenue})` : ''} for ${payload.prospect_name} — that deal is off my follow-up list.${statusNote}${moveNote}` });
+  } else if (result.reason === 'not_promotable') {
+    // Someone else already resolved it (dash, another card, a race) — that is
+    // a finished deal, not an error. Stamp it so the card stops accepting taps.
+    await upsertKnowledge('process', `open-deal-nudge:${payload.appointment_id}`, `resolved|${todayISO}|${result.existing?.outcome || 'external'}`, 'open-deal-nudge');
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `This deal is already *${result.existing?.outcome || 'resolved'}* (source: ${result.existing?.source || '?'}) — no change needed.` });
+  } else if (result.reason === 'won_needs_revenue') {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: 'Logging won needs the amount — reply `won 3500`.' });
+  } else {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Couldn't log it: ${result.message || result.reason}. Log it in GHL directly, or tell Ron the outcome write path is down.` });
+    if (result.reason === 'not_configured') {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: '⚠️ Open-deal card write failed: PORTAL_WRITER_DATABASE_URL is not set on ng-pm-MAX, so open-deal promotions are dead. The follow-up cards are still going out.' }).catch(() => {});
+    }
+  }
+}
+
+// A reaction on an open-deal card. Ownership and idempotency mirror
+// handleOutcomeProposalReaction; the verbs are this card's own: 💤 snoozes,
+// 👎/🙅 promote to lost/no-fit, everything else gets an explanation. There is
+// deliberately no dismiss — an open deal stays on the list until it is won,
+// lost, or snoozed; that is the entire point of the feature.
+async function handleOpenDealFollowupReaction(event, baseEmoji, dmMsg, payload) {
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+  const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
+  if (event.user !== RON_SLACK_ID && event.user !== expectedSlackId) {
+    console.log(`open-deal card ${payload.appointment_id}: reaction from ${event.user} is not the owning closer, ignoring`);
+    return;
+  }
+  const actioned = (dmMsg.reactions || []).find(r =>
+    ['white_check_mark', 'warning'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+  if (actioned) {
+    console.log(`open-deal card ${payload.appointment_id} already actioned, ignoring`);
+    return;
+  }
+  if (baseEmoji === OPEN_DEAL_SNOOZE_EMOJI) {
+    await applyOpenDealSnooze({ payload, channel, cardTs: ts, threadTs: ts });
+    return;
+  }
+  const tapped = EMOJI_TO_OUTCOME[baseEmoji];
+  if (tapped && OPEN_DEAL_PROMOTABLE.has(tapped)) {
+    const result = await promoteOpenDealOutcome({
+      appointmentId: payload.appointment_id,
+      outcome: tapped,
+      source: 'closer',
+      notes: `Promoted from follow_up via one-tap ${OUTCOME_EMOJI[tapped].char} on the open-deal card by <@${event.user}> (prospect: ${payload.prospect_name})`,
+    });
+    await reportOpenDealCardResult({ channel, ts, payload, result, outcome: tapped });
+    return;
+  }
+  // ✅ / ❌ / 📞 / 👻 — none of them answer this card.
+  await slack.client.chat.postMessage({
+    channel, thread_ts: ts,
+    text: `This card has no proposal to confirm and doesn't dismiss — an open deal stays on my list until it's won, lost, or snoozed. 💤 snoozes ${OPEN_DEAL_SNOOZE_DAYS} days · 👎/🙅 close it out · reply \`won <amount>\` for a win.`,
+  });
+}
+
+// A typed reply in an open-deal card's thread. Deterministic like the outcome
+// cards: the card knows its appointment, so `lost` or `won 3500` is
+// unambiguous. Returns true when fully handled, a context string when the text
+// is conversational (handed to the LLM), matching handleOutcomeCardThreadReply.
+async function handleOpenDealCardThreadReply(message, say, payload) {
+  const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
+  if (message.user !== RON_SLACK_ID && message.user !== expectedSlackId) {
+    return `[CONTEXT: reply in the open-deal follow-up thread for prospect ${payload.prospect_name}, but the sender is not the owning closer — do not log or promote an outcome from this.]`;
+  }
+  const parsed = parseOpenDealReply(message.text);
+  if (!parsed) {
+    return `[CONTEXT: this message is a reply in the open-deal follow-up thread for prospect ${payload.prospect_name} (appointment_id ${payload.appointment_id}, outcome currently follow_up). Do NOT use log_call_outcome here — it refuses existing rows. If the user states the deal's resolution in their own words, tell them to answer on the card: tap 👎/🙅, or type won <amount> / lost / no fit / snooze in this thread.]`;
+  }
+  if (parsed.snooze) {
+    await applyOpenDealSnooze({ payload, channel: message.channel, cardTs: message.thread_ts, threadTs: message.thread_ts });
+    return true;
+  }
+  if (parsed.outcome === 'won' && !parsed.revenue) {
+    await say({ text: 'Almost — logging won needs the real amount: `won 3500`.', thread_ts: message.thread_ts });
+    return true;
+  }
+  const result = await promoteOpenDealOutcome({
+    appointmentId: payload.appointment_id,
+    outcome: parsed.outcome,
+    source: 'closer',
+    notes: `Promoted from follow_up — typed on the open-deal card by <@${message.user}> (prospect: ${payload.prospect_name})`,
+    closedRevenue: parsed.revenue,
+  });
+  await reportOpenDealCardResult({ channel: message.channel, ts: message.thread_ts, payload, result, outcome: parsed.outcome, revenue: parsed.revenue });
+  return true;
+}
+
+// The sweep — see cron registration below. Mode is OPEN_DEAL_SWEEP_MODE:
+// 'dry_run' (default — computes everything, DMs no closers, writes no state,
+// sends Ron one summary) | 'live'. Same arming pattern as STRIKE_MOVER_MODE.
+async function runOpenDealFollowupSweep(correlationId) {
+  const mode = (process.env.OPEN_DEAL_SWEEP_MODE || '').toLowerCase() === 'live' ? 'live' : 'dry_run';
+  const isLive = mode === 'live';
+  const now = Date.now();
+  const deals = await fetchOpenDeals();
+  if (deals === null) { console.log('Open-deal sweep: portal read-only DB not configured, skipping.'); return; }
+  if (!deals.length)  { console.log('Open-deal sweep: healthy — 0 open deals.'); return; }
+
+  const keys = deals.map(d => `open-deal-nudge:${d.appointment_id}`);
+  const stateByKey = {};
+  for (let i = 0; i < keys.length; i += 100) {
+    const { data } = await supabase.from('agent_knowledge').select('key, value').in('key', keys.slice(i, i + 100));
+    for (const row of (data || [])) stateByKey[row.key] = row.value;
+  }
+
+  const byCloser = {};
+  for (const d of deals) {
+    const email = d.closer_id || 'unassigned';
+    (byCloser[email] = byCloser[email] || []).push(d);
+  }
+
+  const skipCounts = {};
+  const bumpSkip = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
+  const dryLines = [];
+  let cardsSent = 0, bumpsSent = 0, driftFound = 0;
+
+  for (const [closerEmail, closerDeals] of Object.entries(byCloser)) {
+    const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
+    if (!slackId) {
+      console.warn(`Open-deal sweep: no Slack ID for closer ${closerEmail} (${closerDeals.length} deal(s)) — digest still sees them`);
+      bumpSkip('no_slack_id');
+      continue;
+    }
+    let newCards = 0;
+    closerDeals.sort((a, b) => String(a.opened_at).localeCompare(String(b.opened_at))); // oldest first
+    for (const deal of closerDeals) {
+      const key = `open-deal-nudge:${deal.appointment_id}`;
+      const state = parseOpenDealNudgeState(stateByKey[key]);
+      const openedMs = Date.parse(deal.opened_at || '');
+      if (!Number.isFinite(openedMs)) { bumpSkip('bad_date'); continue; }
+      const ageDays = Math.floor((now - openedMs) / 86400000);
+      let decision = evaluateOpenDealNudge({ ageDays, state, ghlStageTerminal: false }, now);
+      if (decision.skip) { bumpSkip(decision.skip); continue; }
+      if (decision.act === 'first_nudge' && newCards >= OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN) { bumpSkip('closer_cap'); continue; }
+
+      // Drift guard — only for deals we'd act on, so GHL reads stay bounded. A
+      // card the closer already dragged to a terminal stage must not be nudged
+      // (that would be noise); the portal/GHL disagreement is Ron's to see in
+      // the Monday digest, via the driftISO marker.
+      let oppId = deal.ghl_opportunity_id || null;
+      if (!oppId && deal.ghl_contact_id) oppId = await ghlFindSalesOpportunityByContact(deal.ghl_contact_id);
+      const ghlStage = oppId ? await ghlGetOpportunityStage(oppId) : null;
+      const pipelineId = (ghlStage && GHL_OUTCOME_STAGES[ghlStage.pipelineId]) ? ghlStage.pipelineId : GHL_PIPELINE.APPT_SETTING;
+      decision = evaluateOpenDealNudge({
+        ageDays, state,
+        ghlStageTerminal: !!(ghlStage && GHL_TERMINAL_STAGE_IDS.has(ghlStage.pipelineStageId)),
+      }, now);
+      if (decision.skip === 'ghl_drift') {
+        driftFound += 1;
+        bumpSkip('ghl_drift');
+        if (isLive) {
+          const s = state || {};
+          if (!s.driftISO) {
+            s.driftISO = new Date(now).toISOString();
+            await upsertKnowledge('process', key, encodeOpenDealNudgeState(s), 'open-deal-nudge');
+          }
+        }
+        continue;
+      }
+      if (decision.skip) { bumpSkip(decision.skip); continue; }
+
+      const pName = deal.full_name || deal.email || 'Unknown prospect';
+      if (!isLive) {
+        dryLines.push(`• ${pName} — ${decision.act === 'first_nudge' ? 'would card' : 'would bump'} (open ${ageDays}d, closer ${resolveSalesMember(closerEmail)})`);
+        if (decision.act === 'first_nudge') newCards += 1;
+        continue;
+      }
+
+      if (decision.act === 'renudge' && state && state.cardChannel && state.cardTs) {
+        try {
+          await slack.client.chat.postMessage({
+            channel: state.cardChannel, thread_ts: state.cardTs,
+            text: `🕰️ Day ${ageDays} in Open Deal — still working it? 💤 on the card (or type \`snooze\`) buys ${OPEN_DEAL_SNOOZE_DAYS} days · 👎/🙅 close it out · \`won <amount>\` logs the win.`,
+          });
+          state.nudgeCount += 1;
+          state.lastNudgedISO = new Date(now).toISOString();
+          await upsertKnowledge('process', key, encodeOpenDealNudgeState(state), 'open-deal-nudge');
+          bumpsSent += 1;
+          continue;
+        } catch (err) {
+          // Thread gone (message purged)? Fall through and send a fresh card.
+          console.error(`Open-deal bump for ${pName} failed (${err.message}) — sending a fresh card`);
+        }
+      }
+
+      if (newCards >= OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN) { bumpSkip('closer_cap'); continue; }
+      const acts = outcomeActionsFor(pipelineId).filter(a => a.outcome === 'lost' || a.outcome === 'disqualified');
+      const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
+      const prev = state || {};
+      const text = buildOpenDealCardText({
+        prospectName: pName, ageDays,
+        nudgeCount: prev.nudgeCount || 0, snoozeCount: prev.snoozeCount || 0,
+        callDateStr: deal.scheduled_start ? formatICTime(deal.scheduled_start, { month: 'short', day: 'numeric' }) : '',
+        acts, wonLabel: stages.won.label,
+      });
+      try {
+        const posted = await slack.client.chat.postMessage({
+          channel: slackId, text,
+          metadata: {
+            event_type: 'open_deal_followup',
+            event_payload: {
+              appointment_id: deal.appointment_id,
+              prospect_name: pName,
+              closer_email: closerEmail,
+              pipeline_id: pipelineId,
+              opened_at: deal.opened_at,
+            },
+          },
+        });
+        await upsertKnowledge('process', key, encodeOpenDealNudgeState({
+          firstNudgedISO: prev.firstNudgedISO || new Date(now).toISOString(),
+          nudgeCount: (prev.nudgeCount || 0) + 1,
+          lastNudgedISO: new Date(now).toISOString(),
+          snoozeUntilISO: '',
+          snoozeCount: prev.snoozeCount || 0,
+          cardChannel: posted.channel || slackId,
+          cardTs: posted.ts || '',
+          driftISO: '',
+        }), 'open-deal-nudge');
+        // Pre-seed 💤 + the pipeline's own close verbs so answering is one tap.
+        // posted.channel is the D-channel id (reactions.add rejects user ids).
+        for (const name of [OPEN_DEAL_SNOOZE_EMOJI, ...acts.map(a => a.emojiName)]) {
+          await slack.client.reactions.add({ channel: posted.channel || slackId, timestamp: posted.ts, name }).catch(() => {});
+        }
+        cardsSent += 1;
+        newCards += 1;
+      } catch (err) {
+        console.error(`Open-deal card DM for ${pName} failed:`, err.message);
+        bumpSkip('dm_failed');
+      }
+    }
+  }
+
+  logActivity({
+    event_type: 'open_deal_sweep', event_source: 'cron', action: 'runOpenDealFollowupSweep',
+    correlation_id: correlationId,
+    metadata: { mode, open_deals: deals.length, cards: cardsSent, bumps: bumpsSent, drift: driftFound, skips: skipCounts },
+  });
+
+  if (!isLive && dryLines.length) {
+    const summary = [
+      'OPEN-DEAL FOLLOW-UP SWEEP — DRY RUN', '',
+      `Open deals: ${deals.length} | Would send: ${dryLines.length}`, '',
+      ...dryLines.slice(0, 25),
+      dryLines.length > 25 ? `• …and ${dryLines.length - 25} more.` : '',
+      '', 'Set OPEN_DEAL_SWEEP_MODE=live on Railway to arm the closer DMs.',
+    ].filter(Boolean);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary.join('\n') })
+      .catch(err => console.error('Open-deal dry-run summary failed:', err.message));
+  }
+  const skipBreakdown = Object.entries(skipCounts).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+  console.log(`runOpenDealFollowupSweep done — ${deals.length} open, ${isLive ? `sent ${cardsSent} card(s) + ${bumpsSent} bump(s)` : `would send ${dryLines.length}`}, drift ${driftFound}, skips: ${skipBreakdown} (mode=${mode})`);
+}
+
+// Ron's Monday zombie digest. Always on (it never DMs closers), even while the
+// sweep is still in dry-run — the backlog picture is the point. Silent when
+// healthy, with a liveness log line the cron audit can read.
+async function runOpenDealZombieDigest(correlationId) {
+  const now = Date.now();
+  const deals = await fetchOpenDeals();
+  if (deals === null) { console.log('Open-deal digest: portal read-only DB not configured, skipping.'); return; }
+
+  const keys = deals.map(d => `open-deal-nudge:${d.appointment_id}`);
+  const stateByKey = {};
+  for (let i = 0; i < keys.length; i += 100) {
+    const { data } = await supabase.from('agent_knowledge').select('key, value').in('key', keys.slice(i, i + 100));
+    for (const row of (data || [])) stateByKey[row.key] = row.value;
+  }
+  const enriched = deals.map((d) => {
+    const state = parseOpenDealNudgeState(stateByKey[`open-deal-nudge:${d.appointment_id}`]);
+    return {
+      display: d.full_name || d.email || 'Unknown prospect',
+      closer: resolveSalesMember(d.closer_id),
+      openedAt: d.opened_at,
+      nudgeCount: state ? state.nudgeCount : 0,
+      snoozeCount: state ? state.snoozeCount : 0,
+      driftISO: state ? state.driftISO : null,
+    };
+  });
+  const buckets = classifyOpenDeals(enriched, now);
+
+  // Cross-check the OTHER direction: GHL Open-Deal cards with no portal
+  // follow-up row (hand-dragged, or logged outside Max). Count only — these
+  // have no appointment_id to promote against, so v1 makes the gap visible
+  // rather than pretending it doesn't exist. Fail-soft: a GHL error degrades
+  // this line, never kills the digest.
+  let unmatchedGhl = 0, ghlCheckFailed = false;
+  try {
+    const known = new Set();
+    for (const d of deals) {
+      if (d.ghl_opportunity_id) known.add(d.ghl_opportunity_id);
+      if (d.ghl_contact_id) known.add(d.ghl_contact_id);
+    }
+    const openDealOpps = [
+      ...await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING].follow_up.id, { pipelineId: GHL_PIPELINE.APPT_SETTING }),
+      ...await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.VSL].follow_up.id, { pipelineId: GHL_PIPELINE.VSL }),
+    ];
+    for (const o of openDealOpps) {
+      const contactId = o.contactId || (o.contact && o.contact.id) || null;
+      if (!known.has(o.id) && !(contactId && known.has(contactId))) unmatchedGhl += 1;
+    }
+  } catch (err) {
+    ghlCheckFailed = true;
+    console.error('Open-deal digest: GHL cross-check unavailable:', err.message);
+  }
+
+  const message = formatOpenDealZombieDigest({ zombies: buckets.zombies, drift: buckets.drift, unmatchedGhl, ghlCheckFailed });
+  logActivity({
+    event_type: 'alert', event_source: 'cron', action: 'runOpenDealZombieDigest',
+    status: message ? 'gap' : 'ok', correlation_id: correlationId,
+    metadata: {
+      open_deals: deals.length, zombies: buckets.zombies.length, drift: buckets.drift.length,
+      active: buckets.active, unmatched_ghl: unmatchedGhl, ghl_check_failed: ghlCheckFailed,
+    },
+  });
+  if (!message) {
+    console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift${ghlCheckFailed ? ' (GHL cross-check unavailable)' : ''}.`);
+    return;
+  }
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
+  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.drift.length} drift, ${unmatchedGhl} unmatched GHL card(s).`);
 }
 
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
@@ -10490,6 +11168,16 @@ cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) 
 // the kill switch).
 // Weekly provisioning-lag nag — Mon 8:30 AM CR, after the 7 AM leaderboard.
 cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => { await runProvisioningLagCheck(c); }), { timezone: 'America/Costa_Rica' });
+
+// Open-deal follow-up sweep — 10 AM CR Mon–Fri, after the 9 AM standups. Cards
+// closers about deals sitting in Open Deal 3+ days, thread-bumps every 4 days,
+// a 💤 tap snoozes 7. Ships in dry-run: OPEN_DEAL_SWEEP_MODE=live arms the
+// closer DMs (also the kill switch). Generous timeout — it does per-candidate
+// GHL drift reads. The Monday 8:45 zombie digest to Ron runs regardless of
+// mode, landing right after the 8:30 provisioning-lag nag so Ron's Monday
+// admin DMs arrive together.
+cron.schedule('0 10 * * 1-5', wrapCronJob('runOpenDealFollowupSweep', async (c) => { await runOpenDealFollowupSweep(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('45 8 * * 1', wrapCronJob('runOpenDealZombieDigest', async (c) => { await runOpenDealZombieDigest(c); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { await runWonHandoffNotes(c); }), { timezone: 'America/Costa_Rica' });
 
 // Stale-lead nag check — every 30 min, 7 AM–9 PM CR (business hours only). Nags
@@ -11839,13 +12527,13 @@ async function ghlFetchJson(url) {
 
 // Pages a whole stage. Uses the meta.startAfter/startAfterId cursor rather than
 // meta.nextPageUrl so the location/pipeline filters can't drift between pages.
-async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40 } = {}) {
+async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40, pipelineId = STRIKE_PIPELINE_ID } = {}) {
   const locationId = process.env.GHL_LOCATION_ID;
   const out = [];
   let startAfter = null, startAfterId = null;
   for (let page = 0; page < maxPages; page++) {
     let url = `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}`
-            + `&pipeline_id=${STRIKE_PIPELINE_ID}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
+            + `&pipeline_id=${pipelineId}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
     if (startAfter && startAfterId) url += `&startAfter=${startAfter}&startAfterId=${startAfterId}`;
     const data  = await ghlFetchJson(url);
     const batch = data.opportunities || [];
@@ -13870,6 +14558,8 @@ const STATIC_CRON_SCHEDULES = {
   runFulfillmentStandup:        '0 9 * * 1-5',
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
+  runOpenDealFollowupSweep:     '0 10 * * 1-5',
+  runOpenDealZombieDigest:      '45 8 * * 1',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
@@ -14124,7 +14814,11 @@ async function handleOutcomeCardThreadReply(message, say) {
     console.log('outcome-card thread lookup failed (falling back to LLM):', err.message);
     return false;
   }
-  if (parent?.metadata?.event_type !== 'outcome_proposal' || !parent.metadata.event_payload) return false;
+  if (!parent?.metadata?.event_payload) return false;
+  if (parent.metadata.event_type === 'open_deal_followup') {
+    return handleOpenDealCardThreadReply(message, say, parent.metadata.event_payload);
+  }
+  if (parent.metadata.event_type !== 'outcome_proposal') return false;
   const payload = parent.metadata.event_payload;
 
   const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
@@ -14162,7 +14856,20 @@ async function handleOutcomeCardThreadReply(message, say) {
     const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}*.` : '';
     await say({ text: `Logged *${label}*${parsed.revenue ? ` ($${parsed.revenue})` : ''} for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}`, thread_ts: message.thread_ts });
   } else if (result.reason === 'exists') {
-    await say({ text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.`, thread_ts: message.thread_ts });
+    // The one legitimate second write: a follow_up row promoted to the
+    // terminal outcome the closer just stated. Anything else stays refused.
+    if (result.existing?.outcome === 'follow_up' && OPEN_DEAL_PROMOTABLE.has(parsed.outcome)) {
+      const promo = await promoteOpenDealOutcome({
+        appointmentId: payload.appointment_id,
+        outcome: parsed.outcome,
+        source: 'closer',
+        notes: `Promoted from follow_up — typed on the outcome card by <@${message.user}> (prospect: ${payload.prospect_name})`,
+        closedRevenue: parsed.revenue,
+      });
+      await reportOpenDealCardResult({ channel: message.channel, ts: message.thread_ts, payload, result: promo, outcome: parsed.outcome, revenue: parsed.revenue });
+    } else {
+      await say({ text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.`, thread_ts: message.thread_ts });
+    }
   } else if (result.reason === 'won_needs_revenue') {
     await say({ text: 'Logging won needs the amount — `won 3500`.', thread_ts: message.thread_ts });
   } else {
@@ -14192,6 +14899,18 @@ async function reportOutcomeCardResult({ channel, ts, payload, result, outcome }
     const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}* — that's Paso 1 done too.` : '';
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}* for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}` });
   } else if (result.reason === 'exists') {
+    // A tapped terminal answer on a card whose row already says follow_up is
+    // the open-deal papercut — promote it instead of stonewalling the closer.
+    if (result.existing?.outcome === 'follow_up' && OPEN_DEAL_PROMOTABLE.has(outcome)) {
+      const promo = await promoteOpenDealOutcome({
+        appointmentId: payload.appointment_id,
+        outcome,
+        source: 'closer',
+        notes: `Promoted from follow_up via the outcome card by the closer (prospect: ${payload.prospect_name})`,
+      });
+      await reportOpenDealCardResult({ channel, ts, payload, result: promo, outcome });
+      return;
+    }
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Already logged as *${result.existing?.outcome || 'unknown'}* (source: ${result.existing?.source || '?'}) — I never overwrite, so no change.` });
   } else {
@@ -14286,7 +15005,7 @@ slack.event('reaction_added', async ({ event }) => {
     // Only intercepts messages whose metadata says outcome_proposal; every
     // other DM reaction falls through to Route 1 untouched.
     if (String(event.item.channel || '').startsWith('D') &&
-        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji) || EMOJI_TO_OUTCOME[baseEmoji])) {
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji) || EMOJI_TO_OUTCOME[baseEmoji] || baseEmoji === OPEN_DEAL_SNOOZE_EMOJI)) {
       try {
         const hist = await slack.client.conversations.history({
           channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
@@ -14294,6 +15013,10 @@ slack.event('reaction_added', async ({ event }) => {
         const msg = hist.messages && hist.messages[0];
         if (msg?.metadata?.event_type === 'outcome_proposal' && msg.metadata.event_payload) {
           await handleOutcomeProposalReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+        if (msg?.metadata?.event_type === 'open_deal_followup' && msg.metadata.event_payload) {
+          await handleOpenDealFollowupReaction(event, baseEmoji, msg, msg.metadata.event_payload);
           return;
         }
       } catch (opErr) {
