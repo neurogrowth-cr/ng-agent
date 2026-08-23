@@ -11169,14 +11169,15 @@ cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) 
 // Weekly provisioning-lag nag — Mon 8:30 AM CR, after the 7 AM leaderboard.
 cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => { await runProvisioningLagCheck(c); }), { timezone: 'America/Costa_Rica' });
 
-// Open-deal follow-up sweep — 10 AM CR Mon–Fri, after the 9 AM standups. Cards
+// Open-deal follow-up sweep — 10 AM CR every day (deals go stale on weekends
+// too — Ron, 2026-08-23), after the 9 AM standups. Cards
 // closers about deals sitting in Open Deal 3+ days, thread-bumps every 4 days,
 // a 💤 tap snoozes 7. Ships in dry-run: OPEN_DEAL_SWEEP_MODE=live arms the
 // closer DMs (also the kill switch). Generous timeout — it does per-candidate
 // GHL drift reads. The Monday 8:45 zombie digest to Ron runs regardless of
 // mode, landing right after the 8:30 provisioning-lag nag so Ron's Monday
 // admin DMs arrive together.
-cron.schedule('0 10 * * 1-5', wrapCronJob('runOpenDealFollowupSweep', async (c) => { await runOpenDealFollowupSweep(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 10 * * *', wrapCronJob('runOpenDealFollowupSweep', async (c) => { await runOpenDealFollowupSweep(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 cron.schedule('45 8 * * 1', wrapCronJob('runOpenDealZombieDigest', async (c) => { await runOpenDealZombieDigest(c); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { await runWonHandoffNotes(c); }), { timezone: 'America/Costa_Rica' });
 
@@ -14558,7 +14559,7 @@ const STATIC_CRON_SCHEDULES = {
   runFulfillmentStandup:        '0 9 * * 1-5',
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
-  runOpenDealFollowupSweep:     '0 10 * * 1-5',
+  runOpenDealFollowupSweep:     '0 10 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
