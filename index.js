@@ -14928,6 +14928,108 @@ function dowMaxGapDays(dow) {
   return max;
 }
 
+// ─── NEXT-FIRE ARITHMETIC ────────────────────────────────────────────────────
+// When does this expression fire next, and when did it last have the chance?
+//
+// Written after a session told Ron a weekdays-only sweep would first run
+// "tomorrow", scheduled its own verification for the next morning, woke up on a
+// Saturday, and spent ten minutes diagnosing a cron that had correctly not run.
+// A fire time nobody derives from the expression is a guess; this makes it
+// arithmetic, so the audit can state its own next run and tell a brand-new job
+// apart from a dead one.
+//
+// Deliberately small — a field parser and a minute walker, no dependency and no
+// general-purpose cron library, matching the no-parser spirit of
+// expectedMaxGapHours above. Costa Rica is UTC−6 with no DST (the same
+// assumption formatICTime makes), so CR wall clock is UTC shifted by a constant
+// and a Date built on the shifted epoch carries CR fields in its getUTC* views.
+const CR_UTC_OFFSET_MS = 6 * 60 * 60 * 1000;
+const CRON_FIRE_HORIZON_MINUTES = 400 * 24 * 60; // longer than any gap Max registers
+
+// "*" | "5" | "1-5" | "*/10" | "7-19/3" | "9,17" → the Set of matching numbers,
+// or null for a shape this parser does not claim to understand. Callers degrade
+// to "unknown" on null rather than to a confidently wrong time.
+function parseCronField(raw, min, max) {
+  const set = new Set();
+  for (const part of String(raw).split(',')) {
+    const m = /^(?:(\*)|(\d+)(?:-(\d+))?)(?:\/(\d+))?$/.exec(part.trim());
+    if (!m) return null;
+    const step = m[4] ? Number(m[4]) : 1;
+    if (step < 1) return null;
+    const from = m[1] ? min : Number(m[2]);
+    const to   = m[1] ? max : (m[3] !== undefined ? Number(m[3]) : (m[4] ? max : Number(m[2])));
+    if (from < min || to > max || to < from) return null;
+    for (let v = from; v <= to; v += step) set.add(v);
+  }
+  return set.size ? set : null;
+}
+
+function parseCronExpr(expr) {
+  const parts = String(expr || '').trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  const minute = parseCronField(parts[0], 0, 59);
+  const hour   = parseCronField(parts[1], 0, 23);
+  const dom    = parseCronField(parts[2], 1, 31);
+  const month  = parseCronField(parts[3], 1, 12);
+  const dowRaw = parseCronField(parts[4], 0, 7);
+  if (!minute || !hour || !dom || !month || !dowRaw) return null;
+  return {
+    minute, hour, month, dom,
+    dow: new Set([...dowRaw].map(d => d % 7)),   // cron accepts 7 for Sunday
+    domRestricted: parts[2] !== '*',
+    dowRestricted: parts[4] !== '*',
+  };
+}
+
+// `d` carries CR wall clock in its UTC fields. When BOTH day-of-month and
+// day-of-week are restricted, cron ORs them — Max registers no such expression
+// today, but guessing AND here would silently mis-time one the day someone does.
+function cronDayMatches(f, d) {
+  if (!f.month.has(d.getUTCMonth() + 1)) return false;
+  const domOk = f.dom.has(d.getUTCDate());
+  const dowOk = f.dow.has(d.getUTCDay());
+  if (f.domRestricted && f.dowRestricted) return domOk || dowOk;
+  if (f.domRestricted) return domOk;
+  if (f.dowRestricted) return dowOk;
+  return true;
+}
+
+// The firing strictly after (dir 1) or before (dir -1) `fromMs`, as epoch ms, or
+// null when the expression is unreadable or nothing matches inside the horizon.
+// Non-matching days and hours are skipped wholesale rather than minute by minute.
+function walkCronFire(expr, fromMs, dir) {
+  const f = parseCronExpr(expr);
+  if (!f) return null;
+  let m = Math.floor((fromMs - CR_UTC_OFFSET_MS) / 60000) + dir; // CR-local minute index
+  for (let guard = 0; guard < CRON_FIRE_HORIZON_MINUTES; guard += 1) {
+    const d = new Date(m * 60000);
+    if (!cronDayMatches(f, d)) {
+      const dayStart = Math.floor(m / 1440) * 1440;
+      m = dir > 0 ? dayStart + 1440 : dayStart - 1;
+      continue;
+    }
+    if (!f.hour.has(d.getUTCHours())) {
+      const hourStart = Math.floor(m / 60) * 60;
+      m = dir > 0 ? hourStart + 60 : hourStart - 1;
+      continue;
+    }
+    if (!f.minute.has(d.getUTCMinutes())) { m += dir; continue; }
+    return m * 60000 + CR_UTC_OFFSET_MS;
+  }
+  return null;
+}
+const nextCronFire = (expr, fromMs = Date.now()) => walkCronFire(expr, fromMs, 1);
+const prevCronFire = (expr, fromMs = Date.now()) => walkCronFire(expr, fromMs, -1);
+
+// "Mon, Aug 24, 10:00 CR" — the string a human checks a promise against.
+function formatCronFire(ms) {
+  if (!Number.isFinite(ms)) return 'unknown (unreadable expression)';
+  return `${new Date(ms).toLocaleString('en-US', {
+    timeZone: 'America/Costa_Rica', weekday: 'short', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  })} CR`;
+}
+
 const SELF_ACTION = 'runCronLivenessAudit';
 
 // Pure. Returns the four ways a scheduled job can be wrong, which are genuinely
@@ -15025,7 +15127,10 @@ async function runCronLivenessAudit(correlationId) {
   const { stale, vanished, drifted, silent } = result;
   const total = stale.length + vanished.length + drifted.length + silent.length;
 
-  console.log(`Cron liveness: ${Object.keys(expectations).length} declared, ${stale.length} stale, ${vanished.length} vanished, ${drifted.length} undeclared, ${silent.length} never logged.`);
+  // The healthy path posts nothing, so this line is the whole record — it names
+  // the next run so "did it stop?" is answerable from the log alone.
+  const bootMs = now - Math.round(process.uptime() * 1000);
+  console.log(`Cron liveness: ${Object.keys(expectations).length} declared, ${stale.length} stale, ${vanished.length} vanished, ${drifted.length} undeclared, ${silent.length} never logged. Next audit ${formatCronFire(nextCronFire(STATIC_CRON_SCHEDULES[SELF_ACTION], now))}.`);
   logActivity({
     event_type: 'audit', event_source: 'cron', action: 'cron_liveness_audit',
     status: total ? 'gap' : 'ok',
@@ -15038,11 +15143,22 @@ async function runCronLivenessAudit(correlationId) {
 
   const lines = [`⚠️ *Cron liveness audit* — ${Object.keys(expectations).length} scheduled jobs declared`];
   if (stale.length) lines.push(`\n*${stale.length} stale* — no successful run inside the expected window:\n` +
-    stale.map(s => `• \`${s.action}\` (\`${s.expr}\`) — last ok ${s.gapHours}h ago, tolerance ${s.maxGapHours}h`).join('\n'));
+    stale.map(s => `• \`${s.action}\` (\`${s.expr}\`) — last ok ${s.gapHours}h ago, tolerance ${s.maxGapHours}h · next fire ${formatCronFire(nextCronFire(s.expr, now))}`).join('\n'));
   if (vanished.length) lines.push(`\n*${vanished.length} vanished* — started and never reached a terminal status, so the process died mid-run or the job hung:\n` +
     vanished.slice(0, 10).map(v => `• \`${v.action}\` — started ${new Date(v.at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`).join('\n'));
+  // A job declared hours ago has not "stopped" — it has not been due yet, and
+  // saying so is the difference between a real miss and the false alarm a
+  // brand-new cron raises every morning until it first fires. Scoped to THIS
+  // deploy on purpose: process.uptime() resets on every restart, so the wording
+  // never claims more than it knows.
   if (silent.length) lines.push(`\n*${silent.length} never logged* — declared but no successful run on record. Either it has never fired, or it is not wrapped in \`wrapCronJob\` and is invisible:\n` +
-    silent.map(s => `• \`${s.action}\` (\`${s.expr}\`)`).join('\n'));
+    silent.map((s) => {
+      const prev = prevCronFire(s.expr, now);
+      const wasDue = prev !== null && prev > bootMs;
+      return `• \`${s.action}\` (\`${s.expr}\`) — ${wasDue
+        ? `⚠️ was due ${formatCronFire(prev)} and logged nothing`
+        : `not due yet this deploy · first fire ${formatCronFire(nextCronFire(s.expr, now))}`}`;
+    }).join('\n'));
   if (drifted.length) lines.push(`\n*${drifted.length} undeclared* — logging but absent from \`STATIC_CRON_SCHEDULES\`, so the registry has drifted:\n` +
     drifted.map(a => `• \`${a}\``).join('\n'));
   if (dynamicNote) lines.push(`\n_${dynamicNote}_`);
@@ -15051,7 +15167,7 @@ async function runCronLivenessAudit(correlationId) {
   // runs next; it has no mechanism to disable itself. If a check here becomes
   // permanently noisy, Ron retires it in chat — the previous fleet is gone
   // precisely because it could make that decision on its own.
-  lines.push(`\n_Audit alive · next run tomorrow 07:30 CR. This job has no expiry and cannot disable itself._`);
+  lines.push(`\n_Audit alive · next run ${formatCronFire(nextCronFire(STATIC_CRON_SCHEDULES[SELF_ACTION], now))}. This job has no expiry and cannot disable itself._`);
 
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
 }
