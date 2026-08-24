@@ -219,6 +219,24 @@ check('11c a deal that was never inherited says nothing about it',
   /Originally|own the follow-up now/.test(card), false);
 check('11d no undefined leaks when inheritedFrom is absent', /undefined/.test(card), false);
 
+// ── 12. The query only returns deals a closer can actually act on ───────────
+// Source-level, because the gates live in SQL. Measured 2026-08-24: 299
+// `follow_up` rows, of which 263 were pre-cutover iClosed history with exactly
+// ONE GHL link between them — no opportunity card to move, so a 👎 tap would
+// write against a card that does not exist. Six of the nine cards the first
+// live run would have sent were such ghosts, one of them a test record named
+// "Prueba". These assertions are what stop that floor being dropped again.
+const fetchSrc = SRC.slice(SRC.indexOf('async function fetchOpenDeals'), SRC.indexOf('async function ghlGetOpportunityStage'));
+check('12a the query floors on the GHL cutover', /a\.scheduled_start >= \$1/.test(fetchSrc), true);
+check('12b bound to the shared constant, not a copied literal',
+  [/\[GHL_CUTOVER_ISO\]/.test(fetchSrc), /'2026-07-23/.test(fetchSrc)], [true, false]);
+check('12c past calls only — a booked prospect is not a stalled deal',
+  /a\.scheduled_start <= now\(\)/.test(fetchSrc), true);
+check('12d still scoped to open deals', /o\.outcome = 'follow_up'/.test(fetchSrc), true);
+const cutoverDecl = SRC.indexOf('const GHL_CUTOVER_ISO');
+check('12e the constant is declared before every use (no temporal dead zone)',
+  [...SRC.matchAll(/GHL_CUTOVER_ISO/g)].map(m => m.index).filter(i => i !== cutoverDecl + 6).every(i => i > cutoverDecl), true);
+
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }
 console.log('\nAll open-deal follow-up rules tests passed.');
