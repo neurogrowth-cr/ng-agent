@@ -18,15 +18,17 @@ if (!block || block.length < 100) { console.error('FAIL: could not extract the o
 const {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
-  buildOpenDealCardText, formatOpenDealZombieDigest,
+  buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
+  OPEN_DEAL_DIGEST_ONLY_DAYS,
 } = new Function(`${block}; return {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
-  buildOpenDealCardText, formatOpenDealZombieDigest,
+  buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
-  OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP };`)();
+  OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
+  OPEN_DEAL_DIGEST_ONLY_DAYS };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -140,10 +142,69 @@ check('7g healthy book + failed GHL check → still null (log line carries it)',
 const mkZombie = (i) => ({ display: `Zombie ${i}`, closer: 'Jose Carranza', ageDays: 30 + i, nudgeCount: 5, snoozeCount: 0 });
 const atBound = formatOpenDealZombieDigest({ zombies: Array.from({ length: OPEN_DEAL_SANITY_MAX }, (_, i) => mkZombie(i)), drift: [], unmatchedGhl: 0, ghlCheckFailed: false });
 check('8a exactly at the bound → still lists, capped with "and N more"',
-  atBound.includes('…and 30 more.') && atBound.split('\n').filter(l => l.startsWith('• ')).length === OPEN_DEAL_LIST_CAP, true);
+  atBound.includes(`…and ${OPEN_DEAL_SANITY_MAX - OPEN_DEAL_LIST_CAP} more.`)
+  && atBound.split('\n').filter(l => l.startsWith('• ')).length === OPEN_DEAL_LIST_CAP, true);
 const overBound = formatOpenDealZombieDigest({ zombies: Array.from({ length: OPEN_DEAL_SANITY_MAX + 1 }, (_, i) => mkZombie(i)), drift: [], unmatchedGhl: 0, ghlCheckFailed: false });
 check('8b over the bound → SANITY BOUND EXCEEDED, names withheld',
   overBound.includes('SANITY BOUND EXCEEDED') && !overBound.includes('Zombie 0'), true);
+
+// ── 9. Historical backlog is its own bucket, not 200 urgent zombies ──────────
+// Calibrated on the book measured in production on 2026-08-24: 299 follow_up
+// rows, 2 fresh (<3d), 31 in 3-21d, 73 actionable (21-60d), 193 older than 60d,
+// oldest 2026-05-19. The first draft called all 266 of the 21d+ rows zombies,
+// which tripped the fail-closed bound and would have told Ron his query was
+// broken when the only thing wrong was three months of unworked deals.
+const realBook = [
+  ...Array.from({ length: 2 },   (_, i) => ({ display: `Fresh ${i}`,      closer: 'Jose Carranza',   openedAt: daysAgoISO(1) })),
+  ...Array.from({ length: 31 },  (_, i) => ({ display: `Working ${i}`,    closer: 'Jonathan Madriz', openedAt: daysAgoISO(10) })),
+  ...Array.from({ length: 73 },  (_, i) => ({ display: `Actionable ${i}`, closer: 'Jose Carranza',   openedAt: daysAgoISO(40) })),
+  ...Array.from({ length: 193 }, (_, i) => ({ display: `Ancient ${i}`,    closer: 'Ron Duarte',      openedAt: daysAgoISO(90) })),
+];
+const rb = classifyOpenDeals(realBook, NOW);
+check('9a the 21-60d band is what counts as a zombie', rb.zombies.length, 73);
+check('9b everything past the card floor is historical, not a zombie', rb.historical.length, 193);
+check('9c fresh and working deals stay out of both', [rb.fresh, rb.active], [2, 31]);
+check('9d the real book does NOT trip the fail-closed bound', rb.zombies.length <= OPEN_DEAL_SANITY_MAX, true);
+const rbMsg = formatOpenDealZombieDigest({ zombies: rb.zombies, drift: [], historical: rb.historical, unmatchedGhl: 0, ghlCheckFailed: false });
+check('9e it reports real names, not "SANITY BOUND EXCEEDED"', rbMsg.includes('SANITY BOUND EXCEEDED'), false);
+check('9f the backlog is one honest count line, never 193 bullets',
+  /📦 \*193 historical\* — open more than 60 days \(oldest 90d\)/.test(rbMsg), true);
+check('9g still only LIST_CAP names in the zombie section',
+  rbMsg.split('\n').filter(l => l.startsWith('• ')).length, OPEN_DEAL_LIST_CAP);
+check('9h a purely historical book still speaks up (it is not "healthy")',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: rb.historical, unmatchedGhl: 0, ghlCheckFailed: false }) !== null, true);
+check('9i a genuinely empty book stays silent',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: [], unmatchedGhl: 0, ghlCheckFailed: false }), null);
+check('9j a capped GHL scan says the count is incomplete',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: [], unmatchedGhl: 4, ghlCheckFailed: false, scanCapped: true })
+    .includes('stage scan hit its page cap'), true);
+check('9k no undefined/NaN anywhere in the real-book digest', /undefined|NaN/.test(rbMsg), false);
+
+// ── 10. Card ordering — which three deals a closer is asked about ───────────
+// Ron's real book from the first dry run (2026-08-24), with opened_at as the
+// Date OBJECTS node-postgres actually returns. The original comparator sorted
+// String(Date) alphabetically — weekday name, then month NAME, so "Jul" < "Jun"
+// — and produced 49d, 55d, 36d, silently pushing a 53-day-old deal past the
+// 3-per-closer cap. ISO strings would have sorted fine; only Date objects
+// expose it, which is why this fixture uses them.
+const ronBook = [
+  { name: 'Flor Lizano Bolanos (49d)', opened_at: new Date('2026-07-06T12:49:39Z') },
+  { name: 'Mario Cardona (55d)',       opened_at: new Date('2026-06-29T22:18:49Z') },
+  { name: 'Liz Zamora (36d)',          opened_at: new Date('2026-07-19T17:42:10Z') },
+  { name: 'Flor Lizano Bolanos (53d)', opened_at: new Date('2026-07-02T18:03:21Z') },
+];
+const ordered = sortOpenDealsOldestFirst(ronBook).map(d => d.name);
+check('10a truly oldest first, with pg Date objects',
+  ordered, ['Mario Cardona (55d)', 'Flor Lizano Bolanos (53d)', 'Flor Lizano Bolanos (49d)', 'Liz Zamora (36d)']);
+check('10b the 3-card cap now takes the three STALEST, not an alphabetical accident',
+  ordered.slice(0, 3).includes('Liz Zamora (36d)'), false);
+check('10c ISO strings sort identically — the fix is shape-agnostic',
+  sortOpenDealsOldestFirst(ronBook.map(d => ({ ...d, opened_at: d.opened_at.toISOString() }))).map(d => d.name),
+  ordered);
+check('10d unparseable dates sort last instead of poisoning the order',
+  sortOpenDealsOldestFirst([{ name: 'bad', opened_at: 'not-a-date' }, ...ronBook])[0].name,
+  'Mario Cardona (55d)');
+check('10e the input array is not mutated', ronBook[0].name, 'Flor Lizano Bolanos (49d)');
 
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }
