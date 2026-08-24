@@ -18,14 +18,14 @@ if (!block || block.length < 100) { console.error('FAIL: could not extract the o
 const {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
-  buildOpenDealCardText, formatOpenDealZombieDigest,
+  buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
   OPEN_DEAL_DIGEST_ONLY_DAYS,
 } = new Function(`${block}; return {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
-  buildOpenDealCardText, formatOpenDealZombieDigest,
+  buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
   OPEN_DEAL_DIGEST_ONLY_DAYS };`)();
@@ -179,6 +179,32 @@ check('9j a capped GHL scan says the count is incomplete',
   formatOpenDealZombieDigest({ zombies: [], drift: [], historical: [], unmatchedGhl: 4, ghlCheckFailed: false, scanCapped: true })
     .includes('stage scan hit its page cap'), true);
 check('9k no undefined/NaN anywhere in the real-book digest', /undefined|NaN/.test(rbMsg), false);
+
+// ── 10. Card ordering — which three deals a closer is asked about ───────────
+// Ron's real book from the first dry run (2026-08-24), with opened_at as the
+// Date OBJECTS node-postgres actually returns. The original comparator sorted
+// String(Date) alphabetically — weekday name, then month NAME, so "Jul" < "Jun"
+// — and produced 49d, 55d, 36d, silently pushing a 53-day-old deal past the
+// 3-per-closer cap. ISO strings would have sorted fine; only Date objects
+// expose it, which is why this fixture uses them.
+const ronBook = [
+  { name: 'Flor Lizano Bolanos (49d)', opened_at: new Date('2026-07-06T12:49:39Z') },
+  { name: 'Mario Cardona (55d)',       opened_at: new Date('2026-06-29T22:18:49Z') },
+  { name: 'Liz Zamora (36d)',          opened_at: new Date('2026-07-19T17:42:10Z') },
+  { name: 'Flor Lizano Bolanos (53d)', opened_at: new Date('2026-07-02T18:03:21Z') },
+];
+const ordered = sortOpenDealsOldestFirst(ronBook).map(d => d.name);
+check('10a truly oldest first, with pg Date objects',
+  ordered, ['Mario Cardona (55d)', 'Flor Lizano Bolanos (53d)', 'Flor Lizano Bolanos (49d)', 'Liz Zamora (36d)']);
+check('10b the 3-card cap now takes the three STALEST, not an alphabetical accident',
+  ordered.slice(0, 3).includes('Liz Zamora (36d)'), false);
+check('10c ISO strings sort identically — the fix is shape-agnostic',
+  sortOpenDealsOldestFirst(ronBook.map(d => ({ ...d, opened_at: d.opened_at.toISOString() }))).map(d => d.name),
+  ordered);
+check('10d unparseable dates sort last instead of poisoning the order',
+  sortOpenDealsOldestFirst([{ name: 'bad', opened_at: 'not-a-date' }, ...ronBook])[0].name,
+  'Mario Cardona (55d)');
+check('10e the input array is not mutated', ronBook[0].name, 'Flor Lizano Bolanos (49d)');
 
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }

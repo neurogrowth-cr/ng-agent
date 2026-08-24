@@ -9353,6 +9353,18 @@ function classifyOpenDeals(deals, now = Date.now()) {
   return { zombies, drift, historical, active, fresh };
 }
 
+// Oldest first, compared as instants. node-postgres hands `opened_at` back as a
+// Date OBJECT, and String(Date) is "Mon Jun 29 2026 …" — sorting those
+// alphabetically compares the weekday name, then the month NAME, so "Jul" beats
+// "Jun". That is exactly how a 49-day-old deal outranked a 55-day-old one in the
+// first dry run (2026-08-24) and pushed a 53-day-old deal out of the daily cap.
+// Which three deals a closer is asked about is the whole product here, so this
+// ordering is load-bearing, not cosmetic.
+function sortOpenDealsOldestFirst(deals) {
+  const ms = (v) => { const t = new Date(v).getTime(); return Number.isFinite(t) ? t : Infinity; };
+  return [...deals].sort((a, b) => ms(a.opened_at) - ms(b.opened_at));
+}
+
 // Renders one open-deal card. Pure — callers pass the pipeline's own action
 // vocabulary — so the exact copy a closer sees is asserted in tests. `won` is
 // never a tap: money is always typed, same convention as the outcome cards.
@@ -9688,8 +9700,7 @@ async function runOpenDealFollowupSweep(correlationId) {
       continue;
     }
     let newCards = 0;
-    closerDeals.sort((a, b) => String(a.opened_at).localeCompare(String(b.opened_at))); // oldest first
-    for (const deal of closerDeals) {
+    for (const deal of sortOpenDealsOldestFirst(closerDeals)) {
       const key = `open-deal-nudge:${deal.appointment_id}`;
       const state = parseOpenDealNudgeState(stateByKey[key]);
       const openedMs = Date.parse(deal.opened_at || '');
