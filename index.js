@@ -181,7 +181,8 @@ Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign lau
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
 Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
-Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999) — High-Ticket Closers. They close deals after setting.
+Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
+Jonathan Madriz — FORMER closer, departed 2026-07-19. He is not on the team: never DM him, never list him in a standup, leaderboard, roster or "who is closing today", and never assign him work. His past results stay attributed to him in reports covering his tenure — name him for history, never as someone current. His open deals are Jose's now.
 
 ---
 
@@ -596,7 +597,10 @@ const TEAM_MEMBERS = {
   'U0BAAC0KS82': { name: 'Gerald',   role: 'fulfillment',    displayName: 'Gerald Arias NG' },
   'U07SMMDMSLQ': { name: 'Tania',    role: 'fulfillment',    displayName: 'Tania NG' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
-  'U0APYAE0999': { name: 'Jonathan', role: 'closer',         displayName: 'Jonathan Madriz' },
+  // Jonathan Madriz (U0APYAE0999) removed 2026-08-24 — departed 2026-07-19.
+  // Off the roster means isRosterMember() is false, so a still-live Slack
+  // account cannot ask Max for sales data. His name still resolves through
+  // SALES_TEAM_MAP, so historical reports read normally. See DEPARTED_MEMBERS.
 };
 
 const ROLE_PERMISSIONS = {
@@ -756,7 +760,7 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closers are Jose Carranza (U0AMTEKDCPN) and Jonathan Madriz (U0APYAE0999). They take booked calls from Oscar, William, and Sebastian and close them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closer is Jose Carranza (U0AMTEKDCPN), and Ron closes as well. (Jonathan Madriz departed 2026-07-19 — historical only, never treat him as current.) They take booked calls from Oscar, William, and Sebastian and close them into paying clients.
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
@@ -3093,7 +3097,7 @@ const SALES_TEAM_MAP = {
   // ── CLOSERS — roster emails (GHL rows carry these in closer_id) ─────────
   'ronny.duarte@neurogrowth.io':  'Ron Duarte',
   'jose.neurogrowth@gmail.com':   'Jose Carranza',
-  'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz',
+  'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz', // departed 2026-07-19 — see DEPARTED_MEMBERS; kept so past reports still name him
 
   // ── SETTERS — roster emails (GHL rows carry these in setter_id) ─────────
   'joseph.neurogrowth@gmail.com':   'Joseph Salazar', // historical — no longer active
@@ -6047,7 +6051,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jonathan, Jose, Ron — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jose and Ron are the current closers; Jonathan Madriz departed 2026-07-19 and appears only in periods he worked — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'closer_monthly_scorecard', description: "Monthly per-closer scorecard from the shared closer_month_scorecard view — the SAME numbers as the portal page /admin/closer-scorecard, so never recompute month stats another way when asked for a closer's month. Returns calls assigned, outcomes logged, pending, showed, no-shows, qualified attended, won/lost/follow-up/DQ, show rate, close rate on shows, revenue, plus a REVI recording reality-check (calls that verifiably happened but were never logged, avg call score, no-show-vs-recording flags) and the month's unattributed outcomes. Months are America/Costa_Rica calendar months anchored on the call's scheduled time. When pending is high, always caveat that show/close rates are unreliable — pending does not mean the call didn't happen.", input_schema: { type: 'object', properties: { month: { type: 'string', description: "Month as YYYY-MM, e.g. 2026-07. For 'last month' compute from today's date in CR time." }, closer: { type: 'string', description: 'Optional closer email or name fragment (jose, ron, jonathan). Omit for all closers.' } }, required: ['month'] } },
           { name: 'log_call_outcome', description: "Log a sales-call outcome to the portal (revops_sales_outcomes) on EXPLICIT human instruction ONLY. Use when a closer or Ron states an outcome in their own words ('won 3500', 'that call was a no show', 'log Marco as lost') — typically replying to an outcome reminder/proposal DM. NEVER call this from your own inference, a REVI read, a transcript, or a report — if a human did not state the outcome in this conversation, do not call this tool. won REQUIRES revenue (the real closed amount; ask if not given — never guess). Writes are first-writer-wins: an existing outcome is never overwritten, the tool will tell you if one exists. Also promotes the prospect's pipeline status per the shared dash contract.", input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Prospect email (preferred) or name fragment to find their appointment.' }, date: { type: 'string', description: 'Optional call date YYYY-MM-DD (CR time) to disambiguate when the prospect had multiple calls.' }, outcome: { type: 'string', enum: ['won', 'lost', 'follow_up', 'disqualified', 'no_show'], description: 'The outcome the human stated.' }, revenue: { type: 'number', description: 'Closed revenue in USD — required when outcome is won.' }, note: { type: 'string', description: 'Optional short context, e.g. who instructed it and why.' } }, required: ['prospect', 'outcome'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
@@ -7207,12 +7211,45 @@ slack.message(async ({ message, say }) => {
 // with a prep brief. Deduplicates via agent_knowledge so each call gets one brief.
 // closer_id in revops_appointments is stored as the roster email (GHL rows are
 // mapped upstream in dash via admin_users; legacy iClosed rows used the same emails).
+// ─── DEPARTED MEMBERS ────────────────────────────────────────────────────────
+// Someone leaving is a roster change, NOT a history rewrite. Three rules follow
+// from that, and all three are load-bearing:
+//
+//   1. Their name still resolves. A July leaderboard that renders
+//      "gqYMYkpDDlTdxvBkfl2C" instead of "Jonathan Madriz" is worse than one
+//      that names him, so SALES_TEAM_MAP keeps every entry (the same treatment
+//      Joseph and Debbanny already get).
+//   2. Max never messages them again — they are absent from CLOSER_SLACK below,
+//      so every DM path that resolves a Slack id simply finds nothing.
+//   3. `coverage` names who inherits their LIVE follow-up. Deliberately NOT a
+//      data change: revops_appointments.closer_id records who actually took the
+//      call and editing it would silently rewrite every past report. Who owns
+//      the chase today is a different question from who ran the call, so it
+//      lives here instead of in the portal.
+const DEPARTED_MEMBERS = {
+  'jonathan.madriz.neurogrowth@gmail.com': {
+    name: 'Jonathan Madriz',
+    since: '2026-07-19',                       // last call taken
+    aliases: ['gqymykpddltdxvbkfl2c', 'U0APYAE0999'],
+    coverage: 'jose.neurogrowth@gmail.com',    // inherits open-deal follow-up (Ron, 2026-08-24)
+  },
+};
+// GHL rows carry a person as a roster email, a raw user id, or a Slack id —
+// index every shape so a lookup cannot miss one and quietly DM a leaver.
+const DEPARTED_BY_ID = (() => {
+  const out = {};
+  for (const [email, rec] of Object.entries(DEPARTED_MEMBERS)) {
+    for (const key of [email, ...(rec.aliases || [])]) out[String(key).toLowerCase()] = { email, ...rec };
+  }
+  return out;
+})();
+function departedMember(id) { return DEPARTED_BY_ID[String(id || '').toLowerCase()] || null; }
+
 const CLOSER_SLACK = {
-  'jonathan.madriz.neurogrowth@gmail.com': 'U0APYAE0999', // Jonathan
+  // Jonathan Madriz departed 2026-07-19 — intentionally absent; see DEPARTED_MEMBERS.
   'jose.neurogrowth@gmail.com':            'U0AMTEKDCPN', // Jose
   'ronny.duarte@neurogrowth.io':           'U05HXGX18H3', // Ron (when he's the closer)
   // Raw GHL user ID fallbacks (unmapped rows)
-  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'gqYMYkpDDlTdxvBkfl2C': 'U0APYAE0999',
   'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyItjV': 'U0AMTEKDCPN',
   'zogw530idnpofqqnfssc': 'U05HXGX18H3', 'zoGW530iDnPOFqQNfssc': 'U05HXGX18H3', // Ron
 };
@@ -9384,7 +9421,7 @@ function sortOpenDealsOldestFirst(deals) {
 // Renders one open-deal card. Pure — callers pass the pipeline's own action
 // vocabulary — so the exact copy a closer sees is asserted in tests. `won` is
 // never a tap: money is always typed, same convention as the outcome cards.
-function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount, callDateStr, acts, wonLabel }) {
+function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount, callDateStr, acts, wonLabel, inheritedFrom }) {
   const meta = [];
   if (nudgeCount > 0) meta.push(`nudged ${nudgeCount}×`);
   if (snoozeCount > 0) meta.push(`snoozed ${snoozeCount}×`);
@@ -9392,6 +9429,7 @@ function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount,
   return [
     `🕰️ *${prospectName}* — sitting in *Open Deal* for ${ageDays} days${meta.length ? ` · ${meta.join(' · ')}` : ''}`,
     `${callDateStr ? `Call was ${callDateStr} CR. ` : ''}This deal is still open — is it going anywhere?`,
+    ...(inheritedFrom ? [`👤 Originally ${inheritedFrom}'s call — you own the follow-up now.`] : []),
     '',
     `→ 💤 *Still working it* (snoozes me ${OPEN_DEAL_SNOOZE_DAYS} days — or type \`snooze\`) · ${tapList}`,
     `→ Closed it? Reply \`won <amount>\` and I'll log *${wonLabel}* — money is always typed, never tapped.`,
@@ -9697,10 +9735,15 @@ async function runOpenDealFollowupSweep(correlationId) {
     for (const row of (data || [])) stateByKey[row.key] = row.value;
   }
 
+  // Group by who should CHASE the deal, not who ran the call: a departed
+  // closer's open deals belong to their coverage closer, and land in that
+  // person's own 3-per-run budget rather than getting a second one.
   const byCloser = {};
   for (const d of deals) {
-    const email = d.closer_id || 'unassigned';
-    (byCloser[email] = byCloser[email] || []).push(d);
+    const owner = d.closer_id || 'unassigned';
+    const departed = departedMember(owner);
+    const target = departed ? departed.coverage : owner;
+    (byCloser[target] = byCloser[target] || []).push({ ...d, inheritedFrom: departed ? departed.name : null });
   }
 
   const skipCounts = {};
@@ -9781,7 +9824,7 @@ async function runOpenDealFollowupSweep(correlationId) {
       const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
       const prev = state || {};
       const text = buildOpenDealCardText({
-        prospectName: pName, ageDays,
+        prospectName: pName, ageDays, inheritedFrom: deal.inheritedFrom,
         nudgeCount: prev.nudgeCount || 0, snoozeCount: prev.snoozeCount || 0,
         callDateStr: deal.scheduled_start ? formatICTime(deal.scheduled_start, { month: 'short', day: 'numeric' }) : '',
         acts, wonLabel: stages.won.label,
@@ -9863,7 +9906,10 @@ async function runOpenDealZombieDigest(correlationId) {
     const state = parseOpenDealNudgeState(stateByKey[`open-deal-nudge:${d.appointment_id}`]);
     return {
       display: d.full_name || d.email || 'Unknown prospect',
-      closer: resolveSalesMember(d.closer_id),
+      closer: (() => {
+        const dep = departedMember(d.closer_id);
+        return dep ? `${resolveSalesMember(dep.coverage)} (for ${dep.name})` : resolveSalesMember(d.closer_id);
+      })(),
       openedAt: d.opened_at,
       nudgeCount: state ? state.nudgeCount : 0,
       snoozeCount: state ? state.snoozeCount : 0,
