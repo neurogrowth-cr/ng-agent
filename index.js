@@ -9260,6 +9260,11 @@ async function runProvisioningLagCheck(_correlationId) {
   console.log(`Provisioning lag: DMed Ron — ${buckets.lagging.length} lagging, ${buckets.unlinked.length} bridge-miss.`);
 }
 
+// The day GHL became the system of record. Everything before it is frozen
+// iClosed history: no opportunity cards, so nothing a closer can act on today.
+// Both the open-deal sweep below and fetchDueSalesCalls floor on this date.
+const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
+
 // ─── OPEN-DEAL FOLLOW-UP SWEEP ───────────────────────────────────────────────
 // A deal logged `follow_up` moves to the GHL Open Deal stage — and, until this
 // sweep, vanished from every nag surface: the strike mover excludes closer
@@ -9484,6 +9489,20 @@ function formatOpenDealZombieDigest({ zombies, drift, historical, unmatchedGhl, 
 // sitting at follow_up. `opened_at` is when that outcome was logged — the
 // moment the deal entered Open Deal. Returns null (not []) when the read-only
 // portal DB is not configured, so callers can tell "no access" from "none".
+// Only deals a closer can actually act on — the same two gates
+// fetchDueSalesCalls applies, and for the same reason its comment gives:
+// chasing impossible items is how a reminder system gets ignored.
+//
+//   1. POST-CUTOVER ONLY. Measured 2026-08-24: of 299 `follow_up` rows, 263
+//      were pre-cutover iClosed history (calls from Apr 8 – Jul 21, 107 of them
+//      backfilled in a single import on May 19) and exactly ONE of those 263
+//      carries a GHL link. There is no opportunity card to move, so a closer
+//      tapping 👎 would write a portal row against a card that does not exist.
+//      Without this floor the first live sweep would have carded six such
+//      ghosts — including a test record literally named "Prueba" — alongside
+//      three real deals. iClosed rows are frozen history, not a backlog.
+//   2. PAST CALLS ONLY. A prospect whose next call is already on the calendar
+//      is booked, not stalled; nudging their closer to chase them is noise.
 async function fetchOpenDeals() {
   if (!portalPg) return null;
   const { rows } = await portalPg.query(
@@ -9495,7 +9514,10 @@ async function fetchOpenDeals() {
        JOIN revops_appointments a ON a.id = o.appointment_id
        JOIN revops_prospects p    ON p.id = a.prospect_id
       WHERE o.outcome = 'follow_up'
-      ORDER BY o.created_at ASC`
+        AND a.scheduled_start >= $1
+        AND a.scheduled_start <= now()
+      ORDER BY o.created_at ASC`,
+    [GHL_CUTOVER_ISO]
   );
   return rows;
 }
@@ -10057,7 +10079,8 @@ async function fetchGhlFunnelStateByEmail(emails) {
 //      lands on the newer appointment, never on this one.
 // NOTE: iClosed-BOOKED calls scheduled after the cutover ARE fulfillable —
 // the prospect has a live GHL opp card, so source is irrelevant here.
-const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
+// GHL_CUTOVER_ISO is declared above with the open-deal sweep, which also
+// floors on it — one date, one definition, shared by both consumers.
 async function fetchDueSalesCalls({ cutoffIso, sinceIso, label }) {
   const floorIso = sinceIso > GHL_CUTOVER_ISO ? sinceIso : GHL_CUTOVER_ISO;
 
