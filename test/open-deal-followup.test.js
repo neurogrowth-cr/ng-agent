@@ -206,6 +206,19 @@ check('10d unparseable dates sort last instead of poisoning the order',
   'Mario Cardona (55d)');
 check('10e the input array is not mutated', ronBook[0].name, 'Flor Lizano Bolanos (49d)');
 
+// ── 11. Inherited deals say so on the card ──────────────────────────────────
+// A deal that was Jonathan's arrives in Jose's DM after 2026-08-24. Without a
+// line explaining why, it reads as Max nagging him about someone else's call.
+const inherited = buildOpenDealCardText({
+  prospectName: 'Kendall Rodríguez', ageDays: 52, nudgeCount: 0, snoozeCount: 0,
+  callDateStr: 'Jul 3', acts, wonLabel: 'Closed', inheritedFrom: 'Jonathan Madriz',
+});
+check('11a the card explains the handover', inherited.includes("Originally Jonathan Madriz's call — you own the follow-up now."), true);
+check('11b it still carries the normal verbs', inherited.includes('💤 *Still working it*') && inherited.includes('`won <amount>`'), true);
+check('11c a deal that was never inherited says nothing about it',
+  /Originally|own the follow-up now/.test(card), false);
+check('11d no undefined leaks when inheritedFrom is absent', /undefined/.test(card), false);
+
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }
 console.log('\nAll open-deal follow-up rules tests passed.');
