@@ -277,6 +277,12 @@ OPS MASTER TRACKER (Google Sheet the ops team maintains by hand — query via ge
 - tab=launch_history — activation date, QA date, launch date, days-to-launch per client, as recorded BY HAND by the ops team. PRECEDENCE: for the activation call date and any day count derived from it, the dashboard CRM (the recipe above) WINS — this sheet is typed by a person, is not written by any automation, and drifts. Use it for what only the ops team records (QA date, launch date, notes) and as a cross-check. If the sheet and the CRM disagree on a client's activation date, report BOTH, say which is which, and treat the CRM as the number — never silently pick one. MEASURED 2026-08-19: they disagree for 14 of 19 clients, median 11 days, max 40, and the sheet is LATER every single time — its Fecha de Activacion matches the portal's activation checkbox, not the call. So the sheet's own 'Dias para Lanzar' understates time-to-launch (mean 15.5d reported vs 25.6d actual across 13 launched clients, and 6 of those 13 look inside the 14-day promise but are not). Never quote 'Dias para Lanzar' as time-to-launch without saying it is measured from the ops sheet's activation tick, not the call.
 Client names in the sheet are messy ("Factory - Will", "Sastrería Triana - Carlos Castillo") — the client filter is fuzzy; use a short fragment.
 
+GHL OPERATION ROUTER (ghl_find_operation → ghl_describe_operation → ghl_run_operation):
+- Reaches GoHighLevel surfaces that have no dedicated tool — custom values, forms, surveys, invoices, blogs, social planner, email templates, and the long tail of contact/opportunity/calendar operations. Search it before telling anyone you cannot see something in GHL.
+- PRECEDENCE: the dedicated tools win for the flows they already cover — get_ghl_conversations, set_appointment_status, log_call_outcome, get_sales_intelligence. Those carry tuned logic (dedup, attribution, outcome contracts) the raw router does not. Use the router for what they do not reach.
+- It is the same GHL API with the same token and the same scopes as everything else Max does, so it grants no extra visibility. "The token is not authorized for this scope" means the integration lacks that scope — say so and tell Ron it is a GHL Settings fix. Never retry it and never present it as the data not existing.
+- Writes are refused unless Ron has armed that specific operation; deletes and money movement are refused always. When a write is blocked, say what was blocked and why — do not look for another route to the same mutation.
+
 REVI (client-call intelligence, revi schema in Max's own Supabase):
 - get_revi_client_context (open to everyone): topic=calls — quicksync + activation-call report summaries per client (what was reviewed, conclusions, risks, health, PDF + recording links), auto-ingested from Fathom. This answers "what was discussed with client X" and "when did X's stabilization topics come up". topic=roster — REVI's client list + status. REVI only sees calls recorded via Fathom on Ron's account.
 - get_revi_intelligence (Ron-only, confidentiality not OAuth): coaching teardowns, closer call scores, won/lost deal detail, leadership initiatives.`;
@@ -6064,10 +6070,17 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'draft_reply_email', description: 'Use this only when the setter is replying to a client message that Max forwarded to them earlier from an active email thread. Body is the setter-dictated reply. Routes through the same setter-review then Ron-approval flow as draft_outbound_email. If the setter has multiple active threads, ask which one before calling.', input_schema: { type: 'object', properties: { body: { type: 'string', description: 'Reply body, plaintext, in whatever language the setter dictated.' }, thread_id: { type: 'string', description: 'Optional email_threads row id; if omitted Max will use the setter\'s single active thread.' } }, required: ['body'] } },
           { name: 'make_list_dlqs', description: 'List the incomplete executions (DLQ) queued on a Make scenario: id, when it failed, and the error reason. Read-only. Use this before make_get_dlq. Incomplete executions are runs that errored and piled up while Make still reports the scenario as active.', input_schema: { type: 'object', properties: { scenario_id: { type: 'string', description: 'Make scenario id, e.g. 5148796' }, limit: { type: 'number', description: 'Default 10, max 25.' } }, required: ['scenario_id'] } },
           { name: 'make_get_dlq',   description: 'Get one Make incomplete execution: which module failed, the error, and the input bundle that caused it. The bundle carries the real contact/appointment ids, so use it to name who was affected. Read-only.', input_schema: { type: 'object', properties: { dlq_id: { type: 'string' } }, required: ['dlq_id'] } },
+          { name: 'ghl_find_operation', description: "Search GoHighLevel's full operation catalogue (hundreds of operations across ~40 domains: contacts, conversations, opportunities, calendars, custom values, forms, surveys, invoices, payments, social planner, blogs, email templates). Use this for any GHL question Max has no dedicated tool for. Returns operationId, kind (read/write/delete/money_movement), domain, and hasRequestBody. If hasRequestBody is false and kind is 'read', skip ghl_describe_operation and call ghl_run_operation directly — you only have 7 tool rounds per turn. Prefer the dedicated tools (get_ghl_conversations, set_appointment_status, log_call_outcome, get_sales_intelligence) for the flows they already cover.", input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural-language description of the GHL operation you need, e.g. \"list invoices\" or \"add a tag to a contact\".' }, domains: { type: 'array', items: { type: 'string' }, description: 'Optional domain filter, e.g. ["contacts"].' }, kind: { type: 'string', description: 'Optional filter: read | write | delete | money_movement.' }, limit: { type: 'number', description: 'Max results, default 8, cap 25.' } }, required: ['query'] } },
+          { name: 'ghl_describe_operation', description: 'Inspect one GHL operationId from ghl_find_operation before running it: required path/query params, request-body fields, a sanitized payload example, required scopes, and safety metadata. Call this when the operation takes a request body or the params are unclear. Skip it for simple reads — it costs a tool round.', input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' } }, required: ['operationId'] } },
+          { name: 'ghl_run_operation', description: "Execute one GHL operation by operationId. Reads run freely. Writes are refused unless Ron has armed that exact operationId in GHL_MCP_WRITE_ALLOWLIST; deletes and money movement are refused always and cannot be armed. Set dryRun true to see the exact REST request that WOULD be sent without sending it — do that first for any write. A 'not authorized for this scope' response means the GHL token lacks that scope, which is Ron's fix in GHL Settings, not something to retry.", input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' }, params: { type: 'object', description: 'Path, query, and body params. Flat or grouped as {path, query, body}.' }, dryRun: { type: 'boolean', description: 'Preview the resolved request without executing. Use before any write.' } }, required: ['operationId'] } },
       ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
        .filter(t => !(opts.dropTools || []).includes(t.name))
        .filter(t => !opts.onlyTools || opts.onlyTools.includes(t.name))
-       .filter(t => process.env.MAKE_API_TOKEN || !t.name.startsWith('make_'));
+       .filter(t => process.env.MAKE_API_TOKEN || !t.name.startsWith('make_'))
+       // Explicit names, not a `ghl_` prefix match — METRIC_REGISTRY already owns
+       // `ghl_new_contacts_today`, and a prefix filter here would be a trap for the
+       // next ghl_-prefixed tool that has nothing to do with this router.
+       .filter(t => process.env.GHL_MCP_ENABLED || !GHL_MCP_TOOL_NAMES.has(t.name));
       if (opts.finalTool) TOOLS.push(opts.finalTool);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
@@ -6142,6 +6155,9 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'draft_reply_email')      result = await draftReplyEmail(toolUse.input, userId);
         else if (toolUse.name === 'make_list_dlqs')         result = await listMakeDlqs(toolUse.input.scenario_id, toolUse.input.limit);
         else if (toolUse.name === 'make_get_dlq')           result = await getMakeDlqDetail(toolUse.input.dlq_id);
+        else if (toolUse.name === 'ghl_find_operation')     result = await ghlMcpFindOperation(toolUse.input);
+        else if (toolUse.name === 'ghl_describe_operation') result = await ghlMcpDescribeOperation(toolUse.input.operationId);
+        else if (toolUse.name === 'ghl_run_operation')      result = await ghlMcpRunOperation(toolUse.input, userId);
         return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
       }
 
@@ -11985,6 +12001,158 @@ async function ghlGetConversationMessages(conversationId) {
   msgs.sort((a, b) => new Date(a.dateAdded || a.createdAt || 0) - new Date(b.dateAdded || b.createdAt || 0));
   return msgs;
 }
+
+// ── GHL native MCP operation router ──────────────────────────────────────────
+// GHL ships an official MCP server. It is NOT a deeper level of access: it routes
+// to the same v2 REST API, with the same Private Integration Token and the same
+// scopes. Probed live 2026-08-23 — `get-pipelines` returned byte-equivalent data
+// to GET /opportunities/pipelines, and `get-workflow` (which is really the
+// /workflows/ LIST endpoint) 401'd with the identical "not authorized for this
+// scope" REST gives. What it buys is breadth without wrappers: hundreds of
+// operations across 40 domains that would each otherwise need a hand-written
+// fetch, plus per-operation safety metadata and a dryRun that resolves the exact
+// REST request without sending it.
+//
+// The endpoint is stateless per request — tools/list and tools/call both answer
+// on a bare POST with no `initialize` handshake and no Mcp-Session-Id. So there is
+// no MCP client library here and no session lifecycle, just JSON-RPC over HTTPS.
+const GHL_MCP_ENDPOINT = 'https://services.leadconnectorhq.com/mcp/anthropic/v2';
+const GHL_MCP_TOOL_NAMES = new Set(['ghl_find_operation', 'ghl_describe_operation', 'ghl_run_operation']);
+const GHL_MCP_MAX_RESULT_CHARS = 6000;
+
+// Kinds no env var may ever arm. Deletes and money movement are not agent-reachable.
+const GHL_MCP_FORBIDDEN_KINDS = new Set(['delete', 'money_movement']);
+// Financial confidentiality (tasks/lessons.md): these are Ron-only, reads included.
+const GHL_MCP_FINANCIAL_DOMAINS = new Set(['payments', 'invoices', 'transactions']);
+
+function ghlMcpWriteAllowlist() {
+  return new Set(String(process.env.GHL_MCP_WRITE_ALLOWLIST || '')
+    .split(',').map(s => s.trim()).filter(Boolean));
+}
+
+// The endpoint answers in SSE framing (`event: message` / `data: {...}`) even for a
+// single JSON-RPC reply, so the body is never straight JSON. Last data frame wins.
+function parseMcpSse(text) {
+  let last = null;
+  for (const line of String(text).split('\n')) {
+    if (line.startsWith('data:')) last = line.slice(5).trim();
+  }
+  if (last === null) throw new Error('GHL MCP: no data frame in response');
+  return JSON.parse(last);
+}
+
+// Every call goes through ghlFetch, never raw fetch — the outcome loop wrote 0 of 6
+// on its first live sweep because it bypassed the retry ladder (lessons.md 2026-08-14).
+// Note a *scope* rejection comes back as HTTP 200 with the 401 inside the payload, so
+// ghlFetch's one-shot 401 retry only fires for a genuinely bad token.
+async function ghlMcpCall(name, args, { label = '' } = {}) {
+  if (!process.env.GHL_API_KEY) throw new Error('GHL MCP: GHL_API_KEY is not set');
+  const res = await ghlFetch(GHL_MCP_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+      'locationId': process.env.GHL_LOCATION_ID || '',
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+  }, { label: label || `mcp ${name}` });
+  if (!res.ok) throw new Error(`GHL MCP ${name} HTTP ${res.status}`);
+  const rpc = parseMcpSse(await res.text());
+  if (rpc.error) throw new Error(`GHL MCP ${name}: ${rpc.error.message || 'rpc error'}`);
+  const text = rpc.result && rpc.result.content && rpc.result.content[0] && rpc.result.content[0].text;
+  if (typeof text !== 'string') throw new Error(`GHL MCP ${name}: empty content`);
+  try { return JSON.parse(text); } catch (_) { return { raw: text }; }
+}
+
+function ghlMcpTruncate(value, limit = GHL_MCP_MAX_RESULT_CHARS) {
+  const s = typeof value === 'string' ? value : JSON.stringify(value);
+  return s.length > limit ? `${s.slice(0, limit)}…[truncated, ${s.length} chars total]` : s;
+}
+
+// operationId -> {kind, domain, ...}. The gate reads kind and domain from HERE, never
+// from tool input, so the model cannot assert its way past it. One describe round trip
+// per distinct operation per process, free thereafter.
+const ghlMcpMetaCache = new Map();
+async function ghlMcpOperationMeta(operationId) {
+  if (ghlMcpMetaCache.has(operationId)) return ghlMcpMetaCache.get(operationId);
+  const out = await ghlMcpCall('describe_operation', { operationId });
+  const op = out.operation || {};
+  // Fail closed: an unrecognised kind is treated as a write, never as a read.
+  const meta = {
+    kind: op.kind || 'write',
+    domain: op.domain || '',
+    method: op.method || '',
+    path: op.path || '',
+    requiresApproval: !!op.requiresApproval,
+  };
+  ghlMcpMetaCache.set(operationId, meta);
+  return meta;
+}
+
+// Pure, so the whole policy is unit-testable offline.
+function ghlMcpGateDecision(meta, { allowlist, operationId, isRon }) {
+  if (GHL_MCP_FORBIDDEN_KINDS.has(meta.kind)) {
+    return { allowed: false, reason: `BLOCKED: ${operationId} is a ${meta.kind} operation. Max never runs deletes or money movement through the GHL router — that has to happen in the GHL UI.` };
+  }
+  if (GHL_MCP_FINANCIAL_DOMAINS.has(meta.domain) && !isRon) {
+    return { allowed: false, reason: `BLOCKED: ${operationId} touches the ${meta.domain} domain, which is Ron-only. Ask Ron to run it.` };
+  }
+  if (meta.kind !== 'read' && !allowlist.has(operationId)) {
+    return { allowed: false, reason: `BLOCKED: ${operationId} is a ${meta.kind} operation and is not in GHL_MCP_WRITE_ALLOWLIST, so the router is read-only for it. Reads work as-is; ask Ron to arm this operation if it should be writable.` };
+  }
+  return { allowed: true };
+}
+
+async function ghlMcpFindOperation(input) {
+  const query = (input.query || '').trim();
+  if (!query) return 'Provide a query describing what you need to do in GHL.';
+  const out = await ghlMcpCall('search_operations', {
+    query,
+    ...(Array.isArray(input.domains) && input.domains.length ? { domains: input.domains } : {}),
+    ...(input.kind ? { kind: input.kind } : {}),
+    limit: Math.min(Number(input.limit) || 8, 25),
+  });
+  const results = (out.results || []).map(o => ({
+    operationId: o.operationId,
+    kind: o.kind,
+    domain: o.domain,
+    method: o.method,
+    summary: o.summary || o.description,
+    hasRequestBody: o.hasRequestBody,
+  }));
+  if (!results.length) {
+    return `No GHL operations matched "${query}"${out.zeroResultReason ? ` (${out.zeroResultReason})` : ''}.`;
+  }
+  return ghlMcpTruncate({ results });
+}
+
+async function ghlMcpDescribeOperation(operationId) {
+  if (!operationId) return 'Provide an operationId — get one from ghl_find_operation first.';
+  const out = await ghlMcpCall('describe_operation', { operationId });
+  return ghlMcpTruncate(out.operation || out);
+}
+
+async function ghlMcpRunOperation(input, userId) {
+  const operationId = input.operationId;
+  if (!operationId) return 'Provide an operationId — get one from ghl_find_operation first.';
+  const meta = await ghlMcpOperationMeta(operationId);
+  // No userId means a cron/system context, which runs as Ron — same convention as the
+  // Ron-only tool gate in askClaude.
+  const gate = ghlMcpGateDecision(meta, {
+    allowlist: ghlMcpWriteAllowlist(),
+    operationId,
+    isRon: !userId || userId === RON_SLACK_ID,
+  });
+  if (!gate.allowed) return gate.reason;
+  const out = await ghlMcpCall('execute_operation', {
+    operationId,
+    params: input.params || {},
+    ...(input.dryRun ? { dryRun: true } : {}),
+  });
+  return ghlMcpTruncate(out);
+}
+// ── end GHL native MCP operation router ──────────────────────────────────────
 
 async function ghlGetContact(contactId) {
   const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
