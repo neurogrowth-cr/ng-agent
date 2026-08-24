@@ -166,6 +166,58 @@ const URL = 'https://services.leadconnectorhq.com/contacts/faew9KFlhcL4TC0ECiAq'
       [[URL, 'PUT', '{"assignedTo":"u1"}'], [URL, 'PUT', '{"assignedTo":"u1"}']]);
   }
 
+  // ── Request timeouts (added 2026-08-24) ────────────────────────────────────
+  // Node's fetch has no default timeout. A GHL request that never answered used
+  // to block its caller forever: the first open-deal zombie digest sat in one
+  // for the full 600s cron budget, was abandoned, and logged nothing at all.
+  // A timeout now behaves like a 5xx — same backoff, same budget — and fails
+  // loudly instead of taking the whole job down.
+  const timeoutErr = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+  function buildThrowing(sequence) {
+    const calls = [], sleeps = [];
+    const fakeFetch = async (url, init) => {
+      calls.push({ url, init });
+      const item = sequence[Math.min(calls.length - 1, sequence.length - 1)];
+      if (item instanceof Error) throw item;
+      return item;
+    };
+    const fakeSetTimeout = (fn, ms) => { sleeps.push(ms); fn(); };
+    const ghlFetch = new Function('fetch', 'setTimeout', 'console', `${block}; return ghlFetch;`)(
+      fakeFetch, fakeSetTimeout, { warn() {}, log() {}, error() {} },
+    );
+    return { ghlFetch, calls, sleeps };
+  }
+
+  {
+    const { ghlFetch, calls, sleeps } = buildThrowing([timeoutErr(), resp(200)]);
+    const res = await ghlFetch(URL, {});
+    check('a timeout is retried like a 5xx', [res.status, calls.length], [200, 2]);
+    check('and backs off on the same schedule', sleeps, [1000]);
+  }
+  {
+    // Every attempt times out — the budget is finite and the error names itself.
+    const { ghlFetch, calls } = buildThrowing([timeoutErr()]);
+    let msg = null;
+    try { await ghlFetch(URL, {}, { label: 'opp-search' }); } catch (e) { msg = e.message; }
+    check('a dead endpoint throws inside the retry budget, never hangs',
+      [calls.length, /timed out after \d+ms on opp-search/.test(msg || '')], [4, true]);
+  }
+  {
+    // A non-timeout error is a real error: surface it, do not silently retry.
+    const { ghlFetch, calls } = buildThrowing([Object.assign(new Error('ECONNREFUSED'), { name: 'TypeError' })]);
+    let msg = null;
+    try { await ghlFetch(URL, {}); } catch (e) { msg = e.message; }
+    check('a non-timeout failure propagates immediately', [calls.length, msg], [1, 'ECONNREFUSED']);
+  }
+  {
+    // The abort signal must not clobber what the caller passed.
+    const { ghlFetch, calls } = buildThrowing([resp(200)]);
+    await ghlFetch(URL, { method: 'PUT', body: '{"a":1}' });
+    const init = calls[0].init;
+    check('every request carries an abort signal', !!init.signal, true);
+    check('caller init survives alongside it', [init.method, init.body], ['PUT', '{"a":1}']);
+  }
+
   console.log(failures === 0 ? '\nAll ghl-retry tests passed.' : `\n${failures} test(s) FAILED.`);
   process.exit(failures === 0 ? 0 : 1);
 })();

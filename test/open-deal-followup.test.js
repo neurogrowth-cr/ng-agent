@@ -21,12 +21,14 @@ const {
   buildOpenDealCardText, formatOpenDealZombieDigest,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
+  OPEN_DEAL_DIGEST_ONLY_DAYS,
 } = new Function(`${block}; return {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
   buildOpenDealCardText, formatOpenDealZombieDigest,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
-  OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP };`)();
+  OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
+  OPEN_DEAL_DIGEST_ONLY_DAYS };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -140,10 +142,43 @@ check('7g healthy book + failed GHL check → still null (log line carries it)',
 const mkZombie = (i) => ({ display: `Zombie ${i}`, closer: 'Jose Carranza', ageDays: 30 + i, nudgeCount: 5, snoozeCount: 0 });
 const atBound = formatOpenDealZombieDigest({ zombies: Array.from({ length: OPEN_DEAL_SANITY_MAX }, (_, i) => mkZombie(i)), drift: [], unmatchedGhl: 0, ghlCheckFailed: false });
 check('8a exactly at the bound → still lists, capped with "and N more"',
-  atBound.includes('…and 30 more.') && atBound.split('\n').filter(l => l.startsWith('• ')).length === OPEN_DEAL_LIST_CAP, true);
+  atBound.includes(`…and ${OPEN_DEAL_SANITY_MAX - OPEN_DEAL_LIST_CAP} more.`)
+  && atBound.split('\n').filter(l => l.startsWith('• ')).length === OPEN_DEAL_LIST_CAP, true);
 const overBound = formatOpenDealZombieDigest({ zombies: Array.from({ length: OPEN_DEAL_SANITY_MAX + 1 }, (_, i) => mkZombie(i)), drift: [], unmatchedGhl: 0, ghlCheckFailed: false });
 check('8b over the bound → SANITY BOUND EXCEEDED, names withheld',
   overBound.includes('SANITY BOUND EXCEEDED') && !overBound.includes('Zombie 0'), true);
+
+// ── 9. Historical backlog is its own bucket, not 200 urgent zombies ──────────
+// Calibrated on the book measured in production on 2026-08-24: 299 follow_up
+// rows, 2 fresh (<3d), 31 in 3-21d, 73 actionable (21-60d), 193 older than 60d,
+// oldest 2026-05-19. The first draft called all 266 of the 21d+ rows zombies,
+// which tripped the fail-closed bound and would have told Ron his query was
+// broken when the only thing wrong was three months of unworked deals.
+const realBook = [
+  ...Array.from({ length: 2 },   (_, i) => ({ display: `Fresh ${i}`,      closer: 'Jose Carranza',   openedAt: daysAgoISO(1) })),
+  ...Array.from({ length: 31 },  (_, i) => ({ display: `Working ${i}`,    closer: 'Jonathan Madriz', openedAt: daysAgoISO(10) })),
+  ...Array.from({ length: 73 },  (_, i) => ({ display: `Actionable ${i}`, closer: 'Jose Carranza',   openedAt: daysAgoISO(40) })),
+  ...Array.from({ length: 193 }, (_, i) => ({ display: `Ancient ${i}`,    closer: 'Ron Duarte',      openedAt: daysAgoISO(90) })),
+];
+const rb = classifyOpenDeals(realBook, NOW);
+check('9a the 21-60d band is what counts as a zombie', rb.zombies.length, 73);
+check('9b everything past the card floor is historical, not a zombie', rb.historical.length, 193);
+check('9c fresh and working deals stay out of both', [rb.fresh, rb.active], [2, 31]);
+check('9d the real book does NOT trip the fail-closed bound', rb.zombies.length <= OPEN_DEAL_SANITY_MAX, true);
+const rbMsg = formatOpenDealZombieDigest({ zombies: rb.zombies, drift: [], historical: rb.historical, unmatchedGhl: 0, ghlCheckFailed: false });
+check('9e it reports real names, not "SANITY BOUND EXCEEDED"', rbMsg.includes('SANITY BOUND EXCEEDED'), false);
+check('9f the backlog is one honest count line, never 193 bullets',
+  /📦 \*193 historical\* — open more than 60 days \(oldest 90d\)/.test(rbMsg), true);
+check('9g still only LIST_CAP names in the zombie section',
+  rbMsg.split('\n').filter(l => l.startsWith('• ')).length, OPEN_DEAL_LIST_CAP);
+check('9h a purely historical book still speaks up (it is not "healthy")',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: rb.historical, unmatchedGhl: 0, ghlCheckFailed: false }) !== null, true);
+check('9i a genuinely empty book stays silent',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: [], unmatchedGhl: 0, ghlCheckFailed: false }), null);
+check('9j a capped GHL scan says the count is incomplete',
+  formatOpenDealZombieDigest({ zombies: [], drift: [], historical: [], unmatchedGhl: 4, ghlCheckFailed: false, scanCapped: true })
+    .includes('stage scan hit its page cap'), true);
+check('9k no undefined/NaN anywhere in the real-book digest', /undefined|NaN/.test(rbMsg), false);
 
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }

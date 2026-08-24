@@ -9226,7 +9226,17 @@ const OPEN_DEAL_ZOMBIE_AGE_DAYS  = 21;  // age alone puts a deal in Ron's digest
 const OPEN_DEAL_ZOMBIE_NUDGES    = 3;   // ...as do this many ignored nudges
 const OPEN_DEAL_DIGEST_ONLY_DAYS = 60;  // cold-start guard: too old for a card, digest-only
 const OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN = 3; // backlog drains gradually, never DM-bombs
-const OPEN_DEAL_SANITY_MAX       = 40;  // more zombies than this means the QUERY is broken
+// Calibrated against the real book measured on 2026-08-24 — 299 follow_up rows
+// across 3 closers, of which 73 sat in the actionable 21-60d band and 193 were
+// historical. The first draft guessed 40 and would have cried "the query is
+// broken" at a backlog that was simply real, which is the exact false alarm a
+// fail-closed bound exists to avoid. Recalibrate (and date it) if the shape of
+// the book changes; the LIST_CAP below, not this bound, is what protects Ron
+// from a wall of names.
+const OPEN_DEAL_SANITY_MAX       = 250; // actionable zombies beyond this ⇒ the QUERY broke
+// The GHL cross-check is the most expensive thing the digest does and the least
+// load-bearing (it yields one count). Bounded so it can never dominate the run.
+const OPEN_DEAL_GHL_SCAN_PAGES   = 6;   // ×100 cards per pipeline
 const OPEN_DEAL_LIST_CAP         = 10;  // digest names at most this many per bucket
 // 💤 — verified against every other reaction route: absent from the campaign
 // approve/skip sets, EMOJI_TO_OUTCOME, and the lead-claim emojis. (⏳ was
@@ -9314,7 +9324,7 @@ function parseOpenDealReply(text) {
 // visibility (the snoozeCount is surfaced so serial snoozers are legible).
 // Rows with unparseable dates are dropped, never NaN'd into the report.
 function classifyOpenDeals(deals, now = Date.now()) {
-  const zombies = [], drift = [];
+  const zombies = [], drift = [], historical = [];
   let active = 0, fresh = 0;
   for (const d of deals || []) {
     const openedMs = Date.parse(d.openedAt || '');
@@ -9328,13 +9338,19 @@ function classifyOpenDeals(deals, now = Date.now()) {
       snoozeCount: d.snoozeCount || 0,
     };
     if (d.driftISO) { drift.push({ ...entry, driftDate: String(d.driftISO).slice(0, 10) }); continue; }
+    // Deals too old to card are too old to chase one-by-one either. They are a
+    // backlog to decide about in bulk, not today's follow-up list — keeping
+    // them among the zombies is what made the first real run look like 266
+    // urgent items instead of 73 actionable ones plus three months of history.
+    if (ageDays >= OPEN_DEAL_DIGEST_ONLY_DAYS) { historical.push(entry); continue; }
     if (ageDays >= OPEN_DEAL_ZOMBIE_AGE_DAYS || entry.nudgeCount >= OPEN_DEAL_ZOMBIE_NUDGES) zombies.push(entry);
     else if (ageDays < OPEN_DEAL_FIRST_NUDGE_DAYS) fresh++;
     else active++;
   }
   zombies.sort((a, b) => b.ageDays - a.ageDays);
   drift.sort((a, b) => b.ageDays - a.ageDays);
-  return { zombies, drift, active, fresh };
+  historical.sort((a, b) => b.ageDays - a.ageDays);
+  return { zombies, drift, historical, active, fresh };
 }
 
 // Renders one open-deal card. Pure — callers pass the pipeline's own action
@@ -9357,11 +9373,11 @@ function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount,
 // Renders Ron's Monday digest, or null when there is nothing to say
 // (silent-when-healthy). Fails closed: an implausible zombie count reports the
 // CHECK as broken instead of spamming names.
-function formatOpenDealZombieDigest({ zombies, drift, unmatchedGhl, ghlCheckFailed }) {
-  const z = zombies || [], dr = drift || [];
-  if (!z.length && !dr.length && !(unmatchedGhl > 0)) return null;
+function formatOpenDealZombieDigest({ zombies, drift, historical, unmatchedGhl, ghlCheckFailed, scanCapped }) {
+  const z = zombies || [], dr = drift || [], hist = historical || [];
+  if (!z.length && !dr.length && !hist.length && !(unmatchedGhl > 0)) return null;
   if (z.length > OPEN_DEAL_SANITY_MAX) {
-    return `*OPEN DEAL ZOMBIES*\n\n⚠️ SANITY BOUND EXCEEDED — ${z.length} open deals qualify as zombies, which is more than plausible. The sweep's query or its state keys are likely broken; not listing names. Check runOpenDealZombieDigest in index.js.`;
+    return `*OPEN DEAL ZOMBIES*\n\n⚠️ SANITY BOUND EXCEEDED — ${z.length} deals sit in the actionable ${OPEN_DEAL_ZOMBIE_AGE_DAYS}-${OPEN_DEAL_DIGEST_ONLY_DAYS}d band, which is implausible even for a backlog. The sweep's query or its state keys are likely broken; not listing names. Check runOpenDealZombieDigest in index.js.`;
   }
   const lines = [];
   if (z.length) {
@@ -9380,9 +9396,13 @@ function formatOpenDealZombieDigest({ zombies, drift, unmatchedGhl, ghlCheckFail
     if (dr.length > OPEN_DEAL_LIST_CAP) lines.push(`…and ${dr.length - OPEN_DEAL_LIST_CAP} more.`);
     lines.push('_The portal row still counts these as open — the closer should log the real outcome so the scorecard stops carrying dead deals._');
   }
+  if (hist.length) {
+    if (lines.length) lines.push('');
+    lines.push(`📦 *${hist.length} historical* — open more than ${OPEN_DEAL_DIGEST_ONLY_DAYS} days (oldest ${hist[0].ageDays}d). Never carded to closers by design; these want one bulk decision, not a daily nag.`);
+  }
   if (unmatchedGhl > 0) {
     if (lines.length) lines.push('');
-    lines.push(`📎 ${unmatchedGhl} GHL Open-Deal card(s) have no portal follow-up row — logged outside Max. Ask the closer, or log them through the card flow.`);
+    lines.push(`📎 ${unmatchedGhl} GHL Open-Deal card(s) have no portal follow-up row — logged outside Max. Ask the closer, or log them through the card flow.${scanCapped ? ' _(stage scan hit its page cap — the real number is higher.)_' : ''}`);
   }
   if (ghlCheckFailed) {
     if (lines.length) lines.push('');
@@ -9830,17 +9850,21 @@ async function runOpenDealZombieDigest(correlationId) {
   // have no appointment_id to promote against, so v1 makes the gap visible
   // rather than pretending it doesn't exist. Fail-soft: a GHL error degrades
   // this line, never kills the digest.
-  let unmatchedGhl = 0, ghlCheckFailed = false;
+  let unmatchedGhl = 0, ghlCheckFailed = false, scanCapped = false;
   try {
     const known = new Set();
     for (const d of deals) {
       if (d.ghl_opportunity_id) known.add(d.ghl_opportunity_id);
       if (d.ghl_contact_id) known.add(d.ghl_contact_id);
     }
-    const openDealOpps = [
-      ...await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING].follow_up.id, { pipelineId: GHL_PIPELINE.APPT_SETTING }),
-      ...await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.VSL].follow_up.id, { pipelineId: GHL_PIPELINE.VSL }),
-    ];
+    const apptCards = await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING].follow_up.id,
+      { pipelineId: GHL_PIPELINE.APPT_SETTING, maxPages: OPEN_DEAL_GHL_SCAN_PAGES });
+    const vslCards = await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.VSL].follow_up.id,
+      { pipelineId: GHL_PIPELINE.VSL, maxPages: OPEN_DEAL_GHL_SCAN_PAGES });
+    // A full page budget means the stage had more cards than we read — say so
+    // rather than reporting a count that quietly excludes the remainder.
+    scanCapped = apptCards.length >= OPEN_DEAL_GHL_SCAN_PAGES * 100 || vslCards.length >= OPEN_DEAL_GHL_SCAN_PAGES * 100;
+    const openDealOpps = [...apptCards, ...vslCards];
     for (const o of openDealOpps) {
       const contactId = o.contactId || (o.contact && o.contact.id) || null;
       if (!known.has(o.id) && !(contactId && known.has(contactId))) unmatchedGhl += 1;
@@ -9850,21 +9874,25 @@ async function runOpenDealZombieDigest(correlationId) {
     console.error('Open-deal digest: GHL cross-check unavailable:', err.message);
   }
 
-  const message = formatOpenDealZombieDigest({ zombies: buckets.zombies, drift: buckets.drift, unmatchedGhl, ghlCheckFailed });
+  const message = formatOpenDealZombieDigest({
+    zombies: buckets.zombies, drift: buckets.drift, historical: buckets.historical,
+    unmatchedGhl, ghlCheckFailed, scanCapped,
+  });
   logActivity({
     event_type: 'alert', event_source: 'cron', action: 'runOpenDealZombieDigest',
     status: message ? 'gap' : 'ok', correlation_id: correlationId,
     metadata: {
       open_deals: deals.length, zombies: buckets.zombies.length, drift: buckets.drift.length,
-      active: buckets.active, unmatched_ghl: unmatchedGhl, ghl_check_failed: ghlCheckFailed,
+      historical: buckets.historical.length, active: buckets.active,
+      unmatched_ghl: unmatchedGhl, ghl_check_failed: ghlCheckFailed, scan_capped: scanCapped,
     },
   });
   if (!message) {
-    console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift${ghlCheckFailed ? ' (GHL cross-check unavailable)' : ''}.`);
+    console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift, 0 historical${ghlCheckFailed ? ' (GHL cross-check unavailable)' : ''}.`);
     return;
   }
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
-  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.drift.length} drift, ${unmatchedGhl} unmatched GHL card(s).`);
+  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.historical.length} historical, ${buckets.drift.length} drift, ${unmatchedGhl} unmatched GHL card(s).`);
 }
 
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
@@ -11891,11 +11919,31 @@ const GHL_RETRY_DELAYS_MS = [1000, 3000, 8000];
 // thresholds instead, which is where a real auth outage belongs: STRIKE_FAILURE_LIMITS
 // alerts at 5 401s in a sweep, and a dead token produces hundreds.
 const GHL_UNAUTH_RETRY_DELAY_MS = 1000;
+// No HTTP call may hang forever. Node's fetch has no default timeout, so before
+// this a GHL request that never answered blocked its caller indefinitely — the
+// first open-deal zombie digest (2026-08-24 08:45 CR) sat in one for the full
+// 600s cron budget, was abandoned, logged not a single line, and told Ron
+// nothing. A timeout is retryable like a 5xx: transient slowness gets the same
+// backoff, and a genuinely dead endpoint fails loudly inside the budget instead
+// of taking the whole job down with it.
+const GHL_REQUEST_TIMEOUT_MS = Number(process.env.GHL_REQUEST_TIMEOUT_MS || 20000);
 
 async function ghlFetch(url, init = {}, { retries = GHL_RETRY_DELAYS_MS.length, label = '' } = {}) {
   let unauthRetried = false;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, init);
+    let res;
+    try {
+      // Caller-supplied signals win — spreading init last is deliberate.
+      res = await fetch(url, { signal: AbortSignal.timeout(GHL_REQUEST_TIMEOUT_MS), ...init });
+    } catch (err) {
+      const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+      if (!timedOut) throw err;
+      if (attempt >= retries) throw new Error(`GHL request timed out after ${GHL_REQUEST_TIMEOUT_MS}ms${label ? ` on ${label}` : ''}`);
+      const wait = GHL_RETRY_DELAYS_MS[Math.min(attempt, GHL_RETRY_DELAYS_MS.length - 1)];
+      console.warn(`GHL timeout${label ? ` on ${label}` : ''} — retry ${attempt + 1}/${retries} in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+      continue;
+    }
     if (res.status === 401 && !unauthRetried) {
       unauthRetried = true;
       console.warn(`GHL 401${label ? ` on ${label}` : ''} — single retry in ${GHL_UNAUTH_RETRY_DELAY_MS}ms (transient auth blink; a dead token will trip the failure-spike alert)`);
