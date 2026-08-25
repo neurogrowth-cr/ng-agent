@@ -9283,7 +9283,12 @@ const OPEN_DEAL_SNOOZE_DAYS      = 7;   // one "still working it" buys this long
 const OPEN_DEAL_ZOMBIE_AGE_DAYS  = 21;  // age alone puts a deal in Ron's digest
 const OPEN_DEAL_ZOMBIE_NUDGES    = 3;   // ...as do this many ignored nudges
 const OPEN_DEAL_DIGEST_ONLY_DAYS = 60;  // cold-start guard: too old for a card, digest-only
-const OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN = 3; // backlog drains gradually, never DM-bombs
+// Raised 3 → 5 on 2026-08-25 (Ron). The cap exists so a first live run against
+// a large book cannot DM-bomb a closer; it is not a daily quota. Sized against
+// the real book measured after the cutover fix — 31 deals, Jose holding 28 —
+// where 5/day clears his queue in under a week while a single DM burst stays
+// readable. Re-check this number if the book ever grows past ~50 per closer.
+const OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN = 5;
 // Calibrated against the real book measured on 2026-08-24 — 299 follow_up rows
 // across 3 closers, of which 73 sat in the actionable 21-60d band and 193 were
 // historical. The first draft guessed 40 and would have cried "the query is
