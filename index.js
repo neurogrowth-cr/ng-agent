@@ -11422,6 +11422,50 @@ const SELF_SERVE_SOURCE_RE   = /self[\s._-]?serv/i;
 // webhook is not guaranteed — wait it out before looking for the parent post.
 const SELF_SERVE_FYI_DELAY_MS = 90 * 1000;
 
+// ─── CLIENT / FULFILLMENT CALLS ARE NOT SALES LEADS ──────────────────────────
+// Once a prospect becomes a client, the dashboard CRM owns them — fulfillment
+// state never rides a GHL contact (architecture decision, 2026-08-18). But GHL's
+// "New Lead Intake and Assignment" workflow enrols EVERY new contact, including
+// the ones its own client-facing calendars create. On 2026-08-25 that put an
+// activation-call booking into #ng-sales-goats as a claimable lead, DM'd a
+// setter, and — the part that actually corrupts numbers — wrote a `lead_posts`
+// row. `lead_posts` is the authoritative lead-volume source for LEADS TODAY,
+// the daily/yesterday counts and the weekly recap, so a client booking their
+// own onboarding call was being counted as demand.
+//
+// Matched on calendar ID first, because names drift: the same leak on
+// 2026-08-13 (Jose Tencio) carries source "LinkedIn Flywheel Internal 1:1 with
+// Ron", a calendar since renamed "LinkedIn Flywheel - Client 1:1 with Ron".
+// The name regex is the backup for payloads that arrive with no attribution.
+//
+// The sales calendars — Intro, Appointment, Appointment-ONLY RON, Self Serving
+// — are deliberately absent and keep their existing paths. Do not match on
+// "flywheel": every calendar in the location carries that prefix.
+const CLIENT_CALL_CALENDAR_IDS = new Set([
+  'VYv8EyyFsNiYpKpyqsus', // LinkedIn Flywheel Activation Call
+  'YkSsJAMlGhOGK93Lix7Y', // LinkedIn Flywheel Quick Sync
+  'H9q2eNZMsr0APPCrinWC', // LinkedIn Flywheel - Client 1:1 with Josue
+  'rRh3CZnC4DlF3Fo1HqXq', // LinkedIn Flywheel - Client 1:1 with Ron
+  'VTdxE8vEJ26U509wazNL', // LinkedIn Flywheel Official Delivery
+  // Env override so a new client calendar can be covered without a deploy.
+  ...String(process.env.CLIENT_CALL_CALENDAR_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
+]);
+const CLIENT_CALL_SOURCE_RE = /activation call|quick[\s._-]?sync|1:1|official delivery/i;
+
+// Returns a human-readable reason this contact is a client/fulfillment call, or
+// null when it is a genuine sales lead. Three independent signals because each
+// one alone has a hole: `createdBy.sourceId` is the calendar that created the
+// contact but is absent on contacts created some other way, attribution can be
+// overwritten by a later session, and the source string is free text.
+function clientCallLeadReason({ sourceRaw = '', contactSource = '', calendarIds = [] } = {}) {
+  const calId = (calendarIds || []).filter(Boolean).find(id => CLIENT_CALL_CALENDAR_IDS.has(id));
+  if (calId) return `calendar ${calId}`;
+  for (const s of [sourceRaw, contactSource]) {
+    if (s && CLIENT_CALL_SOURCE_RE.test(String(s))) return `source "${s}"`;
+  }
+  return null;
+}
+
 const LEAD_CLAIM_EMOJIS = new Set(['raised_hand', 'hand', 'white_check_mark', 'heavy_check_mark']);
 const LEAD_CLAIMED_EMOJI = 'white_check_mark';
 
@@ -11588,6 +11632,24 @@ async function handleGHLWebhook(req, res) {
         // on some payloads, and a contact created long before the VSL launched keeps
         // its original source but still books on the self-serve calendar.
         const attributionMediumIds = [ghlContact?.attributionSource?.mediumId, ghlContact?.lastAttributionSource?.mediumId].filter(Boolean);
+
+        // A client booking an activation call / quick sync / 1:1 is not a new
+        // lead. Dropped BEFORE the Slack card, the setter DM, the phone
+        // writeback and the lead_posts row — see CLIENT_CALL_CALENDAR_IDS.
+        const clientCallReason = clientCallLeadReason({
+          sourceRaw,
+          contactSource: ghlContact?.source || '',
+          calendarIds: [ghlContact?.createdBy?.sourceId, ...attributionMediumIds],
+        });
+        if (clientCallReason) {
+          console.log(`GHL lead ${contactId} ("${fullName}") DROPPED — client/fulfillment call, not a sales lead (${clientCallReason}). No Slack post, no setter DM, no lead_posts row.`);
+          logActivity({
+            event_type: 'ghl_webhook', event_source: 'ghl', action: 'client_call_dropped',
+            correlation_id: newCorrelationId(),
+            output: { contact_id: contactId, full_name: fullName, reason: clientCallReason, source: sourceRaw || null },
+          });
+          return;
+        }
         const isSelfServe = SELF_SERVE_SOURCE_RE.test(sourceRaw || '')
           || SELF_SERVE_SOURCE_RE.test(ghlContact?.source || '')
           || attributionMediumIds.includes(SELF_SERVE_CALENDAR_ID);
