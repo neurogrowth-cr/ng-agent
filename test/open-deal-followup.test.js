@@ -21,14 +21,14 @@ const {
   buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
-  OPEN_DEAL_DIGEST_ONLY_DAYS,
+  OPEN_DEAL_DIGEST_ONLY_DAYS, OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN,
 } = new Function(`${block}; return {
   encodeOpenDealNudgeState, parseOpenDealNudgeState, evaluateOpenDealNudge,
   evaluateOutcomePromotion, parseOpenDealReply, classifyOpenDeals,
   buildOpenDealCardText, formatOpenDealZombieDigest, sortOpenDealsOldestFirst,
   OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS,
   OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES, OPEN_DEAL_SANITY_MAX, OPEN_DEAL_LIST_CAP,
-  OPEN_DEAL_DIGEST_ONLY_DAYS };`)();
+  OPEN_DEAL_DIGEST_ONLY_DAYS, OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -236,6 +236,20 @@ check('12d still scoped to open deals', /o\.outcome = 'follow_up'/.test(fetchSrc
 const cutoverDecl = SRC.indexOf('const GHL_CUTOVER_ISO');
 check('12e the constant is declared before every use (no temporal dead zone)',
   [...SRC.matchAll(/GHL_CUTOVER_ISO/g)].map(m => m.index).filter(i => i !== cutoverDecl + 6).every(i => i > cutoverDecl), true);
+
+// ── 13. The per-closer burst cap ────────────────────────────────────────────
+// The cap is what stops a first live run against a large book from dumping the
+// whole backlog into one closer's DMs. It went unpinned until 2026-08-25, when
+// Ron raised it 3 → 5; a behavioural constant nobody asserts is one someone
+// silently hardcodes at a call site.
+check('13a the cap is the value Ron set', OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN, 5);
+check('13b it stays a small positive integer — this is a burst guard, not a quota',
+  Number.isInteger(OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN)
+  && OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN >= 1 && OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN <= 10, true);
+const sweepSrc = SRC.slice(SRC.indexOf('async function runOpenDealFollowupSweep'), SRC.indexOf('async function runOpenDealZombieDigest'));
+const capSites = [...sweepSrc.matchAll(/newCards >= ([A-Z_]+|\d+)/g)].map(m => m[1]);
+check('13c every enforcement site reads the constant, never a literal',
+  [capSites.length >= 2, capSites.every(s => s === 'OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN')], [true, true]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 if (failures) { console.error(`\n${failures} failure(s).`); process.exit(1); }
