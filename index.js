@@ -9297,9 +9297,6 @@ const OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN = 5;
 // the book changes; the LIST_CAP below, not this bound, is what protects Ron
 // from a wall of names.
 const OPEN_DEAL_SANITY_MAX       = 250; // actionable zombies beyond this ⇒ the QUERY broke
-// The GHL cross-check is the most expensive thing the digest does and the least
-// load-bearing (it yields one count). Bounded so it can never dominate the run.
-const OPEN_DEAL_GHL_SCAN_PAGES   = 6;   // ×100 cards per pipeline
 const OPEN_DEAL_LIST_CAP         = 10;  // digest names at most this many per bucket
 // 💤 — verified against every other reaction route: absent from the campaign
 // approve/skip sets, EMOJI_TO_OUTCOME, and the lead-claim emojis. (⏳ was
@@ -9449,9 +9446,9 @@ function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount,
 // Renders Ron's Monday digest, or null when there is nothing to say
 // (silent-when-healthy). Fails closed: an implausible zombie count reports the
 // CHECK as broken instead of spamming names.
-function formatOpenDealZombieDigest({ zombies, drift, historical, unmatchedGhl, ghlCheckFailed, scanCapped }) {
+function formatOpenDealZombieDigest({ zombies, drift, historical }) {
   const z = zombies || [], dr = drift || [], hist = historical || [];
-  if (!z.length && !dr.length && !hist.length && !(unmatchedGhl > 0)) return null;
+  if (!z.length && !dr.length && !hist.length) return null;
   if (z.length > OPEN_DEAL_SANITY_MAX) {
     return `*OPEN DEAL ZOMBIES*\n\n⚠️ SANITY BOUND EXCEEDED — ${z.length} deals sit in the actionable ${OPEN_DEAL_ZOMBIE_AGE_DAYS}-${OPEN_DEAL_DIGEST_ONLY_DAYS}d band, which is implausible even for a backlog. The sweep's query or its state keys are likely broken; not listing names. Check runOpenDealZombieDigest in index.js.`;
   }
@@ -9475,14 +9472,6 @@ function formatOpenDealZombieDigest({ zombies, drift, historical, unmatchedGhl, 
   if (hist.length) {
     if (lines.length) lines.push('');
     lines.push(`📦 *${hist.length} historical* — open more than ${OPEN_DEAL_DIGEST_ONLY_DAYS} days (oldest ${hist[0].ageDays}d). Never carded to closers by design; these want one bulk decision, not a daily nag.`);
-  }
-  if (unmatchedGhl > 0) {
-    if (lines.length) lines.push('');
-    lines.push(`📎 ${unmatchedGhl} GHL Open-Deal card(s) have no portal follow-up row — logged outside Max. Ask the closer, or log them through the card flow.${scanCapped ? ' _(stage scan hit its page cap — the real number is higher.)_' : ''}`);
-  }
-  if (ghlCheckFailed) {
-    if (lines.length) lines.push('');
-    lines.push('_(GHL cross-check unavailable this run — the 📎 count may be incomplete.)_');
   }
   lines.push('');
   lines.push('Each zombie is one decision: push it to close, or call it lost. The closer can answer right on their card DM.');
@@ -9945,38 +9934,18 @@ async function runOpenDealZombieDigest(correlationId) {
   });
   const buckets = classifyOpenDeals(enriched, now);
 
-  // Cross-check the OTHER direction: GHL Open-Deal cards with no portal
-  // follow-up row (hand-dragged, or logged outside Max). Count only — these
-  // have no appointment_id to promote against, so v1 makes the gap visible
-  // rather than pretending it doesn't exist. Fail-soft: a GHL error degrades
-  // this line, never kills the digest.
-  let unmatchedGhl = 0, ghlCheckFailed = false, scanCapped = false;
-  try {
-    const known = new Set();
-    for (const d of deals) {
-      if (d.ghl_opportunity_id) known.add(d.ghl_opportunity_id);
-      if (d.ghl_contact_id) known.add(d.ghl_contact_id);
-    }
-    const apptCards = await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING].follow_up.id,
-      { pipelineId: GHL_PIPELINE.APPT_SETTING, maxPages: OPEN_DEAL_GHL_SCAN_PAGES });
-    const vslCards = await ghlSearchOppsByStage(GHL_OUTCOME_STAGES[GHL_PIPELINE.VSL].follow_up.id,
-      { pipelineId: GHL_PIPELINE.VSL, maxPages: OPEN_DEAL_GHL_SCAN_PAGES });
-    // A full page budget means the stage had more cards than we read — say so
-    // rather than reporting a count that quietly excludes the remainder.
-    scanCapped = apptCards.length >= OPEN_DEAL_GHL_SCAN_PAGES * 100 || vslCards.length >= OPEN_DEAL_GHL_SCAN_PAGES * 100;
-    const openDealOpps = [...apptCards, ...vslCards];
-    for (const o of openDealOpps) {
-      const contactId = o.contactId || (o.contact && o.contact.id) || null;
-      if (!known.has(o.id) && !(contactId && known.has(contactId))) unmatchedGhl += 1;
-    }
-  } catch (err) {
-    ghlCheckFailed = true;
-    console.error('Open-deal digest: GHL cross-check unavailable:', err.message);
-  }
-
+  // The GHL cross-check that used to live here — paging both Open-Deal stages
+  // to count cards with no portal row — was removed 2026-08-25 (Ron). It cost
+  // this job its first live run (a hung request with no timeout burned the full
+  // 600s budget and DMed nobody), and after the cutover floor in #120 it had
+  // become actively misleading: it compares GHL's stage, which still holds
+  // every pre-cutover card, against a portal book that deliberately excludes
+  // them, so it would report ~28 of 57 cards as "logged outside Max" every week
+  // when they are the same iClosed ghosts #120 filtered out. One count line is
+  // not worth an unbounded scan that can take the digest down — and a number
+  // that is wrong by construction is worth less than nothing.
   const message = formatOpenDealZombieDigest({
     zombies: buckets.zombies, drift: buckets.drift, historical: buckets.historical,
-    unmatchedGhl, ghlCheckFailed, scanCapped,
   });
   logActivity({
     event_type: 'alert', event_source: 'cron', action: 'runOpenDealZombieDigest',
@@ -9984,15 +9953,14 @@ async function runOpenDealZombieDigest(correlationId) {
     metadata: {
       open_deals: deals.length, zombies: buckets.zombies.length, drift: buckets.drift.length,
       historical: buckets.historical.length, active: buckets.active,
-      unmatched_ghl: unmatchedGhl, ghl_check_failed: ghlCheckFailed, scan_capped: scanCapped,
     },
   });
   if (!message) {
-    console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift, 0 historical${ghlCheckFailed ? ' (GHL cross-check unavailable)' : ''}.`);
+    console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift, 0 historical.`);
     return;
   }
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
-  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.historical.length} historical, ${buckets.drift.length} drift, ${unmatchedGhl} unmatched GHL card(s).`);
+  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.historical.length} historical, ${buckets.drift.length} drift.`);
 }
 
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
@@ -12891,13 +12859,13 @@ async function ghlFetchJson(url) {
 
 // Pages a whole stage. Uses the meta.startAfter/startAfterId cursor rather than
 // meta.nextPageUrl so the location/pipeline filters can't drift between pages.
-async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40, pipelineId = STRIKE_PIPELINE_ID } = {}) {
+async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40 } = {}) {
   const locationId = process.env.GHL_LOCATION_ID;
   const out = [];
   let startAfter = null, startAfterId = null;
   for (let page = 0; page < maxPages; page++) {
     let url = `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}`
-            + `&pipeline_id=${pipelineId}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
+            + `&pipeline_id=${STRIKE_PIPELINE_ID}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
     if (startAfter && startAfterId) url += `&startAfter=${startAfter}&startAfterId=${startAfterId}`;
     const data  = await ghlFetchJson(url);
     const batch = data.opportunities || [];
