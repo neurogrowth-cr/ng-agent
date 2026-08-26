@@ -6634,11 +6634,46 @@ async function checkApproval(message, say, userId) {
   return false;
 }
 
+// A draft awaiting approval belongs to the person who has to act on it, never
+// to a room. In a DM `say` is already private. In a channel `say` is a
+// broadcast — and on 2026-08-25 that published an escalation draft bound for
+// #ng-pm-agent into #ng-sales-goats, in front of the whole sales team, before
+// anyone had approved it. Max had emitted the APPROVAL_NEEDED sentinel exactly
+// as designed; this function is what leaked it.
+//
+// So in a channel the body goes to the recipient's DM and the room gets a
+// pointer carrying no part of the draft. `promoteDraftToRon` already worked
+// this way for emails — this brings the channel-post and setter-review paths in
+// line with it.
+function deliverDraft({ say, recipientId, inChannel, body, pointer, correlationId, label }) {
+  const post = (text) => Promise.resolve(say(text))
+    .catch(err => console.error(`${label}: say failed:`, err && err.message));
+
+  if (!inChannel) {
+    if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: body.slice(0, 2000) }, correlation_id: correlationId });
+    return post(body);
+  }
+
+  slack.client.chat.postMessage({ channel: recipientId, text: body })
+    .then(() => {
+      if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: recipientId, output: { text: body.slice(0, 2000) }, correlation_id: correlationId });
+    })
+    .catch(err => {
+      // The pointer promised a DM that never arrived. Say so in the room —
+      // without the draft — rather than leaving them waiting on nothing.
+      console.error(`${label}: draft DM to ${recipientId} failed:`, err && err.message);
+      post("I couldn't DM you the draft — open a DM with me and ask again.");
+    });
+  return post(pointer);
+}
+
 // Approval sentinel format:
 //   APPROVAL_NEEDED|<channelName>|<escalate '0'|'1'>|<originUserId>|<reason>|<message...>
 // message is everything after the 5th pipe so it may itself contain pipes.
-function handleDraftReply(reply, userId, say, correlationId) {
-  if (reply.startsWith('SETTER_REVIEW_NEEDED|')) return handleSetterReview(reply, userId, say);
+// `inChannel` tells the draft delivery whether `say` is a broadcast — see
+// deliverDraft. It defaults to false so a missed call site errs private.
+function handleDraftReply(reply, userId, say, correlationId, inChannel = false) {
+  if (reply.startsWith('SETTER_REVIEW_NEEDED|')) return handleSetterReview(reply, userId, say, inChannel);
   if (!reply.startsWith('APPROVAL_NEEDED|')) return false;
   const parts = reply.split('|');
   const channelName = parts[1];
@@ -6668,10 +6703,14 @@ function handleDraftReply(reply, userId, say, correlationId) {
   };
 
   if (escalate && approver !== originUserId) {
-    // Tell the originator we're routing to Ron
+    // Tell the originator we're routing to Ron. The pointer carries no part of
+    // the draft and not the reason either — an escalation reason is itself
+    // often the sensitive bit ("client threatening to cancel").
     const tO = `This one needs Ron's call${reason ? ` — ${reason}` : ''}. I've routed the draft to him and I'll let you know when he signs off.\n\nFor ${channelName}:\n\n"${draftMessage}"`;
-    say(tO);
-    if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: tO.slice(0, 2000) }, correlation_id: correlationId });
+    deliverDraft({
+      say, recipientId: originUserId, inChannel, body: tO, correlationId, label: 'escalation ack',
+      pointer: `That one needs Ron's sign-off. I've routed it to him and sent you the draft in a DM — I'll let you know when he signs off.`,
+    });
     // DM Ron with the attributed draft
     const tR = `Escalation from ${origin.displayName}${reason ? ` — ${reason}` : ''}\n\nDraft for ${channelName}:\n\n"${draftMessage}"\n\nReply "send it" to post or "cancel" to discard.`;
     slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: tR })
@@ -6680,9 +6719,13 @@ function handleDraftReply(reply, userId, say, correlationId) {
       })
       .catch(err => console.error('Escalation DM to Ron failed:', err.message));
   } else {
+    // Approval is answered where the draft lands — `yes` typed in a channel
+    // does not reliably reach checkApproval, so the pointer says DM.
     const tA = `Here is what I would post to *${channelName}*:\n\n"${draftMessage}"\n\nReply *yes* to send it or *no* to cancel.`;
-    say(tA);
-    if (correlationId) logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', output: { text: tA.slice(0, 2000) }, correlation_id: correlationId });
+    deliverDraft({
+      say, recipientId: approver, inChannel, body: tA, correlationId, label: 'draft approval',
+      pointer: `Drafted it — I sent it to your DMs. Reply *yes* there to post it to *${channelName}*.`,
+    });
   }
   return true;
 }
@@ -6716,11 +6759,11 @@ async function getActiveThreadHint(setterSlackId) {
 // ─── EMAIL PROXY: setter-review sentinel handler ──────────────────────────────
 // Sentinel format: SETTER_REVIEW_NEEDED|<outbound|reply>|<setterSlackId>
 // Reads the staged draft from pendingDrafts and posts a preview to the setter.
-function handleSetterReview(reply, userId, say) {
+function handleSetterReview(reply, userId, say, inChannel = false) {
   if (!reply.startsWith('SETTER_REVIEW_NEEDED|')) return false;
   const draft = pendingDrafts[userId];
   if (!draft) {
-    say("Draft expired. Please start over.").catch(() => {});
+    Promise.resolve(say("Draft expired. Please start over.")).catch(() => {});
     return true;
   }
 
@@ -6733,9 +6776,15 @@ function handleSetterReview(reply, userId, say) {
     const subj = t.subject.toLowerCase().startsWith('re:') ? t.subject : `Re: ${t.subject}`;
     preview = `📝 Draft reply on "${t.subject}" — review before I send to Ron for approval:\n\nTo: ${(t.to_addresses || []).join(', ')}\nSubject: ${subj}\n\n${draft.body}\n\nReply *looks good* (or *se ve bien*) to send for Ron's approval, *cancel* to drop, or tell me what to change.`;
   }
-  say(preview).catch(err => console.error('setter-review preview DM failed:', err.message));
+  // The preview carries the prospect's address and the full body — never a
+  // channel post, even when the setter asked for it from one.
+  deliverDraft({
+    say, recipientId: userId, inChannel, body: preview, label: 'setter review',
+    pointer: `Drafted it — I sent it to your DMs to review before it goes to Ron.`,
+  });
   return true;
 }
+// ─── end draft delivery (test/draft-privacy.test.js slices to here) ──────────
 
 // ─── SHARED FILE HANDLER ──────────────────────────────────────────────────────
 async function handleFileMessage(message, say, userId, threadReply = false) {
@@ -6779,7 +6828,7 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
       let reply = await callClaude(history, 3, userId, correlation_id);
       if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId, correlation_id);
       if (!reply || !reply.trim()) return;
-      if (handleDraftReply(reply, userId, say, correlation_id)) return;
+      if (handleDraftReply(reply, userId, say, correlation_id, message.channel_type !== 'im')) return;
       await saveMessage(userId, 'user', `[Voice note]: ${transcript}`);
       await saveMessage(userId, 'assistant', reply);
       await say(threadReply ? { text: reply, thread_ts: message.thread_ts || message.ts } : reply);
@@ -7191,7 +7240,7 @@ slack.event('app_mention', async ({ event, say }) => {
     let reply = await callClaude(history, 3, userId, mentionCid);
     if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId, mentionCid); }
     if (!reply || !reply.trim()) return;
-    if (handleDraftReply(reply, userId, say, mentionCid)) return;
+    if (handleDraftReply(reply, userId, say, mentionCid, true)) return;
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: event.thread_ts || event.ts });
@@ -7265,7 +7314,7 @@ slack.message(async ({ message, say }) => {
       logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'suppressed', actor_user_id: userId, actor_name: chCtx.displayName, channel_id: message.channel, channel_name: channelName, thread_ts: message.thread_ts, input: { text: (message.text || '').slice(0, 2000) }, output: { reason: 'no_value_to_add' }, correlation_id: chCid });
       return;
     }
-    if (handleDraftReply(reply, userId, say, chCid)) return;
+    if (handleDraftReply(reply, userId, say, chCid, true)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: message.thread_ts || message.ts });
