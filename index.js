@@ -17,6 +17,13 @@ const slack = new App({
   socketMode: true,
 });
 
+// Max's own Slack bot id (B…), resolved from auth.test before the socket opens
+// — see resolveBotIdentity(). Every other app in the workspace posts with a
+// bot_id too, so this is the only way to tell his posts from Make's. Null means
+// unresolved: isMaxMessage() then matches nothing and Max stays quiet in threads
+// he would otherwise carry on, which is the safe way to be wrong.
+let MAX_BOT_ID = process.env.SLACK_BOT_ID || null;
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
@@ -6829,16 +6836,34 @@ const THREAD_REPLY_LIMIT = 300;
 const THREAD_FETCH_LIMIT = 50;
 const EVENT_CLAIM_TTL_MS = 60_000;
 
-// A message is Max's if Slack tagged it as a bot post or it came from his user.
-function isMaxMessage(m, botUserId) {
-  return Boolean(m && (m.bot_id || (botUserId && m.user === botUserId)));
+// A message is Max's only if it carries HIS bot id or came from his user.
+//
+// It used to be `m.bot_id || …` — any bot post at all. Every other app in the
+// workspace posts with a bot_id too, so Make's booking cards (B08BC34U486)
+// registered as Max's own posts (B0AMNSM25QW) and pulled him into every thread
+// hanging off one. That is how he ended up answering a Make card in
+// #ng-sales-goats on 2026-08-25 and leaking an escalation draft into the
+// channel. `maxBotId` is resolved from auth.test at boot; when it is null
+// nothing matches and he stays quiet, which is the safe direction to fail.
+function isMaxMessage(m, botUserId, maxBotId) {
+  if (!m) return false;
+  if (maxBotId && m.bot_id === maxBotId) return true;
+  return Boolean(botUserId && m.user === botUserId);
 }
 
-// True when Max is already part of a thread — he posted the root or replied in
-// it. This is the gate for channels he does not otherwise answer in: he carries
-// on his own conversations, he does not barge into other people's.
-function isMaxThread(messages, botUserId) {
-  return (messages || []).some(m => isMaxMessage(m, botUserId));
+// Did Max post the thread root? This is what makes a thread "his" — a report or
+// a card he published, which people reply under.
+function maxRootsThread(messages, botUserId, maxBotId) {
+  return isMaxMessage((messages || [])[0], botUserId, maxBotId);
+}
+
+// Was Max the last one to speak? `messages` excludes the incoming message, so
+// the tail is whatever the new message is replying to. Max speaking last means
+// someone is answering *him*; a human speaking last means the humans are
+// talking to each other and he should stay out of it.
+function maxSpokeLast(messages, botUserId, maxBotId) {
+  const list = messages || [];
+  return isMaxMessage(list[list.length - 1], botUserId, maxBotId);
 }
 
 // Renders a thread as a readable transcript. Senders resolve through the roster
@@ -6847,11 +6872,18 @@ function isMaxThread(messages, botUserId) {
 // a thread with more than two people in it. The root gets a bigger budget than
 // the replies because it is normally the report being asked about.
 function formatThreadTranscript(messages, opts = {}) {
-  const { botUserId, nameFor, rootLimit = THREAD_ROOT_LIMIT, replyLimit = THREAD_REPLY_LIMIT } = opts;
+  const { botUserId, maxBotId, nameFor, rootLimit = THREAD_ROOT_LIMIT, replyLimit = THREAD_REPLY_LIMIT } = opts;
   const label = (id) => (nameFor ? nameFor(id) : `user:${id}`);
+  // Other apps' posts carry a bot_id and no `user`, so the roster lookup used to
+  // render Make's booking cards as "Team Member". Name the app instead.
+  const senderOf = (m) => {
+    if (isMaxMessage(m, botUserId, maxBotId)) return 'Max';
+    if (m.bot_id) return m.bot_profile?.name || m.username || 'App';
+    return label(m.user);
+  };
   return (messages || []).map((m, i) => {
     const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    const sender = isMaxMessage(m, botUserId) ? 'Max' : label(m.user);
+    const sender = senderOf(m);
     const limit  = i === 0 ? rootLimit : replyLimit;
     const text   = (m.text || '').replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${label(id)}`);
     return `[${time}] ${sender}: ${text.length > limit ? `${text.slice(0, limit)}…` : text}`;
@@ -6859,11 +6891,29 @@ function formatThreadTranscript(messages, opts = {}) {
 }
 
 // Decides whether a non-DM message is Max's to answer. #ng-pm-agent is his
-// channel and behaves as before. Anywhere else he only answers inside a thread
-// he is already part of — top-level channel chatter stays none of his business.
-function shouldAnswerChannelMessage({ channelName, isThreadReply, maxIsInThread }) {
+// channel and behaves as before. Anywhere else he speaks only when tagged, or
+// when someone is answering him directly: the thread is rooted on his own post
+// AND he was the last one to speak in it.
+//
+// "Already in the thread" (the old rule) was too loose in both directions — it
+// counted other apps' posts as his, and once he had spoken anywhere in a thread
+// he answered every message in it forever, including humans talking to each
+// other under one of his reports. Two consecutive human messages now drop him
+// out until someone tags him again.
+function shouldAnswerChannelMessage({ channelName, isThreadReply, tagged, maxRootedThread, maxIsLastSpeaker }) {
+  if (tagged) return true;
   if ((channelName || '').includes('ng-pm-agent')) return true;
-  return Boolean(isThreadReply && maxIsInThread);
+  if (!isThreadReply) return false;
+  return Boolean(maxRootedThread && maxIsLastSpeaker);
+}
+
+// The value gate. On an untagged reply Max may decline to speak by answering
+// with this and nothing else — the deterministic gate above only proves the
+// message *could* be for him, not that he has anything worth adding. A tag is
+// never suppressed this way.
+const NO_REPLY_SENTINEL = /^\s*`?NO_REPLY`?[.!]?\s*$/i;
+function isNoReply(text) {
+  return NO_REPLY_SENTINEL.test(String(text || ''));
 }
 
 // One-reply-per-Slack-event guard. Answering thread replies in every channel
@@ -6888,8 +6938,8 @@ function claimEvent(channel, ts, now = Date.now()) {
 // an explicit tag on purpose: two of them are LLM calls, and firing them on
 // every thread reply everywhere would multiply cost and manufacture "lessons"
 // out of ordinary follow-up questions.
-async function buildThreadContext({ channel, threadTs, excludeTs, userId, userText = '', tagged = false, knownChannelName }) {
-  const empty = { context: '', maxIsInThread: false, channelName: null, messages: [] };
+async function buildThreadContext({ channel, threadTs, excludeTs, userId, userText = '', tagged = false, knownChannelName, valueGate = false }) {
+  const empty = { context: '', maxRootedThread: false, maxIsLastSpeaker: false, channelName: null, messages: [] };
   if (!threadTs) return empty;
   try {
     const threadResult = await slack.client.conversations.replies({ channel, ts: threadTs, limit: THREAD_FETCH_LIMIT });
@@ -6903,9 +6953,15 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
     const channelName = knownChannelName !== undefined ? (knownChannelName || null) : (channelInfo?.channel?.name || null);
     const where       = channelName ? `#${channelName}` : 'this DM';
     const nameFor     = (id) => (id && id === botUserId ? 'Max' : getMemberContext(id).displayName);
-    const maxIsInThread = isMaxThread(messages, botUserId);
+    const maxBotId    = MAX_BOT_ID;
+    const maxRootedThread   = maxRootsThread(messages, botUserId, maxBotId);
+    const maxIsLastSpeaker  = maxSpokeLast(messages, botUserId, maxBotId);
 
-    let context = `\n\nTHREAD CONTEXT — you are replying inside a Slack thread in ${where}. This thread is the subject of the question and OUTRANKS the recent conversation history, which is a different conversation that happened elsewhere. Answer about this thread. If the thread does not contain what was asked, say so plainly — do not answer from the other conversation.\n${formatThreadTranscript(messages, { botUserId, nameFor })}`;
+    let context = `\n\nTHREAD CONTEXT — you are replying inside a Slack thread in ${where}. This thread is the subject of the question and OUTRANKS the recent conversation history, which is a different conversation that happened elsewhere. Answer about this thread. If the thread does not contain what was asked, say so plainly — do not answer from the other conversation.\n${formatThreadTranscript(messages, { botUserId, maxBotId, nameFor })}`;
+
+    if (valueGate) {
+      context += `\n\nNOBODY TAGGED YOU. You are seeing this only because the last message in the thread was yours, so this one may be a reply to you. Before answering, decide whether it actually is. If the message is aimed at someone else, is two colleagues talking to each other, is a plain acknowledgement ("ok", "gracias", "listo"), or you have nothing of substance to add, reply with exactly NO_REPLY and nothing else — that posts nothing and is the right answer more often than not. Only answer when someone is genuinely asking you something or you hold information they clearly need. Silence is not a failure here.`;
+    }
 
     if (tagged) {
       const rootMessage = messages[0];
@@ -6915,8 +6971,11 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
       );
 
       // If the thread root was posted by Max (a report), extract the lesson from
-      // the user's feedback before responding — so Max can acknowledge it.
-      const isMaxBotPost = rootMessage && !rootMessage.user && rootMessage.bot_id;
+      // the user's feedback before responding — so Max can acknowledge it. This
+      // used to test `!rootMessage.user && rootMessage.bot_id`, which matched any
+      // app: tagging Max under a Make card ran lesson extraction against Make's
+      // text as if it were one of his own reports.
+      const isMaxBotPost = isMaxMessage(rootMessage, botUserId, maxBotId);
       if (isMaxBotPost) {
         try {
           const lesson = await extractAndSaveReportLesson(rootMessage.text || '', userText, channelName || 'unknown channel', userId, newCorrelationId());
@@ -6929,7 +6988,7 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
       } else {
         // Thread not rooted in a Max report, but Max may have spoken earlier in
         // it — if this mention corrects him, capture the lesson too.
-        const lastMaxMsg = [...messages].reverse().find(m => m.bot_id);
+        const lastMaxMsg = [...messages].reverse().find(m => isMaxMessage(m, botUserId, maxBotId));
         if (lastMaxMsg) detectAndSaveCorrection(userText, lastMaxMsg.text || '', userId).catch(() => {});
       }
 
@@ -6946,7 +7005,7 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
       }
     }
 
-    return { context, maxIsInThread, channelName, messages };
+    return { context, maxRootedThread, maxIsLastSpeaker, channelName, messages };
   } catch (err) {
     console.error('Thread context fetch error:', err.message);
     return empty;
@@ -7140,25 +7199,31 @@ slack.event('app_mention', async ({ event, say }) => {
   } catch (err) { console.error('Claude API error (mention):', err); await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts }); }
 });
 
-// Channel handler — #ng-pm-agent, plus thread replies anywhere else Max is
-// already in the thread (public, private, group DM).
+// Channel handler — #ng-pm-agent, plus tagged messages and direct follow-ups to
+// Max anywhere else (public, private, group DM).
 slack.message(async ({ message, say }) => {
   if (message.subtype || message.bot_id) return;
   if (message.channel_type === 'im') return;
   const isThreadReply = Boolean(message.thread_ts && message.thread_ts !== message.ts);
+  // A tagged message reaches both this handler and `app_mention`; claimEvent
+  // lets whichever lands first win, so this handler has to recognise a tag on
+  // its own or a tag would be ignored roughly half the time.
+  const tagged = Boolean(process.env.SLACK_BOT_USER_ID) && (message.text || '').includes(`<@${process.env.SLACK_BOT_USER_ID}>`);
   let channelInfo;
   try { channelInfo = await slack.client.conversations.info({ channel: message.channel }); } catch { return; }
   const channelName = channelInfo.channel?.name || '';
   const inMaxChannel = channelName.includes('ng-pm-agent');
-  // Top-level chatter outside his own channel is still none of Max's business —
-  // only a thread he is already part of pulls him in.
-  if (!inMaxChannel && !isThreadReply) return;
+  // Top-level chatter outside his own channel is still none of Max's business
+  // unless he was tagged — skip the thread fetch entirely for it.
+  if (!inMaxChannel && !isThreadReply && !tagged) return;
 
-  // Read the thread before deciding anything: outside #ng-pm-agent, Max only
-  // answers threads he is already in. This gate must come before checkApproval
-  // and the roster rejection so neither fires in a channel he stays out of.
-  const chThread = await buildThreadContext({ channel: message.channel, threadTs: isThreadReply ? message.thread_ts : null, excludeTs: message.ts, userId: message.user, userText: message.text || '', knownChannelName: channelName });
-  if (!shouldAnswerChannelMessage({ channelName, isThreadReply, maxIsInThread: chThread.maxIsInThread })) return;
+  // Read the thread before deciding anything: outside #ng-pm-agent, Max answers
+  // only when tagged or when someone is answering him directly. This gate must
+  // come before checkApproval and the roster rejection so neither fires in a
+  // channel he stays out of.
+  const valueGate = !tagged && !inMaxChannel && isThreadReply;
+  const chThread = await buildThreadContext({ channel: message.channel, threadTs: isThreadReply ? message.thread_ts : null, excludeTs: message.ts, userId: message.user, userText: message.text || '', knownChannelName: channelName, valueGate });
+  if (!shouldAnswerChannelMessage({ channelName, isThreadReply, tagged, maxRootedThread: chThread.maxRootedThread, maxIsLastSpeaker: chThread.maxIsLastSpeaker })) return;
 
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
@@ -7191,6 +7256,15 @@ slack.message(async ({ message, say }) => {
     let reply = await callClaude(history, 3, userId, chCid);
     if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId, chCid); }
     if (!reply || !reply.trim()) return;
+    // The value gate: he was not tagged and decided this one is not for him.
+    // Post nothing, and save neither turn — a user turn with no assistant turn
+    // would break the alternating-role contract on the next call. Logged so the
+    // silence is auditable instead of invisible.
+    if (valueGate && isNoReply(reply)) {
+      console.log(`Value gate: stayed out of thread ${message.thread_ts} in #${channelName}`);
+      logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'suppressed', actor_user_id: userId, actor_name: chCtx.displayName, channel_id: message.channel, channel_name: channelName, thread_ts: message.thread_ts, input: { text: (message.text || '').slice(0, 2000) }, output: { reason: 'no_value_to_add' }, correlation_id: chCid });
+      return;
+    }
     if (handleDraftReply(reply, userId, say, chCid)) return;
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
@@ -15215,8 +15289,28 @@ cron.schedule('30 7 * * *', wrapCronJob('runCronLivenessAudit', async (c) => { a
 console.log('Registered static cron: cron liveness audit (30 7 * * *)');
 
 // ─── START ────────────────────────────────────────────────────────────────────
+
+// Resolve who Max is before the socket opens, so no event can be handled while
+// his identity is unknown. Non-fatal: a failure here degrades thread handling
+// toward silence, it does not stop the bot.
+async function resolveBotIdentity() {
+  try {
+    const auth = await slack.client.auth.test();
+    if (auth.bot_id) MAX_BOT_ID = auth.bot_id;
+    console.log(`Bot identity resolved: user ${auth.user_id} / bot ${MAX_BOT_ID}`);
+    // SLACK_BOT_USER_ID is load-bearing for thread labelling and for every
+    // reaction handler, and nothing verified it until now.
+    if (auth.user_id && process.env.SLACK_BOT_USER_ID !== auth.user_id) {
+      console.error(`WARNING: SLACK_BOT_USER_ID is "${process.env.SLACK_BOT_USER_ID}" but auth.test says "${auth.user_id}". Reaction handlers and thread labelling will misbehave until this is fixed in Railway.`);
+    }
+  } catch (err) {
+    console.error('WARNING: auth.test failed — Max cannot identify his own posts. He will not answer untagged thread replies until this resolves:', err && err.message);
+  }
+}
+
 (async () => {
   try {
+    await resolveBotIdentity();
     await slack.start();
   } catch (err) {
     // Socket Mode could not be established (revoked/rotated SLACK_APP_TOKEN,
