@@ -1,102 +1,112 @@
-// The catalog of record, machine-checked against Max's system prompt. Run:
+// The catalog of record must never live in this repo. Run:
 //   node test/offer-catalog.test.js
 //
-// The North Star says retired offers "must not reappear anywhere". Max briefs
-// the team daily and closers borrow his language, so if a dead SKU or a dead
-// price survives in this prompt it goes straight into customer-facing talk.
-// Prose review missed exactly that: the prompt still defined OMEGA and the old
-// 6-month DWY/DFY ROLEX and PATEK on 2026-08-26, thirteen days after the
-// catalog was locked and the build brief marked the update due.
+// ng-agent is PUBLIC; the repo that owns the catalog
+// (neurogrowth-cr/roi-rm-okr-reporting, docs/plan-of-record.md §2) is PRIVATE.
+// On 2026-08-26 the locked catalog was written straight into the system prompt
+// to close an overdue north-star item, and that published the founding
+// $325/$975 prices, the 60/40 payment split and the upfront→day-120 lever to
+// anyone on the internet. The catalog now lives in one Supabase row loaded at
+// boot; scripts/sync-offer-catalog.js copies §2 there from the private clone.
 //
-// Source of truth: roi-rm-okr-reporting docs/plan-of-record.md §2. When the
-// catalog changes there, this test is the thing that fails until the prompt
-// follows.
-//
-// Reads the system-prompt constants as source text rather than requiring
-// index.js, which boots the Slack app on require.
+// This test is the thing that stops it coming back. It reads TRACKED SOURCE —
+// index.js and everything in scripts/ — and fails on any price literal, any
+// retired SKU, and any dead price. It also pins the loader contract: the prompt
+// carries the token, both prompt paths get substituted, the catalog loads
+// before the socket opens, and a failed load makes Max refuse rather than
+// improvise.
 const fs   = require('fs');
 const path = require('path');
 
-const SRC = fs.readFileSync(process.argv[2] || path.join(__dirname, '..', 'index.js'), 'utf8');
-// Every SYSTEM_PROMPT_* constant, start of the first to the end of the last.
-const PROMPT = SRC.slice(
-  SRC.indexOf('const SYSTEM_PROMPT_BASE'),
-  SRC.indexOf("const RON_SLACK_ID = 'U05HXGX18H3';"),
-);
+const ROOT = path.join(__dirname, '..');
+const INDEX = process.argv[2] || path.join(ROOT, 'index.js');
+const SRC = fs.readFileSync(INDEX, 'utf8');
 
-// The RETIRED block names the dead SKUs and dead prices on purpose — Max has to
-// recognise them to refuse them. So "must not reappear" is asked of everything
-// OUTSIDE that block: a dead price is a guardrail there and a live quote
-// anywhere else. Losing the block itself is checked separately below.
-const RETIRED_START = 'RETIRED — never quote these';
-const RETIRED_END   = 'Core promise:';
-const retiredBlock = PROMPT.slice(PROMPT.indexOf(RETIRED_START), PROMPT.indexOf(RETIRED_END));
-const LIVE = PROMPT.replace(retiredBlock, '');
+// Every tracked source file that ships publicly. scripts/ is in the repo too —
+// the first version of the sync script hardcoded the catalog, which would have
+// defeated the entire change.
+const SCRIPTS_DIR = path.join(ROOT, 'scripts');
+const PUBLIC_FILES = [['index.js', SRC]].concat(
+  fs.existsSync(SCRIPTS_DIR)
+    ? fs.readdirSync(SCRIPTS_DIR).filter(f => f.endsWith('.js'))
+        .map(f => [`scripts/${f}`, fs.readFileSync(path.join(SCRIPTS_DIR, f), 'utf8')])
+    : [],
+);
 
 let failures = 0;
 function check(label, actual, expected) {
   if (JSON.stringify(actual) === JSON.stringify(expected)) { console.log(`  ok  ${label}`); }
   else { failures += 1; console.error(`FAIL  ${label}\n      expected ${JSON.stringify(expected)}\n      got      ${JSON.stringify(actual)}`); }
 }
-const has = (s) => PROMPT.includes(s);
-const hasRe = (re) => re.test(PROMPT);
-// Asked of the prompt minus the RETIRED block.
-const liveHas   = (s) => LIVE.includes(s);
-const liveHasRe = (re) => re.test(LIVE);
-
-check('the prompt block was actually located (guards the slice markers)',
-  PROMPT.length > 5000, true);
-
-console.log('the three rungs and their prices are stated');
-check('Build & Release at $4,997', has('$4,997'), true);
-check('ROLEX at $475/mo', has('$475/mo'), true);
-check('PATEK at $1,297/mo', has('$1,297/mo'), true);
-check('the embedded 90 days are named', has('90 days of ROLEX'), true);
-check('100% upfront extends to day 120', has('day 120'), true);
-check('continuation at day 91 is automatic unless cancelled',
-  hasRe(/day[- ]91[\s\S]{0,120}unless the client cancels/), true);
-check('PATEK carries its three-month minimum', hasRe(/[Tt]hree-month minimum/), true);
-check('CAPI is gated on a GHL sub-account', hasRe(/CAPI[\s\S]{0,200}GHL sub-account/), true);
-
-console.log('\nthe RETIRED guardrail block itself exists');
-check('the block is present', retiredBlock.length > 200, true);
-check('it names OMEGA so Max can refuse it', retiredBlock.includes('OMEGA'), true);
-check('it names the founding prices so Max can refuse them',
-  retiredBlock.includes('$325') && retiredBlock.includes('$975'), true);
-check('it kills the seat caps', /slots/.test(retiredBlock), true);
-
-console.log('\nretired offers must not reappear OUTSIDE that block (killed 2026-08-05)');
-check('OMEGA is not offered anywhere', /\bOMEGA\b/.test(LIVE), false);
-for (const dead of ['3-month community', '6-month Done-With-You', '6-month Done-For-You']) {
-  check(`"${dead}" is gone`, liveHas(dead), false);
-}
-check('Full Service is not framed as a winding-down product line',
-  liveHasRe(/Full[- ]service SDR management is no longer offered/), false);
-check("Josue's role no longer allocates 40% to Full Service",
-  hasRe(/40% Full Service/), false);
-check('no DFY portfolio language left in the role blocks',
-  hasRe(/DFY portfolio/), false);
-
-console.log('\ndead prices and dead scarcity are never quoted as live');
-check('founding ROLEX price $325 is not quoted', liveHasRe(/\$325\b/), false);
-check('founding PATEK price $975 is not quoted', liveHasRe(/\$975\b/), false);
-check('no seat count is quoted as available',
-  liveHasRe(/15 slots|8 slots|15 ROLEX slots/), false);
-
-console.log('\nthe US price card does not exist and must not be invented');
-check('the prompt says so explicitly', has('THERE IS NO US PRICE CARD'), true);
-check('and forbids estimating one', hasRe(/[Nn]ever estimate it/), true);
-// The placeholder US numbers live in plan-of-record §4 marked [confirm]. If any
-// of them ever appear here, someone has copied an unconfirmed number into the
-// thing that talks to the team every morning.
-for (const notYet of ['$997', '$2,497', '$8,000', '$10,000']) {
-  check(`unconfirmed US placeholder ${notYet} is not quoted`, has(notYet), false);
+// Reports which public file leaked, not just that something did.
+function nowhereInPublicSource(label, re) {
+  const hits = PUBLIC_FILES.filter(([, body]) => re.test(body)).map(([name]) => name);
+  check(label, hits, []);
 }
 
-console.log('\nKai is internal-only in customer-facing copy');
-check('the prompt says what a client hears instead',
-  has('automated outreach replies in your voice'), true);
-check('and flags Kai as the internal name', hasRe(/"Kai"[\s\S]{0,120}internal name/), true);
+console.log('no price or term from the catalog may appear in tracked source');
+nowhereInPublicSource('Build & Release price $4,997',        /\$4,?997/);
+nowhereInPublicSource('ROLEX price $475',                    /\$475/);
+nowhereInPublicSource('PATEK price $1,297',                  /\$1,?297/);
+nowhereInPublicSource('embedded-tier value $1,425',          /\$1,?425/);
+nowhereInPublicSource('founding ROLEX price $325',           /\$325/);
+nowhereInPublicSource('founding PATEK price $975',           /\$975/);
+nowhereInPublicSource('the 60/40 payment split',             /\b60\/40\b/);
+nowhereInPublicSource('unconfirmed US placeholders',         /\$997|\$2,?497|\$8,?000|\$10,?000/);
+// Catch-all for a price nobody thought to list here — a future rung, a changed
+// number. Scoped to three digits or more, or a thousands comma, or a /mo rate:
+// broad enough to catch any plausible catalog price, narrow enough to ignore
+// SQL placeholders ($1, $2), regex backreferences, and the $25 vendor-spend
+// escalation threshold, which is a rule rather than something we sell.
+nowhereInPublicSource('any amount that could be a price',
+  /\$\s?\d[\d,]*,\d{3}|\$\s?\d{3,}|\$\s?\d+\s*\/\s*mo/);
+
+console.log('\nretired SKUs are not named in tracked source either');
+nowhereInPublicSource('OMEGA',                               /\bOMEGA\b/);
+nowhereInPublicSource('the old 6-month DWY/DFY tiers',       /6-month Done-(With|For)-You/);
+nowhereInPublicSource('seat counts',                         /15 slots|8 slots/);
+
+console.log('\nthe prompt carries the token, not the catalog');
+check('the {{OFFER_CATALOG}} token is in the prompt', SRC.includes('{{OFFER_CATALOG}}'), true);
+check('the token is a literal, not a template interpolation',
+  /\$\{OFFER_CATALOG\}/.test(SRC), false);
+check('ROLEX and PATEK are still named as tier names (Max needs the vocabulary)',
+  /ROLEX/.test(SRC) && /PATEK/.test(SRC), true);
+
+console.log('\nthe loader contract');
+check('the catalog is read from agent_knowledge config/offer_catalog',
+  /category', 'config'[\s\S]{0,200}OFFER_CATALOG_KEY|OFFER_CATALOG_KEY = 'offer_catalog'/.test(SRC), true);
+check('loadOfferCatalog runs BEFORE slack.start()',
+  SRC.indexOf('await loadOfferCatalog()') < SRC.indexOf('await slack.start()')
+    && SRC.indexOf('await loadOfferCatalog()') !== -1, true);
+check('a failed load alerts Ron rather than passing silently',
+  /CATALOG LOAD FAILED[\s\S]{0,600}RON_SLACK_ID/.test(SRC), true);
+
+console.log('\nsubstitution behaviour (sliced from index.js, so it cannot drift)');
+const block = SRC.slice(SRC.indexOf('const OFFER_CATALOG_KEY'), SRC.indexOf('async function loadOfferCatalog'));
+const g = new Function(`${block}; return { getOfferCatalog, injectOfferCatalog, OFFER_CATALOG_UNAVAILABLE, setCatalog: v => { OFFER_CATALOG = v; } };`)();
+
+check('with no catalog loaded, the token becomes the refusal text',
+  g.injectOfferCatalog('A {{OFFER_CATALOG}} B'), `A ${g.OFFER_CATALOG_UNAVAILABLE} B`);
+g.setCatalog('ROLEX is $1/mo.');
+check('with a catalog loaded, the token becomes the catalog',
+  g.injectOfferCatalog('A {{OFFER_CATALOG}} B'), 'A ROLEX is $1/mo. B');
+check('every occurrence is substituted, not just the first',
+  g.injectOfferCatalog('{{OFFER_CATALOG}}|{{OFFER_CATALOG}}'), 'ROLEX is $1/mo.|ROLEX is $1/mo.');
+check('a prompt without the token is returned untouched',
+  g.injectOfferCatalog('no token here'), 'no token here');
+check('null prompt does not throw', g.injectOfferCatalog(null), '');
+g.setCatalog('   ');
+check('a blank catalog row counts as unavailable, not as an empty catalog',
+  g.injectOfferCatalog('{{OFFER_CATALOG}}').trim(), g.OFFER_CATALOG_UNAVAILABLE);
+
+console.log('\nthe unavailable text refuses instead of guessing');
+const U = g.OFFER_CATALOG_UNAVAILABLE;
+check('it forbids quoting a price from memory', /Do NOT state a price/i.test(U), true);
+check('it closes the "but I am confident" loophole', /confident/i.test(U), true);
+check('it routes to Ron', /Ron/.test(U), true);
+check('it does not disable Max entirely', /Answer everything else normally/i.test(U), true);
+check('it contains no price of its own', /\$\s?\d/.test(U), false);
 
 console.log('');
 if (failures) { console.error(`${failures} test(s) failed.`); process.exit(1); }

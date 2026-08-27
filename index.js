@@ -168,22 +168,7 @@ Your job is to remove operational friction across the whole NeuroGrowth team —
 
 THE BUSINESS
 
-NeuroGrowth sells three things and nothing else. Every deal is born with a subscription tier inside it.
-
-- BUILD & RELEASE — $4,997 one-time (60/40; paid 100% upfront extends the included tier to day 120). A complete LinkedIn prospecting system (the "LinkedIn Flywheel") built in 14 days and handed off as a client-owned asset. It includes 90 days of ROLEX embedded ("valor $1,425"); the subscription is created at signing and the trial ends day 90.
-- ROLEX — $475/mo. No contract, cancel anytime. 1:1 channel, monthly strategy call, on-demand reviews, automated outreach replies in the client's voice, dashboard.
-- PATEK — $1,297/mo. Three-month minimum. Hands-on execution, managed outreach replies, GHL sub-account, team-shared REVI insights, biweekly calls with Ron.
-- ADD-ON: CAPI ATTRIBUTION — price not set. Sales-led upsell only, and only where the client has a GHL sub-account and is running Meta ads. Never quote a number for it.
-
-Continuation is automatic: at day 91 the embedded ROLEX keeps billing unless the client cancels. The included 90/120 days run from the day the activation call is actually held, plus 14 days — not from payment. ROLEX or PATEK sold directly, with no Build & Release in front of it, bills immediately with no trial.
-
-These are the LATAM prices and they are the only prices that exist. THERE IS NO US PRICE CARD. If anyone asks what we charge in the US, say the card does not exist yet and Ron has to set it. Never estimate it, never convert from LATAM, never extrapolate.
-
-RETIRED — never quote these, never describe them as available:
-- OMEGA, Full Service / Done-For-You SDR management, Kai as a standalone product, and one-off dashboards. All killed 2026-08-05.
-- Seat caps. ROLEX was once sold as "15 slots" and PATEK as "8"; the caps were retired 2026-08-15 and both are uncapped. Never quote a slot count or use scarcity as a closing angle — the urgency is the day-91 mechanic.
-- Founding-cohort pricing ($325 ROLEX / $975 PATEK). That offer was never sent, nobody took it, there are zero founding clients and no price lock to honour anywhere.
-- "Kai" in anything client-facing. It is our internal name; to a client it is "automated outreach replies in your voice".
+{{OFFER_CATALOG}}
 
 Core promise: 10-30 qualified LinkedIn calls per month with decision-makers. ICP: B2B and B2C coaches, consultants, and premium service providers. Markets: US, Costa Rica, Mexico.
 
@@ -476,6 +461,75 @@ When you escalate, tell the user clearly: "This one needs Ron's call — I'm rou
 You have access to GHL (live sales source since the 2026-07-23 cutover; iClosed is frozen history), Meta Ads, the portal, Supabase, Slack, Notion, Google Drive/Docs/Sheets, the Ops Master Tracker (get_ops_tracker), and REVI client context (get_revi_client_context — quicksync and activation-call summaries plus the client roster; these are ingested automatically from Fathom recordings). You do NOT have access to Ron's Gmail or Google Calendar (Ron's personal OAuth) or to REVI coaching teardowns, call scores, deal transcripts, leadership meetings, and initiatives (confidential to Ron — NOT an OAuth limitation; never claim REVI itself is OAuth-gated). If asked for any of those, say they are Ron-only, name the reason, and offer the team-accessible alternative.`;
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + SYSTEM_PROMPT_DATA_MAP + SYSTEM_PROMPT_RULES + SYSTEM_PROMPT_RON;
+
+// ─── OFFER CATALOG ────────────────────────────────────────────────────────────
+// The catalog of record — prices, terms, retired SKUs — is NOT in this file.
+//
+// This repo is PUBLIC; the strategy repo that owns the catalog
+// (neurogrowth-cr/roi-rm-okr-reporting, docs/plan-of-record.md §2) is PRIVATE.
+// Hardcoding prices here published the founding-cohort prices, the deal payment
+// split and the paid-upfront extension lever to anyone on the internet
+// (2026-08-26, PR #134). So the catalog lives in one Supabase row, loaded at
+// boot — and note that this comment names none of those numbers either:
+//
+//   agent_knowledge · category 'config' · key 'offer_catalog'
+//
+// scripts/sync-offer-catalog.js renders plan-of-record §2 into that row, which
+// keeps the strategy repo the single source of truth and lets a price change
+// ship without a deploy. `test/offer-catalog.test.js` asserts no price literal
+// ever comes back into this file.
+const OFFER_CATALOG_KEY = 'offer_catalog';
+const OFFER_CATALOG_TOKEN = '{{OFFER_CATALOG}}';
+
+// What Max is told when the catalog cannot be read. He must never fill the gap
+// from memory — a model that half-remembers a price quotes a wrong one
+// confidently, and closers repeat his language to prospects. Refusing is the
+// only safe failure.
+const OFFER_CATALOG_UNAVAILABLE = `THE CATALOG IS UNAVAILABLE RIGHT NOW. You do not know current prices, tiers, terms, or what is still being sold. If anyone asks about pricing, packages, what a tier includes, or what we charge, say plainly that you cannot reach the catalog and they should confirm with Ron. Do NOT state a price, a tier name, a discount, or a term from memory — not even one you are confident about, and not even to be helpful. Answer everything else normally.`;
+
+let OFFER_CATALOG = null;   // set by loadOfferCatalog() before the socket opens
+
+// Blank counts as unavailable, not as "an empty catalog". A whitespace row
+// would otherwise be truthy and hand Max a prompt with no catalog AND no
+// instruction to refuse — the one state where he improvises prices.
+function getOfferCatalog() {
+  return (OFFER_CATALOG || '').trim() ? OFFER_CATALOG : OFFER_CATALOG_UNAVAILABLE;
+}
+
+// Single substitution point — every prompt path (per-user and cron) funnels
+// through the one call site in callClaude, so the catalog cannot be missed on
+// one branch and present on another.
+function injectOfferCatalog(prompt) {
+  return String(prompt || '').split(OFFER_CATALOG_TOKEN).join(getOfferCatalog());
+}
+
+async function loadOfferCatalog() {
+  try {
+    const { data, error } = await supabase
+      .from('agent_knowledge')
+      .select('value, updated_at')
+      .eq('category', 'config')
+      .eq('key', OFFER_CATALOG_KEY)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data || !data.value || !data.value.trim()) {
+      throw new Error(`no agent_knowledge row for config/${OFFER_CATALOG_KEY}`);
+    }
+    OFFER_CATALOG = data.value.trim();
+    console.log(`Offer catalog loaded (${OFFER_CATALOG.length} chars, updated ${data.updated_at}).`);
+    return true;
+  } catch (err) {
+    // Loud, and visible where Ron will see it — Max stays up and answers
+    // everything else, but he will refuse every pricing question until this is
+    // fixed, and nobody should have to discover that from a confused closer.
+    console.error('CATALOG LOAD FAILED — Max will refuse all pricing questions:', err && err.message);
+    slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `Heads up — I could not load the offer catalog at startup (${err && err.message}). I'm running normally otherwise, but I'll refuse every pricing or tier question until it loads. Re-run scripts/sync-offer-catalog.js to restore it.`,
+    }).catch(() => {});
+    return false;
+  }
+}
 
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
 const OPS_CHANNEL           = process.env.OPS_CHANNEL           || '#ng-fullfillment-ops';
@@ -6044,7 +6098,9 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
 - Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
 - For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
 - Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
-      const fullSystemPrompt = (userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + lessonBlock + emailProxyGuidance + (opts.systemAppend || '');
+      // injectOfferCatalog wraps the whole composition, not just the base prompt:
+      // both branches carry the token and this is the only place both meet.
+      const fullSystemPrompt = injectOfferCatalog((userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + lessonBlock + emailProxyGuidance + (opts.systemAppend || ''));
 
       const TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
@@ -15374,6 +15430,9 @@ async function resolveBotIdentity() {
 (async () => {
   try {
     await resolveBotIdentity();
+    // Before the socket opens: no message should ever be answered with the
+    // catalog in an unknown state.
+    await loadOfferCatalog();
     await slack.start();
   } catch (err) {
     // Socket Mode could not be established (revoked/rotated SLACK_APP_TOKEN,
