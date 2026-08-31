@@ -6420,6 +6420,311 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
   return { alerts };
 }
 
+// ── 7-day department metrics (2026-08-31) ────────────────────────────────────
+// The daily metrics above catch day-scale shocks; these catch the week-scale
+// drift Ron actually steers by. All windows are trailing 7 COMPLETE CR days
+// (yesterday backwards), so the 6 AM cron never scrapes a partial day.
+// House rules apply: errors THROW (a fake zero poisons the baseline), null
+// means "skip today", and every appointment set is flywheel-filtered.
+function _cr7dBoundsUtc() {
+  return { start: _crDayBoundsUtc(7).start, end: _crDayBoundsUtc(0).start };
+}
+
+async function _wonOutcomes7d() {
+  const w = _cr7dBoundsUtc();
+  const { data, error } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('id, outcome, closed_revenue, created_at')
+    .eq('outcome', 'won')
+    .gte('created_at', w.start)
+    .lt('created_at',  w.end);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+// ROAS — 7d won revenue ÷ 7d Meta spend. Closes north-star required change #2
+// ("add a ROAS metric to the anomaly registry before scaling ad spend").
+// Revenue anchors on the CRM (real won deals), never the pixel. Zero revenue
+// with real spend is an honest 0.00 — an alarming week is signal, not noise.
+async function _scrapeRoasMeta7d() {
+  const row = await _metaAccountInsights('last_7d');
+  if (!row) return null;
+  const spend = parseFloat(row.spend || 0);
+  if (spend <= 0) return null;
+  const revenue = (await _wonOutcomes7d()).reduce((s, o) => s + (parseFloat(o.closed_revenue) || 0), 0);
+  return +(revenue / spend).toFixed(2);
+}
+
+// True CPA — 7d Meta spend ÷ 7d actual won deals. meta_cac_today trusts the
+// pixel's Purchase events; this one trusts the CRM. The two drifting apart is
+// itself a signal (pixel/CAPI wiring degrading). Null when there are no wins —
+// an infinite CPA is unrepresentable, and the win drought already shows up in
+// revenue_won_7d.
+async function _scrapeCpaTrue7d() {
+  const row = await _metaAccountInsights('last_7d');
+  if (!row) return null;
+  const spend = parseFloat(row.spend || 0);
+  if (spend <= 0) return null;
+  const wins = (await _wonOutcomes7d()).length;
+  if (wins <= 0) return null;
+  return +(spend / wins).toFixed(2);
+}
+
+// Total leads 7d, BOTH funnels: lead_posts (Form/WA, deduped) + VSL self-booked
+// appointments (booked with no setter — they skip the lead feed entirely, so
+// the daily lead metric never sees them). Caveat: an unmapped setter makes a
+// setter-booked call look self-booked, so this can read slightly high when
+// setter attribution lags; it cannot read low.
+async function _scrapeLeadsTotal7d() {
+  const w = _cr7dBoundsUtc();
+  const { data: leads, error } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts')
+    .gte('posted_at', w.start)
+    .lt('posted_at',  w.end);
+  if (error) throw new Error(error.message);
+  const leadCount = new Set((leads || []).map(r => r.slack_message_ts).filter(Boolean)).size;
+  const { data: appts, error: aErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, iclosed_call_id, ghl_appointment_id, setter_id')
+    .is('setter_id', null)
+    .gte('booked_at', w.start)
+    .lt('booked_at',  w.end);
+  if (aErr) throw new Error(aErr.message);
+  const excludeIds = await getNonFlywheelCallIds();
+  return leadCount + filterFlywheelAppts(appts, excludeIds).length;
+}
+
+// Revenue won 7d — the number the week is steered by. 0 is honest.
+async function _scrapeRevenueWon7d() {
+  const won = await _wonOutcomes7d();
+  return +won.reduce((s, o) => s + (parseFloat(o.closed_revenue) || 0), 0).toFixed(2);
+}
+
+// Shared 7d appointment+outcome pull for the two rate metrics below.
+async function _apptsWithOutcomes7d() {
+  const w = _cr7dBoundsUtc();
+  const { data, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, iclosed_call_id, ghl_appointment_id, attended')
+    .gte('scheduled_start', w.start)
+    .lt('scheduled_start',  w.end);
+  if (error) throw new Error(error.message);
+  const excludeIds = await getNonFlywheelCallIds();
+  const appts = filterFlywheelAppts(data, excludeIds);
+  if (!appts.length) return { appts: [], outcomesById: {} };
+  const { data: outcomes } = await portalSupabase
+    .from('revops_sales_outcomes')
+    .select('appointment_id, outcome')
+    .in('appointment_id', appts.map(a => a.id));
+  return { appts, outcomesById: Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o])) };
+}
+
+// Close rate 7d — won ÷ held, same held definition as the daily metric
+// (attended=true OR the logged outcome says the call happened). The daily
+// version whipsaws between 0% and 100% on 1-2 call days; this is the signal.
+async function _scrapeCloseRate7d() {
+  const { appts, outcomesById } = await _apptsWithOutcomes7d();
+  if (!appts.length) return null;
+  let held = 0, won = 0;
+  for (const a of appts) {
+    const o = outcomesById[a.id];
+    if (a.attended === true || classifyOutcome(o).showed) held += 1;
+    if ((o?.outcome || '').toLowerCase() === 'won') won += 1;
+  }
+  if (held <= 0) return null;
+  return +(won / held).toFixed(4);
+}
+
+// Show rate 7d — showed ÷ (showed + no-show). OUTCOME-DERIVED on both sides:
+// the attended boolean is ~always null (2026-05 finding), so gating the
+// denominator on it would read near-0% forever. Pending calls (no outcome yet)
+// are excluded from both sides rather than counted as no-shows.
+async function _scrapeShowRate7d() {
+  const { appts, outcomesById } = await _apptsWithOutcomes7d();
+  if (!appts.length) return null;
+  let showed = 0, noShow = 0;
+  for (const a of appts) {
+    const c = classifyOutcome(outcomesById[a.id]);
+    if (a.attended === true || c.showed) showed += 1;
+    else if (c.noShow) noShow += 1;
+  }
+  const resolved = showed + noShow;
+  if (resolved <= 0) return null;
+  return +(showed / resolved).toFixed(4);
+}
+
+// Booking rate 7d — setter-booked calls ÷ leads in. Measures the setter engine:
+// CPL can hold steady while this quietly dies. Self-booked calls are excluded
+// from the numerator (they never touched a setter) and lead_posts is the
+// denominator (self-bookers never enter the lead feed).
+async function _scrapeBookingRate7d() {
+  const w = _cr7dBoundsUtc();
+  const { data: leads, error } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts')
+    .gte('posted_at', w.start)
+    .lt('posted_at',  w.end);
+  if (error) throw new Error(error.message);
+  const leadCount = new Set((leads || []).map(r => r.slack_message_ts).filter(Boolean)).size;
+  if (leadCount <= 0) return null;
+  const { data: appts, error: aErr } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, iclosed_call_id, ghl_appointment_id, setter_id')
+    .not('setter_id', 'is', null)
+    .gte('booked_at', w.start)
+    .lt('booked_at',  w.end);
+  if (aErr) throw new Error(aErr.message);
+  const excludeIds = await getNonFlywheelCallIds();
+  return +(filterFlywheelAppts(appts, excludeIds).length / leadCount).toFixed(4);
+}
+
+// Days-to-launch avg over launches in the trailing 28 days (7d is too sparse —
+// launches run ~2-3/week). REAL launch definition: latest customer_activities
+// completed_at whose template title contains 'campaign qa check' or 'campaign
+// validation' — verified 2026-08-07 against the team's tracked launch dates.
+// go_live_at is provisioning, NOT launch, and is deliberately not used.
+async function _scrapeDaysToLaunchAvg() {
+  const since = new Date(Date.now() - 28 * 86400000).toISOString();
+  const { data: templates, error: tErr } = await portalSupabase
+    .from('customer_activity_templates').select('id, title');
+  if (tErr) throw new Error(tErr.message);
+  const launchTemplateIds = (templates || [])
+    .filter(t => /campaign qa check|campaign validation/i.test(t.title || ''))
+    .map(t => t.id);
+  if (!launchTemplateIds.length) return null;
+  const { data: launches, error: lErr } = await portalSupabase
+    .from('customer_activities')
+    .select('customer_id, template_id, completed_at')
+    .in('template_id', launchTemplateIds)
+    .gte('completed_at', since)
+    .not('completed_at', 'is', null);
+  if (lErr) throw new Error(lErr.message);
+  if (!launches || !launches.length) return null;
+  const { data: dashboards, error: dErr } = await portalSupabase
+    .from('client_dashboards').select('id, email, created_at, customer_status');
+  if (dErr) throw new Error(dErr.message);
+  const dashById = Object.fromEntries((dashboards || []).map(d => [d.id, d]));
+  const activationFor = await loadActivationDates();
+  // Latest launch-step completion per client = the launch date.
+  const launchByClient = {};
+  for (const l of launches) {
+    if (!launchByClient[l.customer_id] || l.completed_at > launchByClient[l.customer_id]) launchByClient[l.customer_id] = l.completed_at;
+  }
+  const days = [];
+  for (const [customerId, launchedAt] of Object.entries(launchByClient)) {
+    const activation = activationFor(dashById[customerId]);
+    if (!activation) continue;
+    const d = (Date.parse(launchedAt) - Date.parse(activation)) / 86400000;
+    if (d >= 0 && d < 120) days.push(d);
+  }
+  if (!days.length) return null;
+  return +(days.reduce((s, d) => s + d, 0) / days.length).toFixed(1);
+}
+
+// Stuck post-activation: activation call held ≥7 days ago, still active, and
+// no launch step completed yet — Max's own worked example of the pattern the
+// reflection loop should be catching ("activation done but follow-up gaps
+// remain before builds can progress").
+async function _scrapePendingActivations() {
+  const { data: templates, error: tErr } = await portalSupabase
+    .from('customer_activity_templates').select('id, title');
+  if (tErr) throw new Error(tErr.message);
+  const launchTemplateIds = new Set((templates || [])
+    .filter(t => /campaign qa check|campaign validation/i.test(t.title || ''))
+    .map(t => t.id));
+  const { data: dashboards, error: dErr } = await portalSupabase
+    .from('client_dashboards')
+    .select('id, email, created_at, customer_status')
+    .eq('is_active', true);
+  if (dErr) throw new Error(dErr.message);
+  const activationFor = await loadActivationDates();
+  const cutoff = Date.now() - 7 * 86400000;
+  let stuck = 0;
+  for (const d of (dashboards || [])) {
+    const activation = activationFor(d);
+    if (!activation || Date.parse(activation) > cutoff) continue;
+    const { data: acts } = await portalSupabase
+      .from('customer_activities')
+      .select('template_id, completed_at')
+      .eq('customer_id', d.id)
+      .not('completed_at', 'is', null);
+    const launched = (acts || []).some(a => launchTemplateIds.has(a.template_id));
+    if (!launched) stuck += 1;
+  }
+  return stuck;
+}
+
+// ── Winning-ads sweep (weekly) ───────────────────────────────────────────────
+// Individual ads churn with every creative refresh, so they get a weekly
+// RANKING, never baseline rows — a per-ad metric key would sever its history
+// the moment the ad is replaced. Ranks the Form-funnel ads (the ones that fire
+// `lead`) against the account's own 7d average CPL. Output feeds the Monday
+// reflection brief. Ranking ONLY: Max never touches campaigns — scaling or
+// killing an ad stays a human decision.
+// test/department-metrics.test.js slices rankAdsForSweep.
+function rankAdsForSweep(ads, { scaleFactor = 0.7, killFactor = 1.5, minSpendShare = 0.05 } = {}) {
+  const ranked = (ads || []).filter(a => a && a.spend > 0 && a.leads > 0)
+    .map(a => ({ ...a, cpl: a.spend / a.leads }));
+  const totalSpend = ranked.reduce((s, a) => s + a.spend, 0);
+  const totalLeads = ranked.reduce((s, a) => s + a.leads, 0);
+  if (!ranked.length || totalLeads <= 0) return { accountCpl: null, scale: [], kill: [] };
+  const accountCpl = totalSpend / totalLeads;
+  const meaningful = (a) => a.spend >= totalSpend * minSpendShare;
+  return {
+    accountCpl: +accountCpl.toFixed(2),
+    scale: ranked.filter(a => meaningful(a) && a.cpl <= accountCpl * scaleFactor).sort((x, y) => x.cpl - y.cpl),
+    kill:  ranked.filter(a => meaningful(a) && a.cpl >= accountCpl * killFactor).sort((x, y) => y.cpl - x.cpl),
+  };
+}
+// ─── end ad sweep ranking (test slices to here) ───────────────────────────────
+
+function _isoWeekKey(d = new Date()) {
+  const dt = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  dt.setUTCDate(dt.getUTCDate() + 4 - (dt.getUTCDay() || 7));
+  const week = Math.ceil((((dt - Date.UTC(dt.getUTCFullYear(), 0, 1)) / 86400000) + 1) / 7);
+  return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+async function runWinningAdsSweep(correlationId) {
+  const accountId = process.env.META_AD_ACCOUNT_ID;
+  const token     = process.env.META_ACCESS_TOKEN;
+  if (!accountId || !token) { console.log('Ad sweep: Meta credentials not configured, skipping.'); return; }
+  const fields = 'name,insights.date_preset(last_7d){spend,actions}';
+  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/ads?fields=${fields}&limit=100&access_token=${token}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  const ads = (data.data || []).map(ad => {
+    const ins = ad.insights?.data?.[0];
+    return ins ? {
+      name:  ad.name,
+      spend: parseFloat(ins.spend || 0),
+      leads: parseInt((ins.actions || []).find(a => a.action_type === 'lead')?.value || '0', 10),
+    } : null;
+  }).filter(Boolean);
+  const { accountCpl, scale, kill } = rankAdsForSweep(ads);
+  const week = _isoWeekKey();
+  // Stability: an ad that was a scale candidate LAST week too has earned the
+  // label — one good week is variance.
+  let prevScale = new Set();
+  try {
+    const { data: prev } = await supabase.from('agent_knowledge')
+      .select('key, value').eq('category', 'intel').like('key', 'ad_sweep:%')
+      .neq('key', `ad_sweep:${week}`).order('updated_at', { ascending: false }).limit(1);
+    if (prev && prev[0]) prevScale = new Set([...prev[0].value.matchAll(/SCALE: (.+?) —/g)].map(m => m[1]));
+  } catch { /* first sweep has no history */ }
+  const fmtAd = (a, tag) => `${tag}: ${a.name} — $${a.cpl.toFixed(2)} CPL on $${a.spend.toFixed(0)} spend${tag === 'SCALE' && prevScale.has(a.name) ? ' (2nd week running)' : ''}`;
+  const lines = [
+    `Form-funnel ad ranking, 7d. Account CPL $${accountCpl ?? 'n/a'}.`,
+    ...scale.slice(0, 3).map(a => fmtAd(a, 'SCALE')),
+    ...kill.slice(0, 3).map(a => fmtAd(a, 'KILL')),
+  ];
+  if (scale.length === 0 && kill.length === 0) lines.push('No ad deviates meaningfully from the account average this week.');
+  await upsertKnowledge('intel', `ad_sweep:${week}`, lines.join('\n'), 'ad-sweep');
+  logActivity({ event_type: 'cron_run', event_source: 'cron', action: 'runWinningAdsSweep', status: 'ok', output: { ads: ads.length, scale: scale.length, kill: kill.length }, correlation_id: correlationId });
+  console.log(`Ad sweep ${week}: ${ads.length} ads ranked, ${scale.length} scale / ${kill.length} kill candidates.`);
+}
+
 // ── Metric registry — single source of truth for what gets scraped ──────────
 const METRIC_REGISTRY = [
   // Marketing — per-funnel CPL signals (blended CPL is meaningless across two funnels)
@@ -6443,6 +6748,19 @@ const METRIC_REGISTRY = [
   { name: 'phase1_cycle_days_p50',        domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_1'), label: 'Phase 1 cycle days (p50)' },
   { name: 'phase2_cycle_days_p50',        domain: 'fulfillment', scrape: () => _scrapePhaseCycleP50('phase_2'), label: 'Phase 2 cycle days (p50)' },
   { name: 'day7_at_risk_count',           domain: 'fulfillment', scrape: _scrapeDay7AtRiskCount,              label: 'Day 7+ at-risk client count' },
+  // ── 7d department drift metrics (2026-08-31, Ron's department spec) ────────
+  // Marketing — efficiency of spend and pixel truth
+  { name: 'roas_meta_7d',                 domain: 'marketing',   scrape: _scrapeRoasMeta7d,                   label: 'ROAS — 7d won revenue ÷ Meta spend' },
+  { name: 'cpa_true_7d',                  domain: 'marketing',   scrape: _scrapeCpaTrue7d,                    label: 'True CPA — 7d Meta spend ÷ CRM won deals' },
+  { name: 'leads_total_7d',               domain: 'marketing',   scrape: _scrapeLeadsTotal7d,                 label: 'Total leads 7d (both funnels incl. self-booked)' },
+  // Sales — money in and conversion at each gate
+  { name: 'revenue_won_7d',               domain: 'sales',       scrape: _scrapeRevenueWon7d,                 label: 'Revenue won (7d)' },
+  { name: 'close_rate_7d',                domain: 'sales',       scrape: _scrapeCloseRate7d,                  label: 'Close rate (7d, won ÷ held)' },
+  { name: 'show_rate_7d',                 domain: 'sales',       scrape: _scrapeShowRate7d,                   label: 'Show rate (7d, outcome-derived)' },
+  { name: 'booking_rate_7d',              domain: 'sales',       scrape: _scrapeBookingRate7d,                label: 'Booking rate (7d, setter-booked ÷ leads)' },
+  // Fulfillment — speed and stuck states, real-launch definition
+  { name: 'fulfillment_days_to_launch_avg', domain: 'fulfillment', scrape: _scrapeDaysToLaunchAvg,            label: 'Days to launch avg (28d, QA/validation = launch)' },
+  { name: 'fulfillment_pending_activations', domain: 'fulfillment', scrape: _scrapePendingActivations,        label: 'Activated ≥7d, not launched' },
 ];
 
 async function runAnomalyDetection({ dryRun = false, threshold = ANOMALY_THRESHOLD_SIGMA } = {}) {
@@ -12085,6 +12403,8 @@ cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => {
 
 // Weekly sales & marketing recap — Friday 5:00 PM CR (DMs Ron with 7-day sales + marketing summary)
 cron.schedule('0 17 * * 5',  wrapCronJob('runWeeklySalesMarketingRecap', async (c) => { await runWeeklySalesMarketingRecap(c); }), { timezone: 'America/Costa_Rica' });
+// Sunday evening so the ranking is fresh for the Monday reflection brief.
+cron.schedule('0 20 * * 0',  wrapCronJob('runWinningAdsSweep', async (c) => { await runWinningAdsSweep(c); }), { timezone: 'America/Costa_Rica' });
 
 // Monday gap detection — 8:00 AM CR (infrastructure — posts to ops channel)
 cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => { await runMondayGapDetection(c); }),  { timezone: 'America/Costa_Rica' });
@@ -15787,6 +16107,7 @@ const STATIC_CRON_SCHEDULES = {
   runUnloggedOutcomeReminders:  '0 16 * * *',
   runWeeklyPortalTrends:        '30 22 * * 5',
   runWeeklySalesMarketingRecap: '0 17 * * 5',
+  runWinningAdsSweep:           '0 20 * * 0',
   runWonHandoffNotes:           '0 9,17 * * *',
 };
 
