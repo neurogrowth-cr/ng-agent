@@ -1128,6 +1128,67 @@ async function lookupReportId(channel, threadTs, fallbackChannel) {
   return fallbackChannel || 'general-report';
 }
 
+// ─── PATTERN REFLECTION (pure guardrails) ─────────────────────────────────────
+// The nightly learning cycle saves each night's insights but, until 2026-08-31,
+// never read prior nights back — a pattern spanning three weeks was invisible
+// by construction. The reflection pass closes that: it re-reads the recent
+// knowledge window and may TAKE ACTION on a recurring pattern (create a Notion
+// task) without human approval. Ron authorized full autonomy at launch, so the
+// safety story lives HERE, in deterministic code — never in the prompt:
+//
+//   - evidence must name >= PATTERN_MIN_DISTINCT_DATES distinct days, parsed
+//     and counted, not trusted (a model can assert "3 weeks" in one breath)
+//   - at most PATTERN_MAX_ACTIONS_PER_NIGHT actions per night, hard cap
+//   - a pattern acted on within PATTERN_DEDUP_DAYS is not acted on again
+//   - the action vocabulary is a whitelist; anything else is dropped and logged
+//
+// Every action is audited: activity_log row + DM to Ron (inform, not approve).
+// test/pattern-reflection.test.js slices this block.
+const PATTERN_MIN_DISTINCT_DATES    = 3;
+const PATTERN_MAX_ACTIONS_PER_NIGHT = 2;
+const PATTERN_DEDUP_DAYS            = 14;
+const PATTERN_ACTIONS               = new Set(['notion_task', 'monitor', 'none']);
+
+// Reflection output line protocol (same pipe style the nightly extractor uses):
+//   PATTERN | <slug> | <evidence dates> | <notion_task|monitor|none> | <payload>
+// The payload is everything after the 4th pipe, so it may itself contain pipes.
+// Returns null for anything malformed — a bad line is skipped, never fatal.
+function parsePatternLine(line) {
+  if (!line || !line.trim().toUpperCase().startsWith('PATTERN')) return null;
+  const parts = line.split('|').map(p => p.trim());
+  if (parts.length < 5) return null;
+  const slug = slugifyReportName(parts[1]);
+  if (!slug) return null;
+  // Distinct ISO dates only — "2026-08-30, 2026-08-30, 2026-08-30" is ONE day
+  // of evidence claimed three times.
+  const dates = [...new Set(parts[2].match(/\d{4}-\d{2}-\d{2}/g) || [])];
+  // The payload is sliced from the ORIGINAL line past the 4th pipe, not rejoined
+  // from trimmed parts — it becomes a Notion task title and must not be mangled.
+  const pipeIdx = [];
+  for (let i = 0; i < line.length && pipeIdx.length < 4; i++) if (line[i] === '|') pipeIdx.push(i);
+  return { slug, dates, action: parts[3].toLowerCase(), payload: line.slice(pipeIdx[3] + 1).trim() };
+}
+
+// Applies every guardrail to the parsed patterns. `tracker` maps slug →
+// { lastActioned } (ms epoch or null) from the pattern-tracker rows. Pure and
+// synchronous so the whole decision table is testable without a database.
+function decidePatternActions(parsed, tracker = {}, now = Date.now()) {
+  const out = { execute: [], monitor: [], dropped: [] };
+  for (const p of (parsed || [])) {
+    if (!p) continue;
+    if (!PATTERN_ACTIONS.has(p.action))                { out.dropped.push({ pattern: p, reason: 'unknown_action' }); continue; }
+    if (p.action === 'none')                           continue;
+    if (p.dates.length < PATTERN_MIN_DISTINCT_DATES)   { out.dropped.push({ pattern: p, reason: 'insufficient_evidence' }); continue; }
+    if (p.action === 'monitor')                        { out.monitor.push(p); continue; }
+    const last = tracker[p.slug] && tracker[p.slug].lastActioned;
+    if (last && (now - last) < PATTERN_DEDUP_DAYS * 86400000) { out.dropped.push({ pattern: p, reason: 'recently_actioned' }); continue; }
+    if (out.execute.length >= PATTERN_MAX_ACTIONS_PER_NIGHT)  { out.dropped.push({ pattern: p, reason: 'nightly_cap' }); continue; }
+    out.execute.push(p);
+  }
+  return out;
+}
+// ─── end pattern reflection guardrails (test slices to here) ──────────────────
+
 // Retrieve the last N lessons for a report (last 90 days) to prepend to reports.
 async function getReportLessons(reportId) {
   try {
@@ -4353,6 +4414,131 @@ async function runMondayGapDetection(correlationId) {
 }
 
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
+// ─── PATTERN REFLECTION (async half) ──────────────────────────────────────────
+// Reads the tracker rows: key 'pattern:<slug>', category 'process',
+// source 'pattern-tracker', value JSON {status, dates, occurrences, lastActioned}.
+async function loadPatternTracker() {
+  const tracker = {};
+  try {
+    const { data, error } = await supabase
+      .from('agent_knowledge')
+      .select('key, value, updated_at')
+      .eq('category', 'process')
+      .eq('source', 'pattern-tracker')
+      .like('key', 'pattern:%')
+      .limit(100);
+    if (error) throw new Error(error.message);
+    for (const row of (data || [])) {
+      const slug = row.key.slice('pattern:'.length);
+      try {
+        const v = JSON.parse(row.value);
+        tracker[slug] = { status: v.status || 'active', dates: v.dates || [], occurrences: v.occurrences || 0, lastActioned: v.lastActioned || null };
+      } catch { tracker[slug] = { status: 'active', dates: [], occurrences: 0, lastActioned: null }; }
+    }
+  } catch (err) { console.error('loadPatternTracker failed:', err && err.message); }
+  return tracker;
+}
+
+async function savePatternRow(slug, entry) {
+  return upsertKnowledge('process', `pattern:${slug}`, JSON.stringify(entry), 'pattern-tracker');
+}
+
+// The reflection pass: re-read the recent knowledge window, ask what recurs,
+// act inside the guardrails. Runs at the END of the nightly cycle in its own
+// try/catch — a reflection failure must never cost the night's learning.
+async function runPatternReflection(correlationId, tonightEntries) {
+  // Window reads — bounded, shared-visibility only. Confidential rows are
+  // excluded at the QUERY, not by prompt instruction.
+  const since = (d) => new Date(Date.now() - d * 86400000).toISOString();
+  const [nightly, alerts, tracker] = await Promise.all([
+    supabase.from('agent_knowledge').select('category, key, value, updated_at')
+      .eq('source', 'nightly-learning').eq('visibility', 'shared')
+      .gte('updated_at', since(21)).order('updated_at', { ascending: false }).limit(150)
+      .then(r => r.data || []),
+    supabase.from('agent_knowledge').select('key, value, updated_at')
+      .eq('category', 'alert').eq('visibility', 'shared')
+      .gte('updated_at', since(14)).order('updated_at', { ascending: false }).limit(40)
+      .then(r => r.data || []),
+    loadPatternTracker(),
+  ]);
+  if (!nightly.length) { console.log('Pattern reflection: no window data, skipping.'); return; }
+
+  const fmt = (rows) => rows.map(r => `${r.updated_at.slice(0, 10)} [${r.category || 'alert'}] ${r.key}: ${String(r.value).slice(0, 220)}`).join('\n');
+  const trackerBlock = Object.entries(tracker).map(([slug, t]) =>
+    `${slug}: status=${t.status} seen=${t.occurrences}x${t.lastActioned ? ` last_actioned=${new Date(t.lastActioned).toISOString().slice(0, 10)}` : ''}`).join('\n') || '(none yet)';
+
+  const reflectionPrompt = `You are Max, NeuroGrowth's PM agent, running your nightly reflection. Below is your own knowledge from the last 21 days (nightly learning entries), the last 14 days of alerts, tonight's fresh entries, and the patterns you are already tracking.
+
+Your job: find OPERATIONAL PATTERNS — the same kind of problem or signal recurring on MULTIPLE DIFFERENT DAYS. Not one-off events, not vibes. A pattern needs evidence from at least ${PATTERN_MIN_DISTINCT_DATES} distinct dates.
+
+Output format — one line per pattern, nothing else:
+PATTERN | <short-slug> | <evidence dates, comma-separated YYYY-MM-DD> | <action> | <payload>
+
+action must be exactly one of:
+- notion_task — this pattern needs a task NOW. payload: <task title> :: <2-3 sentence context note>
+- monitor — real but below action threshold, keep tracking. payload: one-line description
+- none — a previously tracked pattern that has resolved. payload: why
+
+Rules: reuse the existing slug when a pattern you already track is still present. Do not re-propose notion_task for a pattern marked last_actioned within ${PATTERN_DEDUP_DAYS} days — use monitor instead. Evidence dates must be dates on which the pattern ACTUALLY appears in the entries below. No markdown. If there are no patterns, output exactly: NO_PATTERNS
+
+=== PATTERNS ALREADY TRACKED ===
+${trackerBlock}
+
+=== TONIGHT'S ENTRIES ===
+${(tonightEntries || []).map(e => `${new Date().toISOString().slice(0, 10)} [${e.category}] ${e.key}: ${String(e.value).slice(0, 220)}`).join('\n') || '(none)'}
+
+=== LAST 21 DAYS ===
+${fmt(nightly).slice(0, 16000)}
+
+=== ALERTS (14d) ===
+${fmt(alerts).slice(0, 4000)}`;
+
+  const tRef = Date.now();
+  const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
+  logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId);
+  const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+  if (text.includes('NO_PATTERNS')) {
+    logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'ok', output: { patterns: 0 }, correlation_id: correlationId });
+    return;
+  }
+
+  const parsed  = text.split('\n').map(parsePatternLine).filter(Boolean);
+  const decided = decidePatternActions(parsed, tracker);
+  const today   = new Date().toISOString().slice(0, 10);
+
+  for (const p of decided.monitor) {
+    const prev = tracker[p.slug] || { occurrences: 0, dates: [], lastActioned: null };
+    await savePatternRow(p.slug, { status: 'active', dates: [...new Set([...prev.dates, ...p.dates])].slice(-30), occurrences: prev.occurrences + 1, lastActioned: prev.lastActioned, note: p.payload.slice(0, 300) });
+  }
+
+  const executed = [];
+  for (const p of decided.execute) {
+    const [rawTitle, ...noteParts] = p.payload.split('::');
+    const title = (rawTitle || '').trim().slice(0, 140) || `Recurring pattern: ${p.slug}`;
+    const note  = `${noteParts.join('::').trim()}\n\nAuto-created by Max's nightly pattern reflection. Evidence dates: ${p.dates.join(', ')}.`.trim();
+    const result = await createNotionTask(title, 'operational', 'P1 - High Business Impact', null, note, null);
+    const prev = tracker[p.slug] || { occurrences: 0, dates: [] };
+    await savePatternRow(p.slug, { status: 'actioned', dates: [...new Set([...prev.dates, ...p.dates])].slice(-30), occurrences: prev.occurrences + 1, lastActioned: Date.now(), note: title });
+    executed.push({ slug: p.slug, title, dates: p.dates, result: String(result).slice(0, 120) });
+    logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_auto_action', status: 'ok', output: { slug: p.slug, title, evidence_dates: p.dates }, correlation_id: correlationId });
+  }
+  for (const d of decided.dropped) {
+    logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_dropped', status: 'ok', output: { slug: d.pattern.slug, reason: d.reason }, correlation_id: correlationId });
+  }
+  logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'ok', output: { patterns: parsed.length, executed: executed.length, monitoring: decided.monitor.length, dropped: decided.dropped.length }, correlation_id: correlationId });
+
+  // Audit DM — Ron is informed of every autonomous action, never asked. The cap
+  // being hit is itself worth knowing: it means the reflection wanted MORE.
+  if (executed.length || decided.dropped.some(d => d.reason === 'nightly_cap')) {
+    const lines = ['🔁 *Pattern reflection — autonomous actions tonight:*'];
+    for (const e of executed) lines.push(`• Created P1 Notion task: "${e.title}" — pattern \`${e.slug}\`, seen on ${e.dates.join(', ')}`);
+    const capped = decided.dropped.filter(d => d.reason === 'nightly_cap');
+    if (capped.length) lines.push(`• ${capped.length} more pattern(s) hit the ${PATTERN_MAX_ACTIONS_PER_NIGHT}/night cap — they'll surface in the Monday brief: ${capped.map(c => `\`${c.pattern.slug}\``).join(', ')}`);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') }).catch(err => console.error('Pattern audit DM failed:', err.message));
+  }
+  console.log(`Pattern reflection: ${parsed.length} pattern(s), ${executed.length} actioned, ${decided.monitor.length} monitoring, ${decided.dropped.length} dropped.`);
+}
+
 async function runNightlyLearning(correlationId) {
   console.log('Running nightly learning cycle...');
   // Report-post registry rows only matter while a lesson could still be written
@@ -4510,6 +4696,17 @@ async function runNightlyLearning(correlationId) {
           text: `🔒 *Confidential — from tonight's learning (not shared with the team):*\n${ronOnlyEntries.map(e => `• *${e.key}:* ${e.value}`).join('\n')}`,
         });
       } catch (dmErr) { console.error('Failed to DM Ron confidential nightly entries:', dmErr.message); }
+    }
+
+    // Reflection pass — cross-night pattern detection and guardrailed action.
+    // Own try/catch: a reflection failure must never cost the night's learning,
+    // but it must be loud — a dead reflection looks identical to a quiet one.
+    try {
+      await runPatternReflection(correlationId, savedEntries);
+    } catch (refErr) {
+      console.error('Pattern reflection failed:', refErr.message);
+      logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'error', error_message: String(refErr.message || refErr).slice(0, 2000), correlation_id: correlationId });
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `Pattern reflection failed tonight (learning itself succeeded): ${refErr.message}` }).catch(() => {});
     }
   } catch (err) {
     console.error('Nightly learning error:', err.message);
