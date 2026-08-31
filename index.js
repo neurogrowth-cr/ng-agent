@@ -3485,6 +3485,25 @@ function filterFlywheelAppts(rows, excludeIds) {
   });
 }
 
+// ─── SALES EOD BOOKED-CALLS WINDOW ───────────────────────────────────────────
+// The Sales EOD Report fires 21:00 CR daily but used to count "booked today" on
+// the CR calendar day — so a call booked between 21:00 and midnight fell into a
+// dead zone no digest ever covered (that's how Sebastian "booked 4" on
+// 2026-08-28 while the digest said 3: his 4th was 22:31 the night before).
+// The digest window is therefore anchored to the CADENCE, not the calendar day:
+// yesterday 21:00 CR → now. Runs late in the evening stretch the window past
+// 24h, which overlaps the previous digest slightly — a digest tolerates a
+// double-mention; it never tolerates a hole. CR is UTC-6 with no DST.
+function computeEodBookedWindow(nowMs) {
+  const CR_OFFSET_MS = 6 * 60 * 60 * 1000;
+  const crClock = new Date(nowMs - CR_OFFSET_MS); // CR wall clock, read as UTC
+  const today21CrMs = Date.UTC(
+    crClock.getUTCFullYear(), crClock.getUTCMonth(), crClock.getUTCDate(), 21, 0, 0
+  ) + CR_OFFSET_MS;
+  return { startMs: today21CrMs - 24 * 60 * 60 * 1000, endMs: nowMs };
+}
+// ─── END SALES EOD BOOKED-CALLS WINDOW ───────────────────────────────────────
+
 async function getSalesIntelligence(query) {
   try {
     const q = (query || '').toLowerCase();
@@ -3589,6 +3608,40 @@ async function getSalesIntelligence(query) {
       lines.push(`Unclaimed (no setter claimed yet): ${unclaimed}`);
       lines.push('Sources:');
       Object.entries(bySource).sort((a, b) => b[1] - a[1]).forEach(([s, c]) => lines.push(`  ${s}: ${c}`));
+      return lines.join('\n');
+    }
+
+    // ── CALLS BOOKED THIS EOD WINDOW (authoritative for the Sales EOD Report) ──
+    // Must run BEFORE the setter-performance branch: that branch also matches
+    // "booked" and would swallow this query. booked_at (not scheduled_start) is
+    // the anchor — a call booked today for next week counts today.
+    if (q.includes('booked') && (q.includes('today') || q.includes('hoy') || q.includes('window'))) {
+      const win = computeEodBookedWindow(Date.now());
+      const { data: bookedRaw, error: bookedErr } = await portalSupabase
+        .from('revops_appointments')
+        .select('id, setter_id, closer_id, booked_at, scheduled_start, iclosed_call_id, ghl_appointment_id, source, prospect:prospect_id ( full_name, email )')
+        .gte('booked_at', new Date(win.startMs).toISOString())
+        .lte('booked_at', new Date(win.endMs).toISOString())
+        .order('booked_at', { ascending: true });
+      // A read error must never render as "0 booked" — that is the scraper-
+      // returns-zero anti-pattern. Emit the sentinel and let the report show it.
+      if (bookedErr) return `⚠️ BOOKED_CALLS_DATA UNAVAILABLE — revops_appointments read failed (${bookedErr.message}). Do not state a booked-calls count.`;
+      const excludeBookedIds = await getNonFlywheelCallIds();
+      const booked = filterFlywheelAppts(bookedRaw, excludeBookedIds);
+      const fmtCr = (iso, opts) => new Date(iso).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', ...opts });
+      const winLabel = `${fmtCr(new Date(win.startMs).toISOString(), { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} → ${fmtCr(new Date(win.endMs).toISOString(), { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} CR`;
+      const lines = [
+        `BOOKED_CALLS_DATA (authoritative — strategy calls BOOKED in the EOD window ${winLabel}; window is 9PM-to-9PM CR so late-night bookings are never skipped; render verbatim, do NOT count from Slack):`,
+        `Total booked this window: ${booked.length}`,
+      ];
+      for (const a of booked) {
+        const name   = a.prospect?.full_name || 'Unknown prospect';
+        const when   = a.scheduled_start ? fmtCr(a.scheduled_start, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'time unknown';
+        const closer = resolveSalesMember(a.closer_id);
+        const setter = a.setter_id ? resolveSalesMember(a.setter_id) : (a.source === 'ghl' ? 'self-booked' : 'setter unknown');
+        lines.push(`• ${name} — call ${when} CR — closer: ${closer} — setter: ${setter} — booked ${fmtCr(a.booked_at, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} CR`);
+      }
+      if (!booked.length) lines.push('None booked in this window.');
       return lines.join('\n');
     }
 
@@ -6999,7 +7052,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jose and Ron are the current closers; Jonathan Madriz departed 2026-07-19 and appears only in periods he worked — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jose and Ron are the current closers; Jonathan Madriz departed 2026-07-19 and appears only in periods he worked — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), calls booked today (query "calls booked today" — authoritative BOOKED_CALLS_DATA block over the 9PM-to-9PM CR EOD window, the only correct source for the STRATEGY CALLS BOOKED section), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'closer_monthly_scorecard', description: "Monthly per-closer scorecard from the shared closer_month_scorecard view — the SAME numbers as the portal page /admin/closer-scorecard, so never recompute month stats another way when asked for a closer's month. Returns calls assigned, outcomes logged, pending, showed, no-shows, qualified attended, won/lost/follow-up/DQ, show rate, close rate on shows, revenue, plus a REVI recording reality-check (calls that verifiably happened but were never logged, avg call score, no-show-vs-recording flags) and the month's unattributed outcomes. Months are America/Costa_Rica calendar months anchored on the call's scheduled time. When pending is high, always caveat that show/close rates are unreliable — pending does not mean the call didn't happen.", input_schema: { type: 'object', properties: { month: { type: 'string', description: "Month as YYYY-MM, e.g. 2026-07. For 'last month' compute from today's date in CR time." }, closer: { type: 'string', description: 'Optional closer email or name fragment (jose, ron, jonathan). Omit for all closers.' } }, required: ['month'] } },
           { name: 'log_call_outcome', description: "Log a sales-call outcome to the portal (revops_sales_outcomes) on EXPLICIT human instruction ONLY. Use when a closer or Ron states an outcome in their own words ('won 3500', 'that call was a no show', 'log Marco as lost') — typically replying to an outcome reminder/proposal DM. NEVER call this from your own inference, a REVI read, a transcript, or a report — if a human did not state the outcome in this conversation, do not call this tool. won REQUIRES revenue (the real closed amount; ask if not given — never guess). Writes are first-writer-wins: an existing outcome is never overwritten, the tool will tell you if one exists. Also promotes the prospect's pipeline status per the shared dash contract.", input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Prospect email (preferred) or name fragment to find their appointment.' }, date: { type: 'string', description: 'Optional call date YYYY-MM-DD (CR time) to disambiguate when the prospect had multiple calls.' }, outcome: { type: 'string', enum: ['won', 'lost', 'follow_up', 'disqualified', 'no_show'], description: 'The outcome the human stated.' }, revenue: { type: 'number', description: 'Closed revenue in USD — required when outcome is won.' }, note: { type: 'string', description: 'Optional short context, e.g. who instructed it and why.' } }, required: ['prospect', 'outcome'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
@@ -11571,7 +11624,11 @@ async function runUnloggedOutcomeReminders(_correlationId) {
 // that reaches a human, and only after cancellation and reschedule have been
 // ruled out from data that already exists.
 const GHL_SALES_CALENDAR_IDS = (process.env.GHL_SALES_CALENDAR_IDS
-  || 'fYQJCzbk4hvV0brpJqoE,HXLeEjxpa0gdiTPNiAzc,KRTGx8XteIJSCcKAShHS').split(',').map(s => s.trim()).filter(Boolean);
+  // ONLY RON (0qwExROq…) added 2026-08-31: it was live since ~08-26 but missing
+  // from every hardcoded list in the stack, which is how five days of a
+  // setter's bookings went dark. runGhlRevopsReconciliation now cross-checks
+  // GHL itself against revops nightly so the next new calendar fails LOUD.
+  || 'fYQJCzbk4hvV0brpJqoE,HXLeEjxpa0gdiTPNiAzc,KRTGx8XteIJSCcKAShHS,0qwExROqOMRBXVmY93i5').split(',').map(s => s.trim()).filter(Boolean);
 
 // Current appointmentStatus for every sales-calendar event in a window, keyed
 // by GHL appointment id. Bulk by calendar (3 calls) rather than per contact.
@@ -15749,6 +15806,147 @@ async function checkBookingAlertDivergence(correlationId) {
 // Every 30 min — the 30-minute grace window means a tighter cadence cannot
 // surface anything sooner, and this costs two Supabase reads per run.
 cron.schedule('*/30 * * * *', wrapCronJob('checkBookingAlertDivergence', async (c) => { await checkBookingAlertDivergence(c); }), { timezone: 'America/Costa_Rica' });
+
+// ─── GHL ↔ REVOPS RECONCILIATION SWEEP ───────────────────────────────────────
+// checkBookingAlertDivergence above answers "did every ingested booking get its
+// Slack alert?" — it starts FROM revops_appointments, so it is blind to a
+// booking that never reached revops at all. That blindness is exactly how the
+// ONLY RON calendar failure ran silent for five days (2026-08-26 → 31): GHL
+// held the appointments, dash never ingested them, every content check read
+// the ingested rows and reported success. This sweep starts from the OTHER
+// side: GHL's own calendar API is the source of truth, and every non-deleted
+// event booked in the lookback window must have a revops_appointments row.
+//
+// The calendar list comes live from the GHL sales calendar GROUP — never from
+// a local allowlist. Three hardcoded lists (dash ×2, appt-status sweep) all
+// missed ONLY RON; a fourth copy here would just be the next one to drift.
+// Recipe spec: automations/ops/recipes/ghl-revops-reconciliation.md
+const RECON_SWEEP_LOOKBACK_MS   = 48 * 60 * 60 * 1000; // 2 nightly runs see every gap twice
+const RECON_SWEEP_GRACE_MS      = 45 * 60 * 1000;      // in-flight webhook/hydration is not a gap
+const RECON_SALES_GROUP_ID      = process.env.GHL_SALES_CALENDAR_GROUP_ID || 'pMCRj3C5wXBzKGmJmtgp';
+const reconSweepAlertedApptIds  = new Set(); // 48h lookback overlaps runs — alert each gap once
+
+// Pure diff, extracted for test/ghl-recon-sweep.test.js: which GHL events
+// booked inside [sinceMs, untilMs] have no revops row? `deleted` events are
+// GHL's own tombstones; cancelled events still count — dash records cancels.
+function diffGhlEventsAgainstRevops(events, existingIdSet, { sinceMs, untilMs }) {
+  return (events || []).filter(e => {
+    if (!e || !e.id || e.deleted) return false;
+    const added = Date.parse(e.dateAdded || '');
+    if (!Number.isFinite(added) || added < sinceMs || added > untilMs) return false;
+    return !existingIdSet.has(e.id);
+  });
+}
+
+async function runGhlRevopsReconciliation(correlationId) {
+  if (process.env.GHL_RECON_SWEEP_DISABLED === 'true') {
+    console.log('GHL↔revops reconciliation: disabled via GHL_RECON_SWEEP_DISABLED.');
+    return;
+  }
+  const now = Date.now();
+  const locationId = process.env.GHL_LOCATION_ID;
+  const ghlHeaders = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' };
+
+  // 1. Sales calendars, live from the group. FAIL CLOSED: an unreadable
+  // calendar list must not alarm — log loudly and let the liveness audit see
+  // the run; a false "everything is missing" would train Ron to ignore this.
+  let calendars = [];
+  try {
+    const res = await ghlFetch(
+      `https://services.leadconnectorhq.com/calendars/?locationId=${locationId}`,
+      { headers: ghlHeaders }, { label: 'recon calendars list' },
+    );
+    if (!res.ok) { console.error(`GHL↔revops reconciliation: calendars list → ${res.status}, skipping run.`); return; }
+    calendars = ((await res.json()).calendars || [])
+      .filter(c => c.id && c.groupId === RECON_SALES_GROUP_ID && c.isActive !== false);
+  } catch (err) {
+    console.error('GHL↔revops reconciliation: calendars list failed, skipping run:', err.message);
+    return;
+  }
+  if (!calendars.length) { console.error('GHL↔revops reconciliation: 0 calendars in sales group — group id wrong? Skipping.'); return; }
+
+  // 2. Events per calendar. The events endpoint filters by START time, but the
+  // gap test is on dateAdded — so the start window must be wide enough to
+  // contain anything bookable inside the lookback (past reschedules + far-out
+  // widget bookings). One calendar failing skips only that calendar, and the
+  // verdict says so rather than silently claiming full coverage.
+  const events = [];
+  const failedCalendars = [];
+  for (const cal of calendars) {
+    try {
+      const res = await ghlFetch(
+        `https://services.leadconnectorhq.com/calendars/events?locationId=${locationId}`
+        + `&calendarId=${cal.id}&startTime=${now - 14 * 24 * 3600 * 1000}&endTime=${now + 120 * 24 * 3600 * 1000}`,
+        { headers: ghlHeaders }, { label: `recon calendar ${cal.id}` },
+      );
+      if (!res.ok) { failedCalendars.push(cal.name || cal.id); continue; }
+      for (const e of (await res.json()).events || []) events.push({ ...e, _calendarName: cal.name || cal.id });
+    } catch (err) {
+      console.warn(`GHL↔revops reconciliation: calendar ${cal.id} fetch failed: ${err.message}`);
+      failedCalendars.push(cal.name || cal.id);
+    }
+  }
+
+  const sinceMs = now - RECON_SWEEP_LOOKBACK_MS;
+  const untilMs = now - RECON_SWEEP_GRACE_MS;
+  const candidates = (events || []).filter(e => {
+    const added = Date.parse(e?.dateAdded || '');
+    return e?.id && Number.isFinite(added) && added >= sinceMs && added <= untilMs;
+  });
+
+  // 3. Which of those ids does revops already have? FAIL CLOSED on read error.
+  let existing = new Set();
+  if (candidates.length) {
+    const { data: rows, error: rowErr } = await portalSupabase
+      .from('revops_appointments')
+      .select('ghl_appointment_id')
+      .in('ghl_appointment_id', candidates.map(e => e.id));
+    if (rowErr) { console.error('GHL↔revops reconciliation: revops read failed, skipping run:', rowErr.message); return; }
+    existing = new Set((rows || []).map(r => r.ghl_appointment_id));
+  }
+
+  const missing = diffGhlEventsAgainstRevops(candidates, existing, { sinceMs, untilMs });
+  const fresh = missing.filter(e => !reconSweepAlertedApptIds.has(e.id));
+  for (const e of missing) reconSweepAlertedApptIds.add(e.id);
+  if (reconSweepAlertedApptIds.size > 500) {
+    for (const id of [...reconSweepAlertedApptIds].slice(0, reconSweepAlertedApptIds.size - 500)) {
+      reconSweepAlertedApptIds.delete(id);
+    }
+  }
+
+  const failNote = failedCalendars.length ? ` (⚠️ ${failedCalendars.length} calendar(s) unreadable this run: ${failedCalendars.join(', ')} — their bookings were NOT checked)` : '';
+  console.log(`GHL↔revops reconciliation: ${calendars.length} calendar(s), ${candidates.length} booking(s) in lookback, ${missing.length} missing from revops (${fresh.length} new)${failNote}.`);
+  logActivity({
+    event_type: 'alert', event_source: 'cron', action: 'ghl_revops_reconciliation',
+    status: missing.length ? 'gap' : 'ok',
+    output: { calendars: calendars.length, candidates: candidates.length, missing: missing.map(e => e.id), failed_calendars: failedCalendars },
+    correlation_id: correlationId,
+  });
+  if (!fresh.length && !failedCalendars.length) return;
+
+  if (fresh.length) {
+    const lines = fresh.slice(0, 10).map(e => {
+      const who = e.createdBy?.userId ? (GHL_USER_NAMES[e.createdBy.userId] || e.createdBy.userId) : 'widget/unknown';
+      const title = String(e.title || '').split('|').pop().trim() || e.id;
+      return `• ${title} — calendar "${e._calendarName}" — booked ${new Date(e.dateAdded).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR by ${who} — \`${e.id}\``;
+    });
+    const more = fresh.length > 10 ? `\n…and ${fresh.length - 10} more.` : '';
+    await postMakeHealthAlert(
+      `🚨 <@${RON_SLACK_ID}> *${fresh.length} GHL booking(s) exist that never reached revops_appointments* (checked ${calendars.length} sales-group calendars, 48h lookback).${failNote}\n` +
+      `These calls are INVISIBLE to every sales report, the setter gets no credit, and outcomes can never attach. Check dash ghl_webhook_deliveries + PR #46 calendar resolution.\n` +
+      lines.join('\n') + more
+    );
+  } else if (failedCalendars.length) {
+    // No gaps found, but coverage was partial — say so once rather than let a
+    // green-looking run hide an unchecked calendar (the Make SUCCESS trap).
+    console.warn(`GHL↔revops reconciliation: no gaps in readable calendars, but coverage was partial${failNote}.`);
+  }
+}
+
+// Nightly 20:30 CR — before the 21:00 Sales EOD digest, so a gap is on Ron's
+// radar before the digest publishes numbers that would be missing those calls.
+cron.schedule('30 20 * * *', wrapCronJob('runGhlRevopsReconciliation', async (c) => { await runGhlRevopsReconciliation(c); }), { timezone: 'America/Costa_Rica' });
+// ─── END GHL ↔ REVOPS RECONCILIATION SWEEP ───────────────────────────────────
 console.log('Registered static cron: booking → alert divergence check (*/30 * * * *)');
 
 // ─── GHL WORKFLOW DRIFT WATCHDOG ────────────────────────────────────────────
@@ -16279,6 +16477,7 @@ const STATIC_CRON_SCHEDULES = {
   runGhlWorkflowDriftCheck:     '45 7 * * *',
   runEmailReplyPoller:          '0 8-20 * * 1-5',
   runFulfillmentStandup:        '0 9 * * 1-5',
+  runGhlRevopsReconciliation:   '30 20 * * *',
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
   runWeeklyReflectionBrief:     '0 8 * * 1',
