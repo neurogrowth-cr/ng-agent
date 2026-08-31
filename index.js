@@ -4592,14 +4592,16 @@ ${fmt(alerts).slice(0, 4000)}`;
   }
   logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'ok', output: { patterns: parsed.length, executed: executed.length, monitoring: decided.monitor.length, dropped: decided.dropped.length }, correlation_id: correlationId });
 
-  // Audit DM — Ron is informed of every autonomous action, never asked. The cap
-  // being hit is itself worth knowing: it means the reflection wanted MORE.
+  // Audit note — every autonomous action is announced, never asked about. Goes
+  // to #ng-pm-agent (Ron's call, 2026-08-31) so it sits next to the nightly
+  // learning post it belongs to; Max's home channel is not a team firehose.
+  // The cap being hit is itself worth knowing: the reflection wanted MORE.
   if (executed.length || decided.dropped.some(d => d.reason === 'nightly_cap')) {
     const lines = ['🔁 *Pattern reflection — autonomous actions tonight:*'];
     for (const e of executed) lines.push(`• Created P1 Notion task: "${e.title}" — pattern \`${e.slug}\`, seen on ${e.dates.join(', ')}`);
     const capped = decided.dropped.filter(d => d.reason === 'nightly_cap');
     if (capped.length) lines.push(`• ${capped.length} more pattern(s) hit the ${PATTERN_MAX_ACTIONS_PER_NIGHT}/night cap — they'll surface in the Monday brief: ${capped.map(c => `\`${c.pattern.slug}\``).join(', ')}`);
-    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') }).catch(err => console.error('Pattern audit DM failed:', err.message));
+    await postToSlack(AGENT_CHANNEL, lines.join('\n')).catch(err => console.error('Pattern audit post failed:', err.message));
   }
   console.log(`Pattern reflection: ${parsed.length} pattern(s), ${executed.length} actioned, ${decided.monitor.length} monitoring, ${decided.dropped.length} dropped.`);
 }

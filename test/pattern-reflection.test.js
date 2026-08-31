@@ -133,8 +133,9 @@ check('confidential rows are excluded at the QUERY, not by prompt',
   (SRC.match(/eq\('visibility', 'shared'\)[\s\S]{0,80}gte\('updated_at'/g) || []).length >= 2, true);
 check('auto-actions write an audit activity row',
   /action: 'pattern_auto_action'/.test(SRC), true);
-check('Ron is informed of every action taken',
-  /Pattern reflection — autonomous actions tonight/.test(SRC), true);
+check('every action is announced in #ng-pm-agent (Ron: 2026-08-31), not a DM',
+  /autonomous actions tonight[\s\S]{0,700}postToSlack\(AGENT_CHANNEL/.test(SRC)
+    && !/autonomous actions tonight[\s\S]{0,700}channel: RON_SLACK_ID/.test(SRC), true);
 check('the cap being hit is surfaced, not swallowed',
   /hit the \$\{PATTERN_MAX_ACTIONS_PER_NIGHT\}\/night cap/.test(SRC), true);
 
