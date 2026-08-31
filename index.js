@@ -7617,30 +7617,6 @@ async function fetchGhlIntakeForProspect(prospectId) {
   }
 }
 
-async function fetchGHLConvoForContact(contactId) {
-  const locationId = process.env.GHL_LOCATION_ID;
-  const apiKey     = process.env.GHL_API_KEY;
-  const headers    = { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
-  // Get conversations for this contact
-  const convoRes  = await fetch(`https://services.leadconnectorhq.com/conversations/search?locationId=${locationId}&contactId=${contactId}&limit=1`, { headers });
-  const convoData = await convoRes.json();
-  const convoCount = (convoData.conversations || []).length;
-  const convoId    = convoData.conversations?.[0]?.id;
-  console.log(`[GHL] fetchConvo contactId=${contactId} status=${convoRes.status} conversations=${convoCount} convoId=${convoId || 'none'}`);
-  if (!convoId) return null;
-  // Get recent messages
-  const msgRes  = await fetch(`https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=12`, { headers });
-  const msgData = await msgRes.json();
-  // GHL wraps the list: { messages: { messages: [...] } }. The old
-  // `msgData.messages || msgData.messages?.messages` took the wrapper object,
-  // failed Array.isArray, and returned [] — so the conversation section never
-  // rendered. Sort oldest→newest so slice(-8) is the latest, chronologically.
-  const messages = (Array.isArray(msgData.messages) ? msgData.messages : msgData.messages?.messages) || [];
-  messages.sort((a, b) => new Date(a.dateAdded || 0) - new Date(b.dateAdded || 0));
-  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${messages.length}`);
-  return messages;
-}
-
 // Contact internal notes — the surface where setters drop prospect background
 // before a call (company, ICP, key contacts, ticket range). GET mirror of the
 // POST the REVI prospect-notes sync uses. Returns [] on any failure — notes
@@ -7791,14 +7767,17 @@ async function runSalesCallPrep(_correlationId) {
       const callTime    = formatICTime(appt.scheduled_start, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       const hoursOut    = Math.round((new Date(appt.scheduled_start).getTime() - now) / (1000 * 60 * 60) * 10) / 10;
 
-      // GHL conversation lookup + setter resolution.
-      // convoSection stays null until something real is found — no placeholder
-      // text lives here, so a brief with nothing to show simply omits the
-      // section (see brief assembly below) instead of printing a dead line.
-      let convoSection = null;
+      // GHL contact lookup + setter resolution. Sections stay null until
+      // something real is found — no placeholder text lives here, so a brief
+      // with nothing to show simply omits the section (see brief assembly
+      // below) instead of printing a dead line. (The GHL conversation-history
+      // section was removed 2026-09-01 at Ron's call: setter-booked calls are
+      // WhatsApp logistics the setter already distills into the contact note,
+      // and self-booked prospects go straight from the VSL to the widget with
+      // no conversation at all — it was noise on every path.)
       let notesSection = null;
+      let intakeSection = null;
       let sourceLine = null;
-      let intake = null; // lazy — fetched at most once, reused by the fallback below
 
       // Native setter attribution: GHL records who booked the appointment
       // (createdBy → setter_id upstream in dash). NULL means widget self-booked
@@ -7834,33 +7813,20 @@ async function runSalesCallPrep(_correlationId) {
               return `📝${when ? ` *${when}*` : ''} ${n.text.length > 1200 ? `${n.text.slice(0, 1199).trimEnd()}…` : n.text}`;
             }).join('\n\n');
           }
-          const messages = await fetchGHLConvoForContact(ghlContact.id);
-          if (messages && messages.length) {
-            const msgLines = messages
-              .filter(m => m.body || m.text)
-              .slice(-8) // last 8 messages
-              .map(m => {
-                const dir  = m.direction === 'inbound' ? '← Prospect' : '→ Team';
-                const time = m.dateAdded ? new Date(m.dateAdded).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-                return `[${time}] ${dir}: ${(m.body || m.text || '').substring(0, 200)}`;
-              });
-            convoSection = msgLines.join('\n');
-          }
         }
       } catch (ghlErr) {
         console.error(`GHL lookup failed for ${prospectName}:`, ghlErr.message);
       }
 
-      // No GHL conversation found — fall back to the booking intake (the
-      // prospect's own Q&A answers) from ghl_webhook_deliveries. If that's
-      // empty too, the section is simply left out of the brief. (The iClosed
-      // intake fallback was deleted 2026-08-03 — the frozen
-      // iclosed_webhook_deliveries table can never hold intake for an
+      // Booking intake — the prospect's own Q&A answers from
+      // ghl_webhook_deliveries. If empty, the section is simply left out of
+      // the brief. (The iClosed intake fallback was deleted 2026-08-03 — the
+      // frozen iclosed_webhook_deliveries table can never hold intake for an
       // upcoming call, so it was a guaranteed-null query per brief.)
-      if (!convoSection) {
-        if (!intake) intake = await fetchGhlIntakeForProspect(prospectId);
+      {
+        const intake = await fetchGhlIntakeForProspect(prospectId);
         if (intake && (intake.eventName || intake.qa.length)) {
-          const lines = ['📋 No GHL message history — here\'s what they shared when booking:'];
+          const lines = [];
           if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
           for (const { question, answer } of intake.qa) {
             lines.push(`• ${question.replace(/[.?!:]+$/, '')}: "${answer}"`);
@@ -7870,7 +7836,7 @@ async function runSalesCallPrep(_correlationId) {
           if (intake.timezone)   meta.push(`Timezone: ${intake.timezone}`);
           if (intake.phone)      meta.push(`Phone: ${intake.phone}`);
           if (meta.length) lines.push(`• ${meta.join(' · ')}`);
-          convoSection = lines.join('\n');
+          if (lines.length) intakeSection = lines.join('\n');
         }
       }
 
@@ -7928,8 +7894,8 @@ async function runSalesCallPrep(_correlationId) {
       if (notesSection) {
         briefLines.push(`*SETTER NOTES (from GHL contact):*`, notesSection, ``);
       }
-      if (convoSection) {
-        briefLines.push(`*GHL CONVERSATION HISTORY:*`, convoSection, ``);
+      if (intakeSection) {
+        briefLines.push(`*BOOKING INTAKE (their own answers):*`, intakeSection, ``);
       }
       if (reviSection) {
         briefLines.push(`*REVI INTEL:*`, reviSection, ``);
