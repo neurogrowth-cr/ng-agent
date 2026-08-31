@@ -7631,10 +7631,14 @@ async function fetchGHLConvoForContact(contactId) {
   // Get recent messages
   const msgRes  = await fetch(`https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=12`, { headers });
   const msgData = await msgRes.json();
-  const messages = msgData.messages || msgData.messages?.messages || [];
-  const msgCount = Array.isArray(messages) ? messages.length : 0;
-  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${msgCount}`);
-  return Array.isArray(messages) ? messages : [];
+  // GHL wraps the list: { messages: { messages: [...] } }. The old
+  // `msgData.messages || msgData.messages?.messages` took the wrapper object,
+  // failed Array.isArray, and returned [] — so the conversation section never
+  // rendered. Sort oldest→newest so slice(-8) is the latest, chronologically.
+  const messages = (Array.isArray(msgData.messages) ? msgData.messages : msgData.messages?.messages) || [];
+  messages.sort((a, b) => new Date(a.dateAdded || 0) - new Date(b.dateAdded || 0));
+  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${messages.length}`);
+  return messages;
 }
 
 // Contact internal notes — the surface where setters drop prospect background
