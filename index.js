@@ -7814,15 +7814,20 @@ async function runSalesCallPrep(_correlationId) {
           // Setter background notes off the contact's internal notes. REVI's
           // auto-posted call reads live on the same surface — excluded here
           // because that intel already arrives via the REVI section below.
+          // Notes typed in the GHL UI arrive as HTML in `body` with the plain
+          // text in `bodyText`; API-posted notes (REVI's) carry plain text in
+          // both. Read bodyText first, and strip tags if only body exists.
+          const noteText = (n) => String(n.bodyText || String(n.body || '').replace(/<[^>]*>/g, ' '))
+            .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
           const notes = (await fetchGHLNotesForContact(ghlContact.id))
-            .filter(n => (n.body || '').trim() && !n.body.trim().startsWith('🧠 REVI'))
+            .map(n => ({ text: noteText(n), dateAdded: n.dateAdded }))
+            .filter(n => n.text && !n.text.startsWith('🧠 REVI'))
             .sort((a, b) => new Date(b.dateAdded || 0) - new Date(a.dateAdded || 0))
             .slice(0, 3); // newest 3 — older background is usually superseded
           if (notes.length) {
             notesSection = notes.map(n => {
-              const body = n.body.trim();
               const when = n.dateAdded ? formatICTime(n.dateAdded, { month: 'short', day: 'numeric' }) : '';
-              return `📝${when ? ` *${when}*` : ''} ${body.length > 1200 ? `${body.slice(0, 1199).trimEnd()}…` : body}`;
+              return `📝${when ? ` *${when}*` : ''} ${n.text.length > 1200 ? `${n.text.slice(0, 1199).trimEnd()}…` : n.text}`;
             }).join('\n\n');
           }
           const messages = await fetchGHLConvoForContact(ghlContact.id);
