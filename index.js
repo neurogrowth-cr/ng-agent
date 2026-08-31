@@ -1015,7 +1015,9 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
 
 // When a team member @mentions Max in a thread on a Max-posted report, extract
 // the lesson from their feedback and store it so future reports apply the fix.
-async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId) {
+// `reportId` is resolved by the caller from the registry (lookupReportId) — this
+// function never inspects the report text to decide what it is.
+async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId, reportId) {
   try {
     const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
     const res = await anthropic.messages.create({
@@ -1025,10 +1027,10 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
     });
     const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     if (!lesson) return null;
-    const reportId = inferReportId(originalReport, channelName);
-    const key = `report_lesson:${reportId}:${new Date().toISOString().slice(0, 10)}`;
+    const scopedId = reportId || channelName || 'general-report';
+    const key = `report_lesson:${scopedId}:${new Date().toISOString().slice(0, 10)}`;
     await upsertKnowledge('process', key, lesson, 'report-feedback', userId, 'shared');
-    console.log(`Report lesson saved for #${channelName}: ${lesson.substring(0, 100)}`);
+    console.log(`Report lesson saved for [${scopedId}] in #${channelName}: ${lesson.substring(0, 100)}`);
     return lesson;
   } catch (err) {
     console.error('extractAndSaveReportLesson error:', err.message);
@@ -1038,17 +1040,91 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
 
 // Map a report's root message text to a stable report ID so lessons are scoped
 // by report type rather than just channel (handles DM reports too).
-function inferReportId(messageText, fallbackChannel) {
-  const t = (messageText || '').toLowerCase();
-  if (t.includes('setter brief'))                                        return 'sales-standup-setter';
-  if (t.includes('closer brief'))                                        return 'sales-standup-closer';
-  if (t.includes('weekly sales') && t.includes('marketing recap'))       return 'weekly-sales-marketing-recap';
-  if (t.includes('monday delivery gap report') || t.includes('gap report')) return 'gap-detection';
-  if (t.includes('fulfillment standup') || t.includes('delivery standup')) return 'fulfillment-standup';
-  if (t.includes('eod pulse') || t.includes('end of day pulse'))         return 'fulfillment-eod';
-  if (t.includes('week in review') || t.includes('friday delivery'))     return 'friday-delivery-wrap';
-  if (t.includes('anomaly') || t.includes('drifted') || t.includes('σ')) return 'anomaly-alert';
-  if (t.includes('still missing an iclosed outcome') || t.includes('still missing an outcome in ghl') || t.includes('outcome not logged')) return 'unlogged-outcome-reminder';
+// ─── REPORT IDENTITY ──────────────────────────────────────────────────────────
+// A report's identity is assigned by whatever POSTS it and looked up later by
+// thread root. It is never inferred from the text.
+//
+// The previous inferReportId() sniffed the message for phrases like 'setter
+// brief' or 'gap report'. Run against Max's real reports on 2026-08-27, DAILY
+// CALL ROSTER, SETTER LEADERBOARD, SALES EOD REPORT, PIPELINE AUTO-MOVER,
+// WEEKLY CLOSER COMPARISON and CANCELLATION RATE *all* fell through to the
+// channel name — six distinct reports sharing one lesson bucket, so feedback on
+// the leaderboard was injected into the call roster. Its own comment said it
+// existed to prevent exactly that.
+//
+// Registry row: agent_knowledge · category 'report_post' · key '<channel>:<ts>'
+// · value '<reportId>'. Written at post time, read at feedback time.
+const REPORT_POST_CATEGORY = 'report_post';
+
+// Scheduled reports are identified by their task name, which already exists in
+// scheduled_tasks and is in scope at both dynamic-cron lesson reads — so write
+// and read derive the id from the same string instead of two guesses at it.
+function slugifyReportName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+}
+function reportIdForTask(taskName) {
+  return `task:${slugifyReportName(taskName)}`;
+}
+
+function reportPostKey(channel, ts) {
+  return `${channel}:${ts}`;
+}
+
+// Fire-and-forget: a failed registration must never take down a report post.
+// The cost of missing one is a lesson scoped to the channel instead of the
+// report, which is exactly the old behaviour — degraded, not broken.
+function registerReportPost(channel, ts, reportId) {
+  if (!channel || !ts || !reportId) return Promise.resolve();
+  return supabase
+    .from('agent_knowledge')
+    .upsert({
+      category: REPORT_POST_CATEGORY,
+      key: reportPostKey(channel, ts),
+      value: reportId,
+      source: 'report-post',
+      user_id: RON_SLACK_ID,
+      visibility: 'shared',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'category,key' })
+    .then(({ error }) => { if (error) throw new Error(error.message); })
+    .catch(err => console.error(`registerReportPost(${reportId}) failed:`, err && err.message));
+}
+
+// Registers whatever chat.postMessage returned. Slack's response carries the
+// resolved channel ID and the ts, which is the pair the lookup uses — passing a
+// channel *name* here would never match.
+function registerPostedReport(postResult, reportId) {
+  const ch = postResult && postResult.channel;
+  const ts = postResult && postResult.ts;
+  if (!ch || !ts) {
+    console.error(`registerPostedReport(${reportId}): no channel/ts on the post result — lesson feedback will fall back to channel scope.`);
+    return Promise.resolve();
+  }
+  return registerReportPost(ch, ts, reportId);
+}
+
+// Which report is this thread hanging off? Falls back to the channel name for
+// anything unregistered (ad-hoc Max posts), which preserves the old behaviour
+// rather than dropping the lesson — and says so, because a report that silently
+// stopped registering would otherwise look identical to one that never did.
+async function lookupReportId(channel, threadTs, fallbackChannel) {
+  try {
+    const { data, error } = await supabase
+      .from('agent_knowledge')
+      .select('value')
+      .eq('category', REPORT_POST_CATEGORY)
+      .eq('key', reportPostKey(channel, threadTs))
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (data && data.value) return data.value;
+  } catch (err) {
+    console.error('lookupReportId failed:', err && err.message);
+  }
+  console.log(`lookupReportId: no registry row for ${reportPostKey(channel, threadTs)} — scoping the lesson to #${fallbackChannel || 'unknown'}.`);
   return fallbackChannel || 'general-report';
 }
 
@@ -1357,7 +1433,9 @@ function registerDynamicCron(task) {
       } catch (e) { console.error('Live context fetch error for scheduled task:', e.message); }
 
       // Inject any lessons learned from team feedback on previous reports for this channel
-      const taskLessons = await getReportLessons(taskChannel);
+      // Scoped to THIS report, not to its channel — six sales reports share
+      // #ng-sales-goats and used to share one lesson bucket.
+      const taskLessons = await getReportLessons(reportIdForTask(task.name));
       const lessonContext = taskLessons.length
         ? `\n\nPREVIOUS FEEDBACK FROM TEAM (apply these corrections to this report):\n${taskLessons.map(l => `• ${l.value}`).join('\n')}`
         : '';
@@ -1691,7 +1769,7 @@ function registerDynamicCron(task) {
 
       // Scheduled reports post directly — feedback learning loop handles quality
       // (user-initiated draft_channel_post requests still use the approval flow)
-      const lessons = await getReportLessons(targetChannel.replace(/^#/, ''));
+      const lessons = await getReportLessons(reportIdForTask(task.name));
       let finalReply = reply;
       if (lessons.length) {
         const lessonNote = `[Corrections applied from team feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`;
@@ -1699,7 +1777,8 @@ function registerDynamicCron(task) {
       }
       // Strip Markdown bold — Slack uses *bold* not **bold**
       finalReply = finalReply.replace(/\*\*(.+?)\*\*/g, '$1');
-      await postToSlack(targetChannel, finalReply);
+      const posted = await postToSlack(targetChannel, finalReply);
+      await registerPostedReport(posted, reportIdForTask(task.name));
 
     } catch (e) { errored = e; throw e; } finally {
       const doneErr = errored || lastErr;
@@ -4267,7 +4346,8 @@ async function runMondayGapDetection(correlationId) {
       : '';
     const message = `${lessonNote}Good morning team. Here's your Monday delivery gap report for ${today}:\n\n${gaps.join('\n')}\n\nTag the responsible team member and confirm resolution by EOD.`;
     // Post directly — team reviews and threads corrections to Max for learning
-    await executeChannelPost(OPS_CHANNEL, message, null, correlationId);
+    const gapPosted = await executeChannelPost(OPS_CHANNEL, message, null, correlationId);
+    await registerPostedReport(gapPosted, 'gap-detection');
     console.log(`Gap detection: ${gaps.length} gap(s) posted directly to ${OPS_CHANNEL}.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
 }
@@ -4275,6 +4355,20 @@ async function runMondayGapDetection(correlationId) {
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
 async function runNightlyLearning(correlationId) {
   console.log('Running nightly learning cycle...');
+  // Report-post registry rows only matter while a lesson could still be written
+  // against them, and getReportLessons looks back 90 days. Anything past 120 is
+  // dead weight — ~10 reports/day would otherwise accrue forever.
+  try {
+    const cutoff = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase
+      .from('agent_knowledge')
+      .delete()
+      .eq('category', REPORT_POST_CATEGORY)
+      .lt('updated_at', cutoff);
+    if (error) throw new Error(error.message);
+  } catch (pruneErr) {
+    console.error('Report-post registry prune failed:', pruneErr && pruneErr.message);
+  }
   try {
     const channels = ['ng-fullfillment-ops','ng-sales-goats','ng-new-client-alerts','ng-app-and-systems-improvents','ng-ops-management'];
     let digest = '';
@@ -6379,12 +6473,17 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
 }
 
 // ─── SLACK HELPERS ────────────────────────────────────────────────────────────
+// Returns the chat.postMessage response. Callers that post a *report* need the
+// resolved channel ID and ts to register the report's identity — see
+// registerPostedReport. It used to await and discard the response, which is why
+// a report had no durable identity and feedback on it had to be guessed from
+// its own text.
 async function postToSlack(channel, text, threadTs = null) {
-  if (!text || !text.trim()) { console.error('postToSlack called with empty text, skipping.'); return; }
+  if (!text || !text.trim()) { console.error('postToSlack called with empty text, skipping.'); return null; }
   const channelName = channel.startsWith('#') ? channel.slice(1) : channel;
   const payload = { channel: channelName, text };
   if (threadTs) payload.thread_ts = threadTs;
-  await slack.client.chat.postMessage(payload);
+  return slack.client.chat.postMessage(payload);
 }
 
 // `say` is absent on cron paths — there is no originating Slack conversation to
@@ -6392,7 +6491,10 @@ async function postToSlack(channel, text, threadTs = null) {
 // TypeError immediately AFTER the channel post succeeded, and the catch below then
 // called say() again and threw a second time, propagating out. Callers with a real
 // `say` (the approval flow) are unaffected.
+// Returns the chat.postMessage response (or null) so a caller posting a report
+// can register its identity — see registerPostedReport.
 async function executeChannelPost(channelName, message, say, correlationId) {
+  let posted = null;
   const reply = async (text) => {
     if (typeof say === 'function') await say(text);
     else console.log(`executeChannelPost: ${text}`);
@@ -6402,7 +6504,7 @@ async function executeChannelPost(channelName, message, say, correlationId) {
     const channel  = channels.find(c => c.name === channelName.replace('#', ''));
     if (!channel) { await reply(`Could not find channel ${channelName}.`); }
     else {
-      await slack.client.chat.postMessage({ channel: channel.id, text: message });
+      posted = await slack.client.chat.postMessage({ channel: channel.id, text: message });
       if (correlationId) {
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: channel.id, output: { text: String(message).slice(0, 2000) }, correlation_id: correlationId });
       }
@@ -6412,6 +6514,7 @@ async function executeChannelPost(channelName, message, say, correlationId) {
       }
     }
   } catch (err) { await reply(`Something went wrong posting: ${err.message}`); }
+  return posted;
 }
 
 // ─── EMAIL PROXY: tool handlers ───────────────────────────────────────────────
@@ -7057,7 +7160,7 @@ function claimEvent(channel, ts, now = Date.now()) {
 // an explicit tag on purpose: two of them are LLM calls, and firing them on
 // every thread reply everywhere would multiply cost and manufacture "lessons"
 // out of ordinary follow-up questions.
-async function buildThreadContext({ channel, threadTs, excludeTs, userId, userText = '', tagged = false, knownChannelName, valueGate = false }) {
+async function buildThreadContext({ channel, threadTs, excludeTs, userId, userText = '', tagged = false, knownChannelName, valueGate = false, learnFromFeedback = false }) {
   const empty = { context: '', maxRootedThread: false, maxIsLastSpeaker: false, channelName: null, messages: [] };
   if (!threadTs) return empty;
   try {
@@ -7082,6 +7185,27 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
       context += `\n\nNOBODY TAGGED YOU. You are seeing this only because the last message in the thread was yours, so this one may be a reply to you. Before answering, decide whether it actually is. If the message is aimed at someone else, is two colleagues talking to each other, is a plain acknowledgement ("ok", "gracias", "listo"), or you have nothing of substance to add, reply with exactly NO_REPLY and nothing else — that posts nothing and is the right answer more often than not. Only answer when someone is genuinely asking you something or you hold information they clearly need. Silence is not a failure here.`;
     }
 
+    // ── Report-feedback learning ────────────────────────────────────────────
+    // Split out of the `tagged` block on 2026-08-28. It used to require an
+    // @mention, and Slack never delivers app_mention for a DM — so the setter
+    // and closer briefs, which runSalesStandup sends as DMs, could not produce
+    // a lesson while that same function read lessons for them on every run.
+    // Two reads that were structurally guaranteed empty forever.
+    //
+    // The other `tagged` side effects stay behind an explicit mention: they are
+    // two more LLM calls each and would fire on every feedback-shaped reply.
+    if ((tagged || learnFromFeedback) && maxRootedThread) {
+      try {
+        const reportId = await lookupReportId(channel, threadTs, channelName);
+        const lesson = await extractAndSaveReportLesson(messages[0]?.text || '', userText, channelName || 'this DM', userId, newCorrelationId(), reportId);
+        if (lesson) {
+          context += `\n\nIMPORTANT: This person is giving feedback on a report Max posted. A lesson has been extracted and saved: "${lesson}". Acknowledge this in your reply — confirm what you learned and that you will apply it to future runs of that report. Keep it to 1-2 sentences, plain text.`;
+        }
+      } catch (lessonErr) {
+        console.error('Lesson extraction error:', lessonErr.message);
+      }
+    }
+
     if (tagged) {
       const rootMessage = messages[0];
       await upsertKnowledge('process', `thread:${channel}:${threadTs}`,
@@ -7094,19 +7218,10 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
       // used to test `!rootMessage.user && rootMessage.bot_id`, which matched any
       // app: tagging Max under a Make card ran lesson extraction against Make's
       // text as if it were one of his own reports.
-      const isMaxBotPost = isMaxMessage(rootMessage, botUserId, maxBotId);
-      if (isMaxBotPost) {
-        try {
-          const lesson = await extractAndSaveReportLesson(rootMessage.text || '', userText, channelName || 'unknown channel', userId, newCorrelationId());
-          if (lesson) {
-            context += `\n\nIMPORTANT: This person is giving feedback on a report Max posted. A lesson has been extracted and saved: "${lesson}". Acknowledge this in your reply — confirm what you learned and that you will apply it to future reports for this channel. Keep it to 1-2 sentences, plain text.`;
-          }
-        } catch (lessonErr) {
-          console.error('Lesson extraction error:', lessonErr.message);
-        }
-      } else {
-        // Thread not rooted in a Max report, but Max may have spoken earlier in
-        // it — if this mention corrects him, capture the lesson too.
+      // Lesson extraction for Max-rooted threads now runs above, for tagged
+      // AND untagged feedback. This branch covers the other case: a thread Max
+      // did not root but spoke in, where the mention may be correcting him.
+      if (!maxRootedThread) {
         const lastMaxMsg = [...messages].reverse().find(m => isMaxMessage(m, botUserId, maxBotId));
         if (lastMaxMsg) detectAndSaveCorrection(userText, lastMaxMsg.text || '', userId).catch(() => {});
       }
@@ -7245,7 +7360,11 @@ slack.message(async ({ message, say }) => {
   const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
   detectAndSaveCorrection(message.text, typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', userId).catch(() => {});
   const threadHint = await getActiveThreadHint(userId);
-  const dmThread = await buildThreadContext({ channel: message.channel, threadTs: dmThreadTs, excludeTs: message.ts, userId, userText: message.text || '' });
+  // A DM reply that looks like a correction on one of Max's own reports is the
+  // main way setters and closers give feedback — their briefs are DMs, and no
+  // @mention is possible there. Gated on the same regex detectAndSaveCorrection
+  // uses so an LLM call does not fire on "ok" / "gracias" / "listo".
+  const dmThread = await buildThreadContext({ channel: message.channel, threadTs: dmThreadTs, excludeTs: message.ts, userId, userText: message.text || '', learnFromFeedback: CORRECTION_HINT_RE.test(message.text || '') });
   const dmHints = cardThreadHint + threadHint;
   history.push({ role: 'user', content: dmThread.context
     ? `${dmThread.context}\n\nMY TASK (what they just asked me, inside that thread): ${message.text || ''}${dmHints}`
@@ -7341,7 +7460,7 @@ slack.message(async ({ message, say }) => {
   // come before checkApproval and the roster rejection so neither fires in a
   // channel he stays out of.
   const valueGate = !tagged && !inMaxChannel && isThreadReply;
-  const chThread = await buildThreadContext({ channel: message.channel, threadTs: isThreadReply ? message.thread_ts : null, excludeTs: message.ts, userId: message.user, userText: message.text || '', knownChannelName: channelName, valueGate });
+  const chThread = await buildThreadContext({ channel: message.channel, threadTs: isThreadReply ? message.thread_ts : null, excludeTs: message.ts, userId: message.user, userText: message.text || '', knownChannelName: channelName, valueGate, learnFromFeedback: CORRECTION_HINT_RE.test(message.text || '') });
   if (!shouldAnswerChannelMessage({ channelName, isThreadReply, tagged, maxRootedThread: chThread.maxRootedThread, maxIsLastSpeaker: chThread.maxIsLastSpeaker })) return;
 
   const isApproval = await checkApproval(message, say, message.user);
@@ -8184,7 +8303,8 @@ async function runSalesStandup(_correlationId) {
         }
 
         lines.push('See something off? Thread on this message and tag @Max with the correction.');
-        await slack.client.chat.postMessage({ channel: setter.slackId, text: lines.join('\n') });
+        const setterPosted = await slack.client.chat.postMessage({ channel: setter.slackId, text: lines.join('\n') });
+        await registerPostedReport(setterPosted, 'sales-standup-setter');
         console.log(`Sales standup DM sent to setter ${setter.name}`);
       } catch (setterErr) {
         console.error(`Sales standup — DM to ${setter.name} failed:`, setterErr.message);
@@ -8259,7 +8379,8 @@ async function runSalesStandup(_correlationId) {
         }
 
         lines.push('See something off? Thread on this message and tag @Max with the correction.');
-        await slack.client.chat.postMessage({ channel: closer.slackId, text: lines.join('\n') });
+        const closerPosted = await slack.client.chat.postMessage({ channel: closer.slackId, text: lines.join('\n') });
+        await registerPostedReport(closerPosted, 'sales-standup-closer');
         console.log(`Sales standup DM sent to closer ${closer.name}`);
       } catch (closerErr) {
         console.error(`Sales standup — DM to ${closer.name} failed:`, closerErr.message);
@@ -10524,7 +10645,8 @@ async function runUnloggedOutcomeReminders(_correlationId) {
           lines.push('Set the outcome on the opportunity card in GHL, or just reply here (e.g. `won 3500`, `lost`, `follow up`) and I\'ll log it for you.');
           lines.push('');
           lines.push('See something off? Thread on this message and tag @Max with the correction.');
-          await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
+          const remPosted = await slack.client.chat.postMessage({ channel: slackId, text: lines.join('\n') });
+          await registerPostedReport(remPosted, 'unlogged-outcome-reminder');
           console.log(`Unlogged-outcome reminder sent to ${closerName} (${aggregate.length} calls)`);
         } catch (closerErr) {
           console.error(`Unlogged-outcome reminder to ${closerName} failed:`, closerErr.message);
@@ -11379,7 +11501,8 @@ async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } 
     const msg = parts.join('\n');
 
     if (preview) return msg;
-    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: msg });
+    const recapPosted = await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: msg });
+    await registerPostedReport(recapPosted, 'weekly-sales-marketing-recap');
     console.log('Weekly sales & marketing recap sent to Ron.');
   } catch (err) {
     console.error('Weekly sales & marketing recap error:', err.message);
