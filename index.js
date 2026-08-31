@@ -5,6 +5,7 @@ const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
+const crypto = require('crypto');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 const sharp = require('sharp');
@@ -15750,6 +15751,191 @@ async function checkBookingAlertDivergence(correlationId) {
 cron.schedule('*/30 * * * *', wrapCronJob('checkBookingAlertDivergence', async (c) => { await checkBookingAlertDivergence(c); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: booking → alert divergence check (*/30 * * * *)');
 
+// ─── GHL WORKFLOW DRIFT WATCHDOG ────────────────────────────────────────────
+// A GHL workflow going published → draft silently stops whatever it drives —
+// lead routing, booking webhooks, CAPI events. Nothing watched that until now.
+// checkBookingAlertDivergence catches it only downstream, only hours later, and
+// only for workflows whose failure happens to produce a missing booking alert;
+// a workflow with no booking symptom fails completely invisibly.
+//
+// `workflows.readonly` was added to the PIT on 2026-08-31, which is what makes
+// this possible. The endpoint is list-only — seven fields per workflow, no
+// steps/actions/triggers — so this can see THAT a workflow changed, never how.
+// GHL also exposes no API to publish, pause, or edit a workflow, so this
+// detects and reports; it can never repair. Re-driving affected contacts
+// through a workflow (`add-contact-to-workflow`) is deliberately out of scope.
+//
+// Spec: ~/automations/ops/recipes/ghl-workflow-drift.md
+const GHL_WORKFLOW_SNAPSHOT_TABLE = 'ghl_workflow_snapshots';
+
+// Only these two are worth waking anyone for. Version bumps and new workflows
+// are recorded and diffable but never alert: someone editing a workflow is
+// normal, and a watchdog that fires on normal activity gets muted — at which
+// point it looks like coverage while providing none.
+function evaluateWorkflowDrift({ current, previous }) {
+  const cur = Array.isArray(current) ? current : [];
+  // No prior snapshot is the warmup case, not a finding. Everything looks
+  // "new" against nothing, so reporting drift here would alarm on first run.
+  if (!Array.isArray(previous)) {
+    return { baseline: true, unpublished: [], disappeared: [], appeared: [], edited: [], alertable: 0 };
+  }
+  const prevById = new Map(previous.map(w => [w.id, w]));
+  const curById = new Map(cur.map(w => [w.id, w]));
+
+  const isPublished = w => String(w && w.status).toLowerCase() === 'published';
+
+  const unpublished = cur
+    .filter(w => prevById.has(w.id) && isPublished(prevById.get(w.id)) && !isPublished(w))
+    .map(w => ({ id: w.id, name: w.name, from: prevById.get(w.id).status, to: w.status }));
+
+  const disappeared = previous
+    .filter(w => !curById.has(w.id))
+    .map(w => ({ id: w.id, name: w.name, status: w.status }));
+
+  const appeared = cur
+    .filter(w => !prevById.has(w.id))
+    .map(w => ({ id: w.id, name: w.name, status: w.status }));
+
+  const edited = cur
+    .filter(w => {
+      const p = prevById.get(w.id);
+      return p && (String(p.version) !== String(w.version) || p.updatedAt !== w.updatedAt);
+    })
+    .map(w => ({ id: w.id, name: w.name, fromVersion: prevById.get(w.id).version, toVersion: w.version }));
+
+  return {
+    baseline: false,
+    unpublished,
+    disappeared,
+    appeared,
+    edited,
+    alertable: unpublished.length + disappeared.length,
+  };
+}
+
+// Rendered separately from the evaluation so the test can assert the text
+// contract (4a) without stubbing Slack or Supabase.
+function renderWorkflowDriftAlert(drift, { count, since }) {
+  const lines = [`⚠️ *WORKFLOW DRIFT* — ${drift.unpublished.length} unpublished, ${drift.disappeared.length} disappeared.`];
+  for (const w of drift.unpublished) lines.push(`• *${w.name}* is no longer published (${w.from} → ${w.to}). Whatever it drives has stopped.`);
+  for (const w of drift.disappeared) lines.push(`• *${w.name}* no longer exists in GHL (was ${w.status}).`);
+  lines.push('');
+  lines.push(`${count} workflows read${since ? `, compared against the snapshot from ${since}` : ''}. GHL exposes no API to re-publish — this has to be fixed in the GHL UI.`);
+  return lines.join('\n');
+}
+
+async function fetchGhlWorkflows() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  if (!locationId) throw new Error('GHL_LOCATION_ID is not set');
+  const res = await ghlFetch(
+    `https://services.leadconnectorhq.com/workflows/?locationId=${encodeURIComponent(locationId)}`,
+    { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+    { label: 'workflow drift check' },
+  );
+  if (!res.ok) throw new Error(`GHL workflows read returned ${res.status}`);
+  const body = await res.json();
+  const rows = (body && body.workflows) || [];
+  if (!Array.isArray(rows)) throw new Error('GHL workflows response was not a list');
+  return rows.map(w => ({
+    id: w.id, name: w.name, status: w.status,
+    version: w.version, updatedAt: w.updatedAt,
+  }));
+}
+
+async function runGhlWorkflowDriftCheck(correlationId) {
+  let current;
+  try {
+    current = await fetchGhlWorkflows();
+  } catch (err) {
+    // Fail closed, loudly. A silent read failure that wrote an empty snapshot
+    // would both fake an all-clear today and poison tomorrow's diff.
+    console.error('Workflow drift: read failed —', err.message);
+    await postMakeHealthAlert(`⚠️ *CHECK BROKEN* — could not read GHL workflows (${err.message}). No snapshot written; this is not an all-clear. <@${RON_SLACK_ID}>`);
+    await logActivity({ event_type: 'audit', event_source: 'cron', action: 'ghl_workflow_drift', status: 'degraded', error_message: String(err.message).slice(0, 2000), correlation_id: correlationId });
+    return { ok: false, reason: err.message };
+  }
+
+  // Zero workflows is indistinguishable from a failed read, and reporting it as
+  // drift would claim every workflow was deleted — the loudest possible false
+  // alarm. Treated as a broken check, never as mass deletion.
+  if (!current.length) {
+    console.error('Workflow drift: GHL returned zero workflows — treating as a failed read, not as deletion.');
+    await postMakeHealthAlert(`⚠️ *CHECK BROKEN* — GHL returned zero workflows. Treating as a failed read, not as mass deletion. No snapshot written. <@${RON_SLACK_ID}>`);
+    await logActivity({ event_type: 'audit', event_source: 'cron', action: 'ghl_workflow_drift', status: 'degraded', error_message: 'zero workflows returned', correlation_id: correlationId });
+    return { ok: false, reason: 'zero workflows' };
+  }
+
+  // Most recent snapshot BEFORE this run — not exactly yesterday. Keying on an
+  // exact date silently returns null after one missed day, which for a watchdog
+  // means a skipped comparison dressed up as a clean baseline.
+  let previous = null, since = null;
+  const { data: prevRows, error: prevErr } = await supabase
+    .from(GHL_WORKFLOW_SNAPSHOT_TABLE)
+    .select('workflows, captured_at')
+    .order('captured_at', { ascending: false })
+    .limit(1);
+  if (prevErr) {
+    console.error('Workflow drift: could not read prior snapshot —', prevErr.message);
+    await postMakeHealthAlert(`⚠️ *CHECK BROKEN* — read ${current.length} GHL workflows but could not load the prior snapshot (${prevErr.message}). No comparison made; this is not an all-clear. <@${RON_SLACK_ID}>`);
+    await logActivity({ event_type: 'audit', event_source: 'cron', action: 'ghl_workflow_drift', status: 'degraded', error_message: String(prevErr.message).slice(0, 2000), correlation_id: correlationId });
+    return { ok: false, reason: prevErr.message };
+  }
+  if (prevRows && prevRows.length) {
+    previous = prevRows[0].workflows;
+    since = String(prevRows[0].captured_at).slice(0, 10);
+  }
+
+  const drift = evaluateWorkflowDrift({ current, previous });
+
+  const { error: insErr } = await supabase.from(GHL_WORKFLOW_SNAPSHOT_TABLE).insert({
+    location_id: process.env.GHL_LOCATION_ID,
+    workflow_count: current.length,
+    workflows: current,
+    correlation_id: correlationId || null,
+  });
+  if (insErr) console.error('Workflow drift: snapshot write failed —', insErr.message);
+
+  const summary = drift.baseline
+    ? `baseline captured — ${current.length} workflows`
+    : `${current.length} workflows · ${drift.alertable} alertable (${drift.unpublished.length} unpublished, ${drift.disappeared.length} gone) · ${drift.edited.length} edited, ${drift.appeared.length} new`;
+  console.log(`Workflow drift: ${summary}`);
+  await logActivity({
+    event_type: 'audit', event_source: 'cron', action: 'ghl_workflow_drift',
+    status: drift.baseline ? 'baseline' : (drift.alertable ? 'drift' : 'ok'),
+    output: { count: current.length, ...drift }, correlation_id: correlationId,
+  });
+
+  if (drift.baseline || !drift.alertable) return { ok: true, drift, count: current.length };
+
+  // Dedup on WHAT drifted, not on the day. A date-only key would let the first
+  // alert suppress every later, different one (lessons.md, REVI cross-checks).
+  const fingerprint = [
+    ...drift.unpublished.map(w => `u:${w.id}:${w.to}`),
+    ...drift.disappeared.map(w => `d:${w.id}`),
+  ].sort().join('|');
+  const dedupKey = `ghl-wf-drift:${crypto.createHash('sha1').update(fingerprint).digest('hex').slice(0, 16)}`;
+  const { data: already } = await supabase.from('agent_knowledge').select('id').eq('key', dedupKey).limit(1);
+  if (already && already.length) {
+    console.log(`Workflow drift: alert already sent for ${dedupKey}.`);
+    return { ok: true, drift, count: current.length, deduped: true };
+  }
+
+  const message = renderWorkflowDriftAlert(drift, { count: current.length, since });
+  await postMakeHealthAlert(`${message}\n<@${RON_SLACK_ID}>`);
+  await upsertKnowledge('alert', dedupKey, message, 'ghl-workflow-drift');
+  await logActivity({ event_type: 'alert', event_source: 'cron', action: 'ghl_workflow_drift', status: 'drift', output: { unpublished: drift.unpublished, disappeared: drift.disappeared }, correlation_id: correlationId });
+  return { ok: true, drift, count: current.length, alerted: true };
+}
+// ─── end GHL workflow drift watchdog ────────────────────────────────────────
+
+// Daily 07:45 CR — after the 07:30 liveness audit, before the 08:30 roster.
+// One GHL request per day, so it costs nothing against the per-location burst
+// budget. Declared in STATIC_CRON_SCHEDULES so the liveness audit watches it:
+// wrapCronJob alerts nobody when a job dies, so that declaration is the only
+// thing standing between this watchdog dying and nobody noticing.
+cron.schedule('45 7 * * *', wrapCronJob('runGhlWorkflowDriftCheck', async (c) => { await runGhlWorkflowDriftCheck(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: GHL workflow drift check (45 7 * * *)');
+
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
 // The customer lifecycle alerts (Make 4356754 + 5975679) had no criteria at all.
 // See ~/automations/ops/recipes/customer-alert-fanout.md.
@@ -16090,6 +16276,7 @@ const STATIC_CRON_SCHEDULES = {
   // next one that survives. It cannot detect its own total death — nothing
   // in-process can — which is the standing limitation noted in the spec.
   runCronLivenessAudit:         '30 7 * * *',
+  runGhlWorkflowDriftCheck:     '45 7 * * *',
   runEmailReplyPoller:          '0 8-20 * * 1-5',
   runFulfillmentStandup:        '0 9 * * 1-5',
   runMondayGapDetection:        '0 14 * * 1',
