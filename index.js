@@ -1189,6 +1189,71 @@ function decidePatternActions(parsed, tracker = {}, now = Date.now()) {
 }
 // ─── end pattern reflection guardrails (test slices to here) ──────────────────
 
+// ─── WEEKLY REFLECTION BRIEF (pure helpers) ───────────────────────────────────
+// Monday 08:00 CR, #ng-ops-management. The brief's sections are built by CODE
+// wherever the content is factual (numbers, actions taken, watch list) — the
+// LLM writes only the interpretive parts (patterns, proposals), and its output
+// is parsed through the line protocol below, never posted raw.
+// test/weekly-brief.test.js slices this block.
+const PROPOSAL_ACTIONS         = new Set(['notion_task', 'decision', 'scheduled_task']);
+const PROPOSAL_MAX_PER_WEEK    = 3;
+const PROPOSAL_EXPIRY_DAYS     = 7;
+const PROPOSAL_SUPPRESS_DAYS   = 30;
+
+// PROPOSAL | <action> | <payload>   (payload may contain pipes; title :: rest)
+function parseProposalLine(line) {
+  if (!line || !line.trim().toUpperCase().startsWith('PROPOSAL')) return null;
+  const firstPipe = line.indexOf('|');
+  const secondPipe = line.indexOf('|', firstPipe + 1);
+  if (firstPipe === -1 || secondPipe === -1) return null;
+  const action = line.slice(firstPipe + 1, secondPipe).trim().toLowerCase();
+  if (!PROPOSAL_ACTIONS.has(action)) return null;
+  const payload = line.slice(secondPipe + 1).trim();
+  const title = (payload.split('::')[0] || '').trim();
+  if (!title) return null;
+  return { action, payload, title, slug: slugifyReportName(title) };
+}
+
+// Cap and suppress. A proposal Ron dismissed in the last 30 days is not
+// re-raised — "no" means no for a month, matched on the title slug.
+function selectProposals(candidates, dismissedSlugs, max = PROPOSAL_MAX_PER_WEEK) {
+  const seen = new Set();
+  const out = [];
+  for (const c of (candidates || [])) {
+    if (!c || seen.has(c.slug)) continue;
+    if ((dismissedSlugs || new Set()).has(c.slug)) continue;
+    seen.add(c.slug);
+    if (out.length < max) out.push(c);
+  }
+  return out;
+}
+
+function proposalExpired(postedTsSec, nowMs = Date.now(), days = PROPOSAL_EXPIRY_DAYS) {
+  return (nowMs - parseFloat(postedTsSec) * 1000) > days * 86400000;
+}
+
+// THE WEEK IN NUMBERS — deterministic. rows: [{label, domain, value, mean, stdDev}].
+// Direction marker only when the drift is over half a sigma; a number wiggling
+// inside noise gets a neutral dot rather than a fake trend.
+function formatWeekNumbers(rows) {
+  const byDomain = { marketing: [], sales: [], fulfillment: [], client_success: [] };
+  for (const r of (rows || [])) {
+    if (!r || r.value === null || r.value === undefined) continue;
+    const dir = (r.mean !== null && r.mean !== undefined && r.stdDev)
+      ? (r.value > r.mean + 0.5 * r.stdDev ? '▲' : r.value < r.mean - 0.5 * r.stdDev ? '▼' : '•')
+      : '•';
+    const base = (r.mean !== null && r.mean !== undefined) ? ` (${dir} vs ${(+r.mean).toFixed(2)} baseline)` : '';
+    (byDomain[r.domain] || (byDomain[r.domain] = [])).push(`• ${r.label}: ${(+r.value).toFixed(2)}${base}`);
+  }
+  const section = (name, lines) => lines.length ? `${name}\n${lines.join('\n')}` : null;
+  return [
+    section('MARKETING', byDomain.marketing),
+    section('SALES', byDomain.sales),
+    section('FULFILLMENT', byDomain.fulfillment),
+  ].filter(Boolean).join('\n\n') || 'No metrics have baselines yet — the week in numbers starts once the scrapers warm up.';
+}
+// ─── end weekly brief helpers (test slices to here) ───────────────────────────
+
 // Retrieve the last N lessons for a report (last 90 days) to prepend to reports.
 async function getReportLessons(reportId) {
   try {
@@ -4537,6 +4602,178 @@ ${fmt(alerts).slice(0, 4000)}`;
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') }).catch(err => console.error('Pattern audit DM failed:', err.message));
   }
   console.log(`Pattern reflection: ${parsed.length} pattern(s), ${executed.length} actioned, ${decided.monitor.length} monitoring, ${decided.dropped.length} dropped.`);
+}
+
+// ─── WEEKLY REFLECTION BRIEF (async) ─────────────────────────────────────────
+const MGMT_CHANNEL = process.env.MGMT_CHANNEL || '#ng-ops-management';
+
+async function runWeeklyReflectionBrief(correlationId) {
+  const since7 = new Date(Date.now() - 7 * 86400000).toISOString();
+
+  // ── Inputs, all bounded, confidential excluded at the query ────────────────
+  const [nightly, tracker, autoActions, dismissedRows, adSweepRows, baselines, observations] = await Promise.all([
+    supabase.from('agent_knowledge').select('category, key, value, updated_at')
+      .eq('source', 'nightly-learning').eq('visibility', 'shared')
+      .gte('updated_at', since7).order('updated_at', { ascending: false }).limit(120).then(r => r.data || []),
+    loadPatternTracker(),
+    portalSupabase.from('agent_activity').select('output, created_at')
+      .eq('event_type', 'pattern_reflection').eq('action', 'pattern_auto_action')
+      .gte('created_at', since7).limit(20).then(r => r.data || []).catch(() => []),
+    supabase.from('agent_knowledge').select('key, value')
+      .eq('source', 'weekly-proposal')
+      .gte('updated_at', new Date(Date.now() - PROPOSAL_SUPPRESS_DAYS * 86400000).toISOString())
+      .limit(50).then(r => r.data || []),
+    supabase.from('agent_knowledge').select('key, value')
+      .eq('category', 'intel').like('key', 'ad_sweep:%')
+      .order('updated_at', { ascending: false }).limit(1).then(r => r.data || []),
+    supabase.from('metric_baselines').select('metric, domain, mean, std_dev').then(r => r.data || []),
+    supabase.from('metric_observations').select('metric, value, observed_at')
+      .gte('observed_at', new Date(Date.now() - 8 * 86400000).toISOString())
+      .order('observed_at', { ascending: false }).limit(400).then(r => r.data || []),
+  ]);
+
+  // ── THE WEEK IN NUMBERS (deterministic) ────────────────────────────────────
+  const latestByMetric = {};
+  for (const o of observations) if (!(o.metric in latestByMetric)) latestByMetric[o.metric] = o.value;
+  const baselineByMetric = Object.fromEntries(baselines.map(b => [b.metric, b]));
+  const numberRows = METRIC_REGISTRY
+    .filter(m => m.name in latestByMetric)
+    .map(m => ({
+      label: m.label, domain: m.domain, value: latestByMetric[m.name],
+      mean: baselineByMetric[m.name]?.mean ?? null, stdDev: baselineByMetric[m.name]?.std_dev ?? null,
+    }));
+  let numbersBlock = formatWeekNumbers(numberRows);
+  if (adSweepRows[0]) numbersBlock += `\n\nADS (weekly sweep)\n${String(adSweepRows[0].value).split('\n').map(l => `• ${l}`).join('\n')}`;
+
+  // ── ACTIONS ALREADY TAKEN + WATCHING (deterministic) ───────────────────────
+  const actionsBlock = autoActions.length
+    ? autoActions.map(a => `• Created P1 task "${a.output?.title || a.output?.slug}" (pattern \`${a.output?.slug}\`, ${String(a.created_at).slice(0, 10)})`).join('\n')
+    : '• None — no pattern crossed the action threshold this week.';
+  const watching = Object.entries(tracker).filter(([, t]) => t.status === 'active');
+  const watchingBlock = watching.length
+    ? watching.map(([slug, t]) => `• \`${slug}\` — seen ${t.occurrences}x${t.note ? `: ${String(t.note).slice(0, 100)}` : ''}`).join('\n')
+    : '• Nothing below threshold worth tracking right now.';
+
+  // ── PATTERNS + PROPOSALS (LLM, parsed — never posted raw) ──────────────────
+  const dismissedSlugs = new Set(dismissedRows
+    .map(r => { try { const v = JSON.parse(r.value); return v.status === 'dismissed' ? slugifyReportName(v.title) : null; } catch { return null; } })
+    .filter(Boolean));
+  const llmPrompt = `You are Max, NeuroGrowth's PM agent, writing the interpretive half of your Monday executive brief for the management channel. Audience: Ron and the management team. High-level, direct, numbers over adjectives.
+
+Write TWO things and nothing else:
+
+1. Three to five short pattern paragraphs (each max 3 lines: what is happening, the evidence, why it matters). Base them ONLY on the data below. If the week genuinely has no patterns, write exactly: No patterns crossed threshold this week.
+
+2. Zero to ${PROPOSAL_MAX_PER_WEEK} proposal lines at the very end, one per line, format:
+PROPOSAL | <notion_task|decision|scheduled_task> | <title> :: <details>
+Only propose things a human must decide (process changes, new recurring reports, SOP decisions) — NOT things already auto-actioned below. Do not propose anything resembling these recently dismissed items: ${[...dismissedSlugs].join(', ') || '(none)'}.
+
+=== PATTERNS CURRENTLY TRACKED ===
+${Object.entries(tracker).map(([s, t]) => `${s}: ${t.status}, seen ${t.occurrences}x`).join('\n') || '(none)'}
+
+=== AUTO-ACTIONS ALREADY TAKEN THIS WEEK ===
+${actionsBlock}
+
+=== THE WEEK'S KNOWLEDGE (7d) ===
+${nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${String(r.value).slice(0, 200)}`).join('\n').slice(0, 14000)}`;
+
+  let patternsText = '', proposalLines = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tB = Date.now();
+    const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
+    logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId);
+    const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    const lines = text.split('\n');
+    proposalLines = lines.map(parseProposalLine).filter(Boolean);
+    patternsText = lines.filter(l => !l.trim().toUpperCase().startsWith('PROPOSAL')).join('\n').trim();
+    if (patternsText) break;
+    console.error(`Weekly brief: empty patterns on attempt ${attempt + 1}${attempt === 0 ? ', reprompting' : ''}`);
+  }
+  // The deterministic sections are always postable; only the LLM half can fail,
+  // and its failure is stated in place rather than posted as garbage.
+  if (!patternsText) {
+    patternsText = 'Pattern generation failed this week — the numbers above are live, the reflection is not. Ron has been notified.';
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: 'Weekly brief: pattern generation failed twice; posted the brief with numbers only.' }).catch(() => {});
+  }
+
+  const proposals = selectProposals(proposalLines, dismissedSlugs);
+  const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'long', month: 'long', day: 'numeric' });
+  const brief = [
+    `\`WEEKLY REFLECTION — MANAGEMENT BRIEF\` — ${today}`,
+    '', '`THE WEEK IN NUMBERS`', numbersBlock,
+    '', '`PATTERNS`', patternsText,
+    '', '`ACTIONS ALREADY TAKEN`', actionsBlock,
+    '', '`PROPOSALS`', proposals.length ? `${proposals.length} below in this thread — Ron approves with ✅, dismisses with ❌.` : '• None this week.',
+    '', '`WATCHING`', watchingBlock,
+  ].join('\n');
+
+  const posted = await postToSlack(MGMT_CHANNEL, brief);
+  if (!posted || !posted.ts) throw new Error('brief post returned no ts — proposals not posted');
+
+  const dateKey = new Date().toISOString().slice(0, 10);
+  for (let i = 0; i < proposals.length; i++) {
+    const p = proposals[i];
+    const id = `${dateKey}-${i + 1}`;
+    await slack.client.chat.postMessage({
+      channel: posted.channel, thread_ts: posted.ts,
+      text: `*PROPOSAL ${i + 1}* — ${p.title}\n${p.payload.split('::').slice(1).join('::').trim() || '(no further detail)'}\n\n_Ron: ✅ to execute (${p.action.replace('_', ' ')}), ❌ to dismiss. Expires in ${PROPOSAL_EXPIRY_DAYS} days._`,
+      metadata: { event_type: 'weekly_proposal', event_payload: { id, action: p.action, payload: p.payload.slice(0, 900), title: p.title.slice(0, 200) } },
+    });
+    await upsertKnowledge('process', `proposal:${id}`, JSON.stringify({ title: p.title, action: p.action, status: 'pending', date: dateKey }), 'weekly-proposal');
+  }
+  logActivity({ event_type: 'cron_run', event_source: 'cron', action: 'runWeeklyReflectionBrief', status: 'ok', output: { proposals: proposals.length, metrics: numberRows.length, patterns_ok: !patternsText.startsWith('Pattern generation failed') }, correlation_id: correlationId });
+  console.log(`Weekly reflection brief posted (${proposals.length} proposal(s)).`);
+}
+
+// One-tap handler for the brief's in-thread proposals. Only Ron's reaction
+// executes — management can react socially without triggering anything.
+async function handleWeeklyProposalReaction(event, baseEmoji, msg, payload) {
+  const approve = CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji);
+  const reject  = CAMPAIGN_SKIP_EMOJIS.has(baseEmoji);
+  if (!approve && !reject) return;
+  if (event.user !== RON_SLACK_ID) { console.log(`weekly-proposal: reaction from ${event.user} ignored (Ron-only)`); return; }
+  const reply = (text) => slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: msg.thread_ts || event.item.ts, text }).catch(() => {});
+
+  const rowKey = `proposal:${payload.id}`;
+  const { data: rowData } = await supabase.from('agent_knowledge').select('value').eq('category', 'process').eq('key', rowKey).maybeSingle();
+  let row = { title: payload.title, action: payload.action, status: 'pending' };
+  try { if (rowData?.value) row = JSON.parse(rowData.value); } catch { /* keep default */ }
+  if (row.status !== 'pending') { await reply(`Already ${row.status} — no action taken.`); return; }
+  if (proposalExpired(event.item.ts)) {
+    await upsertKnowledge('process', rowKey, JSON.stringify({ ...row, status: 'expired' }), 'weekly-proposal');
+    await reply(`This proposal expired (${PROPOSAL_EXPIRY_DAYS}-day window). It can come back in a future brief if the pattern persists.`);
+    return;
+  }
+
+  if (reject) {
+    await upsertKnowledge('process', rowKey, JSON.stringify({ ...row, status: 'dismissed', date: new Date().toISOString().slice(0, 10) }), 'weekly-proposal');
+    await reply(`Dismissed — I won't re-propose this for ${PROPOSAL_SUPPRESS_DAYS} days.`);
+    logActivity({ event_type: 'weekly_proposal', event_source: 'slack', action: 'proposal_dismissed', actor_user_id: event.user, output: { id: payload.id, title: payload.title } });
+    return;
+  }
+
+  // Approve — execute by action type.
+  const parts = String(payload.payload).split('::').map(s => s.trim());
+  let outcome;
+  try {
+    if (payload.action === 'notion_task') {
+      outcome = await createNotionTask(payload.title, 'operational', 'P2 - Growth & Scalability', null, parts.slice(1).join(' :: ') || 'Approved from the Monday reflection brief.', null);
+    } else if (payload.action === 'decision') {
+      outcome = await upsertKnowledge('decision', slugifyReportName(payload.title), `${payload.title}. ${parts.slice(1).join(' :: ')}`.trim(), 'weekly-proposal', event.user, 'shared');
+    } else if (payload.action === 'scheduled_task') {
+      // payload: title :: schedule :: prompt :: channel(optional)
+      if (parts.length < 3) throw new Error('scheduled_task needs: title :: schedule :: prompt [:: channel]');
+      outcome = await createScheduledTask(parts[0], parts[1], parts[2], parts[3] || AGENT_CHANNEL, event.user);
+    } else {
+      throw new Error(`unknown action ${payload.action}`);
+    }
+  } catch (execErr) {
+    await reply(`Approved, but execution failed: ${execErr.message}. The proposal stays pending — fix and re-react, or tell me what to change.`);
+    return;
+  }
+  await upsertKnowledge('process', rowKey, JSON.stringify({ ...row, status: 'executed', date: new Date().toISOString().slice(0, 10) }), 'weekly-proposal');
+  await reply(`Done — ${String(outcome).slice(0, 300)}`);
+  logActivity({ event_type: 'weekly_proposal', event_source: 'slack', action: 'proposal_executed', actor_user_id: event.user, output: { id: payload.id, title: payload.title, action: payload.action } });
 }
 
 async function runNightlyLearning(correlationId) {
@@ -11840,6 +12077,8 @@ async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } 
 
 // Nightly learning — 11:30 PM CR (infrastructure — reads all channels, saves knowledge)
 cron.schedule('30 5 * * *',  wrapCronJob('runNightlyLearning', runNightlyLearning),     { timezone: 'America/Costa_Rica' });
+// Monday 08:00 CR — after the 07:00 closer comparison, before the 08:30 roster.
+cron.schedule('0 8 * * 1',   wrapCronJob('runWeeklyReflectionBrief', async (c) => { await runWeeklyReflectionBrief(c); }), { timezone: 'America/Costa_Rica' });
 
 // Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
 cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
@@ -15533,6 +15772,7 @@ const STATIC_CRON_SCHEDULES = {
   runFulfillmentStandup:        '0 9 * * 1-5',
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
+  runWeeklyReflectionBrief:     '0 8 * * 1',
   runOpenDealFollowupSweep:     '0 10 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runProvisioningLagCheck:      '30 8 * * 1',
@@ -16112,6 +16352,26 @@ slack.event('reaction_added', async ({ event }) => {
 
     // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
     const baseEmoji = String(event.reaction || '').split('::')[0];
+
+    // Route -1: weekly-brief proposal in #ng-ops-management. Channel messages
+    // only (Route 0 owns DMs), identified by message metadata, Ron-only inside
+    // the handler. Falls through untouched on any miss.
+    if (String(event.item.channel || '').startsWith('C') &&
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji))) {
+      try {
+        const hist = await slack.client.conversations.replies({
+          channel: event.item.channel, ts: event.item.ts, limit: 1, include_all_metadata: true,
+        });
+        const msg = hist.messages && hist.messages[0];
+        if (msg?.metadata?.event_type === 'weekly_proposal' && msg.metadata.event_payload) {
+          await handleWeeklyProposalReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+      } catch (wpErr) {
+        console.log('weekly-proposal pre-route miss:', wpErr.message);
+        // fall through — this reaction belongs to another route
+      }
+    }
 
     // Route 0: outcome-proposal DM — sits ahead of the campaign route because
     // closers are not in SLACK_TO_GHL_USER, so the campaign gate would swallow
