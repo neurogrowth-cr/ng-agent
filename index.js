@@ -7637,6 +7637,25 @@ async function fetchGHLConvoForContact(contactId) {
   return Array.isArray(messages) ? messages : [];
 }
 
+// Contact internal notes — the surface where setters drop prospect background
+// before a call (company, ICP, key contacts, ticket range). GET mirror of the
+// POST the REVI prospect-notes sync uses. Returns [] on any failure — notes
+// are enrichment, never a reason to hold the brief.
+async function fetchGHLNotesForContact(contactId) {
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    });
+    const data = res.ok ? await res.json() : {};
+    const notes = Array.isArray(data.notes) ? data.notes : [];
+    console.log(`[GHL] fetchNotes contactId=${contactId} status=${res.status} notes=${notes.length}`);
+    return notes;
+  } catch (err) {
+    console.error(`[GHL] fetchNotes contactId=${contactId} threw: ${err.message}`);
+    return [];
+  }
+}
+
 async function searchGHLContact(email, name) {
   const locationId = process.env.GHL_LOCATION_ID;
   const apiKey     = process.env.GHL_API_KEY;
@@ -7773,6 +7792,7 @@ async function runSalesCallPrep(_correlationId) {
       // text lives here, so a brief with nothing to show simply omits the
       // section (see brief assembly below) instead of printing a dead line.
       let convoSection = null;
+      let notesSection = null;
       let sourceLine = null;
       let intake = null; // lazy — fetched at most once, reused by the fallback below
 
@@ -7791,6 +7811,20 @@ async function runSalesCallPrep(_correlationId) {
       try {
         const ghlContact = await searchGHLContact(email, prospectName);
         if (ghlContact) {
+          // Setter background notes off the contact's internal notes. REVI's
+          // auto-posted call reads live on the same surface — excluded here
+          // because that intel already arrives via the REVI section below.
+          const notes = (await fetchGHLNotesForContact(ghlContact.id))
+            .filter(n => (n.body || '').trim() && !n.body.trim().startsWith('🧠 REVI'))
+            .sort((a, b) => new Date(b.dateAdded || 0) - new Date(a.dateAdded || 0))
+            .slice(0, 3); // newest 3 — older background is usually superseded
+          if (notes.length) {
+            notesSection = notes.map(n => {
+              const body = n.body.trim();
+              const when = n.dateAdded ? formatICTime(n.dateAdded, { month: 'short', day: 'numeric' }) : '';
+              return `📝${when ? ` *${when}*` : ''} ${body.length > 1200 ? `${body.slice(0, 1199).trimEnd()}…` : body}`;
+            }).join('\n\n');
+          }
           const messages = await fetchGHLConvoForContact(ghlContact.id);
           if (messages && messages.length) {
             const msgLines = messages
@@ -7882,6 +7916,9 @@ async function runSalesCallPrep(_correlationId) {
         sourceLine,
         ``,
       ];
+      if (notesSection) {
+        briefLines.push(`*SETTER NOTES (from GHL contact):*`, notesSection, ``);
+      }
       if (convoSection) {
         briefLines.push(`*GHL CONVERSATION HISTORY:*`, convoSection, ``);
       }
