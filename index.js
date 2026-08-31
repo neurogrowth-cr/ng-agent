@@ -7631,10 +7631,14 @@ async function fetchGHLConvoForContact(contactId) {
   // Get recent messages
   const msgRes  = await fetch(`https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=12`, { headers });
   const msgData = await msgRes.json();
-  const messages = msgData.messages || msgData.messages?.messages || [];
-  const msgCount = Array.isArray(messages) ? messages.length : 0;
-  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${msgCount}`);
-  return Array.isArray(messages) ? messages : [];
+  // GHL wraps the list: { messages: { messages: [...] } }. The old
+  // `msgData.messages || msgData.messages?.messages` took the wrapper object,
+  // failed Array.isArray, and returned [] — so the conversation section never
+  // rendered. Sort oldest→newest so slice(-8) is the latest, chronologically.
+  const messages = (Array.isArray(msgData.messages) ? msgData.messages : msgData.messages?.messages) || [];
+  messages.sort((a, b) => new Date(a.dateAdded || 0) - new Date(b.dateAdded || 0));
+  console.log(`[GHL] fetchConvo convoId=${convoId} status=${msgRes.status} messages=${messages.length}`);
+  return messages;
 }
 
 // Contact internal notes — the surface where setters drop prospect background
@@ -7814,15 +7818,20 @@ async function runSalesCallPrep(_correlationId) {
           // Setter background notes off the contact's internal notes. REVI's
           // auto-posted call reads live on the same surface — excluded here
           // because that intel already arrives via the REVI section below.
+          // Notes typed in the GHL UI arrive as HTML in `body` with the plain
+          // text in `bodyText`; API-posted notes (REVI's) carry plain text in
+          // both. Read bodyText first, and strip tags if only body exists.
+          const noteText = (n) => String(n.bodyText || String(n.body || '').replace(/<[^>]*>/g, ' '))
+            .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
           const notes = (await fetchGHLNotesForContact(ghlContact.id))
-            .filter(n => (n.body || '').trim() && !n.body.trim().startsWith('🧠 REVI'))
+            .map(n => ({ text: noteText(n), dateAdded: n.dateAdded }))
+            .filter(n => n.text && !n.text.startsWith('🧠 REVI'))
             .sort((a, b) => new Date(b.dateAdded || 0) - new Date(a.dateAdded || 0))
             .slice(0, 3); // newest 3 — older background is usually superseded
           if (notes.length) {
             notesSection = notes.map(n => {
-              const body = n.body.trim();
               const when = n.dateAdded ? formatICTime(n.dateAdded, { month: 'short', day: 'numeric' }) : '';
-              return `📝${when ? ` *${when}*` : ''} ${body.length > 1200 ? `${body.slice(0, 1199).trimEnd()}…` : body}`;
+              return `📝${when ? ` *${when}*` : ''} ${n.text.length > 1200 ? `${n.text.slice(0, 1199).trimEnd()}…` : n.text}`;
             }).join('\n\n');
           }
           const messages = await fetchGHLConvoForContact(ghlContact.id);
