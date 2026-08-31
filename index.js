@@ -5289,6 +5289,28 @@ async function reviFindCallsByProspect(emailOrName, limit = 3) {
   return data || [];
 }
 
+// Latest weekly review for a closer: focus_json (week read + top actions with
+// exact scripts — the closer-facing weekly DM's source) and adoption_json
+// (whether the closer actually executed each suggested action, measured over
+// their calls). Powers the call-prep game plan. Ron-only teardowns do not
+// live in these columns.
+async function reviGetWeeklyFocus(closerName) {
+  if (!closerName) return null;
+  const { data: closers, error } = await reviSupabase
+    .from('revi_closers')
+    .select('id, full_name');
+  if (error) throw error;
+  const match = (closers || []).find(c => (c.full_name || '').toLowerCase().includes(closerName.toLowerCase()));
+  if (!match) return null;
+  const { data: runs } = await reviSupabase
+    .from('weekly_runs')
+    .select('week_start, focus_json, adoption_json')
+    .eq('closer_id', match.id)
+    .order('week_start', { ascending: false })
+    .limit(1);
+  return (runs && runs[0]) || null;
+}
+
 // Per-closer scoring + coaching summary. closerName null = all active closers.
 // forCloserEyes=true swaps Ron-only teardown_text for the closer-safe draft.
 async function reviGetCoachingSummary(closerName = null, days = 14, forCloserEyes = false) {
@@ -7721,6 +7743,75 @@ async function resolveSetterForContact(email, name) {
   }
 }
 
+// ─── REVI GAME PLAN (call prep) ──────────────────────────────────────────────
+// One Claude call per brief that turns REVI's weekly review (top actions +
+// measured adoption) into coach lines aimed at THIS prospect. Ron's spec
+// 2026-09-01: "no bs straight up coach lines — if too long, closers will not
+// read it." The length cap is enforced in code (enforceGamePlanLines), never
+// trusted to the prompt. Closer-facing inputs only — weekly focus_json and
+// adoption_json feed the closer's own weekly DM; teardown_text never enters.
+
+function buildReviGamePlanPrompt({ closerFirst, prospectLines, weeklyLines }) {
+  return [
+    `Sos REVI, el coach de ventas de NeuroGrowth. Escribí el plan de juego para la próxima llamada de ${closerFirst}.`,
+    '',
+    'REGLAS DURAS:',
+    '- Máximo 4 bullets, cada uno UNA línea imperativa de máximo 20 palabras. Sin introducción, sin cierre, sin teoría.',
+    '- Conectá las acciones semanales NO adoptadas con ESTE prospecto: su industria, su ticket, su objeción más probable.',
+    '- Si hay un script exacto para decir, citalo corto entre comillas.',
+    '- Español, tono directo de coach. Empezá cada línea con "• ".',
+    '- Usá SOLO los datos de abajo. No inventes nada.',
+    '',
+    'PROSPECTO:',
+    prospectLines,
+    '',
+    'COACHING SEMANAL VIGENTE (qué pidió REVI y cuánto lo ejecutó el closer):',
+    weeklyLines,
+  ].join('\n');
+}
+
+// Hard cap: bullet lines only, max 4, max 200 chars each. Anything else the
+// model emits (preamble, closer, prose) is dropped. Null when nothing usable.
+function enforceGamePlanLines(raw) {
+  const lines = String(raw || '')
+    .split('\n').map(l => l.trim())
+    .filter(l => l.startsWith('•') || l.startsWith('- '))
+    .map(l => (l.startsWith('- ') ? `• ${l.slice(2)}` : l))
+    .slice(0, 4)
+    .map(l => (l.length > 200 ? `${l.slice(0, 199).trimEnd()}…` : l));
+  return lines.length ? lines.join('\n') : null;
+}
+
+async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa, leadScore, priorCalls, weekly }) {
+  if (!weekly || !weekly.focus_json) return null;
+  const f = weekly.focus_json || {};
+  const adoption = Array.isArray(weekly.adoption_json) ? weekly.adoption_json : [];
+  const prospectLines = [
+    `Nombre: ${prospect.name}${prospect.company ? ` — ${prospect.company}` : ''}`,
+    leadScore != null ? `Lead score: ${leadScore}/100` : null,
+    setterNotes ? `Notas del setter: ${truncateOneLine(setterNotes, 900)}` : null,
+    intakeQa && intakeQa.length ? `Respuestas al agendar: ${intakeQa.map(q => `${q.question} → ${q.answer}`).join(' | ').slice(0, 500)}` : null,
+    ...(priorCalls || []).slice(0, 2).map(pc => {
+      const sig = pc.prospect_signals || {};
+      return `Llamada previa (${pc.call_date ? String(pc.call_date).slice(0, 10) : '?'}): score ${pc.overall_score ?? '?'}, outcome ${pc.deal_outcome || 'pending'}${sig.objection_type ? `, objeción: ${truncateOneLine(sig.objection_type, 150)}` : ''}${sig.decision_maker_status ? `, decisor: ${truncateOneLine(sig.decision_maker_status, 120)}` : ''}`;
+    }),
+  ].filter(Boolean).join('\n');
+  const weeklyLines = [
+    f.week_read ? `Lectura de la semana: ${truncateOneLine(f.week_read, 400)}` : null,
+    ...(Array.isArray(f.top_actions) ? f.top_actions : []).slice(0, 3).map((a, i) =>
+      `Acción ${i + 1}: ${truncateOneLine(a.action || '', 200)}${a.how ? ` | Script: ${truncateOneLine(a.how, 300)}` : ''}`),
+    adoption.length ? `Adopción medida: ${adoption.map(a => `${a.label} ${Math.round((a.now_rate || 0) * 100)}% (${a.verdict})`).join('; ').slice(0, 400)}` : null,
+    f.metric_to_watch ? `Métrica de la semana: ${truncateOneLine(f.metric_to_watch, 150)}` : null,
+  ].filter(Boolean).join('\n');
+
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 300,
+    messages: [{ role: 'user', content: buildReviGamePlanPrompt({ closerFirst, prospectLines, weeklyLines }) }],
+  });
+  return enforceGamePlanLines(res.content?.[0]?.text);
+}
+
 async function runSalesCallPrep(_correlationId) {
   console.log('Running sales call prep...');
   try {
@@ -7778,6 +7869,8 @@ async function runSalesCallPrep(_correlationId) {
       let notesSection = null;
       let intakeSection = null;
       let sourceLine = null;
+      let setterNotesRaw = null; // unformatted note text, feeds the game plan
+      let intakeQa = null;       // prospect's Q&A answers, feeds the game plan
 
       // Native setter attribution: GHL records who booked the appointment
       // (createdBy → setter_id upstream in dash). NULL means widget self-booked
@@ -7808,6 +7901,7 @@ async function runSalesCallPrep(_correlationId) {
             .sort((a, b) => new Date(b.dateAdded || 0) - new Date(a.dateAdded || 0))
             .slice(0, 3); // newest 3 — older background is usually superseded
           if (notes.length) {
+            setterNotesRaw = notes.map(n => n.text).join(' | ');
             notesSection = notes.map(n => {
               const when = n.dateAdded ? formatICTime(n.dateAdded, { month: 'short', day: 'numeric' }) : '';
               return `📝${when ? ` *${when}*` : ''} ${n.text.length > 1200 ? `${n.text.slice(0, 1199).trimEnd()}…` : n.text}`;
@@ -7826,6 +7920,7 @@ async function runSalesCallPrep(_correlationId) {
       {
         const intake = await fetchGhlIntakeForProspect(prospectId);
         if (intake && (intake.eventName || intake.qa.length)) {
+          if (intake.qa.length) intakeQa = intake.qa;
           const lines = [];
           if (intake.eventName) lines.push(`• Event: ${intake.eventName}`);
           for (const { question, answer } of intake.qa) {
@@ -7863,9 +7958,32 @@ async function runSalesCallPrep(_correlationId) {
         if (closerSlack) {
           // First-name match — Max's display names and REVI's full_name differ in
           // suffixes; closers are first-name-unique (Jose, Jonathan).
-          const [coachSum] = await reviGetCoachingSummary((closerName || '').split(' ')[0], 14, true);
-          if (coachSum && coachSum.latest_coaching_focus) {
-            reviLines.push(`🎯 Your current coaching focus (${coachSum.latest_coaching_date}): ${coachSum.latest_coaching_focus.slice(0, 250)}`);
+          const closerFirst = (closerName || '').split(' ')[0];
+          // Game plan: REVI's weekly actions + measured adoption, aimed at this
+          // prospect. Any failure falls back to the raw coaching-focus line —
+          // the brief never loses its REVI section to an LLM hiccup.
+          let gamePlan = null;
+          try {
+            const weekly = await reviGetWeeklyFocus(closerFirst);
+            gamePlan = await buildReviGamePlan({
+              closerFirst,
+              prospect: { name: prospectName, company },
+              setterNotes: setterNotesRaw,
+              intakeQa,
+              leadScore: appt.qualification_snapshot?.parsed?.lead_quality_score ?? null,
+              priorCalls,
+              weekly,
+            });
+          } catch (gpErr) {
+            console.error(`REVI game plan failed for ${prospectName}:`, gpErr.message);
+          }
+          if (gamePlan) {
+            reviLines.push(`🎯 *Game plan:*\n${gamePlan}`);
+          } else {
+            const [coachSum] = await reviGetCoachingSummary(closerFirst, 14, true);
+            if (coachSum && coachSum.latest_coaching_focus) {
+              reviLines.push(`🎯 Your current coaching focus (${coachSum.latest_coaching_date}): ${coachSum.latest_coaching_focus.slice(0, 250)}`);
+            }
           }
         }
         if (reviLines.length) reviSection = reviLines.join('\n');
