@@ -100,10 +100,16 @@ const auditSrc = SRC.slice(SRC.indexOf('const SELF_ACTION'), SRC.indexOf('// ─
 check('6a the hardcoded "next run tomorrow" is gone', /next run tomorrow/.test(auditSrc), false);
 check('6b the footer computes its next run instead',
   /Audit alive · next run \$\{formatCronFire\(nextCronFire\(/.test(auditSrc), true);
+// The triage moved into evaluateCronLiveness, where it now also decides whether
+// the audit speaks at all rather than only how it words a bullet. The promise
+// checked here is unchanged: every never-logged job says which side of due it is
+// on, and a not-yet-due one names the date that will settle it.
 check('6c never-logged jobs are triaged, not just listed',
-  [/not due yet this deploy · first fire/.test(auditSrc),
-   /was due \$\{formatCronFire\(prev\)\} and logged nothing/.test(auditSrc),
+  [/not due yet this deploy/.test(auditSrc),
+   /was due \$\{formatCronFire\(s\.prevFire\)\} and logged nothing/.test(auditSrc),
    /prevCronFire\(s\.expr, now\)/.test(auditSrc)], [true, true, true]);
+check('6d a not-yet-due job still names its first fire',
+  /first fire \$\{formatCronFire\(nextCronFire\(s\.expr, now\)\)\}/.test(auditSrc), true);
 
 console.log(failures ? `\n${failures} check(s) failed.` : '\nAll cron next-fire checks passed.');
 process.exit(failures ? 1 : 0);

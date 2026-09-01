@@ -143,5 +143,64 @@ check('7a the audit contains no self-termination',
 check('7b the audit states its own liveness',
   /Audit alive/.test(auditSrc), true);
 
+// ── 8. Never-logged splits into a finding and a non-finding.
+//
+// The 2026-09-01 report is the case: three crons shipped the day before, none of
+// them due yet, all three posted under a ⚠️ header — and two of them would have
+// re-posted every morning for a week while nothing at all was wrong.
+const WEEKLY_SUN = '0 20 * * 0';   // runWinningAdsSweep — first fire is days away
+const DAILY_6AM  = '0 6 * * *';    // due at 06:00 CR, an hour before this audit
+const silentOf = (expr, opts) => evaluateCronLiveness({
+  expectations: { theJob: expr }, lastOkByAction: {}, recentRuns: [], now: NOW, ...opts,
+});
+
+check('8a a cron declared hours ago is pending, not a finding',
+  (() => { const r = silentOf(WEEKLY_SUN, { bootMs: NOW - 2 * HOUR });
+    return [r.missed.length, r.pending.map(x => x.action)]; })(), [0, ['theJob']]);
+
+check('8b a cron that was due since boot and logged nothing IS a finding',
+  (() => { const r = silentOf(DAILY_6AM, { bootMs: NOW - 4 * HOUR });
+    return [r.missed.map(x => x.action), r.missed[0].reason]; })(),
+  [['theJob'], 'due-since-boot']);
+
+// The hole boot-scoping alone leaves. This job has NEVER succeeded, so it can
+// never be `stale` — and every redeploy landing after Sunday 20:00 renews the
+// "not due yet this deploy" excuse. On Railway a deploy usually does.
+check('8c a job silent since declaration is caught even when boot excuses it',
+  (() => { const r = silentOf(WEEKLY_SUN, {
+      bootMs: NOW - 2 * HOUR,
+      firstSeenSilentByAction: { theJob: new Date(NOW - 30 * 24 * HOUR).toISOString() },
+    });
+    return [r.missed.map(x => x.action), r.missed[0].reason]; })(),
+  [['theJob'], 'watched-past-tolerance']);
+
+check('8d but the backstop waits out the job\'s own tolerance before firing',
+  (() => { const r = silentOf(WEEKLY_SUN, {
+      bootMs: NOW - 2 * HOUR,
+      firstSeenSilentByAction: { theJob: new Date(NOW - 48 * HOUR).toISOString() },
+    });
+    return [r.missed.length, r.pending.length]; })(), [0, 1]);
+
+check('8e no bootMs and no history means nothing is claimed missed',
+  silentOf(WEEKLY_SUN, {}).missed.length, 0);
+
+check('8f missed and pending together account for every silent job',
+  (() => { const r = evaluateCronLiveness({
+      expectations: { weekly: WEEKLY_SUN, daily: DAILY_6AM }, lastOkByAction: {},
+      recentRuns: [], now: NOW, bootMs: NOW - 4 * HOUR });
+    return [r.silent.length, r.missed.length + r.pending.length]; })(), [2, 2]);
+
+// ── 9. Two invariants the message builder must hold, guarded at the source
+// because breaking either is silent — the audit keeps posting and keeps looking
+// like coverage.
+check('9a the alarm total counts missed, never merely-pending jobs',
+  /const total = stale\.length \+ vanished\.length \+ drifted\.length \+ missed\.length;/.test(auditSrc), true);
+check('9b pending jobs are reported, but only as a footnote',
+  /if \(pending\.length\) lines\.push\(`\\n_/.test(auditSrc), true);
+// The backstop reads its own history out of output.silent. Narrowing that field
+// to just the findings would disable check 8c without failing anything.
+check('9c the activity row still records EVERY silent job, not just the findings',
+  /silent: silent\.map\(s => s\.action\), silent_missed: missed\.map\(s => s\.action\)/.test(auditSrc), true);
+
 console.log(failures ? `\n${failures} check(s) failed.` : '\nAll cron-liveness checks passed.');
 process.exit(failures ? 1 : 0);
