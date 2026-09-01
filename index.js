@@ -16858,7 +16858,7 @@ const SELF_ACTION = 'runCronLivenessAudit';
 
 // Pure. Returns the four ways a scheduled job can be wrong, which are genuinely
 // different failures and want different reactions.
-function evaluateCronLiveness({ expectations, lastOkByAction, recentRuns, now }) {
+function evaluateCronLiveness({ expectations, lastOkByAction, recentRuns, now, bootMs = null, firstSeenSilentByAction = {} }) {
   const stale = [], vanished = [], drifted = [], silent = [];
 
   for (const [action, expr] of Object.entries(expectations)) {
@@ -16899,7 +16899,36 @@ function evaluateCronLiveness({ expectations, lastOkByAction, recentRuns, now })
     if (!declared.has(a)) drifted.push(a);
   }
 
-  return { stale, vanished, drifted: drifted.sort(), silent };
+  // Split "never logged" into a real finding and a non-finding. A job declared a
+  // few hours ago has not STOPPED — it has not been due yet, and alarming on it
+  // every morning until its first Sunday is exactly the noise that gets an audit
+  // muted, and a muted audit looks like coverage.
+  //
+  // Two independent ways to earn the alarm, because either alone leaves a hole:
+  //   due-since-boot         — it was scheduled at least once since this process
+  //                            started and logged nothing. Catches a job that
+  //                            broke today.
+  //   watched-past-tolerance — the audit has seen it declared-and-never-logged for
+  //                            longer than its own tolerance, across however many
+  //                            restarts. Needed because a job that has NEVER
+  //                            succeeded can never be `stale` (staleness needs a
+  //                            prior success to measure from), so on boot-scoping
+  //                            alone a weekly job that has never once worked is
+  //                            excused indefinitely as long as a deploy keeps
+  //                            landing after its fire time — and on Railway one
+  //                            usually does.
+  for (const s of silent) {
+    s.prevFire = prevCronFire(s.expr, now);
+    const dueSinceBoot = s.prevFire !== null && bootMs !== null && s.prevFire > bootMs;
+    const firstSeen = firstSeenSilentByAction[s.action];
+    s.watchedHours = firstSeen ? (now - new Date(firstSeen).getTime()) / 3600000 : null;
+    const watchedPastTolerance = s.watchedHours !== null && s.watchedHours > expectedMaxGapHours(s.expr);
+    s.reason = dueSinceBoot ? 'due-since-boot' : watchedPastTolerance ? 'watched-past-tolerance' : null;
+  }
+  const missed  = silent.filter(s => s.reason);
+  const pending = silent.filter(s => !s.reason);
+
+  return { stale, vanished, drifted: drifted.sort(), silent, missed, pending };
 }
 
 const VANISHED_LOOKBACK_MS = 48 * 60 * 60 * 1000;
@@ -16947,45 +16976,64 @@ async function runCronLivenessAudit(correlationId) {
     return;
   }
 
-  const result = evaluateCronLiveness({ expectations, lastOkByAction, recentRuns: recentRuns || [], now });
-  const { stale, vanished, drifted, silent } = result;
-  const total = stale.length + vanished.length + drifted.length + silent.length;
+  // How long has the audit been watching each never-logged job? Read out of its
+  // own history, so the watched-past-tolerance backstop survives restarts with no
+  // new table and works retroactively on rows already written. It cannot raise a
+  // false alarm on a job that recovered: one successful run gives it a `lastOk`
+  // forever, and a job with a `lastOk` is never `silent` again.
+  let watchNote = '';
+  const firstSeenSilentByAction = {};
+  const { data: auditHistory, error: histErr } = await portalSupabase
+    .from('agent_activity')
+    .select('created_at, output')
+    .eq('event_type', 'audit').eq('action', 'cron_liveness_audit')
+    .order('created_at', { ascending: true }).limit(400);
+  if (histErr) watchNote = `could not read this audit's own history (${histErr.message}) — never-logged jobs judged against this deploy only`;
+  else for (const row of auditHistory || []) {
+    for (const action of (row.output && row.output.silent) || []) {
+      if (!(action in firstSeenSilentByAction)) firstSeenSilentByAction[action] = row.created_at;
+    }
+  }
+
+  const bootMs = now - Math.round(process.uptime() * 1000);
+  const result = evaluateCronLiveness({ expectations, lastOkByAction, recentRuns: recentRuns || [], now, bootMs, firstSeenSilentByAction });
+  const { stale, vanished, drifted, silent, missed, pending } = result;
+  // `pending` is deliberately absent: a job that has not been due yet is not a
+  // finding, and must never be the reason this audit speaks.
+  const total = stale.length + vanished.length + drifted.length + missed.length;
 
   // The healthy path posts nothing, so this line is the whole record — it names
   // the next run so "did it stop?" is answerable from the log alone.
-  const bootMs = now - Math.round(process.uptime() * 1000);
-  console.log(`Cron liveness: ${Object.keys(expectations).length} declared, ${stale.length} stale, ${vanished.length} vanished, ${drifted.length} undeclared, ${silent.length} never logged. Next audit ${formatCronFire(nextCronFire(STATIC_CRON_SCHEDULES[SELF_ACTION], now))}.`);
+  console.log(`Cron liveness: ${Object.keys(expectations).length} declared, ${stale.length} stale, ${vanished.length} vanished, ${drifted.length} undeclared, ${missed.length} never logged and overdue, ${pending.length} declared but not due yet. Next audit ${formatCronFire(nextCronFire(STATIC_CRON_SCHEDULES[SELF_ACTION], now))}.`);
   logActivity({
     event_type: 'audit', event_source: 'cron', action: 'cron_liveness_audit',
     status: total ? 'gap' : 'ok',
-    output: { declared: Object.keys(expectations).length, stale: stale.map(s => s.action), vanished: vanished.map(v => v.action), drifted, silent: silent.map(s => s.action) },
+    // `silent` stays EVERY never-logged action, overdue or merely pending. The
+    // first-sighting lookup above reads this exact field back out of history, so
+    // narrowing it here would silently disable the watched-past-tolerance backstop.
+    output: { declared: Object.keys(expectations).length, stale: stale.map(s => s.action), vanished: vanished.map(v => v.action), drifted, silent: silent.map(s => s.action), silent_missed: missed.map(s => s.action) },
     correlation_id: correlationId,
   });
 
   // Quiet when healthy. An audit that posts every day teaches you to skim it.
-  if (!total && !dynamicNote) return;
+  if (!total && !dynamicNote && !watchNote) return;
 
   const lines = [`⚠️ *Cron liveness audit* — ${Object.keys(expectations).length} scheduled jobs declared`];
   if (stale.length) lines.push(`\n*${stale.length} stale* — no successful run inside the expected window:\n` +
     stale.map(s => `• \`${s.action}\` (\`${s.expr}\`) — last ok ${s.gapHours}h ago, tolerance ${s.maxGapHours}h · next fire ${formatCronFire(nextCronFire(s.expr, now))}`).join('\n'));
   if (vanished.length) lines.push(`\n*${vanished.length} vanished* — started and never reached a terminal status, so the process died mid-run or the job hung:\n` +
     vanished.slice(0, 10).map(v => `• \`${v.action}\` — started ${new Date(v.at).toLocaleString('en-US', { timeZone: 'America/Costa_Rica' })} CR`).join('\n'));
-  // A job declared hours ago has not "stopped" — it has not been due yet, and
-  // saying so is the difference between a real miss and the false alarm a
-  // brand-new cron raises every morning until it first fires. Scoped to THIS
-  // deploy on purpose: process.uptime() resets on every restart, so the wording
-  // never claims more than it knows.
-  if (silent.length) lines.push(`\n*${silent.length} never logged* — declared but no successful run on record. Either it has never fired, or it is not wrapped in \`wrapCronJob\` and is invisible:\n` +
-    silent.map((s) => {
-      const prev = prevCronFire(s.expr, now);
-      const wasDue = prev !== null && prev > bootMs;
-      return `• \`${s.action}\` (\`${s.expr}\`) — ${wasDue
-        ? `⚠️ was due ${formatCronFire(prev)} and logged nothing`
-        : `not due yet this deploy · first fire ${formatCronFire(nextCronFire(s.expr, now))}`}`;
-    }).join('\n'));
+  if (missed.length) lines.push(`\n*${missed.length} never logged* — declared but no successful run on record. Either it has never fired, or it is not wrapped in \`wrapCronJob\` and is invisible:\n` +
+    missed.map((s) => `• \`${s.action}\` (\`${s.expr}\`) — ${s.reason === 'due-since-boot'
+      ? `⚠️ was due ${formatCronFire(s.prevFire)} and logged nothing`
+      : `⚠️ declared and silent for ${Math.round(s.watchedHours)}h, past its ${Math.round(expectedMaxGapHours(s.expr))}h tolerance — never once succeeded`}`).join('\n'));
   if (drifted.length) lines.push(`\n*${drifted.length} undeclared* — logging but absent from \`STATIC_CRON_SCHEDULES\`, so the registry has drifted:\n` +
     drifted.map(a => `• \`${a}\``).join('\n'));
+  // Not a finding and never a reason to post — context only, once the audit is
+  // already speaking about something real.
+  if (pending.length) lines.push(`\n_${pending.length} declared and not due yet this deploy, nothing wrong: ${pending.map(s => `\`${s.action}\` first fire ${formatCronFire(nextCronFire(s.expr, now))}`).join(' · ')}_`);
   if (dynamicNote) lines.push(`\n_${dynamicNote}_`);
+  if (watchNote) lines.push(`\n_${watchNote}_`);
 
   // Liveness, never an expiry. This audit reports that it is alive and when it
   // runs next; it has no mechanism to disable itself. If a check here becomes
