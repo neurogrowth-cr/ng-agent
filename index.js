@@ -4345,22 +4345,41 @@ async function runWeeklyPortalTrends(_correlationId) {
 }
 
 // ─── GAP REPORT GROOMING (pure helpers) ──────────────────────────────────────
-// Groomed 2026-08-31 after Ron's read on that day's post: nobody reads a wall of
-// text. The contract now: one sentence per client, counts instead of activity
-// dumps, the newest context note only, and a consecutive-week streak so chronic
-// clients surface as escalate-or-close decisions instead of identical repeats.
+// Groomed 2026-08-31 (Ron: nobody reads a wall of text), tightened same day to
+// transitions-only (Ron: known customer-side blocks are not news — the team
+// already knows; re-listing them erodes trust). The contract: a client earns a
+// bullet only on a TRANSITION — newly flagged, newly crossed the 60-day line,
+// or moved off the list. Stale items (our own assignees not updating) and
+// blocked clients with no documented blocker keep their bullets, because those
+// are on us. Everything else collapses to a count; the full roster stays
+// available on demand via the get_portal_alerts tool.
 // Pure and self-contained — test/gap-report-format.test.js extracts this block.
 const GAP_CHRONIC_DAYS = 60;
-const GAP_WORK_MAX_LINES = 10;
+const GAP_NEW_MAX_LINES = 10;
 const GAP_CTX_MAX_CHARS = 140;
 const GAP_PHASE_LABELS = { phase_1: 'Phase 1', phase_2: 'Phase 2' };
 
-// Consecutive-Monday streaks: +1 for clients flagged again this week, everyone
-// else drops out, reappearing clients restart at 1.
-function computeGapStreaks(prevStreaks, currentNames) {
-  const next = {};
-  for (const name of currentNames) next[name] = ((prevStreaks || {})[name] || 0) + 1;
-  return next;
+// Week-over-week diff against the persisted state row {name: {s: streak, d: days}}.
+// Returns the transition sets plus the next state to persist. A client already
+// past the chronic line on FIRST appearance goes straight to crossed — the
+// escalate-or-close ask matters more than "new".
+function computeGapDelta(prevClients, currentGaps) {
+  const prev = prevClients || {};
+  const nextClients = {};
+  const newNames = [];
+  const crossedNames = [];
+  for (const g of currentGaps) {
+    const p = prev[g.name];
+    nextClients[g.name] = { s: (p?.s || 0) + 1, d: g.daysSince };
+    if (!p) {
+      (g.daysSince >= GAP_CHRONIC_DAYS ? crossedNames : newNames).push(g.name);
+    } else if ((p.d ?? 0) < GAP_CHRONIC_DAYS && g.daysSince >= GAP_CHRONIC_DAYS) {
+      crossedNames.push(g.name);
+    }
+  }
+  const currentSet = new Set(currentGaps.map(g => g.name));
+  const resolvedNames = Object.keys(prev).filter(n => !currentSet.has(n));
+  return { newNames, crossedNames, resolvedNames, nextClients };
 }
 
 function gapOrdinal(n) {
@@ -4378,11 +4397,15 @@ function gapCtxSentence(ctx) {
   return ` ${t}`;
 }
 
-// One sentence-style bullet per client. Severity is carried by which section
-// the client sits in (decision vs. work this week), not by per-line emoji tags.
-function formatGapClientLine(c, firstRun) {
-  const newNote    = !firstRun && c.streak === 1 ? ' New this week.' : '';
-  const streakNote = !firstRun && c.streak >= 2 ? ` ${gapOrdinal(c.streak)} week on this list.` : '';
+function gapListJoin(names) {
+  if (names.length <= 1) return names[0] || '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+// One sentence-style bullet per client. Which section it sits in carries the
+// meaning; the line itself stays free of emoji tags and separator chains.
+function formatGapClientLine(c) {
+  const streakNote = c.streak >= 2 ? ` ${gapOrdinal(c.streak)} week on this list.` : '';
   let body;
   if (c.severity === 'blocked') {
     const steps = `${c.blockedCount} step${c.blockedCount === 1 ? '' : 's'} blocked`;
@@ -4394,45 +4417,62 @@ function formatGapClientLine(c, firstRun) {
   } else {
     body = `${c.staleCount} activit${c.staleCount === 1 ? 'y' : 'ies'} untouched for 72h+ (Day ${c.daysSince}).${c.assignees ? ` Assigned to ${c.assignees}.` : ''}`;
   }
-  return `• *${c.name}* — ${body}${newNote}${streakNote}${gapCtxSentence(c.ctx)}`;
+  const noteNag = c.noNote ? ' No blocker documented — add the note in the portal.' : '';
+  return `• *${c.name}* — ${body}${streakNote}${noteNag}${gapCtxSentence(c.ctx)}`;
 }
 
-// The whole Monday post: structured gap data in, Slack mrkdwn out. Real headers
-// with blank lines around them, flowing sentences, never a raw activity dump.
-function formatGapReport({ todayLabel, firstRun, clients, phase0, sales }) {
-  const chronic = clients.filter(c => c.daysSince >= GAP_CHRONIC_DAYS)
-    .sort((a, b) => b.daysSince - a.daysSince);
-  const sevRank = { blocked: 0, overdue: 1, stale: 2 };
-  const work = clients.filter(c => c.daysSince < GAP_CHRONIC_DAYS)
-    .sort((a, b) => (sevRank[a.severity] - sevRank[b.severity]) || (b.daysSince - a.daysSince));
+// The whole Monday post: transitions in, Slack mrkdwn out. Returns hasSignal so
+// the caller can skip posting on a nothing-changed week — the standing-holds
+// count alone is not worth a post.
+function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }) {
+  const newSet     = new Set(firstRun ? [] : delta.newNames);
+  const crossedSet = new Set(firstRun ? [] : delta.crossedNames);
+  const resolved   = firstRun ? [] : delta.resolvedNames;
+
+  const newClients     = clients.filter(c => newSet.has(c.name));
+  const crossedClients = clients.filter(c => crossedSet.has(c.name)).sort((a, b) => b.daysSince - a.daysSince);
+  const bulleted = new Set([...newSet, ...crossedSet]);
+  // Always on us regardless of age: our assignees sitting on activities, and
+  // blocked clients nobody wrote a blocker note for.
+  const ourSide = clients.filter(c => !bulleted.has(c.name) && (c.severity === 'stale' || c.noNote));
+  ourSide.forEach(c => bulleted.add(c.name));
+  const holds = clients.filter(c => !bulleted.has(c.name));
 
   const sections = [`📋 *Monday Delivery Gaps — ${todayLabel}*`];
 
-  if (clients.length) {
-    const counts = { blocked: 0, overdue: 0, stale: 0 };
-    for (const c of clients) counts[c.severity] = (counts[c.severity] || 0) + 1;
-    const parts = ['blocked', 'overdue', 'stale'].filter(k => counts[k]).map(k => `${counts[k]} ${k}`);
-    const newCount = firstRun ? 0 : clients.filter(c => c.streak === 1).length;
-    let summary = `${clients.length} client${clients.length === 1 ? ' needs' : 's need'} attention this week: ${parts.join(', ')}.`;
-    if (newCount) summary += ` ${newCount === 1 ? 'One is' : `${newCount} are`} new.`;
-    if (chronic.length) {
-      summary += `\n${chronic.length === 1 ? 'One has' : `${chronic.length} have`} been stuck past ${GAP_CHRONIC_DAYS} days — ${chronic.length === 1 ? 'that one needs' : 'those need'} a decision, not another follow-up.`;
-    }
-    sections.push(summary);
+  const bits = [];
+  if (newClients.length)     bits.push(`${newClients.length} client${newClients.length === 1 ? '' : 's'} newly flagged`);
+  if (crossedClients.length) bits.push(`${crossedClients.length} crossed the ${GAP_CHRONIC_DAYS}-day line`);
+  if (resolved.length)       bits.push(`${resolved.length} moved forward`);
+  let summary;
+  if (firstRun) {
+    summary = clients.length
+      ? `${clients.length} client${clients.length === 1 ? ' is' : 's are'} currently flagged — baseline set; from next Monday only changes get named.`
+      : 'Baseline set — from next Monday only changes get named.';
+  } else {
+    summary = bits.length ? `Since last Monday: ${bits.join(', ')}.` : 'No new gaps since last Monday.';
+  }
+  if (holds.length) summary += `\n${holds.length} remain${holds.length === 1 ? 's' : ''} in known customer-side holds — no change; ask Max for the full roster.`;
+  sections.push(summary);
+
+  if (newClients.length) {
+    const shown = newClients.slice(0, GAP_NEW_MAX_LINES).map(formatGapClientLine);
+    if (newClients.length > GAP_NEW_MAX_LINES) shown.push(`…plus ${newClients.length - GAP_NEW_MAX_LINES} more in the portal.`);
+    sections.push(`*New this week*\n\n${shown.join('\n')}`);
   }
 
-  if (chronic.length) {
+  if (crossedClients.length) {
     sections.push([
-      '*Needs a decision: escalate or close*',
-      chronic.map(c => formatGapClientLine(c, firstRun)).join('\n'),
-      "Reply in-thread with the call on each — these won't move on follow-ups alone.",
+      `*Crossed ${GAP_CHRONIC_DAYS} days — needs an escalate-or-close call*`,
+      crossedClients.map(formatGapClientLine).join('\n'),
+      "Reply in-thread with the call — these won't move on follow-ups alone.",
     ].join('\n\n'));
   }
 
-  if (work.length) {
-    const shown = work.slice(0, GAP_WORK_MAX_LINES).map(c => formatGapClientLine(c, firstRun));
-    if (work.length > GAP_WORK_MAX_LINES) shown.push(`…plus ${work.length - GAP_WORK_MAX_LINES} more in the portal.`);
-    sections.push(`*Work this week*\n\n${shown.join('\n')}`);
+  if (ourSide.length) sections.push(`*On our side*\n\n${ourSide.map(formatGapClientLine).join('\n')}`);
+
+  if (resolved.length) {
+    sections.push(`*Moved forward*\n\n${gapListJoin(resolved)} ${resolved.length === 1 ? 'is' : 'are'} no longer flagged.`);
   }
 
   const tail = [];
@@ -4443,14 +4483,16 @@ function formatGapReport({ todayLabel, firstRun, clients, phase0, sales }) {
     tail.push(`${phase0.length} signups stuck in Phase 0:\n${phase0.map(p => `• *${p.name}*${p.company ? ` (${p.company})` : ''} — Day ${p.days}, ${p.stepLabel}.`).join('\n')}`);
   }
   if (sales && (sales.noShowCount || sales.staleLeadCount)) {
-    const bits = [];
-    if (sales.noShowCount) bits.push(`${sales.noShowCount} no-show${sales.noShowCount === 1 ? '' : 's'} without a reschedule`);
-    if (sales.staleLeadCount) bits.push(`${sales.staleLeadCount} inbound lead${sales.staleLeadCount === 1 ? '' : 's'} waiting 72h+ on a setter`);
-    tail.push(`Sales side: ${bits.join(' and ')} — details in the thread.`);
+    const bits2 = [];
+    if (sales.noShowCount) bits2.push(`${sales.noShowCount} no-show${sales.noShowCount === 1 ? '' : 's'} without a reschedule`);
+    if (sales.staleLeadCount) bits2.push(`${sales.staleLeadCount} inbound lead${sales.staleLeadCount === 1 ? '' : 's'} waiting 72h+ on a setter`);
+    tail.push(`Sales side: ${bits2.join(' and ')} — details in the thread.`);
   }
   if (tail.length) sections.push(`*Phase 0 and sales*\n\n${tail.join('\n')}`);
 
-  return sections.join('\n\n');
+  const hasSignal = !!(newClients.length || crossedClients.length || ourSide.length || resolved.length
+    || phase0.length || (sales && (sales.noShowCount || sales.staleLeadCount)));
+  return { message: sections.join('\n\n'), hasSignal };
 }
 // ─── END GAP REPORT GROOMING ─────────────────────────────────────────────────
 
@@ -4474,12 +4516,12 @@ async function runMondayGapDetection(correlationId) {
     const clientGaps = [];
     for (const dash of dashboards) {
       // ── Dual-path activity query: dash.id first, merge onboarding.id if different ──
-      const { data: actsByDashId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at').eq('customer_id', dash.id).in('status', ['blocked','phase_1','phase_2']);
+      const { data: actsByDashId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at, notes').eq('customer_id', dash.id).in('status', ['blocked','phase_1','phase_2']);
       let acts = actsByDashId || [];
 
       const { data: onboarding } = await portalSupabase.from('customer_onboarding').select('id').eq('email', dash.email).limit(1);
       if (onboarding?.[0] && onboarding[0].id !== dash.id) {
-        const { data: actsByObId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at').eq('customer_id', onboarding[0].id).in('status', ['blocked','phase_1','phase_2']);
+        const { data: actsByObId } = await portalSupabase.from('customer_activities').select('template_id, status, assigned_to, updated_at, completed_at, notes').eq('customer_id', onboarding[0].id).in('status', ['blocked','phase_1','phase_2']);
         if (actsByObId?.length) {
           const existingIds = new Set(acts.map(a => a.template_id + a.status));
           acts = [...acts, ...actsByObId.filter(a => !existingIds.has(a.template_id + a.status))];
@@ -4499,7 +4541,8 @@ async function runMondayGapDetection(correlationId) {
       if (dash.customer_status === 'blocked') {
         const blockedActs = acts.filter(a => a.status === 'blocked');
         const oldest = [...blockedActs].sort((a, b) => (tOrder[a.template_id] ?? 999) - (tOrder[b.template_id] ?? 999))[0];
-        gap = { severity: 'blocked', blockedCount: blockedActs.length, oldestBlocked: oldest ? (tMap[oldest.template_id] || '') : '' };
+        const hasPortalNote = blockedActs.some(a => String(a.notes || '').trim());
+        gap = { severity: 'blocked', blockedCount: blockedActs.length, oldestBlocked: oldest ? (tMap[oldest.template_id] || '') : '', hasPortalNote };
       } else if (daysSince >= 14) {
         gap = { severity: 'overdue' };
       } else if (daysSince >= 7 && staleActs.length > 0) {
@@ -4511,7 +4554,9 @@ async function runMondayGapDetection(correlationId) {
         // mean getClientContext returns near-duplicate restatements of the same
         // situation — joining all five was most of the old report's bloat.
         const clientCtx = await getClientContext(dash.client_name);
-        clientGaps.push({ name: dash.client_name || dash.email, status: dash.customer_status, daysSince, ctx: clientCtx[0]?.value || '', ...gap });
+        const ctx = clientCtx[0]?.value || '';
+        const noNote = gap.severity === 'blocked' && !gap.hasPortalNote && !ctx;
+        clientGaps.push({ name: dash.client_name || dash.email, status: dash.customer_status, daysSince, ctx, noNote, ...gap });
       }
     }
     // ── Phase 0 gaps: stuck ≥7 days ───────────────────────────────────────────
@@ -4628,52 +4673,59 @@ async function runMondayGapDetection(correlationId) {
       console.error('Sales gap detection error:', salesGapErr.message);
     }
 
-    if (!clientGaps.length && !phase0List.length && !salesDetailSections.length) {
-      console.log('Gap detection: no critical gaps found.');
+    // Transition state — one JSON row {date, clients:{name:{s: streak, d: days}}}
+    // diffed each Monday. On the very first run there is no baseline, so
+    // new/crossed/resolved phrasing is suppressed rather than calling the whole
+    // roster "new".
+    let prevClients = null;
+    try {
+      const { data: stateRow } = await supabase
+        .from('agent_knowledge').select('value')
+        .eq('category', 'intel').eq('key', 'gap-report-state').limit(1);
+      if (stateRow?.[0]?.value) prevClients = JSON.parse(stateRow[0].value).clients || null;
+    } catch (stateErr) { console.error('Gap state read error:', stateErr.message); }
+    const firstRun = !prevClients;
+    const delta = computeGapDelta(prevClients, clientGaps);
+    clientGaps.forEach(c => { c.streak = delta.nextClients[c.name].s; });
+
+    const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
+    const { message: report, hasSignal } = formatGapReport({
+      todayLabel: today,
+      firstRun,
+      clients: clientGaps,
+      delta,
+      phase0: phase0List,
+      sales: { noShowCount, staleLeadCount },
+    });
+
+    const stateJson = JSON.stringify({ date: new Date().toISOString().slice(0, 10), clients: delta.nextClients });
+    if (!hasSignal) {
+      // Nothing changed and nothing is on us — no post. Ron's rule: known
+      // customer-side holds are not news. State still advances so next week's
+      // diff stays honest.
+      await upsertKnowledge('intel', 'gap-report-state', stateJson, 'gap-detection');
+      console.log(`Gap detection: no transitions or team-side items (${clientGaps.length} known holds) — post skipped, state saved.`);
       return;
     }
 
-    // Consecutive-week streaks — the "12th week on this list" data point.
-    // One JSON row, diffed each Monday. On the very first run there is no
-    // baseline, so new/streak phrasing is suppressed rather than calling
-    // every client "new".
-    let prevStreaks = null;
-    try {
-      const { data: streakRow } = await supabase
-        .from('agent_knowledge').select('value')
-        .eq('category', 'intel').eq('key', 'gap-report-streaks').limit(1);
-      if (streakRow?.[0]?.value) prevStreaks = JSON.parse(streakRow[0].value).streaks || null;
-    } catch (streakErr) { console.error('Gap streak read error:', streakErr.message); }
-    const firstRun = !prevStreaks;
-    const streaks = computeGapStreaks(prevStreaks, clientGaps.map(c => c.name));
-    clientGaps.forEach(c => { c.streak = streaks[c.name]; });
-
-    const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     // Two newest lessons only — the lesson block is a report surface too and
     // was stacking five bullets on top of an already-long post.
     const gapLessons = (await getReportLessons('gap-detection')).slice(0, 2);
     const lessonNote = gapLessons.length
       ? `[Corrections applied from team feedback]\n${gapLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
       : '';
-    const message = lessonNote + formatGapReport({
-      todayLabel: today,
-      firstRun,
-      clients: clientGaps,
-      phase0: phase0List,
-      sales: { noShowCount, staleLeadCount },
-    });
     // Post directly — team reviews and threads corrections to Max for learning
-    const gapPosted = await executeChannelPost(OPS_CHANNEL, message, null, correlationId);
+    const gapPosted = await executeChannelPost(OPS_CHANNEL, lessonNote + report, null, correlationId);
     await registerPostedReport(gapPosted, 'gap-detection');
     if (gapPosted?.ts && salesDetailSections.length) {
       await postToSlack(OPS_CHANNEL, `*Sales gap detail*\n\n${salesDetailSections.join('\n\n')}`, gapPosted.ts);
     }
     if (gapPosted) {
-      // Advance streaks only on a successful post — a failed Monday shouldn't count.
-      await upsertKnowledge('intel', 'gap-report-streaks',
-        JSON.stringify({ date: new Date().toISOString().slice(0, 10), streaks }), 'gap-detection');
+      // Advance state only when the post actually landed — a failed post must
+      // not swallow this week's transitions; they should resurface next Monday.
+      await upsertKnowledge('intel', 'gap-report-state', stateJson, 'gap-detection');
     }
-    console.log(`Gap detection: ${clientGaps.length} client gap(s), ${phase0List.length} phase-0, ${noShowCount + staleLeadCount} sales item(s) posted to ${OPS_CHANNEL}.`);
+    console.log(`Gap detection: ${delta.newNames.length} new, ${delta.crossedNames.length} crossed, ${delta.resolvedNames.length} resolved, ${phase0List.length} phase-0, ${noShowCount + staleLeadCount} sales item(s) posted to ${OPS_CHANNEL}.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
 }
 
