@@ -1030,7 +1030,7 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
     const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: MODEL_AGENT,
+      model: MODEL_LIGHT,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1764,7 +1764,8 @@ function registerDynamicCron(task) {
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          reply = await callClaude([{ role: 'user', content: enrichedPrompt }], 3, null, correlation_id);
+          const cronOpts = process.env.ICM_CRON_ALL_TOOLS === '1' ? {} : { onlyTools: REPORT_TOOLS };
+          reply = await callClaude([{ role: 'user', content: enrichedPrompt }], 3, null, correlation_id, cronOpts);
           lastErr = null;
           break;
         } catch (err) {
@@ -1887,7 +1888,7 @@ function registerDynamicCron(task) {
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
             { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
-          ], 3, null, correlation_id)), task.name);
+          ], 3, null, correlation_id, process.env.ICM_CRON_ALL_TOOLS === '1' ? {} : { onlyTools: REPORT_TOOLS })), task.name);
           const secondCheck = validateFinalReport(finalReply, task.name);
           if (finalReply && secondCheck.ok) {
             reply = finalReply;
@@ -1976,7 +1977,7 @@ Reply with ONLY the cron expression, nothing else. Examples:
     const cIdTask = newCorrelationId();
     const tCronLlm = Date.now();
     const cronResponse = await anthropic.messages.create({
-      model: MODEL_AGENT,
+      model: MODEL_LIGHT,
       max_tokens: 50,
       messages: [{ role: 'user', content: cronPrompt }]
     });
@@ -5610,7 +5611,7 @@ async function narrateAnomaly(snapshot) {
     const prompt = `Metric "${snapshot.metric}" (domain: ${snapshot.domain}) is ${Math.abs(snapshot.z).toFixed(1)}σ ${direction} its ${snapshot.sampleSize}-sample baseline.\nLatest value: ${snapshot.value}. Baseline mean: ${snapshot.mean.toFixed(2)} (std dev ${snapshot.stdDev.toFixed(2)}).\n\nWrite ONE short sentence (no markdown, no preamble) on what this likely means in plain business English and what to watch next. Max 30 words.`;
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: MODEL_AGENT,
+      model: MODEL_LIGHT,
       max_tokens: 100,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -7264,6 +7265,23 @@ const ALL_TOOLS = [
           { name: 'ghl_find_operation', description: "Search GoHighLevel's full operation catalogue (hundreds of operations across ~40 domains: contacts, conversations, opportunities, calendars, custom values, forms, surveys, invoices, payments, social planner, blogs, email templates). Use this for any GHL question Max has no dedicated tool for. Returns operationId, kind (read/write/delete/money_movement), domain, and hasRequestBody. If hasRequestBody is false and kind is 'read', skip ghl_describe_operation and call ghl_run_operation directly — you only have 7 tool rounds per turn. Prefer the dedicated tools (get_ghl_conversations, set_appointment_status, log_call_outcome, get_sales_intelligence) for the flows they already cover.", input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural-language description of the GHL operation you need, e.g. \"list invoices\" or \"add a tag to a contact\".' }, domains: { type: 'array', items: { type: 'string' }, description: 'Optional domain filter, e.g. ["contacts"].' }, kind: { type: 'string', description: 'Optional filter: read | write | delete | money_movement.' }, limit: { type: 'number', description: 'Max results, default 8, cap 25.' } }, required: ['query'] } },
           { name: 'ghl_describe_operation', description: 'Inspect one GHL operationId from ghl_find_operation before running it: required path/query params, request-body fields, a sanitized payload example, required scopes, and safety metadata. Call this when the operation takes a request body or the params are unclear. Skip it for simple reads — it costs a tool round.', input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' } }, required: ['operationId'] } },
           { name: 'ghl_run_operation', description: "Execute one GHL operation by operationId. Reads run freely. Writes are refused unless Ron has armed that exact operationId in GHL_MCP_WRITE_ALLOWLIST; deletes and money movement are refused always and cannot be armed. Set dryRun true to see the exact REST request that WOULD be sent without sending it — do that first for any write. A 'not authorized for this scope' response means the GHL token lacks that scope, which is Ron's fix in GHL Settings, not something to retry.", input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' }, params: { type: 'object', description: 'Path, query, and body params. Flat or grouped as {path, query, body}.' }, dryRun: { type: 'boolean', description: 'Preview the resolved request without executing. Use before any write.' } }, required: ['operationId'] } },
+];
+
+// ICM: shared allow-list for dynamic cron reports. Derived from 30 days of
+// observed tool_call rows on cron correlation ids in agent_activity (every tool
+// any dynamic cron actually used), plus the schema-discovery set rule #6 needs
+// and make_get_dlq (companion to the observed make_list_dlqs). One standardized
+// variant = one extra cache identity shared by ALL report crons — never build
+// bespoke per-cron lists. Escape hatch: ICM_CRON_ALL_TOOLS=1 restores all tools
+// via a Railway env flip, no redeploy.
+const REPORT_TOOLS = [
+  'get_sales_intelligence', 'read_slack_channel', 'draft_channel_post',
+  'get_ghl_conversations', 'get_client_status', 'get_phase0_clients',
+  'search_knowledge', 'get_knowledge_category', 'get_portal_alerts',
+  'search_portal_schema', 'list_portal_tables', 'describe_portal_table',
+  'query_portal_db', 'closer_monthly_scorecard', 'get_revi_intelligence',
+  'get_revi_client_context', 'get_ops_tracker', 'get_meta_ads_summary',
+  'make_list_dlqs', 'make_get_dlq',
 ];
 
 // ICM: rolling cache breakpoint — marks the last block of the final user message
@@ -18032,7 +18050,15 @@ slack.event('member_joined_channel', async ({ event }) => {
     const roleIntro = roleIntros[member.role] || `You are greeting a new NeuroGrowth team member named ${member.displayName}. Welcome them warmly and briefly explain what you can help with.`;
     const prompt    = `You are Max, the NeuroGrowth PM Agent. A new team member just joined the #ng-pm-agent channel.\n\n${roleIntro}\n\nAddress them by name: ${member.displayName}.\nSound like a sharp, friendly colleague — not a corporate bot. No markdown formatting. No bullet points. Conversational tone.`;
     const mjCid = newCorrelationId();
-    const greeting  = await callClaude([{ role: 'user', content: prompt }], 3, event.user, mjCid);
+    // ICM: a greeting needs no tools and no agent loop — one Haiku call.
+    const tGreet = Date.now();
+    const mjRes = await anthropic.messages.create({
+      model: MODEL_LIGHT,
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    logLlmFromAnthropicResponse(mjRes, Date.now() - tGreet, mjCid, 'member_greeting');
+    const greeting = mjRes.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     if (!greeting || !greeting.trim()) return;
     await slack.client.chat.postMessage({ channel: event.channel, text: greeting });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: event.channel, output: { text: String(greeting).slice(0, 2000) }, correlation_id: mjCid });
