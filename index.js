@@ -26,6 +26,10 @@ const slack = new App({
 let MAX_BOT_ID = process.env.SLACK_BOT_ID || null;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ICM model tiers — the only place model ids may appear (env-overridable, no redeploy to switch)
+const MODEL_AGENT = process.env.NG_AGENT_MODEL || 'claude-sonnet-4-6';
+const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-4-5-20251001';
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
@@ -60,15 +64,18 @@ const portalWriterPg = process.env.PORTAL_WRITER_DATABASE_URL
     })
   : null;
 
-function logLlmFromAnthropicResponse(response, durationMs, correlation_id) {
+function logLlmFromAnthropicResponse(response, durationMs, correlation_id, callSite = null) {
   if (!response) return;
   logActivity({
     event_type: 'llm_call',
     event_source: 'internal',
     action: 'anthropic.messages.create',
+    call_site: callSite,
     model: response.model,
     tokens_in: response.usage?.input_tokens,
     tokens_out: response.usage?.output_tokens,
+    tokens_cache_write: response.usage?.cache_creation_input_tokens,
+    tokens_cache_read: response.usage?.cache_read_input_tokens,
     duration_ms: durationMs,
     correlation_id,
   });
@@ -1021,11 +1028,13 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
 async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId, reportId) {
   try {
     const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, correlationId, 'report_lesson');
     const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     if (!lesson) return null;
     const scopedId = reportId || channelName || 'general-report';
@@ -1287,11 +1296,13 @@ async function detectAndSaveCorrection(userText, priorAssistantText, userId) {
     if (!userText || !priorAssistantText) return null;
     if (!CORRECTION_HINT_RE.test(userText)) return null;
     const prompt = `Max (an ops agent) previously said:\n${priorAssistantText.slice(0, 1200)}\n\nThe user replied:\n${userText.slice(0, 800)}\n\nIs the user CORRECTING a factual claim or behavior of Max's (not just disagreeing, negotiating, or changing topic)? If yes respond JSON: {"topic":"<2-4 word kebab-case topic>","lesson":"<2-3 sentences: what Max got wrong and what to do instead>"}. If no: {"topic":null}. JSON only, no markdown fences.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'correction_detect');
     const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));
     if (!parsed?.topic) return null;
@@ -1333,11 +1344,13 @@ async function extractClientContext(threadMessages, mentionText, channelName, us
   try {
     const threadText = threadMessages.map(m => m.text || '').join('\n').substring(0, 2000);
     const prompt = `A team member tagged Max in a Slack thread in #${channelName}.\n\nThread:\n${threadText}\n\nTag: ${mentionText}\n\nDoes this thread contain a specific update about a named client? If yes, respond with JSON: {"client": "<client name>", "context": "<1-2 sentence summary of the update, blocker, status change, or action item>"}. If no specific client is mentioned, respond with: {"client": null}. No preamble, JSON only.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 150,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'client_context');
     const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     const parsed = JSON.parse(raw);
     if (!parsed.client || !parsed.context) return null;
@@ -1963,11 +1976,11 @@ Reply with ONLY the cron expression, nothing else. Examples:
     const cIdTask = newCorrelationId();
     const tCronLlm = Date.now();
     const cronResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 50,
       messages: [{ role: 'user', content: cronPrompt }]
     });
-    logLlmFromAnthropicResponse(cronResponse, Date.now() - tCronLlm, cIdTask);
+    logLlmFromAnthropicResponse(cronResponse, Date.now() - tCronLlm, cIdTask, 'cron_parse');
     const cronExpression = cronResponse.content
       .filter(b => b.type === 'text').map(b => b.text).join('').trim()
       .replace(/[^0-9*,/\- ]/g, '').trim();
@@ -4823,8 +4836,8 @@ ${fmt(nightly).slice(0, 16000)}
 ${fmt(alerts).slice(0, 4000)}`;
 
   const tRef = Date.now();
-  const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
-  logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId);
+  const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
+  logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId, 'pattern_reflection');
   const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   if (text.includes('NO_PATTERNS')) {
     logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'ok', output: { patterns: 0 }, correlation_id: correlationId });
@@ -4946,8 +4959,8 @@ ${nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${Str
   let patternsText = '', proposalLines = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     const tB = Date.now();
-    const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
-    logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId);
+    const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
+    logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId, 'weekly_reflection');
     const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
     const lines = text.split('\n');
     proposalLines = lines.map(parseProposalLine).filter(Boolean);
@@ -5125,10 +5138,10 @@ async function runNightlyLearning(correlationId) {
 
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${capText(digest, 30000)}`;
     const tNightly = Date.now();
-    const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
-    logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
+    const response = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId, 'nightly_learning');
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
     let saved = 0;
@@ -5178,11 +5191,11 @@ async function runNightlyLearning(correlationId) {
           .slice(0, 24000);
         const tSum = Date.now();
         const sumRes = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: MODEL_AGENT,
           max_tokens: 350,
           messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Never mention company financial, banking, or billing details (balances, payments, invoices, subscription status) — those are confidential to Ron and must not appear in this team-facing summary. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
         });
-        logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId);
+        logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId, 'nightly_summary');
         const sumText = sumRes.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
         if (sumText) learnedBlock = `\n\n*What I learned tonight:*\n${sumText}`;
       } catch (sumErr) { console.error('Nightly learning summary generation failed:', sumErr.message); }
@@ -5237,8 +5250,8 @@ async function runProactiveAlerts(correlationId) {
     const alertText = staleAlerts.map(a => `${a.key}: ${a.value}`).join('\n\n');
     const prompt    = `You are the NeuroGrowth PM agent checking on unresolved alerts.\n\nThese items have been flagged as alerts and have not been updated in over 24 hours:\n\n${alertText}\n\nWrite a brief, direct message to Ron (2-4 sentences) summarizing what is still unresolved and what needs his attention today. No markdown formatting. Sound like a colleague, not a report.`;
     const tPa = Date.now();
-    const response  = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
-    logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId);
+    const response  = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId, 'proactive_alerts');
     const message   = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     await postToSlack(AGENT_CHANNEL, message);
     console.log(`Proactive alert posted. ${staleAlerts.length} unresolved items flagged.`);
@@ -5595,11 +5608,13 @@ async function narrateAnomaly(snapshot) {
   try {
     const direction = snapshot.z > 0 ? 'above' : 'below';
     const prompt = `Metric "${snapshot.metric}" (domain: ${snapshot.domain}) is ${Math.abs(snapshot.z).toFixed(1)}σ ${direction} its ${snapshot.sampleSize}-sample baseline.\nLatest value: ${snapshot.value}. Baseline mean: ${snapshot.mean.toFixed(2)} (std dev ${snapshot.stdDev.toFixed(2)}).\n\nWrite ONE short sentence (no markdown, no preamble) on what this likely means in plain business English and what to watch next. Max 30 words.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 100,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'anomaly_narrate');
     const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     return text || null;
   } catch (err) {
@@ -7153,10 +7168,10 @@ async function processFileWithClaude(fileBuffer, mimeType, userInstruction, syst
   }
   const t0 = Date.now();
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6', max_tokens: 1024, system: systemPrompt,
+    model: MODEL_AGENT, max_tokens: 1024, system: systemPrompt,
     messages: [{ role: 'user', content: [contentBlock, { type: 'text', text: userInstruction || 'Analyze this file and provide a useful summary. Extract any action items, key information, or insights relevant to NeuroGrowth operations.' }] }],
   });
-  logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId);
+  logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId, 'file_analysis');
   return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
 }
 
@@ -7192,51 +7207,11 @@ async function transcribeAudio(fileBuffer, filename) {
   }
 }
 
-// ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
-// opts.systemAppend — extra text appended to the system prompt for this call only.
-// opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
-//                     calls it, callClaude returns { structured: <tool input> } instead
-//                     of text. Used by /agent/consult for schema-constrained verdicts.
-// opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
-// opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
-//                     dropTools, for narrow modes like alert triage where banning ~38 tools
-//                     by name would be unmaintainable. [] means finalTool only.
-async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
-  const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
-  // Learned lessons ride every interactive prompt (fetched once, not per retry).
-  // Scheduled reports inject their own scoped lessons via getReportLessons.
-  let lessonBlock = '';
-  try {
-    const lessons = await getGlobalLessons();
-    if (lessons.length) {
-      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
-    }
-  } catch { /* lessons are best-effort — never block a reply */ }
-  let lastErr;
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      // Inject current Costa Rica date/time — built once, reused in ALL calls (initial + follow-ups)
-      const nowCR = new Date().toLocaleString('en-US', {
-        timeZone: 'America/Costa_Rica',
-        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-        hour: '2-digit', minute: '2-digit', hour12: true
-      });
-      const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
-      const emailProxyGuidance = EMAIL_PROXY_LIVE ? `
-
-EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
-- Mirror the user's language. If they DM in Spanish, respond in Spanish through every step (slot-filling, preview, confirmation). The email body itself stays in whatever language the setter dictated — do NOT translate it.
-- Conversationally collect three required fields: recipient email (to), subject, body. cc is optional.
-- If any required field is missing, name exactly what is missing and ask for it. Do NOT call draft_outbound_email until to + subject + body are all known.
-- Quote values back to the setter for typo-checking before drafting (e.g. "OK so to: acme@x.com, subject: Follow-up — confirm the body before I draft").
-- Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
-- For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
-- Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
-      // injectOfferCatalog wraps the whole composition, not just the base prompt:
-      // both branches carry the token and this is the only place both meet.
-      const fullSystemPrompt = injectOfferCatalog((userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + lessonBlock + emailProxyGuidance + (opts.systemAppend || ''));
-
-      const TOOLS = [
+// ── ICM: full tool catalogue at module scope ─────────────────────────────────
+// Hoisted so the array is byte-identical across calls — a requirement for
+// prompt-cache prefix reuse. Per-call filtering (dropTools / onlyTools / env
+// gates) still happens inside callClaude on this shared base.
+const ALL_TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
           { name: 'get_notion_page',      description: 'Get the content of a specific Notion page by its ID',                                   input_schema: { type: 'object', properties: { page_id: { type: 'string' } }, required: ['page_id'] } },
           { name: 'get_recent_emails',    description: "Get recent unread emails from Ron's Gmail inbox including full email body content",      input_schema: { type: 'object', properties: {} } },
@@ -7289,7 +7264,88 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'ghl_find_operation', description: "Search GoHighLevel's full operation catalogue (hundreds of operations across ~40 domains: contacts, conversations, opportunities, calendars, custom values, forms, surveys, invoices, payments, social planner, blogs, email templates). Use this for any GHL question Max has no dedicated tool for. Returns operationId, kind (read/write/delete/money_movement), domain, and hasRequestBody. If hasRequestBody is false and kind is 'read', skip ghl_describe_operation and call ghl_run_operation directly — you only have 7 tool rounds per turn. Prefer the dedicated tools (get_ghl_conversations, set_appointment_status, log_call_outcome, get_sales_intelligence) for the flows they already cover.", input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural-language description of the GHL operation you need, e.g. \"list invoices\" or \"add a tag to a contact\".' }, domains: { type: 'array', items: { type: 'string' }, description: 'Optional domain filter, e.g. ["contacts"].' }, kind: { type: 'string', description: 'Optional filter: read | write | delete | money_movement.' }, limit: { type: 'number', description: 'Max results, default 8, cap 25.' } }, required: ['query'] } },
           { name: 'ghl_describe_operation', description: 'Inspect one GHL operationId from ghl_find_operation before running it: required path/query params, request-body fields, a sanitized payload example, required scopes, and safety metadata. Call this when the operation takes a request body or the params are unclear. Skip it for simple reads — it costs a tool round.', input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' } }, required: ['operationId'] } },
           { name: 'ghl_run_operation', description: "Execute one GHL operation by operationId. Reads run freely. Writes are refused unless Ron has armed that exact operationId in GHL_MCP_WRITE_ALLOWLIST; deletes and money movement are refused always and cannot be armed. Set dryRun true to see the exact REST request that WOULD be sent without sending it — do that first for any write. A 'not authorized for this scope' response means the GHL token lacks that scope, which is Ron's fix in GHL Settings, not something to retry.", input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' }, params: { type: 'object', description: 'Path, query, and body params. Flat or grouped as {path, query, body}.' }, dryRun: { type: 'boolean', description: 'Preview the resolved request without executing. Use before any write.' } }, required: ['operationId'] } },
-      ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
+];
+
+// ICM: rolling cache breakpoint — marks the last block of the final user message
+// on a request-time copy (never persisted into history; persisted markers would
+// accumulate and blow the API's 4-breakpoint limit). Each tool round then re-reads
+// the previous rounds' context at 0.1x instead of full input price.
+function markCacheTail(msgs) {
+  if (!Array.isArray(msgs) || !msgs.length) return msgs;
+  const last = msgs[msgs.length - 1];
+  if (!last || last.role !== 'user') return msgs;
+  const blocks = Array.isArray(last.content)
+    ? last.content
+    : [{ type: 'text', text: String(last.content) }];
+  if (!blocks.length || typeof blocks[blocks.length - 1] !== 'object') return msgs;
+  const marked = [...blocks.slice(0, -1), { ...blocks[blocks.length - 1], cache_control: { type: 'ephemeral' } }];
+  return [...msgs.slice(0, -1), { ...last, content: marked }];
+}
+
+// ICM: head/tail cap for anything entering model context. Tool results were
+// previously unbounded — one fat query_portal_db result rode along at full
+// price in every subsequent round of the loop.
+function capText(str, max = Number(process.env.ICM_TOOL_RESULT_CAP || 8000)) {
+  const s = String(str);
+  if (s.length <= max) return s;
+  const head = Math.floor(max * 0.75);
+  const tail = max - head;
+  return s.slice(0, head) + `\n[... ${s.length - max} chars elided — re-query with a narrower filter if you need the middle ...]\n` + s.slice(-tail);
+}
+
+// ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
+// opts.systemAppend — extra text appended to the system prompt for this call only.
+// opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
+//                     calls it, callClaude returns { structured: <tool input> } instead
+//                     of text. Used by /agent/consult for schema-constrained verdicts.
+// opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
+// opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
+//                     dropTools, for narrow modes like alert triage where banning ~38 tools
+//                     by name would be unmaintainable. [] means finalTool only.
+async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
+  const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
+  // Learned lessons ride every interactive prompt (fetched once, not per retry).
+  // Scheduled reports inject their own scoped lessons via getReportLessons.
+  let lessonBlock = '';
+  try {
+    const lessons = await getGlobalLessons();
+    if (lessons.length) {
+      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
+    }
+  } catch { /* lessons are best-effort — never block a reply */ }
+  let lastErr;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      // Inject current Costa Rica date/time — built once, reused in ALL calls (initial + follow-ups)
+      const nowCR = new Date().toLocaleString('en-US', {
+        timeZone: 'America/Costa_Rica',
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: true
+      });
+      const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
+      const emailProxyGuidance = EMAIL_PROXY_LIVE ? `
+
+EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
+- Mirror the user's language. If they DM in Spanish, respond in Spanish through every step (slot-filling, preview, confirmation). The email body itself stays in whatever language the setter dictated — do NOT translate it.
+- Conversationally collect three required fields: recipient email (to), subject, body. cc is optional.
+- If any required field is missing, name exactly what is missing and ask for it. Do NOT call draft_outbound_email until to + subject + body are all known.
+- Quote values back to the setter for typo-checking before drafting (e.g. "OK so to: acme@x.com, subject: Follow-up — confirm the body before I draft").
+- Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
+- For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
+- Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
+      // injectOfferCatalog wraps the static composition — the catalog token lives in
+      // the base prompt, and this is the only place every branch meets.
+      // ICM: block 1 is byte-stable per deploy and carries the cache breakpoint (1h —
+      // hourly crons + all-day DMs sit inside the window); everything volatile
+      // (timestamp, lessons, per-call appends) lives below it, where changes are free.
+      const staticSystem = injectOfferCatalog((userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + emailProxyGuidance);
+      const fullSystemPrompt = [
+        { type: 'text', text: staticSystem, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: timeContext + lessonBlock + (opts.systemAppend || '') },
+      ];
+
+      const TOOLS = ALL_TOOLS
+        .filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
        .filter(t => !(opts.dropTools || []).includes(t.name))
        .filter(t => !opts.onlyTools || opts.onlyTools.includes(t.name))
        .filter(t => process.env.MAKE_API_TOKEN || !t.name.startsWith('make_'))
@@ -7298,6 +7354,9 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
        // next ghl_-prefixed tool that has nothing to do with this router.
        .filter(t => process.env.GHL_MCP_ENABLED || !GHL_MCP_TOOL_NAMES.has(t.name));
       if (opts.finalTool) TOOLS.push(opts.finalTool);
+      // ICM: breakpoint on the last tool definition — tools render before system in
+      // the cache hierarchy, so this caches the whole tools array for every variant.
+      const toolsForRequest = TOOLS.map((t, i) => i === TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral', ttl: '1h' } } : t);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
       async function dispatchTool(toolUse) {
@@ -7378,19 +7437,19 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'ghl_find_operation')     result = await ghlMcpFindOperation(toolUse.input);
         else if (toolUse.name === 'ghl_describe_operation') result = await ghlMcpDescribeOperation(toolUse.input.operationId);
         else if (toolUse.name === 'ghl_run_operation')      result = await ghlMcpRunOperation(toolUse.input, userId);
-        return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
+        return { type: 'tool_result', tool_use_id: toolUse.id, content: capText(JSON.stringify(result)) };
       }
 
       // ── Initial call ─────────────────────────────────────────────────────────
       const tInitial = Date.now();
       let response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: MODEL_AGENT,
         max_tokens: 4096,
         system: fullSystemPrompt,
-        messages,
-        tools: TOOLS,
+        messages: markCacheTail(messages),
+        tools: toolsForRequest,
       });
-      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id);
+      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id, 'agent_loop');
 
       // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
       // 7 rounds: rule #6 mandates data-map → schema search → query before any
@@ -7453,13 +7512,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           try {
             const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
-              model: 'claude-sonnet-4-6',
+              model: MODEL_AGENT,
               max_tokens: 4096,
               system: fullSystemPrompt,
-              messages: currentMessages,
-              tools: TOOLS,
+              messages: markCacheTail(currentMessages),
+              tools: toolsForRequest,
             });
-            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id);
+            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id, 'agent_loop');
             break;
           } catch (fuErr) {
             if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
@@ -7490,14 +7549,14 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         }
         const tForce = Date.now();
         const forced = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: MODEL_AGENT,
           max_tokens: 4096,
           system: fullSystemPrompt,
-          messages: forceMsgs,
-          tools: TOOLS,
+          messages: markCacheTail(forceMsgs),
+          tools: toolsForRequest,
           tool_choice: { type: 'tool', name: opts.finalTool.name },
         });
-        logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id);
+        logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id, 'agent_loop_forced');
         const fin = forced.content.find(b => b.type === 'tool_use' && b.name === opts.finalTool.name);
         if (fin) return { structured: fin.input };
       }
@@ -8044,7 +8103,7 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
       const history = await loadHistory(userId);
       history.push({ role: 'user', content: `[Voice note transcript]: ${transcript}` });
       let reply = await callClaude(history, 3, userId, correlation_id);
-      if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId, correlation_id);
+      if (!reply || !reply.trim()) { logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'voice_dm', correlation_id }); reply = await callClaude(history, 2, userId, correlation_id); }
       if (!reply || !reply.trim()) return;
       if (handleDraftReply(reply, userId, say, correlation_id, message.channel_type !== 'im')) return;
       await saveMessage(userId, 'user', `[Voice note]: ${transcript}`);
@@ -8416,7 +8475,7 @@ slack.message(async ({ message, say }) => {
     : (message.text || '') + dmHints });
   try {
     let reply = await callClaude(history, 3, userId, correlation_id);
-    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
+    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'dm', correlation_id }); reply = await callClaude(history, 2, userId, correlation_id); }
     if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say, correlation_id)) return;
     await saveMessage(userId, 'user', message.text);
@@ -8472,7 +8531,7 @@ slack.event('app_mention', async ({ event, say }) => {
   history.push({ role: 'user', content: fullMessage });
   try {
     let reply = await callClaude(history, 3, userId, mentionCid);
-    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId, mentionCid); }
+    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'mention', correlation_id: mentionCid }); reply = await callClaude(history, 2, userId, mentionCid); }
     if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say, mentionCid, true)) return;
     await saveMessage(userId, 'user', cleanText);
@@ -8537,7 +8596,7 @@ slack.message(async ({ message, say }) => {
     : message.text });
   try {
     let reply = await callClaude(history, 3, userId, chCid);
-    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId, chCid); }
+    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'channel', correlation_id: chCid }); reply = await callClaude(history, 2, userId, chCid); }
     if (!reply || !reply.trim()) return;
     // The value gate: he was not tagged and decided this one is not for him.
     // Post nothing, and save neither turn — a user turn with no assistant turn
@@ -8827,11 +8886,13 @@ async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa,
     f.metric_to_watch ? `Métrica de la semana: ${truncateOneLine(f.metric_to_watch, 150)}` : null,
   ].filter(Boolean).join('\n');
 
+  const tLlm = Date.now();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 300,
     messages: [{ role: 'user', content: buildReviGamePlanPrompt({ closerFirst, prospectLines, weeklyLines }) }],
   });
+  logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'call_prep_gameplan');
   return enforceGamePlanLines(res.content?.[0]?.text);
 }
 
@@ -10085,11 +10146,13 @@ function buildWonHandoffPrompt({ prospectName, coaching }) {
 // executive summary.
 async function generateWonHandoffSummary({ prospectName, coaching }) {
   const prompt = buildWonHandoffPrompt({ prospectName, coaching });
+  const tLlm = Date.now();
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 700,
     messages: [{ role: 'user', content: prompt }],
   });
+  logLlmFromAnthropicResponse(response, Date.now() - tLlm, null, 'won_handoff');
   const text = (response.content?.[0]?.text || '').trim();
   if (!text) throw new Error('empty summary from model');
   return text;
@@ -12472,11 +12535,13 @@ async function composeRecapNarrative(statText, lessons) {
     const lessonBlock = (lessons || []).length
       ? `\n\nApply these standing corrections from Ron's past feedback:\n${lessons.map(l => `- ${l.value}`).join('\n')}`
       : '';
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 300,
       messages: [{ role: 'user', content: `You are Max, NeuroGrowth's ops agent, writing the executive takeaway for Ron's weekly sales & marketing recap. Below is the final stat block (all numbers are verified — copy any number verbatim, never recompute or rephrase a stat's meaning).\n\n${statText}${lessonBlock}\n\nWrite the takeaway: 2–3 SHORT sentences, 60 words max, plain text. Sentence 1: the single most important thing that happened this week. Sentence 2: the one thing to watch or act on. Restate at most two numbers total. No preamble, no markdown, no bullet points, no run-on sentences.` }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'recap_narrative');
     return res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
   } catch (err) {
     console.error('composeRecapNarrative error:', err.message);
@@ -12754,12 +12819,14 @@ const VOC_EXTRACT_PROMPT = [
 
 async function vocExtractOne(meeting) {
   const transcriptText = vocMeetingTranscriptText(meeting).slice(0, 90000);
+  const tLlm = Date.now();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 1800,
     system: VOC_EXTRACT_PROMPT,
     messages: [{ role: 'user', content: 'TRANSCRIPT:\n' + transcriptText }],
   });
+  logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'voc_extract');
   const raw = (res.content && res.content[0] && res.content[0].text ? res.content[0].text : '').trim();
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
@@ -13554,8 +13621,8 @@ async function handleGHLWebhook(req, res) {
           : `Their first action (reach out now, check GHL).`;
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}${contextLine}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. ${actionGuidance} Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
         const tGhl = Date.now();
-        const briefingResponse = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
-        logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr);
+        const briefingResponse = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
+        logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr, 'lead_briefing');
         const briefing = briefingResponse.content.filter(b => b.type === 'text').map(b => b.text).join('');
         if (!briefing || !briefing.trim()) { console.error('GHL webhook: empty briefing from Claude'); return; }
 
@@ -15069,11 +15136,11 @@ Output ONLY the message text. No preamble, no explanation.`;
   const t = Date.now();
   const corr = newCorrelationId();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 200,
     messages: [{ role: 'user', content: prompt }],
   });
-  logLlmFromAnthropicResponse(res, Date.now() - t, corr);
+  logLlmFromAnthropicResponse(res, Date.now() - t, corr, 'campaign_draft');
   const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
   return text.replace(/^["']+|["']+$/g, '');
 }
