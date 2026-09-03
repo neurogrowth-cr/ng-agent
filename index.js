@@ -26,6 +26,10 @@ const slack = new App({
 let MAX_BOT_ID = process.env.SLACK_BOT_ID || null;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ICM model tiers — the only place model ids may appear (env-overridable, no redeploy to switch)
+const MODEL_AGENT = process.env.NG_AGENT_MODEL || 'claude-sonnet-4-6';
+const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-4-5-20251001';
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
@@ -60,15 +64,18 @@ const portalWriterPg = process.env.PORTAL_WRITER_DATABASE_URL
     })
   : null;
 
-function logLlmFromAnthropicResponse(response, durationMs, correlation_id) {
+function logLlmFromAnthropicResponse(response, durationMs, correlation_id, callSite = null) {
   if (!response) return;
   logActivity({
     event_type: 'llm_call',
     event_source: 'internal',
     action: 'anthropic.messages.create',
+    call_site: callSite,
     model: response.model,
     tokens_in: response.usage?.input_tokens,
     tokens_out: response.usage?.output_tokens,
+    tokens_cache_write: response.usage?.cache_creation_input_tokens,
+    tokens_cache_read: response.usage?.cache_read_input_tokens,
     duration_ms: durationMs,
     correlation_id,
   });
@@ -1021,11 +1028,13 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
 async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId, reportId) {
   try {
     const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, correlationId, 'report_lesson');
     const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     if (!lesson) return null;
     const scopedId = reportId || channelName || 'general-report';
@@ -1287,11 +1296,13 @@ async function detectAndSaveCorrection(userText, priorAssistantText, userId) {
     if (!userText || !priorAssistantText) return null;
     if (!CORRECTION_HINT_RE.test(userText)) return null;
     const prompt = `Max (an ops agent) previously said:\n${priorAssistantText.slice(0, 1200)}\n\nThe user replied:\n${userText.slice(0, 800)}\n\nIs the user CORRECTING a factual claim or behavior of Max's (not just disagreeing, negotiating, or changing topic)? If yes respond JSON: {"topic":"<2-4 word kebab-case topic>","lesson":"<2-3 sentences: what Max got wrong and what to do instead>"}. If no: {"topic":null}. JSON only, no markdown fences.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'correction_detect');
     const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));
     if (!parsed?.topic) return null;
@@ -1333,11 +1344,13 @@ async function extractClientContext(threadMessages, mentionText, channelName, us
   try {
     const threadText = threadMessages.map(m => m.text || '').join('\n').substring(0, 2000);
     const prompt = `A team member tagged Max in a Slack thread in #${channelName}.\n\nThread:\n${threadText}\n\nTag: ${mentionText}\n\nDoes this thread contain a specific update about a named client? If yes, respond with JSON: {"client": "<client name>", "context": "<1-2 sentence summary of the update, blocker, status change, or action item>"}. If no specific client is mentioned, respond with: {"client": null}. No preamble, JSON only.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 150,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'client_context');
     const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     const parsed = JSON.parse(raw);
     if (!parsed.client || !parsed.context) return null;
@@ -1963,11 +1976,11 @@ Reply with ONLY the cron expression, nothing else. Examples:
     const cIdTask = newCorrelationId();
     const tCronLlm = Date.now();
     const cronResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 50,
       messages: [{ role: 'user', content: cronPrompt }]
     });
-    logLlmFromAnthropicResponse(cronResponse, Date.now() - tCronLlm, cIdTask);
+    logLlmFromAnthropicResponse(cronResponse, Date.now() - tCronLlm, cIdTask, 'cron_parse');
     const cronExpression = cronResponse.content
       .filter(b => b.type === 'text').map(b => b.text).join('').trim()
       .replace(/[^0-9*,/\- ]/g, '').trim();
@@ -4823,8 +4836,8 @@ ${fmt(nightly).slice(0, 16000)}
 ${fmt(alerts).slice(0, 4000)}`;
 
   const tRef = Date.now();
-  const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
-  logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId);
+  const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
+  logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId, 'pattern_reflection');
   const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   if (text.includes('NO_PATTERNS')) {
     logActivity({ event_type: 'pattern_reflection', event_source: 'cron', action: 'pattern_reflection', status: 'ok', output: { patterns: 0 }, correlation_id: correlationId });
@@ -4946,8 +4959,8 @@ ${nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${Str
   let patternsText = '', proposalLines = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     const tB = Date.now();
-    const res = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
-    logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId);
+    const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
+    logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId, 'weekly_reflection');
     const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
     const lines = text.split('\n');
     proposalLines = lines.map(parseProposalLine).filter(Boolean);
@@ -5127,8 +5140,8 @@ async function runNightlyLearning(correlationId) {
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${digest}`;
     const tNightly = Date.now();
-    const response = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
-    logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId);
+    const response = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId, 'nightly_learning');
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
     let saved = 0;
@@ -5178,11 +5191,11 @@ async function runNightlyLearning(correlationId) {
           .slice(0, 24000);
         const tSum = Date.now();
         const sumRes = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: MODEL_AGENT,
           max_tokens: 350,
           messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Never mention company financial, banking, or billing details (balances, payments, invoices, subscription status) — those are confidential to Ron and must not appear in this team-facing summary. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
         });
-        logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId);
+        logLlmFromAnthropicResponse(sumRes, Date.now() - tSum, correlationId, 'nightly_summary');
         const sumText = sumRes.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
         if (sumText) learnedBlock = `\n\n*What I learned tonight:*\n${sumText}`;
       } catch (sumErr) { console.error('Nightly learning summary generation failed:', sumErr.message); }
@@ -5237,8 +5250,8 @@ async function runProactiveAlerts(correlationId) {
     const alertText = staleAlerts.map(a => `${a.key}: ${a.value}`).join('\n\n');
     const prompt    = `You are the NeuroGrowth PM agent checking on unresolved alerts.\n\nThese items have been flagged as alerts and have not been updated in over 24 hours:\n\n${alertText}\n\nWrite a brief, direct message to Ron (2-4 sentences) summarizing what is still unresolved and what needs his attention today. No markdown formatting. Sound like a colleague, not a report.`;
     const tPa = Date.now();
-    const response  = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
-    logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId);
+    const response  = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
+    logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId, 'proactive_alerts');
     const message   = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     await postToSlack(AGENT_CHANNEL, message);
     console.log(`Proactive alert posted. ${staleAlerts.length} unresolved items flagged.`);
@@ -5595,11 +5608,13 @@ async function narrateAnomaly(snapshot) {
   try {
     const direction = snapshot.z > 0 ? 'above' : 'below';
     const prompt = `Metric "${snapshot.metric}" (domain: ${snapshot.domain}) is ${Math.abs(snapshot.z).toFixed(1)}σ ${direction} its ${snapshot.sampleSize}-sample baseline.\nLatest value: ${snapshot.value}. Baseline mean: ${snapshot.mean.toFixed(2)} (std dev ${snapshot.stdDev.toFixed(2)}).\n\nWrite ONE short sentence (no markdown, no preamble) on what this likely means in plain business English and what to watch next. Max 30 words.`;
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: MODEL_AGENT,
       max_tokens: 100,
       messages: [{ role: 'user', content: prompt }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'anomaly_narrate');
     const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
     return text || null;
   } catch (err) {
@@ -7153,10 +7168,10 @@ async function processFileWithClaude(fileBuffer, mimeType, userInstruction, syst
   }
   const t0 = Date.now();
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6', max_tokens: 1024, system: systemPrompt,
+    model: MODEL_AGENT, max_tokens: 1024, system: systemPrompt,
     messages: [{ role: 'user', content: [contentBlock, { type: 'text', text: userInstruction || 'Analyze this file and provide a useful summary. Extract any action items, key information, or insights relevant to NeuroGrowth operations.' }] }],
   });
-  logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId);
+  logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId, 'file_analysis');
   return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
 }
 
@@ -7384,13 +7399,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
       // ── Initial call ─────────────────────────────────────────────────────────
       const tInitial = Date.now();
       let response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: MODEL_AGENT,
         max_tokens: 4096,
         system: fullSystemPrompt,
         messages,
         tools: TOOLS,
       });
-      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id);
+      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id, 'agent_loop');
 
       // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
       // 7 rounds: rule #6 mandates data-map → schema search → query before any
@@ -7453,13 +7468,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           try {
             const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
-              model: 'claude-sonnet-4-6',
+              model: MODEL_AGENT,
               max_tokens: 4096,
               system: fullSystemPrompt,
               messages: currentMessages,
               tools: TOOLS,
             });
-            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id);
+            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id, 'agent_loop');
             break;
           } catch (fuErr) {
             if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
@@ -7490,14 +7505,14 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         }
         const tForce = Date.now();
         const forced = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: MODEL_AGENT,
           max_tokens: 4096,
           system: fullSystemPrompt,
           messages: forceMsgs,
           tools: TOOLS,
           tool_choice: { type: 'tool', name: opts.finalTool.name },
         });
-        logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id);
+        logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id, 'agent_loop_forced');
         const fin = forced.content.find(b => b.type === 'tool_use' && b.name === opts.finalTool.name);
         if (fin) return { structured: fin.input };
       }
@@ -8044,7 +8059,7 @@ async function handleFileMessage(message, say, userId, threadReply = false) {
       const history = await loadHistory(userId);
       history.push({ role: 'user', content: `[Voice note transcript]: ${transcript}` });
       let reply = await callClaude(history, 3, userId, correlation_id);
-      if (!reply || !reply.trim()) reply = await callClaude(history, 2, userId, correlation_id);
+      if (!reply || !reply.trim()) { logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'voice_dm', correlation_id }); reply = await callClaude(history, 2, userId, correlation_id); }
       if (!reply || !reply.trim()) return;
       if (handleDraftReply(reply, userId, say, correlation_id, message.channel_type !== 'im')) return;
       await saveMessage(userId, 'user', `[Voice note]: ${transcript}`);
@@ -8416,7 +8431,7 @@ slack.message(async ({ message, say }) => {
     : (message.text || '') + dmHints });
   try {
     let reply = await callClaude(history, 3, userId, correlation_id);
-    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); reply = await callClaude(history, 2, userId, correlation_id); }
+    if (!reply || !reply.trim()) { console.error('Empty reply, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'dm', correlation_id }); reply = await callClaude(history, 2, userId, correlation_id); }
     if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say, correlation_id)) return;
     await saveMessage(userId, 'user', message.text);
@@ -8472,7 +8487,7 @@ slack.event('app_mention', async ({ event, say }) => {
   history.push({ role: 'user', content: fullMessage });
   try {
     let reply = await callClaude(history, 3, userId, mentionCid);
-    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); reply = await callClaude(history, 2, userId, mentionCid); }
+    if (!reply || !reply.trim()) { console.error('Empty reply on mention, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'mention', correlation_id: mentionCid }); reply = await callClaude(history, 2, userId, mentionCid); }
     if (!reply || !reply.trim()) return;
     if (handleDraftReply(reply, userId, say, mentionCid, true)) return;
     await saveMessage(userId, 'user', cleanText);
@@ -8537,7 +8552,7 @@ slack.message(async ({ message, say }) => {
     : message.text });
   try {
     let reply = await callClaude(history, 3, userId, chCid);
-    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); reply = await callClaude(history, 2, userId, chCid); }
+    if (!reply || !reply.trim()) { console.error('Empty reply on channel, retrying for user:', userId); logActivity({ event_type: 'empty_reply_retry', event_source: 'internal', call_site: 'channel', correlation_id: chCid }); reply = await callClaude(history, 2, userId, chCid); }
     if (!reply || !reply.trim()) return;
     // The value gate: he was not tagged and decided this one is not for him.
     // Post nothing, and save neither turn — a user turn with no assistant turn
@@ -8827,11 +8842,13 @@ async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa,
     f.metric_to_watch ? `Métrica de la semana: ${truncateOneLine(f.metric_to_watch, 150)}` : null,
   ].filter(Boolean).join('\n');
 
+  const tLlm = Date.now();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 300,
     messages: [{ role: 'user', content: buildReviGamePlanPrompt({ closerFirst, prospectLines, weeklyLines }) }],
   });
+  logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'call_prep_gameplan');
   return enforceGamePlanLines(res.content?.[0]?.text);
 }
 
@@ -10085,11 +10102,13 @@ function buildWonHandoffPrompt({ prospectName, coaching }) {
 // executive summary.
 async function generateWonHandoffSummary({ prospectName, coaching }) {
   const prompt = buildWonHandoffPrompt({ prospectName, coaching });
+  const tLlm = Date.now();
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 700,
     messages: [{ role: 'user', content: prompt }],
   });
+  logLlmFromAnthropicResponse(response, Date.now() - tLlm, null, 'won_handoff');
   const text = (response.content?.[0]?.text || '').trim();
   if (!text) throw new Error('empty summary from model');
   return text;
@@ -12472,11 +12491,13 @@ async function composeRecapNarrative(statText, lessons) {
     const lessonBlock = (lessons || []).length
       ? `\n\nApply these standing corrections from Ron's past feedback:\n${lessons.map(l => `- ${l.value}`).join('\n')}`
       : '';
+    const tLlm = Date.now();
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL_LIGHT,
       max_tokens: 300,
       messages: [{ role: 'user', content: `You are Max, NeuroGrowth's ops agent, writing the executive takeaway for Ron's weekly sales & marketing recap. Below is the final stat block (all numbers are verified — copy any number verbatim, never recompute or rephrase a stat's meaning).\n\n${statText}${lessonBlock}\n\nWrite the takeaway: 2–3 SHORT sentences, 60 words max, plain text. Sentence 1: the single most important thing that happened this week. Sentence 2: the one thing to watch or act on. Restate at most two numbers total. No preamble, no markdown, no bullet points, no run-on sentences.` }],
     });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'recap_narrative');
     return res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
   } catch (err) {
     console.error('composeRecapNarrative error:', err.message);
@@ -12754,12 +12775,14 @@ const VOC_EXTRACT_PROMPT = [
 
 async function vocExtractOne(meeting) {
   const transcriptText = vocMeetingTranscriptText(meeting).slice(0, 90000);
+  const tLlm = Date.now();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 1800,
     system: VOC_EXTRACT_PROMPT,
     messages: [{ role: 'user', content: 'TRANSCRIPT:\n' + transcriptText }],
   });
+  logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'voc_extract');
   const raw = (res.content && res.content[0] && res.content[0].text ? res.content[0].text : '').trim();
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
@@ -13554,8 +13577,8 @@ async function handleGHLWebhook(req, res) {
           : `Their first action (reach out now, check GHL).`;
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}${contextLine}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. ${actionGuidance} Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
         const tGhl = Date.now();
-        const briefingResponse = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
-        logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr);
+        const briefingResponse = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
+        logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr, 'lead_briefing');
         const briefing = briefingResponse.content.filter(b => b.type === 'text').map(b => b.text).join('');
         if (!briefing || !briefing.trim()) { console.error('GHL webhook: empty briefing from Claude'); return; }
 
@@ -15069,11 +15092,11 @@ Output ONLY the message text. No preamble, no explanation.`;
   const t = Date.now();
   const corr = newCorrelationId();
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: MODEL_AGENT,
     max_tokens: 200,
     messages: [{ role: 'user', content: prompt }],
   });
-  logLlmFromAnthropicResponse(res, Date.now() - t, corr);
+  logLlmFromAnthropicResponse(res, Date.now() - t, corr, 'campaign_draft');
   const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
   return text.replace(/^["']+|["']+$/g, '');
 }
