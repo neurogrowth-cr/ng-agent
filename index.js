@@ -5138,7 +5138,7 @@ async function runNightlyLearning(correlationId) {
 
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${digest}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${capText(digest, 30000)}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId, 'nightly_learning');
@@ -7207,51 +7207,11 @@ async function transcribeAudio(fileBuffer, filename) {
   }
 }
 
-// ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
-// opts.systemAppend — extra text appended to the system prompt for this call only.
-// opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
-//                     calls it, callClaude returns { structured: <tool input> } instead
-//                     of text. Used by /agent/consult for schema-constrained verdicts.
-// opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
-// opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
-//                     dropTools, for narrow modes like alert triage where banning ~38 tools
-//                     by name would be unmaintainable. [] means finalTool only.
-async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
-  const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
-  // Learned lessons ride every interactive prompt (fetched once, not per retry).
-  // Scheduled reports inject their own scoped lessons via getReportLessons.
-  let lessonBlock = '';
-  try {
-    const lessons = await getGlobalLessons();
-    if (lessons.length) {
-      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
-    }
-  } catch { /* lessons are best-effort — never block a reply */ }
-  let lastErr;
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      // Inject current Costa Rica date/time — built once, reused in ALL calls (initial + follow-ups)
-      const nowCR = new Date().toLocaleString('en-US', {
-        timeZone: 'America/Costa_Rica',
-        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-        hour: '2-digit', minute: '2-digit', hour12: true
-      });
-      const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
-      const emailProxyGuidance = EMAIL_PROXY_LIVE ? `
-
-EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
-- Mirror the user's language. If they DM in Spanish, respond in Spanish through every step (slot-filling, preview, confirmation). The email body itself stays in whatever language the setter dictated — do NOT translate it.
-- Conversationally collect three required fields: recipient email (to), subject, body. cc is optional.
-- If any required field is missing, name exactly what is missing and ask for it. Do NOT call draft_outbound_email until to + subject + body are all known.
-- Quote values back to the setter for typo-checking before drafting (e.g. "OK so to: acme@x.com, subject: Follow-up — confirm the body before I draft").
-- Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
-- For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
-- Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
-      // injectOfferCatalog wraps the whole composition, not just the base prompt:
-      // both branches carry the token and this is the only place both meet.
-      const fullSystemPrompt = injectOfferCatalog((userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + timeContext + lessonBlock + emailProxyGuidance + (opts.systemAppend || ''));
-
-      const TOOLS = [
+// ── ICM: full tool catalogue at module scope ─────────────────────────────────
+// Hoisted so the array is byte-identical across calls — a requirement for
+// prompt-cache prefix reuse. Per-call filtering (dropTools / onlyTools / env
+// gates) still happens inside callClaude on this shared base.
+const ALL_TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
           { name: 'get_notion_page',      description: 'Get the content of a specific Notion page by its ID',                                   input_schema: { type: 'object', properties: { page_id: { type: 'string' } }, required: ['page_id'] } },
           { name: 'get_recent_emails',    description: "Get recent unread emails from Ron's Gmail inbox including full email body content",      input_schema: { type: 'object', properties: {} } },
@@ -7304,7 +7264,88 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           { name: 'ghl_find_operation', description: "Search GoHighLevel's full operation catalogue (hundreds of operations across ~40 domains: contacts, conversations, opportunities, calendars, custom values, forms, surveys, invoices, payments, social planner, blogs, email templates). Use this for any GHL question Max has no dedicated tool for. Returns operationId, kind (read/write/delete/money_movement), domain, and hasRequestBody. If hasRequestBody is false and kind is 'read', skip ghl_describe_operation and call ghl_run_operation directly — you only have 7 tool rounds per turn. Prefer the dedicated tools (get_ghl_conversations, set_appointment_status, log_call_outcome, get_sales_intelligence) for the flows they already cover.", input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural-language description of the GHL operation you need, e.g. \"list invoices\" or \"add a tag to a contact\".' }, domains: { type: 'array', items: { type: 'string' }, description: 'Optional domain filter, e.g. ["contacts"].' }, kind: { type: 'string', description: 'Optional filter: read | write | delete | money_movement.' }, limit: { type: 'number', description: 'Max results, default 8, cap 25.' } }, required: ['query'] } },
           { name: 'ghl_describe_operation', description: 'Inspect one GHL operationId from ghl_find_operation before running it: required path/query params, request-body fields, a sanitized payload example, required scopes, and safety metadata. Call this when the operation takes a request body or the params are unclear. Skip it for simple reads — it costs a tool round.', input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' } }, required: ['operationId'] } },
           { name: 'ghl_run_operation', description: "Execute one GHL operation by operationId. Reads run freely. Writes are refused unless Ron has armed that exact operationId in GHL_MCP_WRITE_ALLOWLIST; deletes and money movement are refused always and cannot be armed. Set dryRun true to see the exact REST request that WOULD be sent without sending it — do that first for any write. A 'not authorized for this scope' response means the GHL token lacks that scope, which is Ron's fix in GHL Settings, not something to retry.", input_schema: { type: 'object', properties: { operationId: { type: 'string', description: 'operationId returned by ghl_find_operation.' }, params: { type: 'object', description: 'Path, query, and body params. Flat or grouped as {path, query, body}.' }, dryRun: { type: 'boolean', description: 'Preview the resolved request without executing. Use before any write.' } }, required: ['operationId'] } },
-      ].filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
+];
+
+// ICM: rolling cache breakpoint — marks the last block of the final user message
+// on a request-time copy (never persisted into history; persisted markers would
+// accumulate and blow the API's 4-breakpoint limit). Each tool round then re-reads
+// the previous rounds' context at 0.1x instead of full input price.
+function markCacheTail(msgs) {
+  if (!Array.isArray(msgs) || !msgs.length) return msgs;
+  const last = msgs[msgs.length - 1];
+  if (!last || last.role !== 'user') return msgs;
+  const blocks = Array.isArray(last.content)
+    ? last.content
+    : [{ type: 'text', text: String(last.content) }];
+  if (!blocks.length || typeof blocks[blocks.length - 1] !== 'object') return msgs;
+  const marked = [...blocks.slice(0, -1), { ...blocks[blocks.length - 1], cache_control: { type: 'ephemeral' } }];
+  return [...msgs.slice(0, -1), { ...last, content: marked }];
+}
+
+// ICM: head/tail cap for anything entering model context. Tool results were
+// previously unbounded — one fat query_portal_db result rode along at full
+// price in every subsequent round of the loop.
+function capText(str, max = Number(process.env.ICM_TOOL_RESULT_CAP || 8000)) {
+  const s = String(str);
+  if (s.length <= max) return s;
+  const head = Math.floor(max * 0.75);
+  const tail = max - head;
+  return s.slice(0, head) + `\n[... ${s.length - max} chars elided — re-query with a narrower filter if you need the middle ...]\n` + s.slice(-tail);
+}
+
+// ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
+// opts.systemAppend — extra text appended to the system prompt for this call only.
+// opts.finalTool    — {name, description, input_schema} added to TOOLS; when the model
+//                     calls it, callClaude returns { structured: <tool input> } instead
+//                     of text. Used by /agent/consult for schema-constrained verdicts.
+// opts.dropTools    — tool names removed from TOOLS for this call (hard ban, not prompt-level).
+// opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
+//                     dropTools, for narrow modes like alert triage where banning ~38 tools
+//                     by name would be unmaintainable. [] means finalTool only.
+async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
+  const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
+  // Learned lessons ride every interactive prompt (fetched once, not per retry).
+  // Scheduled reports inject their own scoped lessons via getReportLessons.
+  let lessonBlock = '';
+  try {
+    const lessons = await getGlobalLessons();
+    if (lessons.length) {
+      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
+    }
+  } catch { /* lessons are best-effort — never block a reply */ }
+  let lastErr;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      // Inject current Costa Rica date/time — built once, reused in ALL calls (initial + follow-ups)
+      const nowCR = new Date().toLocaleString('en-US', {
+        timeZone: 'America/Costa_Rica',
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: true
+      });
+      const timeContext = `\n\nCURRENT DATE AND TIME: ${nowCR} (Costa Rica time). Use this as your time reference for all date and day-of-week logic. Never assume or guess the date.`;
+      const emailProxyGuidance = EMAIL_PROXY_LIVE ? `
+
+EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
+- Mirror the user's language. If they DM in Spanish, respond in Spanish through every step (slot-filling, preview, confirmation). The email body itself stays in whatever language the setter dictated — do NOT translate it.
+- Conversationally collect three required fields: recipient email (to), subject, body. cc is optional.
+- If any required field is missing, name exactly what is missing and ask for it. Do NOT call draft_outbound_email until to + subject + body are all known.
+- Quote values back to the setter for typo-checking before drafting (e.g. "OK so to: acme@x.com, subject: Follow-up — confirm the body before I draft").
+- Once you have all three, call draft_outbound_email. The system will show the draft to the setter for review (Stage 1), then route to Ron for final approval (Stage 2). You do not handle the approval flow yourself — just call the tool.
+- For replies to active email threads: only call draft_reply_email when the setter is clearly responding to a client message Max forwarded earlier. If they say "never mind", "cancel", a question about something else, or anything ambiguous, respond conversationally — do NOT call the tool.
+- Never claim an email was sent unless the system DMs the success notification. The tool call alone does not send anything.` : '';
+      // injectOfferCatalog wraps the static composition — the catalog token lives in
+      // the base prompt, and this is the only place every branch meets.
+      // ICM: block 1 is byte-stable per deploy and carries the cache breakpoint (1h —
+      // hourly crons + all-day DMs sit inside the window); everything volatile
+      // (timestamp, lessons, per-call appends) lives below it, where changes are free.
+      const staticSystem = injectOfferCatalog((userId ? buildRoleSystemPrompt(userId) : SYSTEM_PROMPT) + emailProxyGuidance);
+      const fullSystemPrompt = [
+        { type: 'text', text: staticSystem, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: timeContext + lessonBlock + (opts.systemAppend || '') },
+      ];
+
+      const TOOLS = ALL_TOOLS
+        .filter(t => EMAIL_PROXY_LIVE || (t.name !== 'draft_outbound_email' && t.name !== 'draft_reply_email'))
        .filter(t => !(opts.dropTools || []).includes(t.name))
        .filter(t => !opts.onlyTools || opts.onlyTools.includes(t.name))
        .filter(t => process.env.MAKE_API_TOKEN || !t.name.startsWith('make_'))
@@ -7313,6 +7354,9 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
        // next ghl_-prefixed tool that has nothing to do with this router.
        .filter(t => process.env.GHL_MCP_ENABLED || !GHL_MCP_TOOL_NAMES.has(t.name));
       if (opts.finalTool) TOOLS.push(opts.finalTool);
+      // ICM: breakpoint on the last tool definition — tools render before system in
+      // the cache hierarchy, so this caches the whole tools array for every variant.
+      const toolsForRequest = TOOLS.map((t, i) => i === TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral', ttl: '1h' } } : t);
 
       // ── Tool dispatcher — shared across initial and all follow-up rounds ──────
       async function dispatchTool(toolUse) {
@@ -7393,7 +7437,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'ghl_find_operation')     result = await ghlMcpFindOperation(toolUse.input);
         else if (toolUse.name === 'ghl_describe_operation') result = await ghlMcpDescribeOperation(toolUse.input.operationId);
         else if (toolUse.name === 'ghl_run_operation')      result = await ghlMcpRunOperation(toolUse.input, userId);
-        return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) };
+        return { type: 'tool_result', tool_use_id: toolUse.id, content: capText(JSON.stringify(result)) };
       }
 
       // ── Initial call ─────────────────────────────────────────────────────────
@@ -7402,8 +7446,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         model: MODEL_AGENT,
         max_tokens: 4096,
         system: fullSystemPrompt,
-        messages,
-        tools: TOOLS,
+        messages: markCacheTail(messages),
+        tools: toolsForRequest,
       });
       logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id, 'agent_loop');
 
@@ -7471,8 +7515,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
               model: MODEL_AGENT,
               max_tokens: 4096,
               system: fullSystemPrompt,
-              messages: currentMessages,
-              tools: TOOLS,
+              messages: markCacheTail(currentMessages),
+              tools: toolsForRequest,
             });
             logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id, 'agent_loop');
             break;
@@ -7508,8 +7552,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           model: MODEL_AGENT,
           max_tokens: 4096,
           system: fullSystemPrompt,
-          messages: forceMsgs,
-          tools: TOOLS,
+          messages: markCacheTail(forceMsgs),
+          tools: toolsForRequest,
           tool_choice: { type: 'tool', name: opts.finalTool.name },
         });
         logLlmFromAnthropicResponse(forced, Date.now() - tForce, correlation_id, 'agent_loop_forced');
