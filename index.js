@@ -1938,6 +1938,13 @@ function registerDynamicCron(task) {
       }
       // Strip Markdown bold — Slack uses *bold* not **bold**
       finalReply = finalReply.replace(/\*\*(.+?)\*\*/g, '$1');
+      // Monthly VoC Digest: a 📄 reaction on the posted digest dispatches the
+      // branded-PDF workflow (see handleVocPdfReaction). Appended at post time,
+      // AFTER structural validation — the hint is not part of the report and
+      // must never count toward (or break) the TASK_HEADERS check.
+      if (task.name === 'Monthly VoC Digest') {
+        finalReply += '\n\n_Reaccioná con 📄 para generar la versión PDF brandeada._';
+      }
       const posted = await postToSlack(targetChannel, finalReply);
       await registerPostedReport(posted, reportIdForTask(task.name));
 
@@ -17839,6 +17846,85 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
   await reportOutcomeCardResult({ channel, ts, payload, result, outcome: payload.proposed_outcome });
 }
 
+// ─── VOC PDF DISPATCH ─────────────────────────────────────────────────────────
+// Ron reacts 📄 on the posted Monthly VoC Digest → dispatch the voc-pdf.yml
+// GitHub Actions workflow in roi-rm-okr-reporting, which builds the branded
+// PDF and uploads it back into the digest's thread. Slack side only fires the
+// starting gun; the workflow owns everything after the 204.
+const VOC_PDF_EMOJI = 'page_facing_up';
+const VOC_PDF_DEDUP_WINDOW_MS = 10 * 60 * 1000;
+const _vocPdfDispatches = new Map(); // digest message ts → last dispatch epoch ms
+
+// Month the PDF should cover: an explicit YYYY-MM anywhere in the digest text
+// wins; otherwise the last CLOSED calendar month in Costa Rica at reaction
+// time — the digest always reports the month that just ended, so a 📄 on
+// September 4th means the August PDF.
+function resolveVocPdfMonth(text) {
+  const m = String(text || '').match(/\b(20\d{2})-(0[1-9]|1[0-2])\b/);
+  if (m) return `${m[1]}-${m[2]}`;
+  const todayCR = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' }); // YYYY-MM-DD
+  const [y, mo] = todayCR.split('-').map(Number);
+  const prevY  = mo === 1 ? y - 1 : y;
+  const prevMo = mo === 1 ? 12 : mo - 1;
+  return `${prevY}-${String(prevMo).padStart(2, '0')}`;
+}
+
+async function handleVocPdfReaction(event, msg) {
+  const channel = event.item.channel;
+  const ts      = event.item.ts;
+
+  // Dedup: a re-react (or a Slack redelivery) inside the window is a no-op —
+  // one digest must never fan out into parallel workflow runs. Failed
+  // dispatches delete their entry below, so re-reacting is a clean retry.
+  for (const [k, v] of _vocPdfDispatches) {
+    if (Date.now() - v > VOC_PDF_DEDUP_WINDOW_MS) _vocPdfDispatches.delete(k);
+  }
+  const last = _vocPdfDispatches.get(ts);
+  if (last && Date.now() - last < VOC_PDF_DEDUP_WINDOW_MS) {
+    console.log(`voc-pdf: duplicate 📄 on ${ts} within dedup window, ignoring`);
+    return;
+  }
+  _vocPdfDispatches.set(ts, Date.now());
+
+  const month = resolveVocPdfMonth(msg.text);
+
+  if (!process.env.GITHUB_TOKEN) {
+    _vocPdfDispatches.delete(ts);
+    await postToSlack(channel, '📄 No puedo generar el PDF — falta `GITHUB_TOKEN` en ng-pm-MAX (Railway). Agregá un fine-grained PAT con permiso *Actions: write* sobre `roi-rm-okr-reporting` y reaccioná de nuevo.', ts);
+    return;
+  }
+
+  let res;
+  try {
+    res = await fetch('https://api.github.com/repos/neurogrowth-cr/roi-rm-okr-reporting/actions/workflows/voc-pdf.yml/dispatches', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ng-agent',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ref: 'main', inputs: { month, channel_id: channel, thread_ts: ts } }),
+    });
+  } catch (err) {
+    _vocPdfDispatches.delete(ts);
+    console.error('voc-pdf dispatch threw:', err.message);
+    await postToSlack(channel, `📄 El dispatch del PDF no llegó a GitHub (${err.message}). Reaccioná de nuevo para reintentar.`, ts);
+    return;
+  }
+
+  if (res.status === 204) {
+    console.log(`voc-pdf: dispatched workflow for ${month} (channel ${channel}, ts ${ts})`);
+    await postToSlack(channel, `📄 Generando el PDF brandeado de ${month}… (~3 min). Lo subo en este thread.`, ts);
+  } else {
+    _vocPdfDispatches.delete(ts);
+    const errBody = await res.text().catch(() => '');
+    console.error(`voc-pdf dispatch failed: ${res.status} ${errBody.slice(0, 200)}`);
+    await postToSlack(channel, `📄 El dispatch del PDF falló — GitHub respondió *${res.status}*. Revisá que \`GITHUB_TOKEN\` tenga *Actions: write* sobre \`roi-rm-okr-reporting\` y que \`voc-pdf.yml\` exista en main, y reaccioná de nuevo.`, ts);
+  }
+}
+
 slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
@@ -17846,6 +17932,29 @@ slack.event('reaction_added', async ({ event }) => {
 
     // Strip skin-tone modifier (Slack delivers e.g. `hand::skin-tone-3`)
     const baseEmoji = String(event.reaction || '').split('::')[0];
+
+    // Route -2: 📄 on the Monthly VoC Digest → branded-PDF workflow dispatch.
+    // Ron-only, and only on a Max-authored message carrying the digest's
+    // MUESTRA DEL MES header (TASK_HEADERS guarantees every posted digest has
+    // it). 📄 belongs to no other emoji set, so any miss here falls through
+    // to the routes below untouched.
+    if (baseEmoji === VOC_PDF_EMOJI && event.user === RON_SLACK_ID) {
+      try {
+        const hist = await slack.client.conversations.history({
+          channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true,
+        });
+        const msg = hist.messages && hist.messages[0];
+        if (msg && msg.ts === event.item.ts &&
+            isMaxMessage(msg, process.env.SLACK_BOT_USER_ID, MAX_BOT_ID) &&
+            String(msg.text || '').includes('MUESTRA DEL MES')) {
+          await handleVocPdfReaction(event, msg);
+          return;
+        }
+      } catch (vocErr) {
+        console.error('voc-pdf reaction pre-route error:', vocErr.message);
+        // fall through — this reaction belongs to another route (or nowhere)
+      }
+    }
 
     // Route -1: weekly-brief proposal in #ng-ops-management. Channel messages
     // only (Route 0 owns DMs), identified by message metadata, Ron-only inside
