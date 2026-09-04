@@ -13122,12 +13122,13 @@ cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) 
 cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => { await runProvisioningLagCheck(c); }), { timezone: 'America/Costa_Rica' });
 
 // ── ICM COST REPORT — Wed 7:45 AM CR weekly ─────────────────────────────────
-// Ron-only DM: per-agent LLM spend in real dollars — actual vs what the same
+// Posts to #ng-pm-agent (Ron's call, 2026-09-03): per-agent LLM spend in real dollars — actual vs what the same
 // traffic would have cost WITHOUT ICM caching (counterfactual: every cached
 // token re-priced at full input rate) — plus Max's prior-week comparison from
 // real agent_activity history. Fully deterministic: a report about token costs
 // spends zero LLM tokens itself.
-// Recipe criteria (what good output looks like): posts ONLY to Ron; every
+// Recipe criteria (what good output looks like): posts ONLY to #ng-pm-agent
+// (Max's own ops channel — operational API costs, not company financials); every
 // unreachable source is NAMED in the report body, never silently omitted;
 // every dollar derives from the usage tables (agent_activity, axon.llm_usage,
 // revi.llm_usage, axon.factory_runs), never estimated; cache writes are billed
@@ -13257,8 +13258,8 @@ async function runIcmCostReport(correlationId) {
     lines.push('');
     lines.push(`⚠️ Sources unreachable this run: ${problems.join(' | ')}`);
   }
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
-  console.log(`ICM cost report posted (${correlationId})`);
+  await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: lines.join('\n') });
+  console.log(`ICM cost report posted to ${AGENT_CHANNEL} (${correlationId})`);
 }
 // Wed 7:45 AM CR — first fire lands exactly 7 days after the 2026-09-03 rollout.
 cron.schedule('45 7 * * 3', wrapCronJob('runIcmCostReport', async (c) => { await runIcmCostReport(c); }), { timezone: 'America/Costa_Rica' });
