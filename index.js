@@ -42,6 +42,13 @@ const reviSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE
   db: { schema: 'revi' },
 });
 
+// Read-only view into AXON's schema for the ICM cost report (llm_usage +
+// factory_runs carry SELECT policies for anon; writes stay AXON's own).
+const axonSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+  auth: { persistSession: false },
+  db: { schema: 'axon' },
+});
+
 const { Pool } = require('pg');
 const portalPg = process.env.PORTAL_READONLY_DATABASE_URL
   ? new Pool({
@@ -13114,6 +13121,148 @@ cron.schedule('0 14 * * *',   wrapCronJob('runReviProspectNotesSync', async (c) 
 // Weekly provisioning-lag nag — Mon 8:30 AM CR, after the 7 AM leaderboard.
 cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => { await runProvisioningLagCheck(c); }), { timezone: 'America/Costa_Rica' });
 
+// ── ICM COST REPORT — Wed 7:45 AM CR weekly ─────────────────────────────────
+// Ron-only DM: per-agent LLM spend in real dollars — actual vs what the same
+// traffic would have cost WITHOUT ICM caching (counterfactual: every cached
+// token re-priced at full input rate) — plus Max's prior-week comparison from
+// real agent_activity history. Fully deterministic: a report about token costs
+// spends zero LLM tokens itself.
+// Recipe criteria (what good output looks like): posts ONLY to Ron; every
+// unreachable source is NAMED in the report body, never silently omitted;
+// every dollar derives from the usage tables (agent_activity, axon.llm_usage,
+// revi.llm_usage, axon.factory_runs), never estimated; cache writes are billed
+// at the 1h rate (2x) even where 5-min was used, so savings are UNDERstated,
+// never overstated.
+const ICM_MODEL_RATES = [
+  // USD per 1M tokens; prefix-matched so dated ids resolve (longest prefix wins)
+  { prefix: 'claude-sonnet-4-6', in: 3, out: 15, write: 6, read: 0.3 },
+  { prefix: 'claude-sonnet-5',   in: 3, out: 15, write: 6, read: 0.3 },
+  { prefix: 'claude-haiku-4-5',  in: 1, out: 5,  write: 2, read: 0.1 },
+];
+function icmRates(model) {
+  const m = String(model || '').toLowerCase();
+  let best = null;
+  for (const r of ICM_MODEL_RATES) {
+    if (m.startsWith(r.prefix) && (!best || r.prefix.length > best.prefix.length)) best = r;
+  }
+  return best || ICM_MODEL_RATES[0]; // unknown model prices at Sonnet rates rather than $0
+}
+function icmCostUsd(row) {
+  const r = icmRates(row.model);
+  const M = 1e6;
+  const actual = (row.tin / M) * r.in + (row.tout / M) * r.out + (row.cw / M) * r.write + (row.cr / M) * r.read;
+  const uncached = ((row.tin + row.cw + row.cr) / M) * r.in + (row.tout / M) * r.out;
+  return { actual, uncached };
+}
+function icmSummarize(rows) {
+  const t = { actual: 0, uncached: 0, calls: 0, tin: 0, tout: 0, cw: 0, cr: 0 };
+  for (const row of rows) {
+    const c = icmCostUsd(row);
+    t.actual += c.actual; t.uncached += c.uncached;
+    t.calls += row.calls || 0;
+    t.tin += row.tin || 0; t.tout += row.tout || 0; t.cw += row.cw || 0; t.cr += row.cr || 0;
+  }
+  const ctx = t.tin + t.cw + t.cr;
+  t.hitRate = ctx > 0 ? t.cr / ctx : 0;
+  t.saved = t.uncached - t.actual;
+  return t;
+}
+function fmtUsd(n) { return `$${n.toFixed(2)}`; }
+function fmtPct(n) { return `${Math.round(n * 100)}%`; }
+// ── end ICM pure block ──────────────────────────────────────────────────────
+
+async function icmMaxAggregates(sinceIso, untilIso) {
+  if (!portalPg) throw new Error('PORTAL_READONLY_DATABASE_URL not set');
+  const { rows } = await portalPg.query(`
+    select coalesce(model, '') as model, coalesce(call_site, 'untagged') as site, count(*)::int as calls,
+           coalesce(sum(tokens_in), 0)::bigint as tin, coalesce(sum(tokens_out), 0)::bigint as tout,
+           coalesce(sum(tokens_cache_write), 0)::bigint as cw, coalesce(sum(tokens_cache_read), 0)::bigint as cr
+      from agent_activity
+     where event_type = 'llm_call' and created_at >= $1 and created_at < $2
+     group by 1, 2`, [sinceIso, untilIso]);
+  return rows.map((r) => ({ model: r.model, site: r.site, calls: Number(r.calls), tin: Number(r.tin), tout: Number(r.tout), cw: Number(r.cw), cr: Number(r.cr) }));
+}
+
+async function icmLlmUsageRows(client, sinceIso) {
+  const { data, error } = await client.from('llm_usage')
+    .select('model, tokens_in, tokens_out, tokens_cache_write, tokens_cache_read')
+    .gte('created_at', sinceIso).limit(10000);
+  if (error) throw new Error(error.message);
+  return (data || []).map((r) => ({ model: r.model, calls: 1, tin: r.tokens_in || 0, tout: r.tokens_out || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
+}
+
+async function icmFactoryRows(sinceIso) {
+  const { data, error } = await axonSupabase.from('factory_runs')
+    .select('model, tokens_input, tokens_output, tokens_cache_write, tokens_cache_read')
+    .gte('created_at', sinceIso).limit(500);
+  if (error) throw new Error(error.message);
+  return (data || []).map((r) => ({ model: r.model || 'claude-sonnet-5', calls: 1, tin: r.tokens_input || 0, tout: r.tokens_output || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
+}
+
+async function runIcmCostReport(correlationId) {
+  const now = new Date();
+  const since = new Date(now.getTime() - 7 * 864e5);
+  const prevSince = new Date(now.getTime() - 14 * 864e5);
+  const day = (d) => d.toISOString().slice(0, 10);
+  const lines = [`\`ICM COST REPORT\` — ${day(since)} → ${day(now)}`, ''];
+  const problems = [];
+  const fleet = { actual: 0, uncached: 0 };
+  const addFleet = (sum) => { fleet.actual += sum.actual; fleet.uncached += sum.uncached; };
+
+  try {
+    const rowsNow = await icmMaxAggregates(since.toISOString(), now.toISOString());
+    const maxNow = icmSummarize(rowsNow);
+    addFleet(maxNow);
+    lines.push('MAX');
+    lines.push(`• Spend: ${fmtUsd(maxNow.actual)} across ${maxNow.calls} calls · cache hit rate ${fmtPct(maxNow.hitRate)}`);
+    lines.push(`• Same traffic uncached: ${fmtUsd(maxNow.uncached)} → saved ${fmtUsd(maxNow.saved)} (${fmtPct(maxNow.uncached > 0 ? maxNow.saved / maxNow.uncached : 0)})`);
+    const rowsPrev = await icmMaxAggregates(prevSince.toISOString(), since.toISOString());
+    const maxPrev = icmSummarize(rowsPrev);
+    if (maxPrev.calls > 0) {
+      const avgNow = maxNow.calls ? maxNow.actual / maxNow.calls : 0;
+      const avgPrev = maxPrev.calls ? maxPrev.actual / maxPrev.calls : 0;
+      const delta = avgPrev > 0 ? (avgPrev - avgNow) / avgPrev : 0;
+      lines.push(`• Prior 7 days: ${fmtUsd(maxPrev.actual)} across ${maxPrev.calls} calls · avg cost/call ${fmtUsd(avgPrev)} → now ${fmtUsd(avgNow)} (${delta >= 0 ? '-' : '+'}${fmtPct(Math.abs(delta))})`);
+    }
+    const bySite = {};
+    for (const r of rowsNow) bySite[r.site] = (bySite[r.site] || 0) + icmCostUsd(r).actual;
+    const top = Object.entries(bySite).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (top.length) lines.push(`• Top call sites: ${top.map(([sName, v]) => `${sName} ${fmtUsd(v)}`).join(' · ')}`);
+  } catch (e) { problems.push(`Max (agent_activity): ${e.message}`); }
+
+  try {
+    const chat = icmSummarize(await icmLlmUsageRows(axonSupabase, since.toISOString()));
+    const factory = icmSummarize(await icmFactoryRows(since.toISOString()));
+    addFleet(chat); addFleet(factory);
+    lines.push('');
+    lines.push('AXON');
+    lines.push(`• Chat/crons: ${fmtUsd(chat.actual)} across ${chat.calls} calls · hit rate ${fmtPct(chat.hitRate)} · saved ${fmtUsd(chat.saved)}`);
+    lines.push(factory.calls > 0
+      ? `• Factory: ${fmtUsd(factory.actual)} across ${factory.calls} run(s) (avg ${fmtUsd(factory.actual / factory.calls)}/run) · uncached would be ${fmtUsd(factory.uncached)}`
+      : '• Factory: no runs this week');
+  } catch (e) { problems.push(`AXON (axon schema): ${e.message}`); }
+
+  try {
+    const revi = icmSummarize(await icmLlmUsageRows(reviSupabase, since.toISOString()));
+    addFleet(revi);
+    lines.push('');
+    lines.push('REVI');
+    lines.push(`• Spend: ${fmtUsd(revi.actual)} across ${revi.calls} calls · hit rate ${fmtPct(revi.hitRate)} · saved ${fmtUsd(revi.saved)}`);
+  } catch (e) { problems.push(`REVI (revi schema): ${e.message}`); }
+
+  lines.push('');
+  lines.push(`FLEET: ${fmtUsd(fleet.actual)} actual vs ${fmtUsd(fleet.uncached)} uncached → ICM saved ${fmtUsd(fleet.uncached - fleet.actual)} this week`);
+  lines.push('_Cache writes billed at the 1h rate everywhere, so savings are understated. Excludes this report (zero LLM calls) and any spend outside the usage tables._');
+  if (problems.length) {
+    lines.push('');
+    lines.push(`⚠️ Sources unreachable this run: ${problems.join(' | ')}`);
+  }
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
+  console.log(`ICM cost report posted (${correlationId})`);
+}
+// Wed 7:45 AM CR — first fire lands exactly 7 days after the 2026-09-03 rollout.
+cron.schedule('45 7 * * 3', wrapCronJob('runIcmCostReport', async (c) => { await runIcmCostReport(c); }), { timezone: 'America/Costa_Rica' });
+
 // Open-deal follow-up sweep — 10 AM CR every day (deals go stale on weekends
 // too — Ron, 2026-08-23), after the 9 AM standups. Cards
 // closers about deals sitting in Open Deal 3+ days, thread-bumps every 4 days,
@@ -17069,6 +17218,7 @@ const STATIC_CRON_SCHEDULES = {
   runWeeklyReflectionBrief:     '0 8 * * 1',
   runOpenDealFollowupSweep:     '0 10 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
+  runIcmCostReport:             '45 7 * * 3',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
