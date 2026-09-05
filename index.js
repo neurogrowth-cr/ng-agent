@@ -9836,9 +9836,16 @@ function computeOutcomeProposal(evidence = {}) {
 // exact copy a closer sees is asserted in tests. `pipelineId` decides the
 // vocabulary: the card must never name a stage this prospect's card does not
 // have (VSL has no separate Lost vs No Fit).
+// heldDays can be 0 for a call from earlier the same day (see the 1h cutoff
+// buffer in runUnloggedOutcomeReminders) — "held 0d ago" reads wrong, so 0 or
+// negative renders as "held today" instead.
+function formatHeldAgo(heldDays) {
+  return heldDays <= 0 ? 'held today' : `held ${heldDays}d ago`;
+}
+
 function buildOutcomeCardText({ prospectName, whenStr, heldDays, rec, proposal, funnel, pipelineId, nudgeCount }) {
   const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
-  const lines = [`📋 *${prospectName}* — ${whenStr} CR — held ${heldDays}d ago${nudgeCount > 1 ? ` · nudged ${nudgeCount}×` : ''}`];
+  const lines = [`📋 *${prospectName}* — ${whenStr} CR — ${formatHeldAgo(heldDays)}${nudgeCount > 1 ? ` · nudged ${nudgeCount}×` : ''}`];
 
   if (rec) {
     const dur = rec.durationMin ? `${rec.durationMin} min` : 'recorded';
@@ -11675,19 +11682,21 @@ function isAppointmentCancelled(appt) {
   return qs.cancelled === true || qs.iclosed?.cancelled === true || qs.ghl?.cancelled === true;
 }
 
-// Fires 4 PM CR every day. DMs the owning closer for any call >24h old that
-// still has no outcome logged in GHL. Re-nudges daily (de-duped via
-// agent_knowledge) and escalates to Ron once unlogged 3+ days despite reminders.
-// Every unlogged call now gets its OWN card carrying Max's read of the REVI
-// evidence, phrased in the GHL stage names the closer would set by hand: ✅
-// logs the proposal and moves the opportunity, a text reply corrects it.
-// Facts auto-surface; judgments always get a human ✅.
+// Fires 9 PM CR every day. DMs the owning closer for any call from earlier
+// the same day (1h buffer so an in-progress call isn't flagged) that still
+// has no outcome logged in GHL, so it can be logged same day or first thing
+// next morning. Re-nudges daily (de-duped via agent_knowledge) and escalates
+// to Ron once unlogged 3+ days despite reminders. Every unlogged call now
+// gets its OWN card carrying Max's read of the REVI evidence, phrased in the
+// GHL stage names the closer would set by hand: ✅ logs the proposal and
+// moves the opportunity, a text reply corrects it. Facts auto-surface;
+// judgments always get a human ✅.
 async function runUnloggedOutcomeReminders(_correlationId) {
   console.log('Running unlogged-outcome reminders...');
   try {
     const now    = Date.now();
     const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
-    const cutoff = new Date(now - 24 * 60 * 60 * 1000).toISOString();      // >24h old
+    const cutoff = new Date(now - 60 * 60 * 1000).toISOString();           // 1h buffer so an in-progress call isn't flagged
 
     const { dueCalls } = await fetchDueSalesCalls({
       cutoffIso: cutoff, sinceIso: since, label: 'Unlogged-outcome reminders',
@@ -11887,7 +11896,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
             const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
             const nudge = count > 1 ? ` · reminded ${count}×` : '';
             const pend  = proposalPending ? ' · ✅ the proposal above or reply to it' : '';
-            lines.push(`• ${pName} — ${dStr} CR — held ${heldDays}d ago${nudge}${pend}`);
+            lines.push(`• ${pName} — ${dStr} CR — ${formatHeldAgo(heldDays)}${nudge}${pend}`);
           });
           lines.push('');
           lines.push('Set the outcome on the opportunity card in GHL, or just reply here (e.g. `won 3500`, `lost`, `follow up`) and I\'ll log it for you.');
@@ -13103,15 +13112,18 @@ cron.schedule('0 9 * * 1-5', wrapCronJob('runSalesStandup', async (c) => { await
 // Sales call prep — every hour Mon–Fri (DMs closer 4h before any strategy call)
 cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { await runSalesCallPrep(c); }),       { timezone: 'America/Costa_Rica' });
 
-// Unlogged GHL outcome reminders — 4 PM CR every day (DMs closers, escalates to Ron after 3d).
+// Unlogged GHL outcome reminders — 9 PM CR every day (DMs closers, escalates to Ron after 3d).
 // "Logged?" is read directly from revops_sales_outcomes (by appointment_id) —
 // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19).
-cron.schedule('0 16 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 21 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
 
-// Appointment-status sweep (Paso 1) — 3 PM CR, one hour BEFORE the outcome
-// reminders so today's calls are already marked Showed by the time their
-// outcome card goes out. Ships in dry-run: set APPT_STATUS_SYNC_MODE=live to
-// let it write to GHL. Kill switch is that same env var.
+// Appointment-status sweep (Paso 1) — 3 PM CR, well ahead of the 9 PM outcome
+// reminders so any call it catches is already marked Showed by the time its
+// outcome card goes out. Its own cutoff only covers calls that ended 2h+
+// before this 3 PM run — later calls still surface on the outcome card via
+// REVI recording matching instead. Ships in dry-run: set
+// APPT_STATUS_SYNC_MODE=live to let it write to GHL. Kill switch is that same
+// env var.
 cron.schedule('0 15 * * *',   wrapCronJob('runAppointmentStatusSync', async (c) => { await runAppointmentStatusSync(c); }), { timezone: 'America/Costa_Rica' });
 
 // REVI prospect notes — 2 PM CR daily, before the status sweep and the cards,
@@ -13276,15 +13288,16 @@ async function runIcmCostReport(correlationId) {
 // Wed 7:45 AM CR — first fire lands exactly 7 days after the 2026-09-03 rollout.
 cron.schedule('45 7 * * 3', wrapCronJob('runIcmCostReport', async (c) => { await runIcmCostReport(c); }), { timezone: 'America/Costa_Rica' });
 
-// Open-deal follow-up sweep — 10 AM CR every day (deals go stale on weekends
-// too — Ron, 2026-08-23), after the 9 AM standups. Cards
+// Open-deal follow-up sweep — 9 PM CR every day (deals go stale on weekends
+// too — Ron, 2026-08-23; moved from 10am to the evening outcome-reminder slot
+// so closers get one evening touchpoint instead of a morning one). Cards
 // closers about deals sitting in Open Deal 3+ days, thread-bumps every 4 days,
 // a 💤 tap snoozes 7. Ships in dry-run: OPEN_DEAL_SWEEP_MODE=live arms the
 // closer DMs (also the kill switch). Generous timeout — it does per-candidate
 // GHL drift reads. The Monday 8:45 zombie digest to Ron runs regardless of
 // mode, landing right after the 8:30 provisioning-lag nag so Ron's Monday
 // admin DMs arrive together.
-cron.schedule('0 10 * * *', wrapCronJob('runOpenDealFollowupSweep', async (c) => { await runOpenDealFollowupSweep(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 21 * * *', wrapCronJob('runOpenDealFollowupSweep', async (c) => { await runOpenDealFollowupSweep(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 cron.schedule('45 8 * * 1', wrapCronJob('runOpenDealZombieDigest', async (c) => { await runOpenDealZombieDigest(c); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { await runWonHandoffNotes(c); }), { timezone: 'America/Costa_Rica' });
 
@@ -17229,7 +17242,7 @@ const STATIC_CRON_SCHEDULES = {
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
   runWeeklyReflectionBrief:     '0 8 * * 1',
-  runOpenDealFollowupSweep:     '0 10 * * *',
+  runOpenDealFollowupSweep:     '0 21 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runIcmCostReport:             '45 7 * * 3',
   runProvisioningLagCheck:      '30 8 * * 1',
@@ -17241,7 +17254,7 @@ const STATIC_CRON_SCHEDULES = {
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
-  runUnloggedOutcomeReminders:  '0 16 * * *',
+  runUnloggedOutcomeReminders:  '0 21 * * *',
   runWeeklyPortalTrends:        '30 22 * * 5',
   runWeeklySalesMarketingRecap: '0 17 * * 5',
   runWinningAdsSweep:           '0 20 * * 0',
