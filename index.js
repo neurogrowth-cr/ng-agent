@@ -13158,8 +13158,13 @@ function icmRates(model) {
 function icmCostUsd(row) {
   const r = icmRates(row.model);
   const M = 1e6;
-  const actual = (row.tin / M) * r.in + (row.tout / M) * r.out + (row.cw / M) * r.write + (row.cr / M) * r.read;
-  const uncached = ((row.tin + row.cw + row.cr) / M) * r.in + (row.tout / M) * r.out;
+  // Batch-tier requests bill every token class at 50% (AXON factory runs can
+  // use service_tier=batch since 2026-09-05). The counterfactual halves too:
+  // the honest "what if uncached" for a batch row is uncached AT batch rates,
+  // so the savings ratio stays truthful instead of flattering.
+  const tier = String(row.tier || '').toLowerCase() === 'batch' ? 0.5 : 1;
+  const actual = ((row.tin / M) * r.in + (row.tout / M) * r.out + (row.cw / M) * r.write + (row.cr / M) * r.read) * tier;
+  const uncached = (((row.tin + row.cw + row.cr) / M) * r.in + (row.tout / M) * r.out) * tier;
   return { actual, uncached };
 }
 function icmSummarize(rows) {
@@ -13201,10 +13206,10 @@ async function icmLlmUsageRows(client, sinceIso) {
 
 async function icmFactoryRows(sinceIso) {
   const { data, error } = await axonSupabase.from('factory_runs')
-    .select('model, tokens_input, tokens_output, tokens_cache_write, tokens_cache_read')
+    .select('model, service_tier, tokens_input, tokens_output, tokens_cache_write, tokens_cache_read')
     .gte('created_at', sinceIso).limit(500);
   if (error) throw new Error(error.message);
-  return (data || []).map((r) => ({ model: r.model || 'claude-sonnet-5', calls: 1, tin: r.tokens_input || 0, tout: r.tokens_output || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
+  return (data || []).map((r) => ({ model: r.model || 'claude-sonnet-5', tier: r.service_tier || 'realtime', calls: 1, tin: r.tokens_input || 0, tout: r.tokens_output || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
 
 async function runIcmCostReport(correlationId) {
