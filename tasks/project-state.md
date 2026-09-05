@@ -410,3 +410,18 @@ These were called out in the spec but explicitly de-scoped or never targeted for
 - Ron reacting 📄 (page_facing_up) to a Monthly VoC Digest post (marker: contains MUESTRA DEL MES, authored by Max) dispatches the `VoC PDF` GitHub Actions workflow in neurogrowth-cr/roi-rm-okr-reporting (`voc-pdf.yml`, inputs month/channel_id/thread_ts) via `GITHUB_TOKEN` env (fine-grained PAT, Actions:write on the strategy repo, resource owner = the org). The workflow renders the branded PDF with the canonical brand kit mirror (`brand/system/` + `brand/generators/voc_pdf_generator.py`, strategy repo PR #3) from `marketing_voc` data and uploads it to the same Slack thread (~3 min). Month resolves from a YYYY-MM in the digest text, else last closed CR month — so reacting to an old digest regenerates that month.
 - Gates: Ron-only trigger, 10-min dedup per message ts, every failure posts to the thread (missing token → setup instructions; non-204 → status code). Digest posts get a closing hint line inviting the 📄 reaction. Scheduled dynamic-task reports post DIRECTLY to their channel (no Ron-approval DM) — corrected assumption; the approval flow only serves ad-hoc drafts.
 - Runner placement decision (Ron 2026-09-04): strategy repo, colocated with the brand mirror it consumes — no third brand copy, nothing brand-related in the public ng-agent repo. Workflow secrets (SUPABASE_URL, SUPABASE_ANON_KEY, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY) are repo secrets on the strategy repo, values mirrored from ng-pm-MAX Railway vars.
+
+---
+
+## 2026-09-05 — ICM cost report: batch-tier pricing (PR #184)
+
+AXON's Document Factory can run on the Batch API (axon.factory_runs.service_tier,
+ng-axon migration 005) at 50% on every token class. icmCostUsd now applies a
+0.5 multiplier for tier=batch to BOTH actual and the uncached counterfactual —
+the honest counterfactual for a batch row is uncached AT batch rates, so the
+savings ratio stays truthful. Pre-migration rows default to realtime and price
+unchanged. Landed before the report's first fire (Sep 10), so no report ever
+overstated batch runs.
+
+Factory cost trajectory for context: $131 uncached → $19.36 post-ICM →
+projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
