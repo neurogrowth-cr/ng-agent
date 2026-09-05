@@ -425,3 +425,9 @@ overstated batch runs.
 
 Factory cost trajectory for context: $131 uncached → $19.36 post-ICM →
 projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
+
+## 2026-09-05 — VoC PDF pipeline verified end-to-end; marketing_voc grants fixed
+
+- Ron completed both manual steps: `GITHUB_TOKEN` PAT on ng-pm-MAX (fine-grained, Actions:write on roi-rm-okr-reporting, org resource owner) and the 4 workflow secrets on the strategy repo (SUPABASE_URL, SUPABASE_ANON_KEY, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY).
+- E2E test of the `VoC PDF` workflow (manual dispatch, month 2026-08 → #ng-pm-agent): PASSED — Supabase read, no-data decision path, Slack notice posted. Real-PDF render + Max's PAT dispatch path remain to be exercised with live data (first extraction Mon 2 AM CR; first digest Oct 1).
+- **Bug caught by the test**: `marketing_voc` was created without API-role grants — anon/authenticated got `permission denied` (42501), which would have silently broken Monday's first extraction too. Fixed with migration `grant_marketing_voc_to_api_roles` (`GRANT SELECT, INSERT, UPDATE … TO anon, authenticated, service_role`). **Lesson for future sessions: a new table in the ng-agent Supabase public schema needs explicit GRANTs for the API roles — Max runs on the anon key (there is no service-role key on ng-pm-MAX), so missing grants fail at runtime, not at migration time.**
