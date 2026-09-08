@@ -6692,6 +6692,38 @@ async function runReviCrossChecks(_correlationId, { dryRun = false } = {}) {
     );
   }
 
+  // Check 2b — LLM usage telemetry dark while scoring is active.
+  //
+  // revi.llm_usage (ICM, ng-revi #90) is written by a logger that swallows its
+  // own insert errors BY DESIGN — cost logging must never break scoring. The
+  // price: the table went dark for its first three days (2026-09-03→06, RLS
+  // allowed reads but not anon inserts, plus an ungranted id sequence) and
+  // nothing noticed until someone went looking for cache hits. Scoring one
+  // call writes at least two usage rows, so "scores written, zero usage rows,
+  // same window" is a contradiction — and this check is its only watcher.
+  try {
+    const { data: scored24, error: s24Err } = await reviSupabase
+      .from('closer_call_scores').select('id').gte('created_at', dayAgoISO).limit(1);
+    if (s24Err) throw s24Err;
+    if (scored24 && scored24.length) {
+      const { data: usage24, error: u24Err } = await reviSupabase
+        .from('llm_usage').select('id').gte('created_at', dayAgoISO).limit(1);
+      if (u24Err) throw u24Err;
+      if (!usage24 || !usage24.length) {
+        alertKinds.push('usage-dark');
+        alerts.push(
+          `📊 *REVI scored calls in the last 24h but logged ZERO rows to \`revi.llm_usage\`.* ` +
+          `Cost/cache telemetry is failing silently — the logger swallows insert errors by design, so this alert is its only watcher. ` +
+          `Last time (2026-09-03→06) the cause was RLS + sequence grants on the table; check those first, then the ng-sales-REVI Railway logs.`
+        );
+      }
+    }
+  } catch (ue) {
+    // A failed READ here is telemetry about telemetry — warn, never block the
+    // health check's real alerts.
+    console.warn('REVI usage-telemetry check failed (skipping):', ue.message);
+  }
+
   if (!alerts.length) { console.log('REVI cross-checks: healthy, staying silent.'); return { alerts: [] }; }
   if (dryRun) { console.log('REVI cross-checks dry-run alerts:\n' + alerts.join('\n\n')); return { alerts }; }
 
