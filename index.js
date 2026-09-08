@@ -16339,6 +16339,66 @@ async function postMakeHealthAlert(text) {
   }
 }
 
+// ─── AXON HEALTH WATCH ───────────────────────────────────────────────────────
+// AXON crash-looped overnight on 2026-09-08 (socket-mode bug → Railway retry
+// budget exhausted → CRASHED) and nobody was told for hours. AXON now upserts
+// axon.engine_heartbeat (id='service') every 5 minutes; this poll alerts when
+// the beat goes stale. Same contract as REVI's engine_heartbeat.
+// Criteria (kind B): beat_at within 20 min = green. 3 consecutive failing
+// polls (10-min cadence, so ~30 min) before alarming — a single blip or a
+// deploy restart never pages. Read failures count as failing polls (fail
+// closed), with the reason surfaced. Kill switch: AXON_HEALTH_WATCH=off.
+const AXON_OPS_CHANNEL = process.env.AXON_OPS_CHANNEL || 'C0BS73DSHP1'; // #ng-fulfillment-axon (private — AXON's home)
+const AXON_HEARTBEAT_STALE_MS = 20 * 60 * 1000;
+const AXON_WATCH_REALERT_MS = 6 * 60 * 60 * 1000;
+let axonDownStreak = 0;
+let axonWatchAlerted = false;
+let axonWatchLastAlertAt = 0;
+
+async function checkAxonHealth() {
+  if (String(process.env.AXON_HEALTH_WATCH || '') === 'off') return;
+
+  let failing = null; // null = healthy; otherwise the human-readable reason
+  try {
+    const { data, error } = await axonSupabase
+      .from('engine_heartbeat').select('beat_at, socket_connected').eq('id', 'service').limit(1);
+    if (error) failing = `heartbeat read failed: ${error.message}`;
+    else if (!data || !data.length) failing = 'no heartbeat row exists — AXON has never beaten (pre-heartbeat deploy, or the migration is missing)';
+    else {
+      const age = Date.now() - new Date(data[0].beat_at).getTime();
+      if (!(age < AXON_HEARTBEAT_STALE_MS)) failing = `last beat ${Math.round(age / 60000)} min ago (cadence is 5 min)`;
+    }
+  } catch (err) {
+    failing = `heartbeat check threw: ${err.message}`;
+  }
+
+  if (!failing) {
+    axonDownStreak = 0;
+    if (axonWatchAlerted) {
+      axonWatchAlerted = false;
+      const text = '✅ *AXON is beating again* — heartbeat fresh, service recovered.';
+      await slack.client.chat.postMessage({ channel: AXON_OPS_CHANNEL, text }).catch(() => {});
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text }).catch(() => {});
+    }
+    return;
+  }
+
+  axonDownStreak += 1;
+  console.warn(`[axon-health] failing poll ${axonDownStreak}/3: ${failing}`);
+  if (axonDownStreak < 3) return;
+  const now = Date.now();
+  if (axonWatchAlerted && now - axonWatchLastAlertAt < AXON_WATCH_REALERT_MS) return;
+  axonWatchAlerted = true;
+  axonWatchLastAlertAt = now;
+  const text =
+    `🔴 *AXON looks DOWN* — ${failing}.\n` +
+    `Nothing AXON does (campaign monitoring, digests, Document Factory, approvals) is running. ` +
+    `Check the ng-fulfillment-AXON Railway service for a crash loop (deployment logs); if the latest deployment says CRASHED, redeploy it. ` +
+    `This alert repeats every 6h until the heartbeat returns.`;
+  await slack.client.chat.postMessage({ channel: AXON_OPS_CHANNEL, text }).catch((e) => console.error('[axon-health] channel alert failed:', e.message));
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text }).catch((e) => console.error('[axon-health] Ron DM failed:', e.message));
+}
+
 async function checkMakeScenarioHealth(correlationId) {
   if (!MAKE_API_TOKEN) return;
 
@@ -16514,6 +16574,7 @@ if (MAKE_API_TOKEN) {
   // and an hourly poll would have seen isActive:true on both sides of it. One API
   // call per tick.
   cron.schedule('*/10 * * * *', wrapCronJob('checkMakeScenarioHealth', async (c) => { await checkMakeScenarioHealth(c); }), { timezone: 'America/Costa_Rica' });
+  cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => { await checkAxonHealth(); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Make [PROD] scenario watchdog (*/10 * * * *)');
 } else {
   console.warn('Make scenario watchdog NOT registered — MAKE_API_TOKEN is not set.');
