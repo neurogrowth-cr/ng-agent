@@ -17348,6 +17348,8 @@ const STATIC_CRON_SCHEDULES = {
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
   runUnloggedOutcomeReminders:  '0 21 * * *',
+  runVocExtraction:             '0 2 * * 1',
+  runVocExtractionMonthly:      '0 6 1 * *',
   runWeeklyPortalTrends:        '30 22 * * 5',
   runWeeklySalesMarketingRecap: '0 17 * * 5',
   runWinningAdsSweep:           '0 20 * * 0',
