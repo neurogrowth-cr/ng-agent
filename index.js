@@ -3918,6 +3918,26 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
 // (src/app/api/revops/reports/closer-scorecard): same prospect email +
 // call_date within 36h of scheduled_start; recordings only UPGRADE
 // pending -> "verifiably happened", absence of a recording proves nothing.
+// public.revops_closer_aliases (dash migration 20260916120000) maps a closer's
+// alternate closer_id to the canonical email closer_month_scorecard groups by. Jose's
+// GHL email change in late Aug 2026 split him into two scorecard rows; the view now
+// merges them, and this map applies the same one-hop resolution wherever Max compares
+// raw closer ids itself (the REVI overlay). Rows with blanks or self-aliases are
+// dropped, matching the table's CHECK constraints.
+function buildCloserAliasMap(rows) {
+  const map = {};
+  for (const r of rows || []) {
+    const alias = String(r.alias_email || '').trim().toLowerCase();
+    const canonical = String(r.canonical_email || '').trim().toLowerCase();
+    if (alias && canonical && alias !== canonical) map[alias] = canonical;
+  }
+  return map;
+}
+function canonicalCloserId(map, id) {
+  const key = String(id || '').trim().toLowerCase();
+  return map[key] || key;
+}
+
 async function getCloserMonthlyScorecard(month, closerQuery) {
   const err = ensurePortalPg(); if (err) return err;
   if (!/^\d{4}-\d{2}$/.test(month || '')) return 'ERROR: month must be YYYY-MM, e.g. 2026-07.';
@@ -3936,6 +3956,16 @@ async function getCloserMonthlyScorecard(month, closerQuery) {
   const { rows: unRows } = await portalPg.query(
     'SELECT outcomes, won, revenue FROM closer_month_unattributed WHERE month = $1', [month]
   );
+
+  // Fails open: before the migration is applied (or if the read fails) nothing is
+  // merged, which is exactly the old behavior.
+  let closerAliases = {};
+  try {
+    const { rows: aliasRows } = await portalPg.query('SELECT alias_email, canonical_email FROM revops_closer_aliases');
+    closerAliases = buildCloserAliasMap(aliasRows);
+  } catch (e) {
+    console.warn('getCloserMonthlyScorecard: revops_closer_aliases unavailable, aliases not merged:', e.message);
+  }
 
   // REVI overlay. CR is UTC-6 with no DST, so the CR month is a fixed UTC interval.
   const [y, mo] = month.split('-').map(Number);
@@ -3962,7 +3992,7 @@ async function getCloserMonthlyScorecard(month, closerQuery) {
     ]);
     const closerByReviId = {};
     for (const rc of (reviClosers || [])) {
-      if (rc.fathom_host_email) closerByReviId[rc.id] = rc.fathom_host_email.toLowerCase();
+      if (rc.fathom_host_email) closerByReviId[rc.id] = canonicalCloserId(closerAliases, rc.fathom_host_email);
     }
     const recsByCloser = {};
     for (const s of (scores || [])) {
@@ -3982,7 +4012,7 @@ async function getCloserMonthlyScorecard(month, closerQuery) {
       let verified = 0;
       const discrepancies = [];
       for (const a of apptQ.rows) {
-        if ((a.closer_id || '').toLowerCase() !== closer || !a.email || !a.scheduled_start) continue;
+        if (canonicalCloserId(closerAliases, a.closer_id) !== closer || !a.email || !a.scheduled_start) continue;
         const apptAt = new Date(a.scheduled_start).getTime();
         const rec = recs.find(x => !x.matched && x.email === a.email && Math.abs(x.at - apptAt) <= PAD);
         if (!rec) continue;
