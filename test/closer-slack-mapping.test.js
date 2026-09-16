@@ -91,6 +91,23 @@ check('5c a bare token is skipped',               Boolean(resolve(junk.CLOSER_SL
 check('5d empty env leaves the map untouched',
   Object.keys(build('').CLOSER_SLACK).length, Object.keys(base.CLOSER_SLACK).length);
 
+// --- 5b. Anyone Max DMs as a closer must also have a report name ---
+// CLOSER_SLACK and SALES_TEAM_MAP are separate maps. On 2026-09-16 the
+// company-domain address was added to the first but not the second, so Jose's
+// cards were delivered while every leaderboard split him into "Jose Carranza"
+// and a raw email row.
+{
+  const tStart = SRC.indexOf('const SALES_TEAM_MAP');
+  const tEnd = SRC.indexOf('};', tStart);
+  const SALES_TEAM_MAP = new Function(`${SRC.slice(tStart, tEnd + 2)}; return SALES_TEAM_MAP;`)();
+  const nameless = Object.keys(base.CLOSER_SLACK)
+    .filter(k => k.includes('@'))
+    .filter(k => !(SALES_TEAM_MAP[k] || SALES_TEAM_MAP[k.toLowerCase()]));
+  check('5e every closer email Max DMs resolves to a report name', nameless, []);
+  check('5f both of Jose\'s identities report as one person',
+    SALES_TEAM_MAP['jose.carranza@neurogrowth.io'], SALES_TEAM_MAP['jose.neurogrowth@gmail.com']);
+}
+
 // --- 6. The unmapped-closer alert only fires on real misses ---
 // A departed member is an EXPECTED miss. Reporting it would train Ron to
 // ignore the alert, which is how the gap stayed invisible in the first place.
