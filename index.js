@@ -11771,8 +11771,17 @@ function isAppointmentCancelled(appt) {
 // GHL stage names the closer would set by hand: ✅ logs the proposal and
 // moves the opportunity, a text reply corrects it. Facts auto-surface;
 // judgments always get a human ✅.
-async function runUnloggedOutcomeReminders(_correlationId) {
-  console.log('Running unlogged-outcome reminders...');
+// opts exist for the one-shot drain below (runOutcomeCardsOnceIfRequested) and
+// default to exactly the nightly cron's behavior:
+//   onlyClosers     lowercased closer ids to include (null = everyone)
+//   perCloserCap    new cards per closer this run (nightly burst guard = 5)
+//   skipEscalation  leave Ron's 3-day escalation to the nightly run, so a manual
+//                   drain on the same day does not escalate the same calls twice
+async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
+  const onlyClosers = Array.isArray(opts.onlyClosers) && opts.onlyClosers.length
+    ? new Set(opts.onlyClosers.map(s => String(s).toLowerCase()))
+    : null;
+  console.log(`Running unlogged-outcome reminders...${onlyClosers ? ` (only: ${[...onlyClosers].join(', ')})` : ''}`);
   try {
     const now    = Date.now();
     const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
@@ -11798,7 +11807,9 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       .select('appointment_id')
       .in('appointment_id', dueIds);
     const loggedApptIds = new Set((outcomeRows || []).map(o => o.appointment_id));
-    const unlogged = dueCalls.filter(a => !loggedApptIds.has(a.id));
+    const unlogged = dueCalls
+      .filter(a => !loggedApptIds.has(a.id))
+      .filter(a => !onlyClosers || onlyClosers.has(String(a.closer_id || '').toLowerCase()));
 
     if (!unlogged.length) {
       console.log('Unlogged-outcome reminders: all attended calls logged.');
@@ -11850,7 +11861,8 @@ async function runUnloggedOutcomeReminders(_correlationId) {
 
     // DM each closer: pre-filled proposal per recording-verified call (capped),
     // then the classic aggregate list for the rest ────────────────────────────
-    const PROPOSALS_PER_CLOSER_PER_RUN = 5;
+    const PROPOSALS_PER_CLOSER_PER_RUN = typeof opts.perCloserCap === 'number' && opts.perCloserCap > 0
+      ? opts.perCloserCap : 5;
     // After this many days a card stops being bumped in-thread; Ron's 3-day
     // escalation has already fired by then, so continuing to poke the closer
     // adds noise without adding pressure.
@@ -11994,7 +12006,7 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     }
 
     // Escalate 3+ day stragglers to Ron ───────────────────────────────────────
-    if (escalations.length) {
+    if (escalations.length && !opts.skipEscalation) {
       const eLines = ['🚨 Outcome-logging escalation — 3+ days unlogged despite reminders:\n'];
       escalations.forEach(({ appt, closerName, count }) => {
         const pName = appt.prospect?.full_name || 'Unknown';
@@ -13200,6 +13212,39 @@ cron.schedule('0 * * * 1-5',  wrapCronJob('runSalesCallPrep', async (c) => { awa
 // "Logged?" is read directly from revops_sales_outcomes (by appointment_id) —
 // reliable since the dash.neurogrowth.io ingestion fix (PR #3, 2026-05-19).
 cron.schedule('0 21 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (c) => { await runUnloggedOutcomeReminders(c); }), { timezone: 'America/Costa_Rica' });
+
+// One-shot outcome-card drain, for when waiting for 9 PM and the 5-per-closer
+// burst guard is the wrong call (2026-09-16: Jose's 11 never-sent cards after
+// the closer-identity fix, #195). Set on Railway:
+//   OUTCOME_CARDS_RUN_ONCE="<any new token>"         arms it
+//   OUTCOME_CARDS_RUN_ONCE_CLOSERS="a@x.io,b@y.com"   optional, scope to closers
+// On boot it sends every due card uncapped, skips Ron's escalation (the nightly
+// run owns that), and records `outcome-cards-run-once:<token>` BEFORE sending,
+// so a restart or crash loop can never deliver the same batch twice. Reusing a
+// token is a no-op; pick a new one to drain again. Deliberately not wrapped in
+// wrapCronJob: it is not a cron, and a cron_run row would read as an undeclared
+// job to runCronLivenessAudit.
+async function runOutcomeCardsOnceIfRequested() {
+  const token = String(process.env.OUTCOME_CARDS_RUN_ONCE || '').trim();
+  if (!token) return;
+  const key = `outcome-cards-run-once:${token}`;
+  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
+  if (prior && prior.length) {
+    console.log(`Outcome cards run-once: token "${token}" already used (${prior[0].value}), skipping.`);
+    return;
+  }
+  await upsertKnowledge('process', key, `claimed|${new Date().toISOString()}`, 'outcome-run-once');
+  const onlyClosers = String(process.env.OUTCOME_CARDS_RUN_ONCE_CLOSERS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  console.log(`Outcome cards run-once: draining now (token "${token}", closers: ${onlyClosers.join(', ') || 'all'}).`);
+  await runUnloggedOutcomeReminders(newCorrelationId(), {
+    onlyClosers: onlyClosers.length ? onlyClosers : null,
+    perCloserCap: Infinity,
+    skipEscalation: true,
+  });
+  await upsertKnowledge('process', key, `done|${new Date().toISOString()}`, 'outcome-run-once');
+  console.log('Outcome cards run-once: done.');
+}
 
 // Appointment-status sweep (Paso 1) — 3 PM CR, well ahead of the 9 PM outcome
 // reminders so any call it catches is already marked Showed by the time its
@@ -17802,6 +17847,7 @@ async function resolveBotIdentity() {
   console.log('NeuroGrowth PM Agent is running.');
   attachSocketWatchdog();
   await loadAndRegisterDynamicCrons();
+  runOutcomeCardsOnceIfRequested().catch(err => console.error('Outcome cards run-once failed:', err.message));
   // Static infrastructure crons (not stored in DB)
   cron.schedule('0 7 15 * *', wrapCronJob('runPhase3Reconciliation', async (c) => { await runPhase3Reconciliation(c); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Phase 3 reconciliation (0 7 15 * *)');
