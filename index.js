@@ -8725,14 +8725,58 @@ const DEPARTED_BY_ID = (() => {
 })();
 function departedMember(id) { return DEPARTED_BY_ID[String(id || '').toLowerCase()] || null; }
 
+// Jose's GHL identity moved from a personal gmail to the company domain in late
+// August 2026 and nothing failed loudly. Every DM path below resolves a Slack id
+// or quietly `continue`s, so from the week of 2026-08-31, when
+// jose.carranza@neurogrowth.io became the majority closer_id, his calls were
+// counted every night and nudged to nobody. Appointments aa350776 and 55cd1223
+// reached an `outcome-reminder` count of 10 with no card ever sent. Same class
+// of bug as the ONLY RON calendar gap: a new identifier appears, a surface goes
+// dark, nothing errors. Three mitigations: both addresses map here,
+// CLOSER_SLACK_EXTRA fixes the next rename without a deploy, and
+// reportUnmappedClosers() below makes the miss itself audible.
 const CLOSER_SLACK = {
   // Jonathan Madriz departed 2026-07-19 — intentionally absent; see DEPARTED_MEMBERS.
-  'jose.neurogrowth@gmail.com':            'U0AMTEKDCPN', // Jose
+  'jose.neurogrowth@gmail.com':            'U0AMTEKDCPN', // Jose (personal, pre-2026-08 rows)
+  'jose.carranza@neurogrowth.io':          'U0AMTEKDCPN', // Jose (company domain, dominant since 2026-08-31)
   'ronny.duarte@neurogrowth.io':           'U05HXGX18H3', // Ron (when he's the closer)
   // Raw GHL user ID fallbacks (unmapped rows)
   'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN', 'izLTA0jy5OrKyMvyItjV': 'U0AMTEKDCPN',
   'zogw530idnpofqqnfssc': 'U05HXGX18H3', 'zoGW530iDnPOFqQNfssc': 'U05HXGX18H3', // Ron
 };
+
+// CLOSER_SLACK_EXTRA="email:U123,ghlUserId:U456" makes a roster rename a config
+// change, not a code change. Departed members are refused: rule 2 above says Max
+// never messages them again, and an env var must not be able to undo that.
+for (const pair of String(process.env.CLOSER_SLACK_EXTRA || '').split(',')) {
+  const [rawId, slackId] = pair.split(':').map(s => (s || '').trim());
+  if (!rawId || !slackId) continue;
+  if (departedMember(rawId)) {
+    console.warn(`CLOSER_SLACK_EXTRA: refusing ${rawId}, departed member (see DEPARTED_MEMBERS).`);
+    continue;
+  }
+  CLOSER_SLACK[rawId] = slackId;
+  CLOSER_SLACK[rawId.toLowerCase()] = slackId;
+}
+
+// A closer_id that resolves to no Slack id is not a no-op. It is a closer who
+// stops being asked for outcomes while the dedupe counter keeps climbing. That
+// was invisible for two weeks as a console.warn nobody reads, so every DM loop
+// that skips an unmapped closer reports the skip to Ron once per run. A
+// departed member is an expected miss and is never reported.
+async function reportUnmappedClosers(jobLabel, misses) {
+  const real = Object.entries(misses || {}).filter(([id]) => !departedMember(id));
+  if (!real.length) return;
+  const lines = [`⚠️ ${jobLabel}: no Slack mapping for ${real.length} closer id(s). These people were skipped, not nudged:\n`];
+  for (const [id, count] of real) lines.push(`• \`${id}\`, ${count} item(s) went unnudged`);
+  lines.push('');
+  lines.push('Fix: add the id to CLOSER_SLACK, or set `CLOSER_SLACK_EXTRA="<id>:<slackId>"` on Railway (no deploy needed).');
+  try {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
+  } catch (err) {
+    console.error(`${jobLabel}: unmapped-closer alert failed:`, err.message);
+  }
+}
 
 // (fetchIClosedIntakeForProspect deleted 2026-08-03 — orphaned once call prep
 // went GHL-native; iclosed_webhook_deliveries is frozen history.)
@@ -11366,12 +11410,14 @@ async function runOpenDealFollowupSweep(correlationId) {
   const skipCounts = {};
   const bumpSkip = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
   const dryLines = [];
+  const unmappedClosers = {};
   let cardsSent = 0, bumpsSent = 0, driftFound = 0;
 
   for (const [closerEmail, closerDeals] of Object.entries(byCloser)) {
     const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
     if (!slackId) {
       console.warn(`Open-deal sweep: no Slack ID for closer ${closerEmail} (${closerDeals.length} deal(s)) — digest still sees them`);
+      unmappedClosers[closerEmail] = (unmappedClosers[closerEmail] || 0) + closerDeals.length;
       bumpSkip('no_slack_id');
       continue;
     }
@@ -11483,6 +11529,8 @@ async function runOpenDealFollowupSweep(correlationId) {
       }
     }
   }
+
+  await reportUnmappedClosers('Open-deal follow-up sweep', unmappedClosers);
 
   logActivity({
     event_type: 'open_deal_sweep', event_source: 'cron', action: 'runOpenDealFollowupSweep',
@@ -11807,10 +11855,12 @@ async function runUnloggedOutcomeReminders(_correlationId) {
     // escalation has already fired by then, so continuing to poke the closer
     // adds noise without adding pressure.
     const OUTCOME_CARD_MAX_BUMPS = 4;
+    const unmappedClosers = {};
     for (const [closerEmail, entries] of Object.entries(unloggedByCloser)) {
       const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
       if (!slackId) {
-        console.warn(`Unlogged-outcome reminders: no Slack ID for closer ${closerEmail}`);
+        console.warn(`Unlogged-outcome reminders: no Slack ID for closer ${closerEmail} (${entries.length} unlogged call(s))`);
+        unmappedClosers[closerEmail] = (unmappedClosers[closerEmail] || 0) + entries.length;
         continue;
       }
       const closerName = resolveSalesMember(closerEmail);
@@ -11954,6 +12004,8 @@ async function runUnloggedOutcomeReminders(_correlationId) {
       await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: eLines.join('\n') });
       console.log(`Unlogged-outcome escalation sent to Ron (${escalations.length} calls)`);
     }
+
+    await reportUnmappedClosers('Unlogged-outcome reminders', unmappedClosers);
 
     console.log('Unlogged-outcome reminders complete.');
   } catch (err) {
