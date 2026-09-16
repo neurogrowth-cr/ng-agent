@@ -3419,6 +3419,7 @@ const SALES_TEAM_MAP = {
   // ── CLOSERS — roster emails (GHL rows carry these in closer_id) ─────────
   'ronny.duarte@neurogrowth.io':  'Ron Duarte',
   'jose.neurogrowth@gmail.com':   'Jose Carranza',
+  'jose.carranza@neurogrowth.io': 'Jose Carranza', // company domain, dominant since 2026-08-31 (see CLOSER_SLACK)
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz', // departed 2026-07-19 — see DEPARTED_MEMBERS; kept so past reports still name him
 
   // ── SETTERS — roster emails (GHL rows carry these in setter_id) ─────────
