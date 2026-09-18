@@ -3527,6 +3527,101 @@ function filterFlywheelAppts(rows, excludeIds) {
   });
 }
 
+// ─── LEAD CLAIM SPEED ────────────────────────────────────────────────────────
+// Speed-to-lead for the Sales EOD Report. The May to Sep 2026 sales diagnostic
+// found the share of leads claimed within 15 minutes fell from 32% to 9% while
+// lead-to-booking fell from 27% to 10%, and nothing reported it day to day.
+// Time is counted in BUSINESS minutes only (7 AM to 9 PM CR, the same window
+// the stale-lead nag uses, every day of the week), so a lead that arrives at
+// 11 PM and is claimed at 7:05 AM reads as 5 minutes, not 8 hours. CR is UTC-6
+// with no DST. Pure functions, no I/O, so the test can extract and eval them.
+const CLAIM_SPEED_TARGET_MIN = 15;
+const CLAIM_SPEED_SLOW_MIN = 240;
+const CLAIM_SPEED_OPEN_HOUR = 7;
+const CLAIM_SPEED_CLOSE_HOUR = 21;
+
+function businessMinutesBetween(startMs, endMs) {
+  if (!(endMs > startMs)) return 0;
+  const CR_OFFSET_MS = 6 * 60 * 60 * 1000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const crStart = new Date(startMs - CR_OFFSET_MS); // CR wall clock, read as UTC
+  let dayMs = Date.UTC(crStart.getUTCFullYear(), crStart.getUTCMonth(), crStart.getUTCDate()) + CR_OFFSET_MS;
+  let total = 0;
+  for (; dayMs < endMs; dayMs += DAY_MS) {
+    const from = Math.max(startMs, dayMs + CLAIM_SPEED_OPEN_HOUR * 3600000);
+    const to = Math.min(endMs, dayMs + CLAIM_SPEED_CLOSE_HOUR * 3600000);
+    if (to > from) total += to - from;
+  }
+  return total / 60000;
+}
+
+// leads: [{ postedAtMs, claimedAtMs|null, setter|null }]
+function computeClaimSpeed(leads, nowMs) {
+  const median = (arr) => {
+    if (!arr.length) return null;
+    const a = [...arr].sort((x, y) => x - y);
+    const mid = Math.floor(a.length / 2);
+    return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+  };
+  const claimedMins = [];
+  const bySetter = {};
+  let longestWaitMin = 0;
+  let unclaimed = 0;
+  for (const l of (leads || [])) {
+    if (!l || !l.postedAtMs) continue;
+    if (l.claimedAtMs) {
+      const m = businessMinutesBetween(l.postedAtMs, l.claimedAtMs);
+      claimedMins.push(m);
+      const key = l.setter || 'Unknown setter';
+      (bySetter[key] = bySetter[key] || []).push(m);
+    } else {
+      unclaimed++;
+      longestWaitMin = Math.max(longestWaitMin, businessMinutesBetween(l.postedAtMs, nowMs));
+    }
+  }
+  const within = (arr) => arr.filter(m => m <= CLAIM_SPEED_TARGET_MIN).length;
+  return {
+    total: claimedMins.length + unclaimed,
+    claimed: claimedMins.length,
+    unclaimed,
+    withinTarget: within(claimedMins),
+    slow: claimedMins.filter(m => m > CLAIM_SPEED_SLOW_MIN).length,
+    medianMin: median(claimedMins),
+    longestWaitMin,
+    bySetter: Object.entries(bySetter)
+      .map(([setter, mins]) => ({ setter, claims: mins.length, medianMin: median(mins), withinTarget: within(mins) }))
+      .sort((a, b) => b.claims - a.claims),
+  };
+}
+
+function formatClaimMinutes(min) {
+  if (min == null) return 'n/a';
+  const m = Math.round(min);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// today / baseline are computeClaimSpeed() results; baseline may be null.
+function formatClaimSpeedLines(today, baseline) {
+  if (!today || !today.total) return [];
+  const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+  const lines = ['CLAIM_SPEED (business minutes, 7AM-9PM CR; a lead that arrives overnight starts its clock at 7AM; render verbatim):'];
+  // Denominator is every lead, not only claimed ones, so an unclaimed lead can never flatter the rate.
+  lines.push(`Claimed within ${CLAIM_SPEED_TARGET_MIN} min: ${today.withinTarget} of ${today.total} (${pct(today.withinTarget, today.total)}%). Target 80%.`);
+  if (today.claimed) {
+    const base = baseline && baseline.claimed >= 5
+      ? ` Prior 7 days: ${formatClaimMinutes(baseline.medianMin)}, ${pct(baseline.withinTarget, baseline.total)}% within ${CLAIM_SPEED_TARGET_MIN} min.`
+      : '';
+    lines.push(`Median time to claim: ${formatClaimMinutes(today.medianMin)}.${base}`);
+  }
+  if (today.slow) lines.push(`Claimed after more than 4 business hours: ${today.slow}`);
+  if (today.unclaimed) lines.push(`Still unclaimed: ${today.unclaimed} (longest waiting ${formatClaimMinutes(today.longestWaitMin)})`);
+  for (const s of today.bySetter) {
+    lines.push(`  ${s.setter}: ${s.claims} claimed, median ${formatClaimMinutes(s.medianMin)}, ${s.withinTarget} within ${CLAIM_SPEED_TARGET_MIN} min`);
+  }
+  return lines;
+}
+// ─── END LEAD CLAIM SPEED ────────────────────────────────────────────────────
+
 // ─── SALES EOD BOOKED-CALLS WINDOW ───────────────────────────────────────────
 // The Sales EOD Report fires 21:00 CR daily but used to count "booked today" on
 // the CR calendar day — so a call booked between 21:00 and midnight fell into a
@@ -3545,6 +3640,46 @@ function computeEodBookedWindow(nowMs) {
   return { startMs: today21CrMs - 24 * 60 * 60 * 1000, endMs: nowMs };
 }
 // ─── END SALES EOD BOOKED-CALLS WINDOW ───────────────────────────────────────
+
+// Lead → first-claim pairs for a posted_at range, one per Slack lead post (the
+// FB→WA dup path shares a slack_message_ts, same dedupe as LEADS TODAY).
+async function getLeadClaimPairs(startDate, endDate) {
+  const { data: leadRows, error: leadErr } = await supabase
+    .from('lead_posts')
+    .select('slack_message_ts, contact_id, posted_at')
+    .gte('posted_at', startDate.toISOString())
+    .lt('posted_at', endDate.toISOString())
+    .order('posted_at', { ascending: true });
+  if (leadErr) throw new Error(`lead_posts read failed: ${leadErr.message}`);
+  const byTs = new Map();
+  for (const r of (leadRows || [])) {
+    if (!r.slack_message_ts) continue;
+    let g = byTs.get(r.slack_message_ts);
+    if (!g) { g = { postedAtMs: Date.parse(r.posted_at), contactIds: new Set() }; byTs.set(r.slack_message_ts, g); }
+    if (r.contact_id) g.contactIds.add(r.contact_id);
+  }
+  const ids = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
+  const firstClaim = new Map(); // contact_id → { atMs, setter }
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data: claimRows, error: claimErr } = await supabase
+      .from('setter_claims')
+      .select('ghl_contact_id, claimed_by_setter_name, claimed_at')
+      .in('ghl_contact_id', ids.slice(i, i + 100))
+      .order('claimed_at', { ascending: true });
+    if (claimErr) throw new Error(`setter_claims read failed: ${claimErr.message}`);
+    for (const c of (claimRows || [])) {
+      if (!firstClaim.has(c.ghl_contact_id)) firstClaim.set(c.ghl_contact_id, { atMs: Date.parse(c.claimed_at), setter: c.claimed_by_setter_name || null });
+    }
+  }
+  return [...byTs.values()].map(g => {
+    let best = null;
+    for (const cid of g.contactIds) {
+      const cl = firstClaim.get(cid);
+      if (cl && (!best || cl.atMs < best.atMs)) best = cl;
+    }
+    return { postedAtMs: g.postedAtMs, claimedAtMs: best ? best.atMs : null, setter: best ? best.setter : null };
+  });
+}
 
 async function getSalesIntelligence(query) {
   try {
@@ -3596,7 +3731,7 @@ async function getSalesIntelligence(query) {
       for (const r of (leadRows || [])) {
         if (!r.slack_message_ts) continue;
         let g = byTs.get(r.slack_message_ts);
-        if (!g) { g = { source: r.source || null, contactIds: new Set() }; byTs.set(r.slack_message_ts, g); }
+        if (!g) { g = { source: r.source || null, contactIds: new Set(), postedAtMs: Date.parse(r.posted_at) }; byTs.set(r.slack_message_ts, g); }
         if (r.contact_id) g.contactIds.add(r.contact_id);
       }
       const totalLeads = byTs.size;
@@ -3628,6 +3763,7 @@ async function getSalesIntelligence(query) {
       const bySetter = {};
       const bySource = {};
       let unclaimed = 0;
+      const speedLeads = []; // feeds CLAIM_SPEED below
       for (const g of byTs.values()) {
         const srcKey = g.source || 'Unknown';
         bySource[srcKey] = (bySource[srcKey] || 0) + 1;
@@ -3639,6 +3775,7 @@ async function getSalesIntelligence(query) {
         }
         if (owner) bySetter[owner] = (bySetter[owner] || 0) + 1;
         else unclaimed++;
+        speedLeads.push({ postedAtMs: g.postedAtMs, claimedAtMs: ownerAt ? Date.parse(ownerAt) : null, setter: owner });
       }
 
       const lines = ['LEADS_TODAY_DATA (authoritative — render verbatim, do NOT recount from Slack):'];
@@ -3650,6 +3787,18 @@ async function getSalesIntelligence(query) {
       lines.push(`Unclaimed (no setter claimed yet): ${unclaimed}`);
       lines.push('Sources:');
       Object.entries(bySource).sort((a, b) => b[1] - a[1]).forEach(([s, c]) => lines.push(`  ${s}: ${c}`));
+
+      // ── CLAIM SPEED (today vs the prior 7 days) ──────────────────────────
+      // Non-fatal: the lead counts above are the contract; a baseline read
+      // error only drops the comparison, never the section or the report.
+      let speedBaseline = null;
+      try {
+        speedBaseline = computeClaimSpeed(await getLeadClaimPairs(
+          new Date(dayStartUtc.getTime() - 7 * 24 * 60 * 60 * 1000), dayStartUtc), Date.now());
+      } catch (speedErr) {
+        console.error('claim-speed baseline failed:', speedErr.message);
+      }
+      lines.push(...formatClaimSpeedLines(computeClaimSpeed(speedLeads, Date.now()), speedBaseline));
       return lines.join('\n');
     }
 
