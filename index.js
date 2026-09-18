@@ -13316,7 +13316,8 @@ cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => 
 const ICM_MODEL_RATES = [
   // USD per 1M tokens; prefix-matched so dated ids resolve (longest prefix wins)
   { prefix: 'claude-sonnet-4-6', in: 3, out: 15, write: 6, read: 0.3 },
-  { prefix: 'claude-sonnet-5',   in: 3, out: 15, write: 6, read: 0.3 },
+  // Sonnet 5 is cheaper than 4.6: $2/$10, 1h cache write 2x, read 0.1x (verified 2026-09-16)
+  { prefix: 'claude-sonnet-5',   in: 2, out: 10, write: 4, read: 0.2 },
   { prefix: 'claude-haiku-4-5',  in: 1, out: 5,  write: 2, read: 0.1 },
 ];
 function icmRates(model) {
@@ -13352,6 +13353,20 @@ function icmSummarize(rows) {
   t.saved = t.uncached - t.actual;
   return t;
 }
+// Per-call-site split for the llm_usage agents. Without it a manual laptop run
+// (AXON copy_lab) reads as scheduled cron spend: on 2026-09-16 "Chat/crons
+// $14.05" was really $11.61 of copy lab and $2.45 of digests.
+const ICM_SITE_LABELS = { chat_loop: 'Chat/crons', copy_lab: 'Copy lab (manual)' };
+function icmBySite(rows) {
+  const groups = {};
+  for (const row of rows) {
+    const site = row.site || 'untagged';
+    (groups[site] = groups[site] || []).push(row);
+  }
+  return Object.entries(groups)
+    .map(([site, siteRows]) => ({ site, label: ICM_SITE_LABELS[site] || site, ...icmSummarize(siteRows) }))
+    .sort((a, b) => b.actual - a.actual);
+}
 function fmtUsd(n) { return `$${n.toFixed(2)}`; }
 function fmtPct(n) { return `${Math.round(n * 100)}%`; }
 // ── end ICM pure block ──────────────────────────────────────────────────────
@@ -13370,10 +13385,10 @@ async function icmMaxAggregates(sinceIso, untilIso) {
 
 async function icmLlmUsageRows(client, sinceIso) {
   const { data, error } = await client.from('llm_usage')
-    .select('model, tokens_in, tokens_out, tokens_cache_write, tokens_cache_read')
+    .select('model, call_site, tokens_in, tokens_out, tokens_cache_write, tokens_cache_read')
     .gte('created_at', sinceIso).limit(10000);
   if (error) throw new Error(error.message);
-  return (data || []).map((r) => ({ model: r.model, calls: 1, tin: r.tokens_in || 0, tout: r.tokens_out || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
+  return (data || []).map((r) => ({ model: r.model, site: r.call_site || 'untagged', calls: 1, tin: r.tokens_in || 0, tout: r.tokens_out || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
 
 async function icmFactoryRows(sinceIso) {
@@ -13416,23 +13431,29 @@ async function runIcmCostReport(correlationId) {
   } catch (e) { problems.push(`Max (agent_activity): ${e.message}`); }
 
   try {
-    const chat = icmSummarize(await icmLlmUsageRows(axonSupabase, since.toISOString()));
+    const chatRows = await icmLlmUsageRows(axonSupabase, since.toISOString());
+    const chat = icmSummarize(chatRows);
     const factory = icmSummarize(await icmFactoryRows(since.toISOString()));
     addFleet(chat); addFleet(factory);
     lines.push('');
     lines.push('AXON');
-    lines.push(`• Chat/crons: ${fmtUsd(chat.actual)} across ${chat.calls} calls · hit rate ${fmtPct(chat.hitRate)} · saved ${fmtUsd(chat.saved)}`);
+    const axonSites = icmBySite(chatRows);
+    if (!axonSites.length) lines.push('• Chat/crons: no calls this week');
+    for (const s of axonSites) lines.push(`• ${s.label}: ${fmtUsd(s.actual)} across ${s.calls} calls · hit rate ${fmtPct(s.hitRate)} · saved ${fmtUsd(s.saved)}`);
     lines.push(factory.calls > 0
       ? `• Factory: ${fmtUsd(factory.actual)} across ${factory.calls} run(s) (avg ${fmtUsd(factory.actual / factory.calls)}/run) · uncached would be ${fmtUsd(factory.uncached)}`
       : '• Factory: no runs this week');
   } catch (e) { problems.push(`AXON (axon schema): ${e.message}`); }
 
   try {
-    const revi = icmSummarize(await icmLlmUsageRows(reviSupabase, since.toISOString()));
+    const reviRows = await icmLlmUsageRows(reviSupabase, since.toISOString());
+    const revi = icmSummarize(reviRows);
     addFleet(revi);
     lines.push('');
     lines.push('REVI');
     lines.push(`• Spend: ${fmtUsd(revi.actual)} across ${revi.calls} calls · hit rate ${fmtPct(revi.hitRate)} · saved ${fmtUsd(revi.saved)}`);
+    const reviTop = icmBySite(reviRows).slice(0, 5);
+    if (reviTop.length) lines.push(`• Top call sites: ${reviTop.map((s) => `${s.label} ${fmtUsd(s.actual)}`).join(' · ')}`);
   } catch (e) { problems.push(`REVI (revi schema): ${e.message}`); }
 
   lines.push('');
