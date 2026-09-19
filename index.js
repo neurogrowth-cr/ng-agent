@@ -10099,9 +10099,13 @@ function formatHeldAgo(heldDays) {
   return heldDays <= 0 ? 'held today' : `held ${heldDays}d ago`;
 }
 
-function buildOutcomeCardText({ prospectName, whenStr, heldDays, rec, proposal, funnel, pipelineId, nudgeCount }) {
+function buildOutcomeCardText({ prospectName, whenStr, heldDays, rec, proposal, funnel, pipelineId, nudgeCount, reopened }) {
   const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
   const lines = [`📋 *${prospectName}* — ${whenStr} CR — ${formatHeldAgo(heldDays)}${nudgeCount > 1 ? ` · nudged ${nudgeCount}×` : ''}`];
+  // A reopened card must say why it is back, or it reads as Max losing the answer.
+  if (reopened) {
+    lines.push(`♻️ You already logged this one${reopened.date ? ` on ${reopened.date}` : ''}, but the portal cleared it when the appointment moved to a new time in GHL. Please log what happened on the date above.`);
+  }
 
   if (rec) {
     const dur = rec.durationMin ? `${rec.durationMin} min` : 'recorded';
@@ -11942,6 +11946,30 @@ function isAppointmentCancelled(appt) {
   return qs.cancelled === true || qs.iclosed?.cancelled === true || qs.ghl?.cancelled === true;
 }
 
+// A card marked `confirmed` means an outcome row WAS written. If that call is
+// back on the unlogged list, the portal cleared the row afterwards: dash deletes
+// a no_show when GHL moves the appointment to a new time (Danny Gomez,
+// 2026-08-29, moved in Google Calendar the day after Jose confirmed). The old
+// card carries Max's own check mark, so every tap on it is ignored, and the
+// cron used to `continue` past it, dropping the call from the closer's list
+// too. Nobody could answer it while Ron's escalation kept counting (14 nudges).
+// Re-read the portal right before reopening: the unlogged list is built earlier
+// in the run, and a tap landing in between must not earn a second card. Fails
+// closed: any read error means "do not reopen".
+async function shouldReopenConfirmedCard(appointmentId) {
+  try {
+    const { data, error } = await portalSupabase
+      .from('revops_sales_outcomes')
+      .select('appointment_id')
+      .eq('appointment_id', appointmentId)
+      .limit(1);
+    if (error) return false;
+    return !(data && data.length);
+  } catch (_) {
+    return false;
+  }
+}
+
 // Fires 9 PM CR every day. DMs the owning closer for any call from earlier
 // the same day (1h buffer so an in-progress call isn't flagged) that still
 // has no outcome logged in GHL, so it can be logged same day or first thing
@@ -12000,6 +12028,7 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
     const todayISO = new Date().toISOString().slice(0, 10);
     const unloggedByCloser = {};
     const escalations = []; // { appt, closerName, count } where 3+ days unlogged
+    const reopenedIds = new Set(); // confirmed cards reopened this run, never escalated the same night
 
     for (const a of unlogged) {
       const dedupKey = `outcome-reminder:${a.id}`;
@@ -12072,8 +12101,20 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
         // reminder reaches "nudged 14×" and stops being read.
         const { data: sentBefore } = await supabase
           .from('agent_knowledge').select('value').eq('key', proposalKey).limit(1);
-        if (sentBefore && sentBefore.length) {
-          const [state, , cardChannel, cardTs] = String(sentBefore[0].value || '').split('|');
+        const prior = sentBefore && sentBefore.length ? String(sentBefore[0].value || '').split('|') : null;
+        let reopened = null; // { date } when a confirmed card lost its outcome row
+        if (prior && prior[0] === 'confirmed' && await shouldReopenConfirmedCard(appt.id)) {
+          // Fresh card, fresh clock: this is a first ask about the moved call,
+          // so "nudged 14x" would be a false claim and an escalation to Ron
+          // tonight would blame the closer for something dash cleared.
+          reopened = { date: prior[1] || null };
+          entry.count = 1;
+          reopenedIds.add(appt.id);
+          await upsertKnowledge('process', `outcome-reminder:${appt.id}`, `${todayISO}|1`, 'outcome-reminder');
+          console.log(`Outcome card for ${pName} (${appt.id}) was confirmed ${prior[1] || '?'} but its outcome row is gone, reopening.`);
+        }
+        if (prior && !reopened) {
+          const [state, , cardChannel, cardTs] = prior;
           const stillOpen = state === 'proposed';
           if (stillOpen && cardChannel && cardTs && entry.count <= OUTCOME_CARD_MAX_BUMPS) {
             try {
@@ -12115,7 +12156,7 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
         const heldDays = Math.floor((now - new Date(appt.scheduled_start).getTime()) / 86400000);
         const cardText = buildOutcomeCardText({
           prospectName: pName, whenStr: dStr, heldDays, rec, proposal, funnel, pipelineId,
-          nudgeCount: entry.count,
+          nudgeCount: entry.count, reopened,
         });
 
         try {
@@ -12186,15 +12227,16 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
     }
 
     // Escalate 3+ day stragglers to Ron ───────────────────────────────────────
-    if (escalations.length && !opts.skipEscalation) {
+    const dueEscalations = escalations.filter(e => !reopenedIds.has(e.appt.id));
+    if (dueEscalations.length && !opts.skipEscalation) {
       const eLines = ['🚨 Outcome-logging escalation — 3+ days unlogged despite reminders:\n'];
-      escalations.forEach(({ appt, closerName, count }) => {
+      dueEscalations.forEach(({ appt, closerName, count }) => {
         const pName = appt.prospect?.full_name || 'Unknown';
         const dStr  = formatICTime(appt.scheduled_start, { month: 'short', day: 'numeric' });
         eLines.push(`• ${pName} — ${dStr} — closer: ${closerName} — reminded ${count}×`);
       });
       await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: eLines.join('\n') });
-      console.log(`Unlogged-outcome escalation sent to Ron (${escalations.length} calls)`);
+      console.log(`Unlogged-outcome escalation sent to Ron (${dueEscalations.length} calls)`);
     }
 
     await reportUnmappedClosers('Unlogged-outcome reminders', unmappedClosers);
