@@ -1624,9 +1624,9 @@ function registerDynamicCron(task) {
       // resets on the 1st of each month (Ron 2026-08-04 — this is the monthly
       // top-performer board, not a rolling week).
       // Meshed intel: GHL bookings/outcomes (truth) + setter_claims (#ng-sales-goats
-      // ✋ flow) + REVI call scores (lead quality of what each setter feeds closers)
-      // + GHL conversation hygiene. Each enrichment is non-fatal — the leaderboard
-      // must still post if REVI or the GHL API is unreachable.
+      // ✋ flow) + REVI call scores (lead quality of what each setter feeds closers).
+      // The REVI enrichment is non-fatal: the leaderboard must still post if REVI
+      // is unreachable.
       if (task.name === 'Setter Leaderboard') {
         try {
           const now = new Date();
@@ -1669,22 +1669,11 @@ function registerDynamicCron(task) {
             console.warn('Setter leaderboard REVI enrichment failed:', reviErr.message);
           }
 
-          // GHL reply hygiene, per setter, asked of GHL directly. The old block
-          // read the location's latest 100 conversations and called the result a
-          // per-setter total: it reported "67 unread" for a setter GHL shows at 600+.
-          let hygieneBlock = '';
-          try {
-            const hygLines = [];
-            for (const name of Object.keys(weeklySetterStats)) {
-              const h = await getSetterInboxHygiene(name, weekStart.getTime());
-              if (h) hygLines.push(`  ${name}: ${h.waiting}${h.capped ? '+' : ''} prospect(s) waiting on a reply (unread, last message inbound, this month), ${h.stale}${h.capped ? '+' : ''} of them waiting 3d+`);
-            }
-            if (hygLines.length) hygieneBlock = `\n\nGHL REPLY HYGIENE (conversations assigned to each setter where the prospect wrote last this month and it is still unread in GHL):\n${hygLines.join('\n')}`;
-          } catch (hygErr) {
-            console.warn('Setter leaderboard hygiene enrichment failed:', hygErr.message);
-          }
-
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls; leads claimed + claimed→booked cross-check come from setter_claims, the ✋ flow in #ng-sales-goats; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}${reviBlock}${hygieneBlock}`;
+          // No GHL conversation-hygiene block (removed 2026-09-21). Setters reply and
+          // call from the WhatsApp phone app, which never marks a GHL conversation
+          // read, so "unread in GHL" flagged people for leads they had already
+          // answered. Do not bring it back without a signal that sees WhatsApp.
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls; leads claimed + claimed→booked cross-check come from setter_claims, the ✋ flow in #ng-sales-goats; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}${reviBlock}`;
         } catch (statsErr) {
           console.error('Setter leaderboard stats failed:', statsErr.message);
           // A public ranking must never be rebuilt from ad-hoc tool calls: the
@@ -4004,6 +3993,51 @@ function classifyOutcome(outcomeRow) {
   return { showed: false, noShow: false, qualifiedAttended: false, pending: true, rescheduled: false };
 }
 
+// How a booked call with NO usable outcome counts on the sales boards (Ron,
+// 2026-09-21). Pure. `outcomeRow` is the revops_sales_outcomes row or undefined;
+// `latestStartByProspect` maps prospect_id to that prospect's latest
+// scheduled_start across ALL their appointments.
+//   'skip'             deleted in GHL (QA bookings, duplicates): never a call.
+//   'skip'             superseded: the prospect has a later appointment, so this
+//                      row is a reschedule and the NEW appointment is the booked
+//                      call. Covers cancel-then-rebook, an orphan nobody can log
+//                      (outcomes attach to the latest appointment), and a row
+//                      whose outcome is literally `rescheduled`.
+//   'cancelled_noshow' cancelled (by the team or the prospect) and never
+//                      rebooked: a booked call that did not happen is a no-show.
+//   null               none of the above: classifyOutcome decides.
+// A real logged outcome always wins: the closer saying what happened outranks
+// every flag, so this only looks at rows with no outcome (or `rescheduled`).
+function classifyUnheldAppt(appt, outcomeRow, latestStartByProspect) {
+  const o = (outcomeRow?.outcome || '').toLowerCase().trim();
+  if (o && o !== 'rescheduled') return null;
+  if (!o && isAppointmentDeleted(appt)) return 'skip';
+  const latest = appt?.prospect_id ? (latestStartByProspect || {})[appt.prospect_id] : null;
+  if (latest && new Date(latest).getTime() > new Date(appt.scheduled_start).getTime()) return 'skip';
+  if (!o && isAppointmentCancelled(appt)) return 'cancelled_noshow';
+  return null;
+}
+
+// prospect_id -> latest scheduled_start over every appointment that prospect
+// has, in or out of any report window. Chunked so a 90-day id list never
+// outgrows the request URL.
+async function fetchLatestStartByProspect(prospectIds) {
+  const ids = [...new Set((prospectIds || []).filter(Boolean))];
+  const latest = {};
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await portalSupabase
+      .from('revops_appointments')
+      .select('prospect_id, scheduled_start')
+      .in('prospect_id', ids.slice(i, i + 100));
+    if (error) throw error;
+    for (const r of (data || [])) {
+      const cur = latest[r.prospect_id];
+      if (!cur || String(r.scheduled_start) > cur) latest[r.prospect_id] = String(r.scheduled_start);
+    }
+  }
+  return latest;
+}
+
 // ─── CLOSER WEEKLY STATS (GHL-native) ────────────────────────────────────────
 // Used by the "Weekly Closer Comparison" scheduled task. GHL appointment +
 // outcome rows in revops_* are the truth source (closer_id = roster email).
@@ -4013,7 +4047,7 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
 
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id, ghl_appointment_id, qualification_snapshot')
+    .select('id, prospect_id, closer_id, scheduled_start, attended, no_show_reason, meeting_type, iclosed_call_id, ghl_appointment_id, qualification_snapshot')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -4030,14 +4064,15 @@ async function getCloserWeeklyStats(weekStartIso, weekEndIso) {
     outcomesById = Object.fromEntries((outcomes || []).map(o => [o.appointment_id, o]));
   }
 
+  const latestStartByProspect = await fetchLatestStartByProspect((appts || []).map(a => a.prospect_id));
   for (const a of (appts || [])) {
+    // Same unheld-call rule as tallySetterStats so the two boards never diverge.
+    const unheld = classifyUnheldAppt(a, outcomesById[a.id], latestStartByProspect);
+    if (unheld === 'skip') continue;
     const name = resolveSalesMember(a.closer_id);
     if (!result[name]) result[name] = { source: 'ghl', calls_booked: 0, attended: 0, no_shows: 0, pending: 0, cancelled: 0, sold: 0, revenue: 0 };
     result[name].calls_booked += 1;
-    // Cancelled in GHL with nothing logged: the call is off and no outcome is
-    // owed. Own bucket, same rule as tallySetterStats, so it can never sit in
-    // "Pending" forever. A logged outcome outranks the cancel flag.
-    if (isAppointmentCancelled(a) && !outcomesById[a.id]) { result[name].cancelled += 1; continue; }
+    if (unheld === 'cancelled_noshow') { result[name].no_shows += 1; result[name].cancelled += 1; continue; }
     // An outcome row on a call that hasn't happened yet is a reschedule leftover
     // (GHL reuses the appointment row) — treat the call as pending, not decided.
     const o = new Date(a.scheduled_start) > new Date() ? null : outcomesById[a.id];
@@ -4228,7 +4263,7 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   ranked.forEach(({ name, s, showRate, closeRate }, idx) => {
     const showRateStr = showRate === null ? '— (no outcomes logged yet)' : `${showRate}%`;
     const pendingStr = s.pending ? ` | Pending: ${s.pending}` : '';
-    const cancelledStr = s.cancelled ? ` | Cancelled before the call: ${s.cancelled}` : '';
+    const cancelledStr = s.cancelled ? ` (${s.cancelled} of them cancelled and never rebooked)` : '';
     lines.push(``);
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
     lines.push(`  Calls booked: ${s.calls_booked} | Attended: ${s.attended} | No-shows: ${s.no_shows}${cancelledStr}${pendingStr} (show rate: ${showRateStr})`);
@@ -4248,7 +4283,8 @@ function formatCloserWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
 function _newSetterSlot() {
   return {
     source: 'ghl', leads_claimed: 0,
-    calls_booked: 0, attended: 0, no_shows: 0, pending: 0, cancelled: 0, aqc: 0,
+    calls_booked: 0, attended: 0, no_shows: 0, pending: 0, aqc: 0,
+    cancelled: 0, // sub-count of no_shows: cancelled and never rebooked
     distinct_leads: 0, // distinct prospects behind those calls (rebookings collapse)
   };
 }
@@ -4281,9 +4317,10 @@ async function fetchSetterClaimsSince(sinceIso) {
 //   appts        flywheel revops_appointments rows in the window
 //   outcomesById appointment_id -> revops_sales_outcomes row
 //   claims       setter_claims rows since (window start - 45d), oldest first
+//   latestStartByProspect  see classifyUnheldAppt (reschedules and deletions)
 // Returns { stats, ownedCalls }. ownedCalls is one entry per attributed call so
 // every enrichment (REVI lead quality) credits the SAME owner as the stats do.
-function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, nowMs) {
+function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, nowMs, latestStartByProspect = {}) {
   const result = {};
 
   // OWNERSHIP MAP: who CLAIMED each prospect in #ng-sales-goats (✋ flow →
@@ -4306,6 +4343,10 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
   const leadsByOwner = {}; // owner → Set(prospect key), for distinct-lead counts
   const ownedCalls = [];
   for (const a of (appts || [])) {
+    // Deleted rows and superseded (rescheduled) rows are not calls: the NEW
+    // appointment is the booked call.
+    const unheld = classifyUnheldAppt(a, outcomesById[a.id], latestStartByProspect);
+    if (unheld === 'skip') continue;
     const prospectEmail = (a.prospect?.email || '').toLowerCase().trim();
     const claimOwner = prospectEmail ? claimOwnerByEmail[prospectEmail] : null;
     const owner = claimOwner || (a.setter_id ? resolveSalesMember(a.setter_id) : null);
@@ -4322,14 +4363,14 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
       if (!leadsByOwner[owner]) leadsByOwner[owner] = new Set();
       leadsByOwner[owner].add(leadKey);
     }
-    // A call cancelled in GHL never took place and no closer will ever log an
-    // outcome for it. It used to fall through to "pending" and sit there
-    // forever, blaming closers for a logging gap that did not exist (3 of 9
-    // "pending" calls on the 2026-09-19 board were cancellations). A logged
-    // outcome outranks the cancel flag: the closer saying what happened wins.
-    const cancelled = isAppointmentCancelled(a) && !outcomesById[a.id];
+    // Cancelled and never rebooked is a NO-SHOW (Ron, 2026-09-21): the call was
+    // booked and did not happen, whoever cancelled it. It used to fall into
+    // "pending" and blame closers for an outcome nobody could log (3 of 9
+    // "pending" calls on the 2026-09-19 board). `cancelled` is kept as a
+    // sub-count of no_shows so the board can say how many were cancellations.
+    const cancelled = unheld === 'cancelled_noshow';
     ownedCalls.push({ owner, email: prospectEmail || null, cancelled });
-    if (cancelled) { slot.cancelled += 1; continue; }
+    if (cancelled) { slot.no_shows += 1; slot.cancelled += 1; continue; }
     // Same reschedule-leftover guard as getCloserWeeklyStats: no outcome can
     // describe a call that hasn't happened yet.
     const c = classifyOutcome(new Date(a.scheduled_start).getTime() > nowMs ? null : outcomesById[a.id]);
@@ -4365,6 +4406,7 @@ async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
   if (apptErr) throw apptErr;
   const excludeIdsSet = await getNonFlywheelCallIds();
   const appts = filterFlywheelAppts(apptsRaw, excludeIdsSet);
+  const latestStartByProspect = await fetchLatestStartByProspect((appts || []).map(a => a.prospect_id));
 
   const apptIds = (appts || []).map(a => a.id);
   let outcomesById = {};
@@ -4378,7 +4420,7 @@ async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
 
   const lookbackIso = new Date(new Date(weekStartIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString();
   const claims = await fetchSetterClaimsSince(lookbackIso);
-  return tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now());
+  return tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now(), latestStartByProspect);
 }
 
 async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
@@ -4420,20 +4462,19 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
     const distinctStr = (dl && dl !== s.calls_booked) ? ` (from ${dl} distinct lead${dl === 1 ? '' : 's'})` : '';
     lines.push(`  OWNED: Leads claimed: ${s.leads_claimed} | Calls from their leads: ${s.calls_booked}${distinctStr}`);
     // 2. SHARED — setter influences via lead quality + confirmation work.
-    // Cancelled calls are stated on their own: they are decided (the call is
-    // off), so they are neither a no-show nor an outcome anyone still owes.
-    const cancelledStr = s.cancelled ? ` | Cancelled before the call: ${s.cancelled}` : '';
+    // A cancelled, never-rebooked call is already INSIDE no_shows; the
+    // parenthesis only says how many of the no-shows were cancellations.
+    const cancelledStr = s.cancelled ? ` (${s.cancelled} of them cancelled and never rebooked)` : '';
     if (decided === 0) {
-      lines.push(`  SHARED: Show rate: not yet known (${s.pending || 0} past call(s) awaiting a closer-logged outcome)${cancelledStr}`);
+      lines.push(`  SHARED: Show rate: not yet known (${s.pending || 0} past call(s) awaiting a closer-logged outcome)`);
     } else {
       lines.push(`  SHARED: Show rate: ${showRateStr} (${s.attended} attended of ${decided} decided) | No-shows: ${s.no_shows}${cancelledStr}${s.pending ? ` | Awaiting closer outcome: ${s.pending}` : ''}`);
       lines.push(`  DOWNSTREAM: Converted calls (AQC, closer-logged): ${s.aqc}`);
     }
   });
   const totalPending = ranked.reduce((n, r) => n + (r.s.pending || 0), 0);
-  const totalCancelled = ranked.reduce((n, r) => n + (r.s.cancelled || 0), 0);
   lines.push(``);
-  lines.push(`POD TOTALS: past calls awaiting a closer-logged outcome: ${totalPending} | cancelled before the call: ${totalCancelled}. "Awaiting closer outcome" counts ONLY past, non-cancelled calls with no outcome row; a cancelled call is never awaiting anything.`);
+  lines.push(`POD TOTALS: past calls awaiting a closer-logged outcome: ${totalPending}. That counts ONLY past calls that were not cancelled and have no outcome row. A cancelled call that was never rebooked is a no-show, a rescheduled call is counted once at its new time, and neither is ever awaiting anything.`);
   return lines.join('\n');
 }
 
@@ -4441,43 +4482,6 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
 // GHL records the booker natively (createdBy.userId → revops_appointments.setter_id,
 // mapped upstream in dash), so the email-match reconciler and its 2h cron are gone.
 // The setter_attributions table (migration 011) remains as frozen iClosed-era history.
-
-// ─── SETTER INBOX HYGIENE ────────────────────────────────────────────────────
-// Pure: counts conversations whose last (inbound) message landed in the window,
-// and how many of those have waited 3+ days. Extracted by the leaderboard test.
-function summarizeSetterInbox(conversations, windowStartMs, nowMs) {
-  const dayMs = 24 * 60 * 60 * 1000;
-  let waiting = 0, stale = 0;
-  for (const c of (conversations || [])) {
-    if (!(c.lastMessageDate >= windowStartMs)) continue;
-    waiting += 1;
-    if ((nowMs - c.lastMessageDate) / dayMs >= 3) stale += 1;
-  }
-  return { waiting, stale };
-}
-
-// Conversations ASSIGNED to one setter that are unread with the prospect's
-// message last, newest first, paged until the window start. Returns null when
-// the setter has no GHL user id on file (nothing to ask GHL about).
-async function getSetterInboxHygiene(setterName, windowStartMs, { maxPages = 5 } = {}) {
-  const ghlUserId = Object.keys(SALES_TEAM_MAP).find(k =>
-    SALES_TEAM_MAP[k] === setterName && !k.includes('@') && k !== k.toLowerCase());
-  if (!ghlUserId) return null;
-  const base = `https://services.leadconnectorhq.com/conversations/search?locationId=${process.env.GHL_LOCATION_ID}`
-    + `&assignedTo=${ghlUserId}&status=unread&lastMessageDirection=inbound&sortBy=last_message_date&sort=desc&limit=100`;
-  const convos = [];
-  let cursor = null, capped = false;
-  for (let page = 0; page < maxPages; page++) {
-    const data = await ghlFetchJson(cursor ? `${base}&startAfterDate=${cursor}` : base);
-    const batch = data.conversations || [];
-    convos.push(...batch);
-    const last = batch[batch.length - 1];
-    if (batch.length < 100 || !last || last.lastMessageDate < windowStartMs) break;
-    cursor = Array.isArray(last.sort) ? last.sort[0] : last.lastMessageDate;
-    if (page === maxPages - 1) capped = true; // more in-window pages exist than we read
-  }
-  return { ...summarizeSetterInbox(convos, windowStartMs, Date.now()), capped };
-}
 
 // ─── GHL CONVERSATIONS ────────────────────────────────────────────────────────
 async function getGHLConversations(limit = 20, unreadOnly = false) {
@@ -12005,18 +12009,7 @@ async function fetchDueSalesCalls({ cutoffIso, sinceIso, label }) {
 
   // Orphan detection: any later appointment for the same prospect means an
   // outcome logged now attaches there, not here.
-  const prospectIds = [...new Set((pastCalls || []).map(a => a.prospect_id).filter(Boolean))];
-  const latestStartByProspect = {};
-  if (prospectIds.length) {
-    const { data: allAppts } = await portalSupabase
-      .from('revops_appointments')
-      .select('prospect_id, scheduled_start')
-      .in('prospect_id', prospectIds);
-    for (const r of (allAppts || [])) {
-      const cur = latestStartByProspect[r.prospect_id];
-      if (!cur || String(r.scheduled_start) > cur) latestStartByProspect[r.prospect_id] = String(r.scheduled_start);
-    }
-  }
+  const latestStartByProspect = await fetchLatestStartByProspect((pastCalls || []).map(a => a.prospect_id));
 
   // Flywheel-only: exclude partner-consulting 1:1s before any state tracking.
   const excludeIds = await getNonFlywheelCallIds();
@@ -12049,6 +12042,17 @@ async function fetchDueSalesCalls({ cutoffIso, sinceIso, label }) {
 function isAppointmentCancelled(appt) {
   const qs = appt?.qualification_snapshot || {};
   return qs.cancelled === true || qs.iclosed?.cancelled === true || qs.ghl?.cancelled === true;
+}
+
+// DELETED is not CANCELLED. The deletion sweep stamps the top level with
+// reason `deleted_in_ghl`; a real cancellation arrives by webhook under
+// `.ghl.cancelled`. Verified 2026-09-21 over every post-cutover row: the 6
+// deleted rows are QA bookings, duplicates, or carry a real outcome; the 9
+// `.ghl.cancelled` rows are genuine cancellations. Reminders skip both, but
+// only a cancellation is a no-show on the boards.
+function isAppointmentDeleted(appt) {
+  const qs = appt?.qualification_snapshot || {};
+  return qs.cancelled === true && qs.reason === 'deleted_in_ghl';
 }
 
 // A card marked `confirmed` means an outcome row WAS written. If that call is
@@ -12090,6 +12094,20 @@ async function shouldReopenConfirmedCard(appointmentId) {
 //   perCloserCap    new cards per closer this run (nightly burst guard = 5)
 //   skipEscalation  leave Ron's 3-day escalation to the nightly run, so a manual
 //                   drain on the same day does not escalate the same calls twice
+// Reminder cadence. Pure, extracted by test/outcome-reminder-window.test.js.
+// Fresh calls (up to 14 days old) are asked about every night, as before.
+// Older ones never stop, but drop to once a week (Monday night CR): the same
+// stale list every night is how a reminder stops being read, and Ron's
+// escalation would repeat it nightly too.
+const OUTCOME_REMINDER_WINDOW_DAYS = 90;
+const OUTCOME_REMINDER_NIGHTLY_DAYS = 14;
+function isOutcomeReminderDueTonight(scheduledStartMs, nowMs, crWeekday, includeAll = false) {
+  const ageDays = (nowMs - scheduledStartMs) / 86400000;
+  if (ageDays > OUTCOME_REMINDER_WINDOW_DAYS) return false;
+  if (includeAll || ageDays <= OUTCOME_REMINDER_NIGHTLY_DAYS) return true;
+  return crWeekday === 'Monday';
+}
+
 async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
   const onlyClosers = Array.isArray(opts.onlyClosers) && opts.onlyClosers.length
     ? new Set(opts.onlyClosers.map(s => String(s).toLowerCase()))
@@ -12097,12 +12115,21 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
   console.log(`Running unlogged-outcome reminders...${onlyClosers ? ` (only: ${[...onlyClosers].join(', ')})` : ''}`);
   try {
     const now    = Date.now();
-    const since  = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14d floor
+    // 90-day floor (Ron, 2026-09-21): a missing outcome is a hole in the sales
+    // data until someone fills it, so Max keeps asking. The old 14-day floor let
+    // four Sep 2-3 calls age out unlogged and they sat on the leaderboard as
+    // "pending" with nobody being asked about them. fetchDueSalesCalls still
+    // floors on the GHL cutover.
+    const since  = new Date(now - OUTCOME_REMINDER_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const cutoff = new Date(now - 60 * 60 * 1000).toISOString();           // 1h buffer so an in-progress call isn't flagged
 
-    const { dueCalls } = await fetchDueSalesCalls({
+    const { dueCalls: allDueCalls } = await fetchDueSalesCalls({
       cutoffIso: cutoff, sinceIso: since, label: 'Unlogged-outcome reminders',
     });
+    // The run-once drain asks about everything; the nightly run thins the old ones.
+    const crWeekday = new Date(now).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/Costa_Rica' });
+    const dueCalls = allDueCalls.filter(a =>
+      isOutcomeReminderDueTonight(new Date(a.scheduled_start).getTime(), now, crWeekday, !!opts.includeAged));
 
     if (!dueCalls.length) {
       console.log('Unlogged-outcome reminders: no due calls in window.');
@@ -13568,6 +13595,7 @@ async function runOutcomeCardsOnceIfRequested() {
     onlyClosers: onlyClosers.length ? onlyClosers : null,
     perCloserCap: Infinity,
     skipEscalation: true,
+    includeAged: true,
   });
   await upsertKnowledge('process', key, `done|${new Date().toISOString()}`, 'outcome-run-once');
   console.log('Outcome cards run-once: done.');
