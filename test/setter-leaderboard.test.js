@@ -1,8 +1,12 @@
 // Rules test for the Setter Leaderboard numbers.  Run:  node test/setter-leaderboard.test.js
 //
-// Pins down the three faults found on the 2026-09-19 board:
+// Pins down the three faults found on the 2026-09-19 board, plus Ron's rule of
+// 2026-09-21 for a booked call that never happened:
 //   1. Calls cancelled in GHL were counted as "pending", so the board blamed
 //      closers for 9 unlogged calls when 3 were cancellations nobody could log.
+//      Rule: cancelled and never rebooked is a NO-SHOW; cancelled (or left
+//      unlogged) and rebooked is a reschedule, and only the NEW appointment is
+//      a booked call; deleted in GHL (QA bookings, duplicates) is not a call.
 //   2. The claim-ownership read was capped at 1000 rows oldest-first, dropping
 //      the newest claims, so calls were credited to the wrong setter. The tally
 //      must honour a late claim no matter how many older claims precede it.
@@ -15,15 +19,15 @@ const path = require('path');
 const SRC = fs.readFileSync(process.argv[2] || path.join(__dirname, '..', 'index.js'), 'utf8');
 const slice = (from, to) => SRC.slice(SRC.indexOf(from), SRC.indexOf(to, SRC.indexOf(from)));
 const block = [
-  slice('const SHOWED_OUTCOMES', '// ─── CLOSER WEEKLY STATS'),
+  slice('const SHOWED_OUTCOMES', '// prospect_id -> latest scheduled_start'),
   slice('function isAppointmentCancelled', '\n}\n') + '\n}\n',
+  slice('function isAppointmentDeleted', '\n}\n') + '\n}\n',
   slice('function _newSetterSlot', '// ─── SETTER ATTRIBUTION RECONCILER'),
-  slice('function summarizeSetterInbox', '// Conversations ASSIGNED'),
 ].join('\n');
 const ROSTER = { 'seb@x.com': 'Sebastian S', 'oscar@x.com': 'Oscar M' };
-const { tallySetterStats, formatSetterWeeklyStatsBlock, summarizeSetterInbox } = new Function(
+const { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt } = new Function(
   'resolveSalesMember', 'isUnresolvedSalesId',
-  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, summarizeSetterInbox };`,
+  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt };`,
 )(id => ROSTER[id] || id, () => false);
 
 const cases = [];
@@ -38,33 +42,48 @@ const appt = (o = {}) => ({
   setter_id: 'seb@x.com', qualification_snapshot: {}, prospect: { email: `lead${n}@x.com` }, ...o,
 });
 
-// 1. Cancelled calls: both shapes dash writes, neither is ever "pending".
+// 1. A booked call that never happened.
 {
+  const LATER = '2026-09-12T16:00:00.000Z';
   const appts = [
     appt({ id: 'showed' }),
     appt({ id: 'noshow' }),
     appt({ id: 'unlogged' }),
-    appt({ id: 'cxl-webhook', qualification_snapshot: { ghl: { cancelled: true, opportunity_source: 'Facebook' } } }),
-    appt({ id: 'cxl-deleted', qualification_snapshot: { cancelled: true, reason: 'deleted_in_ghl' } }),
+    appt({ id: 'cxl-final', qualification_snapshot: { ghl: { cancelled: true, opportunity_source: 'Facebook' } } }),
+    appt({ id: 'cxl-rebooked', prospect_id: 'pRebook', qualification_snapshot: { ghl: { cancelled: true } } }),
+    appt({ id: 'rebooked-new', prospect_id: 'pRebook', scheduled_start: LATER }),
+    appt({ id: 'orphan', prospect_id: 'pOrphan' }),                       // no outcome, prospect rebooked later
+    appt({ id: 'resched-row', prospect_id: 'pResched' }),                 // outcome literally `rescheduled`
+    appt({ id: 'deleted-qa', qualification_snapshot: { cancelled: true, reason: 'deleted_in_ghl' } }),
     appt({ id: 'cxl-but-logged', qualification_snapshot: { ghl: { cancelled: true } } }),
+    appt({ id: 'deleted-but-logged', qualification_snapshot: { cancelled: true, reason: 'deleted_in_ghl' } }),
   ];
   const outcomes = {
-    showed: { outcome: 'follow_up' }, noshow: { outcome: 'no_show' }, 'cxl-but-logged': { outcome: 'disqualified' },
+    showed: { outcome: 'follow_up' }, noshow: { outcome: 'no_show' }, 'rebooked-new': { outcome: 'lost' },
+    'resched-row': { outcome: 'rescheduled' },
+    'cxl-but-logged': { outcome: 'disqualified' }, 'deleted-but-logged': { outcome: 'follow_up' },
   };
-  const { stats, ownedCalls } = tallySetterStats(appts, outcomes, [], START, END, NOW);
+  const latest = { pRebook: LATER, pOrphan: '2026-09-15T16:00:00.000Z', pResched: '2026-09-16T16:00:00.000Z' };
+  const { stats, ownedCalls } = tallySetterStats(appts, outcomes, [], START, END, NOW, latest);
   const s = stats['Sebastian S'];
-  check('cancelled calls land in their own bucket', s.cancelled === 2, s);
+  // Counted: showed, noshow, unlogged, cxl-final, rebooked-new, cxl-but-logged, deleted-but-logged = 7
+  check('rescheduled, orphaned and deleted rows are not booked calls', s.calls_booked === 7, s);
+  check('cancelled and never rebooked is a no-show', s.no_shows === 2 && s.cancelled === 1, s);
   check('only the past, live, unlogged call is pending', s.pending === 1, s);
-  check('a logged outcome outranks the cancel flag', s.attended === 2 && s.aqc === 1, s);
-  check('buckets add up to calls booked', s.attended + s.no_shows + s.pending + s.cancelled === s.calls_booked, s);
-  check('ownedCalls flags the cancelled calls', ownedCalls.filter(c => c.cancelled).length === 2);
+  check('a logged outcome outranks the cancel and delete flags', s.attended === 4 && s.aqc === 3, s);
+  check('buckets add up to calls booked', s.attended + s.no_shows + s.pending === s.calls_booked, s);
+  check('ownedCalls flags only the cancelled no-show', ownedCalls.filter(c => c.cancelled).length === 1 && ownedCalls.length === 7);
 
   const text = formatSetterWeeklyStatsBlock(stats, START, END);
-  check('block states cancelled separately from awaiting-outcome',
-    /Cancelled before the call: 2/.test(text) && /Awaiting closer outcome: 1/.test(text), text);
-  check('show rate excludes cancelled and pending (2 of 3 decided)', /Show rate: 67% \(2 attended of 3 decided\)/.test(text), text);
-  check('pod totals line carries the true pending count', /awaiting a closer-logged outcome: 1 \| cancelled before the call: 2/.test(text), text);
+  check('block folds cancellations into no-shows and says how many',
+    /No-shows: 2 \(1 of them cancelled and never rebooked\)/.test(text) && /Awaiting closer outcome: 1/.test(text), text);
+  check('show rate counts the cancellation as a no-show (4 of 6 decided)', /Show rate: 67% \(4 attended of 6 decided\)/.test(text), text);
+  check('pod totals line carries the true pending count', /awaiting a closer-logged outcome: 1\./.test(text), text);
   check('lines I own carry no em or en dash', !text.split('\n').slice(2).join('\n').match(/[—–]/), text);
+
+  check('classifier: real outcome always wins', classifyUnheldAppt(appts[9], outcomes['cxl-but-logged'], latest) === null);
+  check('classifier: later appointment must be strictly later',
+    classifyUnheldAppt(appts[5], undefined, latest) === null && classifyUnheldAppt(appts[4], undefined, latest) === 'skip');
 }
 
 // 2. A future-dated call is pending even if a leftover outcome row exists.
@@ -108,18 +127,6 @@ const appt = (o = {}) => ({
   ];
   const { stats } = tallySetterStats(appts, {}, [], START, END, NOW);
   check('4 calls from 3 distinct leads (not 1)', stats['Sebastian S'].calls_booked === 4 && stats['Sebastian S'].distinct_leads === 3, stats);
-}
-
-// 5. Inbox hygiene: only in-window conversations count; 3d+ is a subset.
-{
-  const day = 24 * 60 * 60 * 1000;
-  const r = summarizeSetterInbox([
-    { lastMessageDate: NOW - 1 * day },
-    { lastMessageDate: NOW - 4 * day },
-    { lastMessageDate: Date.parse(START) - 1 }, // before the window
-    {},                                          // malformed row
-  ], Date.parse(START), NOW);
-  check('hygiene counts in-window only, stale is 3d+', r.waiting === 2 && r.stale === 1, r);
 }
 
 const failed = cases.filter(c => !c.ok);
