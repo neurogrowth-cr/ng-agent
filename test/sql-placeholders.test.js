@@ -139,7 +139,7 @@ const promoStart = SRC.indexOf('async function promoteOpenDealOutcome');
 const promoEnd = SRC.indexOf('// One snooze: push snoozeUntil out', promoStart);
 const promoLines = [lineOf(promoStart), lineOf(promoEnd)];
 const promoUpdate = checked.find(c => c.line >= promoLines[0] && c.line <= promoLines[1] && c.maxPlaceholder === 5);
-check('2b the open-deal promotion UPDATE is one of the scanned queries', !!promoUpdate, true);
+check('2b the open-deal promotion query is one of the scanned queries', !!promoUpdate, true);
 check('2c it passes five values for its five placeholders', promoUpdate && promoUpdate.count, 5);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }

@@ -11445,12 +11445,18 @@ async function ghlGetOpportunityStage(oppId) {
 
 // The deliberate second-writer path that logOutcomeToPortal refuses to be.
 // Promotes an existing follow_up row to the terminal outcome a HUMAN stated.
-// The WHERE clause's outcome='follow_up' is the whole safety story: a
-// concurrent promotion (or a dash-side change) zeroes rowCount and nothing is
-// touched. Notes are APPENDED, never replaced — the original follow_up note is
-// audit history. Mirrors logOutcomeToPortal's shape: portal in one
-// transaction, GHL after, honestly reported. Never called by a cron — every
-// caller traces to a tap or a typed reply.
+// The write goes through the portal RPC ng_promote_open_deal_outcome (dash
+// migration 20260920120000), NOT a raw UPDATE: the max_outcome_writer role can
+// INSERT outcomes but deliberately cannot UPDATE them, so a raw UPDATE is
+// refused with "permission denied for table revops_sales_outcomes". That is
+// what this function shipped with in PR #109, hidden until 2026-09-20 behind a
+// parameter bug that failed first. The RPC keeps the safety story inside the
+// database: it only touches a row still in follow_up (a concurrent promotion,
+// or dash resolving it first, returns NULL and nothing is touched), only
+// accepts terminal targets, requires revenue for won, and APPENDS notes, since
+// the original follow_up note is audit history. Mirrors logOutcomeToPortal's
+// shape: portal in one transaction, GHL after, honestly reported. Never called
+// by a cron. Every caller traces to a tap or a typed reply.
 async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, closedRevenue }) {
   if (!portalWriterPg) return { ok: false, reason: 'not_configured', message: 'PORTAL_WRITER_DATABASE_URL not set.' };
   const guard = evaluateOutcomePromotion('follow_up', outcome, closedRevenue);
@@ -11459,22 +11465,18 @@ async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, c
   try {
     await client.query('BEGIN');
     const upd = await client.query(
-      `UPDATE revops_sales_outcomes
-          SET outcome = $2, source = $3,
-              notes = trim(both E'\\n' from coalesce(notes, '') || E'\\n' || $4),
-              closed_revenue = COALESCE($5, closed_revenue),
-              close_date = CASE WHEN $2 = 'won' THEN (now() AT TIME ZONE 'America/Costa_Rica')::date ELSE close_date END
-        WHERE appointment_id = $1 AND outcome = 'follow_up'
-        RETURNING id`,
+      // Explicit casts: node-postgres sends untyped values, and Postgres must
+      // resolve them to the function's exact signature.
+      'SELECT ng_promote_open_deal_outcome($1::uuid, $2::text, $3::text, $4::text, $5::numeric) AS id',
       // Five placeholders, five values, in placeholder order. `source` ($3) was
-      // missing from this array from the day the sweep shipped (PR #109) until
-      // 2026-09-20, so every promotion died with "bind message supplies 4
-      // parameters, but prepared statement requires 5": 50 open-deal cards
-      // issued, zero ever resolved through Max. test/sql-placeholders.test.js
-      // now checks every inline query in this file for that mismatch.
+      // missing from this array until 2026-09-20, which failed every promotion
+      // before it reached the database. test/sql-placeholders.test.js now
+      // checks every inline query in this file for that mismatch.
       [appointmentId, outcome, source, notes || '', closedRevenue == null ? null : Number(closedRevenue)]
     );
-    if (!upd.rowCount) {
+    // The RPC returns the outcome row id, or NULL when the row is no longer
+    // follow_up. NULL is a finished deal, not an error.
+    if (!(upd.rows[0] && upd.rows[0].id)) {
       await client.query('ROLLBACK');
       const { rows } = await client.query('SELECT outcome, source FROM revops_sales_outcomes WHERE appointment_id = $1', [appointmentId]);
       return { ok: false, reason: 'not_promotable', existing: rows[0] || null };
