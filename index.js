@@ -11381,7 +11381,13 @@ async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, c
               close_date = CASE WHEN $2 = 'won' THEN (now() AT TIME ZONE 'America/Costa_Rica')::date ELSE close_date END
         WHERE appointment_id = $1 AND outcome = 'follow_up'
         RETURNING id`,
-      [appointmentId, outcome, notes || '', closedRevenue == null ? null : Number(closedRevenue)]
+      // Five placeholders, five values, in placeholder order. `source` ($3) was
+      // missing from this array from the day the sweep shipped (PR #109) until
+      // 2026-09-20, so every promotion died with "bind message supplies 4
+      // parameters, but prepared statement requires 5": 50 open-deal cards
+      // issued, zero ever resolved through Max. test/sql-placeholders.test.js
+      // now checks every inline query in this file for that mismatch.
+      [appointmentId, outcome, source, notes || '', closedRevenue == null ? null : Number(closedRevenue)]
     );
     if (!upd.rowCount) {
       await client.query('ROLLBACK');
@@ -11455,6 +11461,12 @@ async function applyOpenDealSnooze({ payload, channel, cardTs, threadTs }) {
   await slack.client.reactions.add({ channel, timestamp: cardTs, name: OPEN_DEAL_SNOOZE_EMOJI }).catch(() => {});
 }
 
+// A card that failed once and then succeeded would otherwise carry ⚠️ and ✅
+// side by side. Best-effort: Slack answers no_reaction when there is no stamp.
+async function clearFailedWriteStamp(channel, ts) {
+  await slack.client.reactions.remove({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+}
+
 // Shared tail of every open-deal promotion: mark the card resolved, stamp it,
 // and report honestly — including the ⚠️ when the portal row promoted but the
 // GHL move did not. The reportOutcomeCardResult sibling, speaking promotion
@@ -11466,6 +11478,7 @@ async function reportOpenDealCardResult({ channel, ts, payload, result, outcome,
   if (result.ok) {
     await upsertKnowledge('process', `open-deal-nudge:${payload.appointment_id}`, `resolved|${todayISO}|${outcome}`, 'open-deal-nudge');
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await clearFailedWriteStamp(channel, ts);
     const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
     const move = result.stageMove;
     const moveNote = move?.ok
@@ -11477,6 +11490,7 @@ async function reportOpenDealCardResult({ channel, ts, payload, result, outcome,
     // a finished deal, not an error. Stamp it so the card stops accepting taps.
     await upsertKnowledge('process', `open-deal-nudge:${payload.appointment_id}`, `resolved|${todayISO}|${result.existing?.outcome || 'external'}`, 'open-deal-nudge');
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await clearFailedWriteStamp(channel, ts);
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `This deal is already *${result.existing?.outcome || 'resolved'}* (source: ${result.existing?.source || '?'}) — no change needed.` });
   } else if (result.reason === 'won_needs_revenue') {
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: 'Logging won needs the amount — reply `won 3500`.' });
@@ -11502,8 +11516,12 @@ async function handleOpenDealFollowupReaction(event, baseEmoji, dmMsg, payload) 
     console.log(`open-deal card ${payload.appointment_id}: reaction from ${event.user} is not the owning closer, ignoring`);
     return;
   }
+  // Only ✅ closes a card. ⚠️ means the last write FAILED, so the card has to
+  // stay answerable: treating it as "actioned" turned one failed tap into a
+  // card that ignored every later tap. A retry is safe because the promotion
+  // only touches a row that is still follow_up.
   const actioned = (dmMsg.reactions || []).find(r =>
-    ['white_check_mark', 'warning'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+    ['white_check_mark'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
   if (actioned) {
     console.log(`open-deal card ${payload.appointment_id} already actioned, ignoring`);
     return;
@@ -18196,6 +18214,7 @@ async function reportOutcomeCardResult({ channel, ts, payload, result, outcome }
   if (result.ok) {
     await upsertKnowledge('process', `outcome-proposal:${payload.appointment_id}`, `confirmed|${new Date().toISOString().slice(0, 10)}`, 'outcome-proposal');
     await slack.client.reactions.add({ channel, timestamp: ts, name: 'white_check_mark' }).catch(() => {});
+    await clearFailedWriteStamp(channel, ts);
     const statusNote = result.statusChange ? ` Prospect status: ${result.statusChange}.` : '';
     // The GHL move is best-effort and reported honestly — the portal row is
     // already written either way, so a CRM hiccup never silently loses it.
@@ -18239,9 +18258,11 @@ async function handleOutcomeProposalReaction(event, baseEmoji, dmMsg, payload) {
     console.log(`outcome-proposal ${payload.appointment_id}: reaction from ${event.user} is not the owning closer, ignoring`);
     return;
   }
-  // Already actioned? Max stamps ✅ / no_entry / warning after handling.
+  // Already actioned? Max stamps ✅ (logged) or no_entry (dismissed). His ⚠️
+  // means the write FAILED, so it must not block a retry. The insert is
+  // first-writer-wins, so a second tap can never double-log.
   const actioned = (dmMsg.reactions || []).find(r =>
-    ['white_check_mark', 'no_entry', 'warning'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+    ['white_check_mark', 'no_entry'].includes(r.name) && r.users?.includes(process.env.SLACK_BOT_USER_ID));
   if (actioned) {
     console.log(`outcome-proposal ${payload.appointment_id} already actioned, ignoring`);
     return;
