@@ -35,6 +35,12 @@ const opp = (stage, lastStageChangeAt) => ({
 });
 const wa  = (dir, ts, source = 'app') => ({ messageType: 'TYPE_WHATSAPP', direction: dir, source, dateAdded: ts });
 const act = (ts) => ({ messageType: 'TYPE_ACTIVITY_OPPORTUNITY', direction: 'outbound', source: 'app', dateAdded: ts, body: 'Opportunity updated' });
+// Shapes captured live 2026-09-22: Messenger sends ride the same per-contact
+// conversation as WhatsApp; setter sends carry source 'app', inbound has no source.
+const fb   = (dir, ts, source = 'app') => ({ messageType: 'TYPE_FACEBOOK', direction: dir, source, dateAdded: ts, meta: { fb: { pageId: '250363091494678' } } });
+const em   = (dir, ts, source = 'app') => ({ messageType: 'TYPE_EMAIL', direction: dir, source, dateAdded: ts });
+const note = (ts) => ({ messageType: 'TYPE_INTERNAL_COMMENT', direction: 'outbound', source: 'app', userId: 'Wdjte1temxfR0lpi5RGV', dateAdded: ts, body: 'internal note' });
+const appt = (ts) => ({ messageType: 'TYPE_ACTIVITY_APPOINTMENT', direction: 'outbound', source: 'app', dateAdded: ts, body: 'New appointment created' });
 
 const NOW = Date.parse('2026-07-28T21:30:00.000Z');
 const cases = [];
@@ -118,6 +124,59 @@ check('lead spoke last is left alone',
     wa('outbound', '2026-07-28T20:00:00.000Z'),
     wa('inbound',  '2026-07-28T20:30:00.000Z'),
   ], NOW).skip, 'lead_spoke_last');
+
+// ── Channels beyond WhatsApp (2026-09-22) ─────────────────────────────────────
+// Until this date the mover counted TYPE_WHATSAPP only, so every Messenger-origin
+// card and every email/call a setter logged in GHL was skipped as no_whatsapp.
+const SEP = Date.parse('2026-09-22T22:00:00.000Z');
+
+check('Messenger first touch moves New Lead → Initial Contact',
+  evaluateStrikeMove(opp(S.NL, '2026-09-21T01:00:00.000Z'), [
+    act('2026-09-21T01:00:00.000Z'),
+    fb('outbound', '2026-09-21T01:51:45.691Z'),
+  ], SEP), { move: S.IC, reason: 'first human touch' });
+
+// REAL: Claudia Cortés — card in Initial Contact since 07-17, two setter Messenger
+// messages on 09-20, never replied. Skipped as no_whatsapp before this change.
+check('Messenger chase advances IC → Strike 1',
+  evaluateStrikeMove(opp(S.IC, '2026-07-17T01:51:12.762Z'), [
+    fb('outbound', '2026-07-14T21:58:17.080Z'),
+    note('2026-07-17T01:51:29.003Z'),
+    fb('outbound', '2026-09-20T18:50:15.984Z'),
+    fb('outbound', '2026-09-20T18:50:52.946Z'),
+  ], SEP), { move: S.S1, reason: 'chase — lead never replied' });
+
+check('internal comment newer than the setter message is ignored',
+  evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
+    wa('outbound', '2026-09-21T10:00:00.000Z'),
+    note('2026-09-21T10:05:00.000Z'),
+  ], SEP), { move: S.S1, reason: 'chase — lead never replied' });
+
+// REAL: GHL workflow emails (pre-call reminders) carry source 'workflow'.
+check('workflow email is an automated send',
+  evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
+    wa('outbound', '2026-09-20T10:00:00.000Z'),
+    em('outbound', '2026-09-22T19:01:18.864Z', 'workflow'),
+  ], SEP).skip, 'automated_send');
+
+check('email a setter sent from GHL counts as a chase',
+  evaluateStrikeMove(opp(S.S1, '2026-09-18T12:00:00.000Z'), [
+    wa('inbound',  '2026-09-19T10:00:00.000Z'),
+    em('outbound', '2026-09-22T15:00:00.000Z'),
+  ], SEP), { move: S.S2, reason: 'chase — lead silent 24h+' });
+
+check('activity and comment rows alone are not a conversation',
+  evaluateStrikeMove(opp(S.NL, '2026-09-21T01:00:00.000Z'), [
+    act('2026-09-21T01:00:00.000Z'),
+    appt('2026-09-21T01:00:05.000Z'),
+    note('2026-09-21T01:10:00.000Z'),
+  ], SEP).skip, 'no_channel_message');
+
+check('a recent Messenger reply protects a WhatsApp follow-up (engagement is channel-wide)',
+  evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
+    fb('inbound',  '2026-09-22T17:43:20.921Z'),
+    wa('outbound', '2026-09-22T20:00:00.000Z'),
+  ], SEP).skip, 'lead_engaged');
 
 let failed = 0;
 for (const c of cases) {
