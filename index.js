@@ -2459,6 +2459,7 @@ async function runEmailReplyPoller(correlationId) {
         const newest = Math.max(...newInbound.map(m => parseInt(m.internalDate, 10) || 0));
         await supabase.from('email_threads').update({
           last_message_at: new Date(newest).toISOString(),
+          last_inbound_at: new Date(newest).toISOString(), // strike mover: lead engaged (migration 014)
         }).eq('id', t.id);
         _replyPollFailureCounts[t.id] = 0;
       } catch (perThreadErr) {
@@ -8126,6 +8127,7 @@ async function executeEmailSend(pending, say) {
         last_rfc822_message_id: sendRes.rfc822MessageId,
         rfc822_message_id_chain: newChain,
         last_message_at: new Date().toISOString(),
+        last_outbound_at: new Date().toISOString(), // strike mover touch (migration 014)
       }).eq('id', threadMeta.threadRowId);
     } else {
       await supabase.from('email_threads').insert({
@@ -8138,8 +8140,31 @@ async function executeEmailSend(pending, say) {
         subject,
         initiated_by_slack_id: setterId,
         last_message_at: new Date().toISOString(),
+        last_outbound_at: new Date().toISOString(), // strike mover touch (migration 014)
         active: true,
       });
+    }
+
+    // Leave the touch on the GHL contact timeline so setters and closers can see
+    // a Max-sent email next to the WhatsApp thread. Notes are not conversation
+    // messages, so the strike mover reads email_threads instead (see
+    // strikeLoadEmailTouches); this is visibility only and must never fail the send.
+    try {
+      const firstTo   = to.split(',').map(s => s.trim()).filter(Boolean)[0];
+      const contactId = await ghlFindContactByEmail(firstTo);
+      if (contactId) {
+        const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            body: `📧 Email sent via Max by ${setter.displayName}: "${subject}"`,
+            relations: [{ objectKey: 'contact', recordId: contactId }],
+          }),
+        }, { label: 'email-proxy note' });
+        if (!res.ok) console.warn(`email proxy: GHL note on ${contactId} → ${res.status}`);
+      }
+    } catch (noteErr) {
+      console.warn('email proxy: GHL note skipped:', noteErr.message);
     }
 
     // DM setter — success.
@@ -13825,7 +13850,8 @@ cron.schedule('0 18 * * *', wrapCronJob('runStaleLeadDailySweep', async (c) => {
 cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
 
 // Auto strike mover — every 2h, 7 AM–9 PM CR. Advances setter pipeline cards on
-// real human WhatsApp follow-ups so nobody has to drag them. Every 2h (not
+// real human follow-ups on any channel (WhatsApp, Messenger, Instagram, SMS,
+// email, GHL-logged calls, or an email sent through Max) so nobody has to drag them. Every 2h (not
 // hourly) because a full sweep costs ~1 API call per candidate card and the 20h
 // debounce means a card can only move once a day anyway. Defaults to DRY RUN —
 // set STRIKE_MOVER_MODE=live on Railway to arm it.
@@ -15336,7 +15362,10 @@ async function runStalledProspectFollowups(correlationId) {
 // free here.
 //
 // RULES (Appointment Setting Pipeline only):
-//   New Lead → Initial Contact   on the first HUMAN outbound WhatsApp.
+//   New Lead → Initial Contact   on the first HUMAN outbound message on any
+//                                conversational channel (STRIKE_TOUCH_TYPES:
+//                                WhatsApp, Messenger, Instagram, SMS, email,
+//                                GHL-logged call) or an email sent through Max.
 //   IC → S1 → S2 → S3            one stage per chase. A chase means the lead has
 //                                been silent 24h+; an engaged conversation never
 //                                marches toward Strike 3.
@@ -15373,6 +15402,17 @@ const STRIKE_SCOPE_STAGES = [
 ];
 const STRIKE_DEBOUNCE_MS     = 20 * 60 * 60 * 1000; // one advance per card per 20h
 const STRIKE_LEAD_SILENCE_MS = 24 * 60 * 60 * 1000; // lead quiet this long ⇒ outreach is a chase
+// Message types that are a real conversation with the lead. Explicit allowlist:
+// GHL interleaves activity rows (TYPE_ACTIVITY_OPPORTUNITY "Opportunity updated",
+// TYPE_ACTIVITY_APPOINTMENT) and TYPE_INTERNAL_COMMENT in the same thread, all
+// with direction 'outbound' and source 'app', so a denylist would let the mover
+// read its own stage change as the newest touch. Until 2026-09-22 this was
+// WhatsApp only, which silently excluded every Messenger-origin card and every
+// email or call a setter logged in GHL. TYPE_CALL only exists for calls placed
+// or logged inside GHL; a call from a personal phone leaves no record.
+const STRIKE_TOUCH_TYPES = new Set([
+  'TYPE_WHATSAPP', 'TYPE_FACEBOOK', 'TYPE_INSTAGRAM', 'TYPE_SMS', 'TYPE_EMAIL', 'TYPE_CALL',
+]);
 
 // contactId → conversationId. Saves one API call per card on every sweep after
 // the first. A stale entry self-heals: a failed messages fetch drops the card for
@@ -15493,13 +15533,12 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
   if (opp.pipelineId !== STRIKE_PIPELINE_ID) return { skip: 'wrong_pipeline' };
   if (!STRIKE_SCOPE_STAGES.includes(stage))  return { skip: 'stage_out_of_scope' };
 
-  // Activity entries (TYPE_ACTIVITY_OPPORTUNITY — "Opportunity updated" etc.)
-  // interleave with real messages; without this filter the mover reads its own
-  // stage-change activity as the newest message in the thread.
-  const wa = (messages || []).filter(m => m.messageType === 'TYPE_WHATSAPP');
-  if (!wa.length) return { skip: 'no_whatsapp' };
+  // Only conversational channels count (see STRIKE_TOUCH_TYPES); activity rows
+  // and internal comments never do.
+  const touches = (messages || []).filter(m => STRIKE_TOUCH_TYPES.has(m.messageType));
+  if (!touches.length) return { skip: 'no_channel_message' };
 
-  const newest = wa[wa.length - 1];
+  const newest = touches[touches.length - 1];
   if (String(newest.direction || '').toLowerCase() !== 'outbound') return { skip: 'lead_spoke_last' };
   if (String(newest.source    || '').toLowerCase() !== 'app')      return { skip: 'automated_send' };
 
@@ -15517,13 +15556,31 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
   // Lead silence, not "was the previous message outbound" — setters routinely
   // double-text within one live conversation, and the naive check reads that as
   // a chase and marches an engaged lead toward Strike 3.
-  const lastInbound   = [...wa].reverse().find(m => String(m.direction || '').toLowerCase() === 'inbound');
+  const lastInbound   = [...touches].reverse().find(m => String(m.direction || '').toLowerCase() === 'inbound');
   const lastInboundTs = lastInbound ? (Date.parse(lastInbound.dateAdded || lastInbound.createdAt || 0) || 0) : 0;
   if (lastInboundTs && now - lastInboundTs < STRIKE_LEAD_SILENCE_MS) return { skip: 'lead_engaged' };
 
   const next = STRIKE_NEXT_STAGE[stage];
   if (!next) return { skip: 'no_next_stage' };
   return { move: next, reason: lastInboundTs ? 'chase — lead silent 24h+' : 'chase — lead never replied' };
+}
+
+// Emails setters send through Max (email proxy) go out from Ron's Gmail and are
+// recorded only in email_threads — GHL never sees them. This folds that record
+// into the card's message history as synthetic TYPE_EMAIL entries (source 'app':
+// a setter dictated it) so evaluateStrikeMove treats a Max email exactly like a
+// WhatsApp typed in GHL. One entry per direction is enough: the rules only look
+// at the newest touch and the last inbound. Pure; returns the input untouched
+// when the contact has no thread.
+function mergeEmailTouches(messages, touch) {
+  const base = messages || [];
+  if (!touch) return base;
+  const extra = [];
+  if (touch.last_outbound_at) extra.push({ messageType: 'TYPE_EMAIL', direction: 'outbound', source: 'app', dateAdded: touch.last_outbound_at, via: 'max_email' });
+  if (touch.last_inbound_at)  extra.push({ messageType: 'TYPE_EMAIL', direction: 'inbound',  source: 'app', dateAdded: touch.last_inbound_at,  via: 'max_email' });
+  if (!extra.length) return base;
+  return [...base, ...extra].sort((a, b) =>
+    (Date.parse(a.dateAdded || a.createdAt || 0) || 0) - (Date.parse(b.dateAdded || b.createdAt || 0) || 0));
 }
 
 // Sweep — see cron registration below. Mode is STRIKE_MOVER_MODE:
@@ -15539,11 +15596,12 @@ async function runAutoStrikeMover(correlationId) {
 
   const cards = [];
   for (const stageId of STRIKE_SCOPE_STAGES) cards.push(...await ghlSearchOppsByStage(stageId));
+  const emailTouches = await strikeLoadEmailTouches(new Date(Date.now() - 45 * 24 * 3600 * 1000).toISOString());
 
   const skipCounts = {};
   const bump = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
   const moves = [], failures = [];
-  let capped = 0;
+  let capped = 0, emailTouchCards = 0;
 
   for (const opp of cards) {
     try {
@@ -15551,7 +15609,10 @@ async function runAutoStrikeMover(correlationId) {
       const convoId = await ghlFindConversationId(opp.contactId);
       if (!convoId) { bump('no_conversation'); continue; }
       const messages = await ghlGetConversationMessages(convoId);
-      const verdict  = evaluateStrikeMove(opp, messages);
+      const email    = String(opp.contact?.email || '').trim().toLowerCase();
+      const touch    = email ? emailTouches.get(email) : null;
+      if (touch) emailTouchCards++;
+      const verdict  = evaluateStrikeMove(opp, mergeEmailTouches(messages, touch));
       if (verdict.skip) { bump(verdict.skip); continue; }
 
       if (moves.length >= maxMoves) { capped++; continue; }
@@ -15578,7 +15639,7 @@ async function runAutoStrikeMover(correlationId) {
   logActivity({
     event_type: 'strike_sweep', event_source: 'cron', action: 'runAutoStrikeMover',
     correlation_id: correlationId,
-    metadata: { mode, scanned: cards.length, moved: moves.length, capped,
+    metadata: { mode, scanned: cards.length, moved: moves.length, capped, emailTouchCards,
                 skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
   });
 
@@ -15610,6 +15671,37 @@ async function runAutoStrikeMover(correlationId) {
   }
 
   console.log(`runAutoStrikeMover done — scanned ${cards.length}, ${isLive ? 'moved' : 'would move'} ${moves.length}, failures ${failures.length} (mode=${mode})`);
+}
+
+// One query per sweep: recipient email → newest Max-sent / lead-replied
+// timestamps from email_threads (migration 014). Keyed on every to_address,
+// lowercased; cc is ignored on purpose (a cc'd lead on someone else's thread is
+// not a chase). A contact whose card email differs from the address the setter
+// typed gets no credit — same as today, and the GHL note written on send still
+// makes the email visible. Never throws: an empty map just means "no email
+// touches this sweep", the GHL-side rules still run.
+async function strikeLoadEmailTouches(sinceIso) {
+  const map = new Map();
+  try {
+    const { data, error } = await supabase.from('email_threads')
+      .select('to_addresses, last_outbound_at, last_inbound_at')
+      .or(`last_outbound_at.gte.${sinceIso},last_inbound_at.gte.${sinceIso}`);
+    if (error) throw new Error(error.message);
+    for (const t of data || []) {
+      for (const addr of t.to_addresses || []) {
+        const key = String(addr || '').trim().toLowerCase();
+        if (!key) continue;
+        const cur = map.get(key) || { last_outbound_at: null, last_inbound_at: null };
+        for (const f of ['last_outbound_at', 'last_inbound_at']) {
+          if (t[f] && (!cur[f] || Date.parse(t[f]) > Date.parse(cur[f]))) cur[f] = t[f];
+        }
+        map.set(key, cur);
+      }
+    }
+  } catch (err) {
+    console.error('strikeLoadEmailTouches failed (sweep continues without Max email touches):', err.message);
+  }
+  return map;
 }
 
 // Daily roll-up of strike_sweep audit rows for the nightly learning report.
@@ -15776,7 +15868,7 @@ async function strikeBuildDailyDigest(hours = 24) {
     salesLines.push('', ...allMoves.slice(0, 20).map(m => `› ${m.name}: ${m.from} → ${m.to}`));
     if (allMoves.length > 20) salesLines.push(`› …and ${allMoves.length - 20} more.`);
   }
-  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups typed in GHL count), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
+  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups a setter actually sent count: any GHL channel, or an email through Max; workflow sends do not), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
 
   return {
     digestBlock: lines.join('\n'),
