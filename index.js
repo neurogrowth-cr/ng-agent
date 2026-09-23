@@ -17171,6 +17171,85 @@ if (MAKE_API_TOKEN) {
   console.warn('Make scenario watchdog NOT registered — MAKE_API_TOKEN is not set.');
 }
 
+// ─── KAI HEALTH WATCH ────────────────────────────────────────────────────────
+// Kai (ng-automation, the LinkedIn reply agent) had no watcher at all until
+// 2026-09-23: an Anthropic spending-limit outage (2026-09-16), 98 replies
+// misreported as failed on a dead Slack channel, and an auto-reply sent on top
+// of a client's own reply all went unnoticed. Recipe:
+// ~/automations/ops/recipes/kai-health-watch.md. Logic lives in lib/kaiHealth.js
+// (tested in test/kai-health-watch.test.js); this block is only I/O.
+// Read-only via portalPg. Posts to #ng-pm-agent (Ron, 2026-09-23). Never
+// pauses, resends or writes anything. Kill switch: KAI_HEALTH_WATCH=off.
+const kaiHealth = require('./lib/kaiHealth');
+const KAI_HEALTH_URL = process.env.KAI_HEALTH_URL || 'https://ng-automation-production.up.railway.app/health';
+const KAI_WATCH_CHANNEL = process.env.KAI_WATCH_CHANNEL || AGENT_CHANNEL;
+let kaiWatchState = {};
+
+async function pingKaiHealth() {
+  try {
+    const res = await fetch(KAI_HEALTH_URL, { signal: AbortSignal.timeout(10000) });
+    const body = await res.json().catch(() => null);
+    if (res.ok && body && body.ok === true) return { ok: true };
+    return { ok: false, error: `HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+async function postKaiWatch(text) {
+  try {
+    await postToSlack(KAI_WATCH_CHANNEL, text);
+  } catch (err) {
+    console.error('[kai-health] post failed:', err.message);
+  }
+}
+
+async function checkKaiHealth() {
+  if (String(process.env.KAI_HEALTH_WATCH || '') === 'off') return;
+  const now = new Date();
+  const health = await pingKaiHealth();
+
+  let snapshot = null;
+  let snapshotError = null;
+  if (!portalPg) snapshotError = 'PORTAL_READONLY_DATABASE_URL is not set';
+  else {
+    try { snapshot = await kaiHealth.readKaiSnapshot(portalPg, now); }
+    catch (err) { snapshotError = err.message; }
+  }
+
+  const results = kaiHealth.evaluateKaiChecks({ health, snapshot, snapshotError, now });
+  const { state, alerts, recoveries } = kaiHealth.stepKaiWatch(kaiWatchState, results, now, { blind: !snapshot });
+  kaiWatchState = state;
+
+  for (const r of results) {
+    if (r.failing) console.warn(`[kai-health] ${r.id} failing (streak ${state[r.id]?.streak || 0}/${r.needed}): ${r.reason}`);
+  }
+  for (const a of alerts) await postKaiWatch(kaiHealth.formatKaiAlert(a, RON_SLACK_ID));
+  for (const r of recoveries) await postKaiWatch(kaiHealth.formatKaiRecovery(r));
+}
+
+async function runKaiHealthDigest() {
+  if (String(process.env.KAI_HEALTH_WATCH || '') === 'off') return;
+  const header = '`KAI DAILY HEALTH`';
+  if (!portalPg) {
+    await postKaiWatch(`${header}\n⚠️ KAI DATA UNAVAILABLE (PORTAL_READONLY_DATABASE_URL is not set). No counts reported.`);
+    return;
+  }
+  let data;
+  try {
+    data = await kaiHealth.readKaiDigest(portalPg, new Date());
+  } catch (err) {
+    await postKaiWatch(`${header}\n⚠️ KAI DATA UNAVAILABLE (${err.message}). No counts reported.`);
+    return;
+  }
+  const openAlerts = Object.entries(kaiWatchState).filter(([, s]) => s.alerted).map(([id]) => id);
+  await postKaiWatch(kaiHealth.formatKaiDigest(data, openAlerts));
+}
+
+cron.schedule('*/15 * * * *', wrapCronJob('checkKaiHealth', async () => { await checkKaiHealth(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 8 * * 1-5', wrapCronJob('runKaiHealthDigest', async () => { await runKaiHealthDigest(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static crons: Kai health watch (*/15 * * * *) + Kai daily digest (0 8 * * 1-5 CR)');
+
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
 // the booking pipeline is broken upstream of it — if a GHL workflow stops firing
@@ -17912,6 +17991,7 @@ const STATIC_CRON_SCHEDULES = {
   checkBookingAlertDivergence:  '*/30 * * * *',
   checkGmailAlertQuality:       '0 * * * *',
   checkMakeScenarioHealth:      '*/10 * * * *',
+  checkKaiHealth:               '*/15 * * * *',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
@@ -17929,6 +18009,7 @@ const STATIC_CRON_SCHEDULES = {
   runOpenDealFollowupSweep:     '0 21 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runIcmCostReport:             '45 7 * * 3',
+  runKaiHealthDigest:           '0 8 * * 1-5',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
