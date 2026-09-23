@@ -178,6 +178,38 @@ check('a recent Messenger reply protects a WhatsApp follow-up (engagement is cha
     wa('outbound', '2026-09-22T20:00:00.000Z'),
   ], SEP).skip, 'lead_engaged');
 
+// ── Meta auto replies (2026-09-22) ────────────────────────────────────────────
+// Business Suite "Auto reply" / "Comment to message" exist so GHL spins up the
+// contact + New Lead card on the lead's first DM or comment. GHL echoes them as
+// outbound TYPE_FACEBOOK, source 'app', no userId — same shape as a human send.
+const AUTO = 'Ron, gracias por escribir acerca del LinkedIn Flywheel. Para responderle con algo útil y no información genérica, cuénteme en una línea a qué se dedica su negocio y qué tipo de cliente busca. Un miembro del equipo le responde en breve.';
+const fbBody = (dir, ts, body) => ({ ...fb(dir, ts), body });
+
+check('Meta auto reply alone does not move New Lead',
+  evaluateStrikeMove(opp(S.NL, '2026-09-22T20:00:00.000Z'), [
+    fbBody('inbound',  '2026-09-22T20:00:00.000Z', 'info'),
+    act('2026-09-22T20:00:02.000Z'),
+    fbBody('outbound', '2026-09-22T20:00:03.000Z', AUTO),
+  ], SEP).skip, 'automated_send');
+
+check('setter message after the auto reply moves New Lead → Initial Contact',
+  evaluateStrikeMove(opp(S.NL, '2026-09-22T20:00:00.000Z'), [
+    fbBody('outbound', '2026-09-22T20:00:03.000Z', AUTO),
+    fbBody('outbound', '2026-09-22T21:15:00.000Z', 'Hola, cuénteme de su negocio'),
+  ], SEP), { move: S.IC, reason: 'first human touch' });
+
+check('auto reply marker matches without accents, in any case, with a different name',
+  evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
+    wa('outbound', '2026-09-19T10:00:00.000Z'),
+    fbBody('outbound', '2026-09-22T20:00:03.000Z', 'MARIA, gracias por su comentario. PARA RESPONDERLE CON ALGO UTIL Y NO INFORMACION GENERICA, cuenteme...'),
+  ], SEP).skip, 'automated_send');
+
+check('a real setter reply that merely quotes part of the template still counts',
+  evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
+    wa('outbound', '2026-09-19T10:00:00.000Z'),
+    fbBody('outbound', '2026-09-22T20:00:03.000Z', 'Gracias por escribir, cuénteme de su negocio'),
+  ], SEP), { move: S.S1, reason: 'chase — lead never replied' });
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);

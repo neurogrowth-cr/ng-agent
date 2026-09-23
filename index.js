@@ -15413,6 +15413,28 @@ const STRIKE_LEAD_SILENCE_MS = 24 * 60 * 60 * 1000; // lead quiet this long ⇒ 
 const STRIKE_TOUCH_TYPES = new Set([
   'TYPE_WHATSAPP', 'TYPE_FACEBOOK', 'TYPE_INSTAGRAM', 'TYPE_SMS', 'TYPE_EMAIL', 'TYPE_CALL',
 ]);
+// Meta Business Suite auto replies (Inbox → Automations: "Auto reply" on the
+// first DM, "Comment to message" on ad/post comments, both enabled 2026-09-22)
+// exist so that GHL creates the contact + New Lead card the moment someone
+// writes, instead of when a setter first answers from Meta's inbox. GHL echoes
+// them back as ordinary outbound TYPE_FACEBOOK messages with source 'app' and
+// no userId — byte-identical to a setter typing on the WhatsApp phone — so
+// `source` cannot tell them apart. The only stable signal is the text: both
+// templates carry this sentence. Matched accent- and case-insensitively as a
+// substring, so the {name} token and small edits around it don't matter.
+// Override with STRIKE_AUTOMATED_BODY_MARKERS (pipe-separated) if the copy
+// changes; keep the sentence in the templates otherwise.
+const STRIKE_AUTOMATED_BODY_MARKERS = String(
+  process.env.STRIKE_AUTOMATED_BODY_MARKERS
+  || 'Para responderle con algo útil y no información genérica',
+).split('|').map(strikeNormalizeText).filter(Boolean);
+function strikeNormalizeText(text) {
+  return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+function strikeIsAutomatedBody(body) {
+  const norm = strikeNormalizeText(body);
+  return !!norm && STRIKE_AUTOMATED_BODY_MARKERS.some(m => norm.includes(m));
+}
 
 // contactId → conversationId. Saves one API call per card on every sweep after
 // the first. A stale entry self-heals: a failed messages fetch drops the card for
@@ -15541,6 +15563,7 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
   const newest = touches[touches.length - 1];
   if (String(newest.direction || '').toLowerCase() !== 'outbound') return { skip: 'lead_spoke_last' };
   if (String(newest.source    || '').toLowerCase() !== 'app')      return { skip: 'automated_send' };
+  if (strikeIsAutomatedBody(newest.body))                          return { skip: 'automated_send' };
 
   const touchTs = Date.parse(newest.dateAdded || newest.createdAt || 0) || 0;
   const stageTs = Date.parse(opp.lastStageChangeAt || opp.createdAt || 0) || 0;
@@ -15868,7 +15891,7 @@ async function strikeBuildDailyDigest(hours = 24) {
     salesLines.push('', ...allMoves.slice(0, 20).map(m => `› ${m.name}: ${m.from} → ${m.to}`));
     if (allMoves.length > 20) salesLines.push(`› …and ${allMoves.length - 20} more.`);
   }
-  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups a setter actually sent count: any GHL channel, or an email through Max; workflow sends do not), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
+  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups a setter actually sent count: any GHL channel, or an email through Max; workflow sends and the Meta auto reply do not), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
 
   return {
     digestBlock: lines.join('\n'),
