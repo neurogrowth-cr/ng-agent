@@ -13661,7 +13661,7 @@ cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => 
 // Recipe criteria (what good output looks like): posts ONLY to #ng-pm-agent
 // (Max's own ops channel — operational API costs, not company financials); every
 // unreachable source is NAMED in the report body, never silently omitted;
-// every dollar derives from the usage tables (agent_activity, axon.llm_usage,
+// every dollar derives from the usage tables (agent_activity for Max and Kai, axon.llm_usage,
 // revi.llm_usage, axon.factory_runs), never estimated; cache writes are billed
 // at the 1h rate (2x) even where 5-min was used, so savings are UNDERstated,
 // never overstated.
@@ -13708,7 +13708,11 @@ function icmSummarize(rows) {
 // Per-call-site split for the llm_usage agents. Without it a manual laptop run
 // (AXON copy_lab) reads as scheduled cron spend: on 2026-09-16 "Chat/crons
 // $14.05" was really $11.61 of copy lab and $2.45 of digests.
-const ICM_SITE_LABELS = { chat_loop: 'Chat/crons', copy_lab: 'Copy lab (manual)' };
+const ICM_SITE_LABELS = {
+  chat_loop: 'Chat/crons', copy_lab: 'Copy lab (manual)',
+  kai_draft: 'Reply drafts', kai_classify: 'Intent classifier',
+  kai_preview_draft: 'Voice preview drafts', kai_preview_classify: 'Voice preview classifier',
+};
 function icmBySite(rows) {
   const groups = {};
   for (const row of rows) {
@@ -13723,15 +13727,18 @@ function fmtUsd(n) { return `$${n.toFixed(2)}`; }
 function fmtPct(n) { return `${Math.round(n * 100)}%`; }
 // ── end ICM pure block ──────────────────────────────────────────────────────
 
-async function icmMaxAggregates(sinceIso, untilIso) {
+// agent_activity is shared: Kai (ng-automation) logs its llm_call rows there
+// too with agent='kai', so every read filters by agent or Kai's spend would
+// be counted as Max's.
+async function icmAgentAggregates(agent, sinceIso, untilIso) {
   if (!portalPg) throw new Error('PORTAL_READONLY_DATABASE_URL not set');
   const { rows } = await portalPg.query(`
     select coalesce(model, '') as model, coalesce(call_site, 'untagged') as site, count(*)::int as calls,
            coalesce(sum(tokens_in), 0)::bigint as tin, coalesce(sum(tokens_out), 0)::bigint as tout,
            coalesce(sum(tokens_cache_write), 0)::bigint as cw, coalesce(sum(tokens_cache_read), 0)::bigint as cr
       from agent_activity
-     where event_type = 'llm_call' and created_at >= $1 and created_at < $2
-     group by 1, 2`, [sinceIso, untilIso]);
+     where event_type = 'llm_call' and agent = $3 and created_at >= $1 and created_at < $2
+     group by 1, 2`, [sinceIso, untilIso, agent]);
   return rows.map((r) => ({ model: r.model, site: r.site, calls: Number(r.calls), tin: Number(r.tin), tout: Number(r.tout), cw: Number(r.cw), cr: Number(r.cr) }));
 }
 
@@ -13762,13 +13769,13 @@ async function runIcmCostReport(correlationId) {
   const addFleet = (sum) => { fleet.actual += sum.actual; fleet.uncached += sum.uncached; };
 
   try {
-    const rowsNow = await icmMaxAggregates(since.toISOString(), now.toISOString());
+    const rowsNow = await icmAgentAggregates('max', since.toISOString(), now.toISOString());
     const maxNow = icmSummarize(rowsNow);
     addFleet(maxNow);
     lines.push('MAX');
     lines.push(`• Spend: ${fmtUsd(maxNow.actual)} across ${maxNow.calls} calls · cache hit rate ${fmtPct(maxNow.hitRate)}`);
     lines.push(`• Same traffic uncached: ${fmtUsd(maxNow.uncached)} → saved ${fmtUsd(maxNow.saved)} (${fmtPct(maxNow.uncached > 0 ? maxNow.saved / maxNow.uncached : 0)})`);
-    const rowsPrev = await icmMaxAggregates(prevSince.toISOString(), since.toISOString());
+    const rowsPrev = await icmAgentAggregates('max', prevSince.toISOString(), since.toISOString());
     const maxPrev = icmSummarize(rowsPrev);
     if (maxPrev.calls > 0) {
       const avgNow = maxNow.calls ? maxNow.actual / maxNow.calls : 0;
@@ -13807,6 +13814,21 @@ async function runIcmCostReport(correlationId) {
     const reviTop = icmBySite(reviRows).slice(0, 5);
     if (reviTop.length) lines.push(`• Top call sites: ${reviTop.map((s) => `${s.label} ${fmtUsd(s.actual)}`).join(' · ')}`);
   } catch (e) { problems.push(`REVI (revi schema): ${e.message}`); }
+
+  // Kai (ng-automation) logs to the portal's agent_activity with agent='kai'.
+  // Live reply traffic and the portal's "Test your voice" preview are split so
+  // a busy onboarding week never reads as reply volume.
+  try {
+    const kaiRows = await icmAgentAggregates('kai', since.toISOString(), now.toISOString());
+    const kai = icmSummarize(kaiRows);
+    addFleet(kai);
+    lines.push('');
+    lines.push('KAI');
+    if (!kai.calls) lines.push('• No calls logged this week');
+    for (const s of icmBySite(kaiRows)) lines.push(`• ${s.label}: ${fmtUsd(s.actual)} across ${s.calls} calls · hit rate ${fmtPct(s.hitRate)}`);
+    const kaiPrev = icmSummarize(await icmAgentAggregates('kai', prevSince.toISOString(), since.toISOString()));
+    if (kaiPrev.calls > 0) lines.push(`• Prior 7 days: ${fmtUsd(kaiPrev.actual)} across ${kaiPrev.calls} calls`);
+  } catch (e) { problems.push(`Kai (agent_activity): ${e.message}`); }
 
   lines.push('');
   lines.push(`FLEET: ${fmtUsd(fleet.actual)} actual vs ${fmtUsd(fleet.uncached)} uncached → ICM saved ${fmtUsd(fleet.uncached - fleet.actual)} this week`);

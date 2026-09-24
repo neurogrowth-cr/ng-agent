@@ -95,6 +95,21 @@ check('5g  site totals sum to the unsplit total (fleet number cannot move)',
 check('5h  hit rate is per site, not the blended figure', near(bySiteKey.copy_lab.hitRate, 0) && bySiteKey.chat_loop.hitRate > 0.7, true);
 check('5i  empty input gives no lines', icmBySite([]), []);
 
+// ── 6. Kai (ng-automation) call sites. Live replies and the portal voice
+// preview must read as separate lines; Kai's Haiku classifier and Sonnet 4.6
+// drafter both price at their real rates, never the fallback.
+const kaiSites = Object.fromEntries(icmBySite([
+  { model: 'claude-sonnet-4-6', site: 'kai_draft', calls: 10, tin: 20000, tout: 3000, cw: 0, cr: 0 },
+  { model: 'claude-haiku-4-5-20251001', site: 'kai_classify', calls: 10, tin: 15000, tout: 800, cw: 0, cr: 0 },
+  { model: 'claude-sonnet-4-6', site: 'kai_preview_draft', calls: 2, tin: 4000, tout: 600, cw: 0, cr: 0 },
+  { model: 'claude-haiku-4-5-20251001', site: 'kai_preview_classify', calls: 2, tin: 3000, tout: 160, cw: 0, cr: 0 },
+]).map((s) => [s.site, s]));
+check('6a  kai sites carry readable labels',
+  [kaiSites.kai_draft.label, kaiSites.kai_classify.label, kaiSites.kai_preview_draft.label, kaiSites.kai_preview_classify.label],
+  ['Reply drafts', 'Intent classifier', 'Voice preview drafts', 'Voice preview classifier']);
+check('6b  kai classifier prices at haiku rates ($0.015 in + $0.004 out)', near(kaiSites.kai_classify.actual, 0.019), true);
+check('6c  kai drafter prices at sonnet-4-6 rates ($0.06 in + $0.045 out)', near(kaiSites.kai_draft.actual, 0.105), true);
+
 // ── 4. Formatting. Slack lines Ron reads.
 check('4a  usd', fmtUsd(1.005), '$1.00');
 check('4b  pct rounds', fmtPct(0.666), '67%');
