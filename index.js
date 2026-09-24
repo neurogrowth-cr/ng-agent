@@ -17165,11 +17165,16 @@ if (MAKE_API_TOKEN) {
   // and an hourly poll would have seen isActive:true on both sides of it. One API
   // call per tick.
   cron.schedule('*/10 * * * *', wrapCronJob('checkMakeScenarioHealth', async (c) => { await checkMakeScenarioHealth(c); }), { timezone: 'America/Costa_Rica' });
-  cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => { await checkAxonHealth(); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Make [PROD] scenario watchdog (*/10 * * * *)');
 } else {
   console.warn('Make scenario watchdog NOT registered — MAKE_API_TOKEN is not set.');
 }
+
+// AXON's heartbeat lives in Supabase, not Make, so this watch must not depend on
+// MAKE_API_TOKEN. It used to sit inside the block above and would have stopped
+// silently if that token were ever unset.
+cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => { await checkAxonHealth(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: AXON heartbeat watch (*/10 * * * *)');
 
 // ─── KAI HEALTH WATCH ────────────────────────────────────────────────────────
 // Kai (ng-automation, the LinkedIn reply agent) had no watcher at all until
@@ -17991,7 +17996,8 @@ const STATIC_CRON_SCHEDULES = {
   checkBookingAlertDivergence:  '*/30 * * * *',
   checkGmailAlertQuality:       '0 * * * *',
   checkMakeScenarioHealth:      '*/10 * * * *',
-  checkKaiHealth:               '*/15 * * * *',
+  checkAxonHealth:              '*/10 * * * *',
+  checkKaiHealth:              '*/15 * * * *',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
