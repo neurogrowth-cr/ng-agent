@@ -17255,6 +17255,162 @@ cron.schedule('*/15 * * * *', wrapCronJob('checkKaiHealth', async () => { await 
 cron.schedule('0 8 * * 1-5', wrapCronJob('runKaiHealthDigest', async () => { await runKaiHealthDigest(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: Kai health watch (*/15 * * * *) + Kai daily digest (0 8 * * 1-5 CR)');
 
+// ─── CLIENT ATTENTION (fulfillment) ─────────────────────────────────────────
+// Mon + Thu report and urgent alerts in #ng-fullfillment-ops (Ron, 2026-09-23).
+// Recipe: ~/automations/ops/recipes/client-attention.md. The list is computed
+// in the dash (GET /api/ops/client-attention, the same engine as Admin ->
+// Campaign health, so Slack and the page never disagree); logic here lives in
+// lib/clientAttention.js (tested in test/client-attention.test.js) and this
+// block is only I/O. Fails closed: if the feed is unreachable, stale, the wrong
+// contract version, or the text fails its criteria, nothing is posted and Ron
+// gets a DM. Modes: CLIENT_ATTENTION_MODE=live posts to the channel; anything
+// else (the default) is a dry run that DMs Ron. Kill switch:
+// CLIENT_ATTENTION_DISABLED=true.
+const clientAttention = require('./lib/clientAttention');
+const DASH_API_URL = (process.env.DASH_API_URL || 'https://dash.neurogrowth.io').replace(/\/$/, '');
+const CLIENT_ATTENTION_CHANNEL = process.env.CLIENT_ATTENTION_CHANNEL || OPS_CHANNEL;
+const CLIENT_ATTENTION_SEED_KEY = 'attention:alerts-armed';
+const CLIENT_ATTENTION_FAILURE_DM_MS = 3 * 60 * 60 * 1000;
+let lastClientAttentionFailureDm = 0;
+
+const clientAttentionDisabled = () => String(process.env.CLIENT_ATTENTION_DISABLED || '') === 'true';
+const clientAttentionLive = () => String(process.env.CLIENT_ATTENTION_MODE || '') === 'live';
+
+async function fetchClientAttentionFeed() {
+  const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+  if (!secret) throw new Error('CLIENT_ATTENTION_FEED_SECRET is not set');
+  const load = async () => {
+    const res = await fetch(`${DASH_API_URL}/api/ops/client-attention`, {
+      headers: { 'x-agent-secret': secret },
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+    return res.json();
+  };
+  try {
+    return await load();
+  } catch (err) {
+    console.warn(`[client-attention] feed read failed, retrying once: ${err.message}`);
+    await new Promise((r) => setTimeout(r, 15000));
+    return load();
+  }
+}
+
+async function postClientAttention(text) {
+  if (clientAttentionLive()) return postToSlack(CLIENT_ATTENTION_CHANNEL, text);
+  return slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${CLIENT_ATTENTION_CHANNEL}]\n${text}` });
+}
+
+async function reportClientAttentionFailure(context, reason, { throttle = false } = {}) {
+  console.error(`[client-attention] ${context} did not post: ${reason}`);
+  logActivity({ event_type: 'alert', event_source: 'cron', action: `clientAttention:${context}`, status: 'error', error_message: reason });
+  if (throttle && Date.now() - lastClientAttentionFailureDm < CLIENT_ATTENTION_FAILURE_DM_MS) return;
+  lastClientAttentionFailureDm = Date.now();
+  try {
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `⚠️ Client attention ${context} did not post: ${reason}\nNothing was sent to ${CLIENT_ATTENTION_CHANNEL}.`,
+    });
+  } catch (err) {
+    console.error('[client-attention] failure DM failed:', err.message);
+  }
+}
+
+async function loadClientAttentionFeed(context, options) {
+  let feed;
+  try {
+    feed = await fetchClientAttentionFeed();
+  } catch (err) {
+    await reportClientAttentionFailure(context, err.message, options);
+    return null;
+  }
+  const check = clientAttention.checkFeed(feed, new Date());
+  if (!check.ok) {
+    await reportClientAttentionFailure(context, check.problem, options);
+    return null;
+  }
+  return feed;
+}
+
+async function runClientAttentionReport() {
+  if (clientAttentionDisabled()) return;
+  const feed = await loadClientAttentionFeed('report');
+  if (!feed) return;
+  const text = clientAttention.formatReport(feed, new Date());
+  const verdict = clientAttention.validateReport(text, feed);
+  if (!verdict.ok) {
+    await reportClientAttentionFailure('report', verdict.problems.join('; '));
+    return;
+  }
+  await postClientAttention(text);
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runClientAttentionReport', status: 'ok',
+    output: { items: feed.items.length, inBand: feed.inBand, live: clientAttentionLive() } });
+}
+
+async function alertedClientAttentionKeys(keys) {
+  if (keys.length === 0) return new Set();
+  const { data, error } = await supabase.from('agent_knowledge').select('key').in('key', keys);
+  if (error) throw new Error(`agent_knowledge read failed: ${error.message}`);
+  return new Set((data || []).map((r) => r.key));
+}
+
+async function markClientAttentionAlerted(item) {
+  const saved = await upsertKnowledge('alert', clientAttention.alertKey(item), `${item.clientName.trim()} · ${item.code}`);
+  if (!String(saved).startsWith('Knowledge saved')) throw new Error(saved);
+}
+
+async function runClientAttentionAlerts() {
+  if (clientAttentionDisabled()) return;
+  const feed = await loadClientAttentionFeed('alerts', { throttle: true });
+  if (!feed) return;
+  const urgent = feed.items.filter((i) => i.level === 'urgent');
+
+  let alerted;
+  let armed;
+  try {
+    alerted = await alertedClientAttentionKeys(urgent.map(clientAttention.alertKey));
+    armed = (await alertedClientAttentionKeys([CLIENT_ATTENTION_SEED_KEY])).size > 0;
+  } catch (err) {
+    await reportClientAttentionFailure('alerts', err.message, { throttle: true });
+    return;
+  }
+
+  // First run: everything already open is the backlog the Mon + Thu report
+  // carries. Mark it seen without posting, so the channel is not flooded; from
+  // here on only new evidence alerts.
+  if (!armed) {
+    for (const item of urgent) await markClientAttentionAlerted(item).catch((err) => console.error('[client-attention] seed:', err.message));
+    await upsertKnowledge('alert', CLIENT_ATTENTION_SEED_KEY, new Date().toISOString());
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `Client attention alerts armed (${clientAttentionLive() ? 'live' : 'dry run'}). ${urgent.length} urgent items already open were marked as seen; they are in the Mon + Thu report. From now on only new evidence alerts.`,
+    }).catch((err) => console.error('[client-attention] armed DM failed:', err.message));
+    return;
+  }
+
+  const { send, overflow } = clientAttention.planAlerts(feed, alerted);
+  for (const item of send) {
+    const text = clientAttention.formatAlert(item, feed.adminUrl);
+    const verdict = clientAttention.validateAlert(text);
+    if (!verdict.ok) {
+      await reportClientAttentionFailure('alerts', `${item.clientName.trim()}: ${verdict.problems.join('; ')}`, { throttle: true });
+      continue;
+    }
+    try {
+      await postClientAttention(text);
+      await markClientAttentionAlerted(item);
+    } catch (err) {
+      await reportClientAttentionFailure('alerts', err.message, { throttle: true });
+      return;
+    }
+  }
+  if (overflow > 0) await postClientAttention(clientAttention.formatAlertOverflow(overflow, feed.adminUrl));
+}
+
+cron.schedule('30 8 * * 1,4', wrapCronJob('runClientAttentionReport', async () => { await runClientAttentionReport(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('*/30 7-19 * * 1-6', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static crons: client attention report (30 8 * * 1,4 CR) + urgent alerts (*/30 7-19 * * 1-6 CR)');
+
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
 // the booking pipeline is broken upstream of it — if a GHL workflow stops firing
@@ -17998,6 +18154,7 @@ const STATIC_CRON_SCHEDULES = {
   checkMakeScenarioHealth:      '*/10 * * * *',
   checkAxonHealth:              '*/10 * * * *',
   checkKaiHealth:              '*/15 * * * *',
+  runClientAttentionAlerts:     '*/30 7-19 * * 1-6',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
@@ -18016,6 +18173,7 @@ const STATIC_CRON_SCHEDULES = {
   runOpenDealZombieDigest:      '45 8 * * 1',
   runIcmCostReport:             '45 7 * * 3',
   runKaiHealthDigest:           '0 8 * * 1-5',
+  runClientAttentionReport:     '30 8 * * 1,4',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
