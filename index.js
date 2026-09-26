@@ -17433,6 +17433,93 @@ cron.schedule('30 8 * * 1,4', wrapCronJob('runClientAttentionReport', async () =
 cron.schedule('*/30 7-19 * * 1-6', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: client attention report (30 8 * * 1,4 CR) + urgent alerts (*/30 7-19 * * 1-6 CR)');
 
+// ─── WEEKLY PERFORMANCE REPORT STATUS ────────────────────────────────────────
+// The dash sends every client a Monday performance email (weekly performance
+// report, Ron 2026-09-25) and computes whether it went out: eligible recipients
+// against its sends table (GET /api/ops/weekly-report-status). Max posts the
+// verdict line to #ng-fullfillment-ops on Monday at 11:00 CR, after the send
+// window and the dash's own watchdog. Rules and formatting live in
+// lib/weeklyReportStatus.js (tested in test/weekly-report-status.test.js);
+// this block is only I/O. Fails closed: an unreachable, stale or malformed
+// feed posts nothing and DMs Ron. A red verdict always goes to Ron as a DM;
+// green goes to the channel when WPR_STATUS_MODE=live, otherwise to Ron as a
+// dry run. Kill switch: WPR_STATUS_DISABLED=true. Recipe:
+// ~/automations/ops/recipes/weekly-performance-report.md.
+const weeklyReportStatus = require('./lib/weeklyReportStatus');
+const WPR_STATUS_CHANNEL = process.env.WPR_STATUS_CHANNEL || CLIENT_ATTENTION_CHANNEL;
+const wprStatusDisabled = () => String(process.env.WPR_STATUS_DISABLED || '') === 'true';
+const wprStatusLive = () => String(process.env.WPR_STATUS_MODE || '') === 'live';
+
+async function fetchWeeklyReportStatusFeed() {
+  const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+  if (!secret) throw new Error('CLIENT_ATTENTION_FEED_SECRET is not set');
+  const load = async () => {
+    const res = await fetch(`${DASH_API_URL}/api/ops/weekly-report-status`, {
+      headers: { 'x-agent-secret': secret },
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+    return res.json();
+  };
+  try {
+    return await load();
+  } catch (err) {
+    console.warn(`[wpr-status] feed read failed, retrying once: ${err.message}`);
+    await new Promise((r) => setTimeout(r, 15000));
+    return load();
+  }
+}
+
+async function reportWeeklyReportStatusFailure(reason) {
+  console.error(`[wpr-status] did not post: ${reason}`);
+  logActivity({ event_type: 'alert', event_source: 'cron', action: 'runWeeklyReportStatusPost', status: 'error', error_message: reason });
+  try {
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `⚠️ Weekly report status did not post: ${reason}\nNothing was sent to ${WPR_STATUS_CHANNEL}. The dash watchdog email is the other signal.`,
+    });
+  } catch (err) {
+    console.error('[wpr-status] failure DM failed:', err.message);
+  }
+}
+
+async function runWeeklyReportStatusPost() {
+  if (wprStatusDisabled()) return;
+  let feed;
+  try {
+    feed = await fetchWeeklyReportStatusFeed();
+  } catch (err) {
+    await reportWeeklyReportStatusFailure(err.message);
+    return;
+  }
+  const check = weeklyReportStatus.checkFeed(feed, new Date());
+  if (!check.ok) {
+    await reportWeeklyReportStatusFailure(check.problem);
+    return;
+  }
+  const text = weeklyReportStatus.formatPost(feed);
+  if (!text) {
+    logActivity({ event_type: 'report', event_source: 'cron', action: 'runWeeklyReportStatusPost', status: 'ok', output: { mode: 'off', week: feed.isoWeek } });
+    return;
+  }
+  const verdict = weeklyReportStatus.validatePost(text);
+  if (!verdict.ok) {
+    await reportWeeklyReportStatusFailure(verdict.problems.join('; '));
+    return;
+  }
+  if (feed.verdict === 'red' || !wprStatusLive()) {
+    const prefix = feed.verdict === 'red' ? '' : `[DRY RUN → ${WPR_STATUS_CHANNEL}]\n`;
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `${prefix}${text}` });
+  } else {
+    await postToSlack(WPR_STATUS_CHANNEL, text);
+  }
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runWeeklyReportStatusPost', status: 'ok',
+    output: { week: feed.isoWeek, mode: feed.mode, verdict: feed.verdict, sent: feed.sent, missing: feed.missing.length, live: wprStatusLive() } });
+}
+
+cron.schedule('0 11 * * 1', wrapCronJob('runWeeklyReportStatusPost', async () => { await runWeeklyReportStatusPost(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: weekly report status post (0 11 * * 1 CR)');
+
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
 // the booking pipeline is broken upstream of it — if a GHL workflow stops firing
@@ -18196,6 +18283,7 @@ const STATIC_CRON_SCHEDULES = {
   runIcmCostReport:             '45 7 * * 3',
   runKaiHealthDigest:           '0 8 * * 1-5',
   runClientAttentionReport:     '30 8 * * 1,4',
+  runWeeklyReportStatusPost:    '0 11 * * 1',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
   runReviProspectNotesSync:     '0 14 * * *',
