@@ -13725,6 +13725,22 @@ function icmBySite(rows) {
 }
 function fmtUsd(n) { return `$${n.toFixed(2)}`; }
 function fmtPct(n) { return `${Math.round(n * 100)}%`; }
+// Budget headroom. Anthropic's spend limit fails as a hard 400 with no warning
+// (hit 2026-09-09 and 2026-09-15), so the alert fires on the way up instead.
+// Months are UTC because the Console limit resets 00:00 UTC on the 1st.
+const API_BUDGET_THRESHOLDS = [0.6, 0.85, 1];
+function icmBudgetThreshold(spent, budget) {
+  if (!(budget > 0)) return 0;
+  let hit = 0;
+  for (const t of API_BUDGET_THRESHOLDS) if (spent >= budget * t) hit = t;
+  return hit;
+}
+function icmMonthProjection(spent, now) {
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  const elapsed = Math.max(now.getTime() - start, 3600e3); // floor at 1h so day-1 math stays sane
+  return spent * ((end - start) / elapsed);
+}
 // ── end ICM pure block ──────────────────────────────────────────────────────
 
 // agent_activity is shared: Kai (ng-automation) logs its llm_call rows there
@@ -13842,6 +13858,60 @@ async function runIcmCostReport(correlationId) {
 }
 // Wed 7:45 AM CR — first fire lands exactly 7 days after the 2026-09-03 rollout.
 cron.schedule('45 7 * * 3', wrapCronJob('runIcmCostReport', async (c) => { await runIcmCostReport(c); }), { timezone: 'America/Costa_Rica' });
+
+// API budget headroom alert. Zero LLM calls. Sums month-to-date spend from the
+// same usage tables as the cost report, pads it for spend those tables miss
+// (Sep 2026: the tables caught ~80% of the Console total, so default pad 1.25), and alerts
+// Ron + #ng-pm-agent once per threshold per month. Unset MONTHLY_API_BUDGET_USD
+// = disabled. Recipe criteria: silent below 60%; each threshold posts at most
+// once a month; an unreachable source is named in the alert, never skipped.
+async function runApiBudgetCheck(correlationId) {
+  const budget = Number(process.env.MONTHLY_API_BUDGET_USD || 0);
+  if (!(budget > 0)) { console.log('API budget check: MONTHLY_API_BUDGET_USD not set, skipping'); return; }
+  const pad = Number(process.env.API_BUDGET_UNLOGGED_PAD || 1.25);
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+  const parts = [];
+  const problems = [];
+  const add = async (label, fn) => {
+    try { parts.push({ label, usd: icmSummarize(await fn()).actual }); } catch (e) { problems.push(`${label}: ${e.message}`); }
+  };
+  await add('Max', () => icmAgentAggregates('max', monthStart, now.toISOString()));
+  await add('Kai', () => icmAgentAggregates('kai', monthStart, now.toISOString()));
+  await add('AXON chat', () => icmLlmUsageRows(axonSupabase, monthStart));
+  await add('AXON factory', () => icmFactoryRows(monthStart));
+  await add('REVI', () => icmLlmUsageRows(reviSupabase, monthStart));
+
+  const logged = parts.reduce((s, p) => s + p.usd, 0);
+  const est = logged * pad;
+  const hit = icmBudgetThreshold(est, budget);
+  const month = monthStart.slice(0, 7);
+  console.log(`API budget check ${month}: logged ${fmtUsd(logged)}, est ${fmtUsd(est)} of ${fmtUsd(budget)} (${correlationId})`);
+  if (problems.length) console.warn(`API budget check: sources unreachable: ${problems.join(' | ')}`);
+  if (!hit) return;
+
+  const dedupKey = `api-budget-alert:${month}`;
+  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', dedupKey).limit(1);
+  const alreadyAt = prior && prior.length ? Number(prior[0].value) || 0 : 0;
+  if (hit <= alreadyAt) return;
+
+  const lines = [
+    `\`API BUDGET\` ${hit >= 1 ? '🚨' : '⚠️'} ${fmtPct(est / budget)} of the ${fmtUsd(budget)} monthly budget used (${month})`,
+    `• Estimated spend: ${fmtUsd(est)} (logged ${fmtUsd(logged)} + ${fmtPct(pad - 1)} for spend the tables miss)`,
+    `• On pace for ${fmtUsd(icmMonthProjection(est, now))} by month end`,
+    `• By agent: ${parts.sort((a, b) => b.usd - a.usd).map((p) => `${p.label} ${fmtUsd(p.usd)}`).join(' · ')}`,
+    hit >= 1
+      ? '• Over budget. If the Console limit is hit, every Claude feature returns an error until it is raised (Console → Limits). Deterministic crons keep running.'
+      : '• Check the Console limit has headroom, or pause the factory/experiments until the 1st.',
+  ];
+  if (problems.length) lines.push(`• Sources unreachable: ${problems.join(' | ')}`);
+  const text = lines.join('\n');
+  await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text });
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text });
+  await upsertKnowledge('process', dedupKey, String(hit), 'api-budget-alert');
+}
+// 9 AM CR daily.
+cron.schedule('0 9 * * *', wrapCronJob('runApiBudgetCheck', async (c) => { await runApiBudgetCheck(c); }), { timezone: 'America/Costa_Rica' });
 
 // Open-deal follow-up sweep — 9 PM CR every day (deals go stale on weekends
 // too — Ron, 2026-08-23; moved from 10am to the evening outcome-reminder slot
