@@ -1911,6 +1911,26 @@ function registerDynamicCron(task) {
 
       const targetChannel = task.channel || AGENT_CHANNEL;
 
+      // Shadow model comparison (temporary, for model switches). When SHADOW_MODEL
+      // is set, the same prompt runs again on that model and ONLY Ron gets the
+      // result by DM; the real report below is untouched. draft_channel_post is
+      // removed so the shadow can never post. Fire-and-forget: a shadow failure
+      // never delays or breaks the real report. Unset SHADOW_MODEL to stop.
+      const shadowModel = process.env.SHADOW_MODEL;
+      if (shadowModel && shadowModel !== MODEL_AGENT) {
+        (async () => {
+          const shadowTools = REPORT_TOOLS.filter(t => t !== 'draft_channel_post');
+          const shadowRaw = await callClaude([{ role: 'user', content: enrichedPrompt }], 2, null, correlation_id, { onlyTools: shadowTools, model: shadowModel, callSite: 'shadow_report' });
+          const shadowReply = trimToLeadAnchor(stripApprovalSentinel(shadowRaw || ''), task.name);
+          const check = validateFinalReport(shadowReply, task.name);
+          const body = shadowReply.length > 3500 ? shadowReply.slice(0, 3500) + '\n[... trimmed ...]' : shadowReply;
+          await slack.client.chat.postMessage({
+            channel: RON_SLACK_ID,
+            text: `\`SHADOW ${shadowModel}\` "${task.name}" (real ${MODEL_AGENT} version posted to ${targetChannel})\nFormat check: ${check.ok ? 'passed' : `FAILED (${check.reason})`}${firstCheck.ok ? '' : ' · real version needed a re-prompt'}\n\n${body}`,
+          });
+        })().catch(e => console.error(`Shadow report failed (${task.name}):`, e.message));
+      }
+
       // Scheduled reports post directly — feedback learning loop handles quality
       // (user-initiated draft_channel_post requests still use the approval flow)
       const lessons = await getReportLessons(reportIdForTask(task.name));
@@ -7639,8 +7659,12 @@ function capText(str, max = Number(process.env.ICM_TOOL_RESULT_CAP || 8000)) {
 // opts.onlyTools    — allow-list: ONLY these tools survive (plus finalTool). The inverse of
 //                     dropTools, for narrow modes like alert triage where banning ~38 tools
 //                     by name would be unmaintainable. [] means finalTool only.
+// opts.model        — model override for this call (shadow comparisons); default MODEL_AGENT.
+// opts.callSite     — agent_activity call_site label; default 'agent_loop'.
 async function callClaude(messages, retries = 3, userId = null, correlationId = null, opts = {}) {
   const correlation_id = correlationId != null && correlationId !== undefined ? correlationId : newCorrelationId();
+  const loopModel = opts.model || MODEL_AGENT;
+  const loopSite = opts.callSite || 'agent_loop';
   // Learned lessons ride every interactive prompt (fetched once, not per retry).
   // Scheduled reports inject their own scoped lessons via getReportLessons.
   let lessonBlock = '';
@@ -7780,13 +7804,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
       // ── Initial call ─────────────────────────────────────────────────────────
       const tInitial = Date.now();
       let response = await anthropic.messages.create({
-        model: MODEL_AGENT,
+        model: loopModel,
         max_tokens: 4096,
         system: fullSystemPrompt,
         messages: markCacheTail(messages),
         tools: toolsForRequest,
       });
-      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id, 'agent_loop');
+      logLlmFromAnthropicResponse(response, Date.now() - tInitial, correlation_id, loopSite);
 
       // ── Multi-round tool loop (max 5 rounds to prevent infinite chains) ──────
       // 7 rounds: rule #6 mandates data-map → schema search → query before any
@@ -7849,13 +7873,13 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           try {
             const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
-              model: MODEL_AGENT,
+              model: loopModel,
               max_tokens: 4096,
               system: fullSystemPrompt,
               messages: markCacheTail(currentMessages),
               tools: toolsForRequest,
             });
-            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id, 'agent_loop');
+            logLlmFromAnthropicResponse(nextResponse, Date.now() - tFollow, correlation_id, loopSite);
             break;
           } catch (fuErr) {
             if ((fuErr.status === 529 || fuErr.status === 503) && fuAttempt < 2) {
@@ -7886,7 +7910,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         }
         const tForce = Date.now();
         const forced = await anthropic.messages.create({
-          model: MODEL_AGENT,
+          model: loopModel,
           max_tokens: 4096,
           system: fullSystemPrompt,
           messages: markCacheTail(forceMsgs),
