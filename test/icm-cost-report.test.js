@@ -14,8 +14,8 @@ const block = SRC.slice(
 );
 if (!block) { console.error('FAIL: could not extract the ICM pure block'); process.exit(1); }
 
-const { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct } =
-  new Function(`${block}; return { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct };`)();
+const { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection } =
+  new Function(`${block}; return { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -114,6 +114,16 @@ check('6c  kai drafter prices at sonnet-4-6 rates ($0.06 in + $0.045 out)', near
 check('4a  usd', fmtUsd(1.005), '$1.00');
 check('4b  pct rounds', fmtPct(0.666), '67%');
 check('4c  empty summarize is all zeros, no NaN', (() => { const z = icmSummarize([]); return z.actual === 0 && z.hitRate === 0; })(), true);
+
+// ── 5. Budget headroom alert. Silent below 60%, then the highest threshold
+// crossed; a missing budget never alerts.
+check('5a  below 60% is silent', icmBudgetThreshold(59, 100), 0);
+check('5b  exactly 60% trips the first threshold', icmBudgetThreshold(60, 100), 0.6);
+check('5c  90% reports 85%, not 60%', icmBudgetThreshold(90, 100), 0.85);
+check('5d  over budget reports 100%', icmBudgetThreshold(130, 100), 1);
+check('5e  no budget never alerts', icmBudgetThreshold(500, 0), 0);
+check('5f  halfway through a 30-day month doubles', near(icmMonthProjection(30, new Date(Date.UTC(2026, 8, 16))), 60), true);
+check('5g  first minutes of the month do not explode', icmMonthProjection(1, new Date(Date.UTC(2026, 9, 1, 0, 1))) < 1000, true);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall checks passed');
