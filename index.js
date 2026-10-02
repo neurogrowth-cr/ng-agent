@@ -1271,7 +1271,8 @@ function formatWeekNumbers(rows) {
 }
 // ─── end weekly brief helpers (test slices to here) ───────────────────────────
 
-// Retrieve the last N lessons for a report (last 90 days) to prepend to reports.
+// Retrieve the last N lessons for a report (last 90 days). Lessons feed the
+// model that WRITES a report; they are never printed on the report itself.
 async function getReportLessons(reportId) {
   try {
     const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
@@ -1932,13 +1933,11 @@ function registerDynamicCron(task) {
       }
 
       // Scheduled reports post directly — feedback learning loop handles quality
-      // (user-initiated draft_channel_post requests still use the approval flow)
-      const lessons = await getReportLessons(reportIdForTask(task.name));
+      // (user-initiated draft_channel_post requests still use the approval flow).
+      // Lessons go into the PROMPT (lessonContext above), never onto the post:
+      // a "[Corrections applied from team feedback]" header used to be prepended
+      // here and published raw lesson text to the team (2026-10-01).
       let finalReply = reply;
-      if (lessons.length) {
-        const lessonNote = `[Corrections applied from team feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`;
-        finalReply = lessonNote + reply;
-      }
       // Strip Markdown bold — Slack uses *bold* not **bold**
       finalReply = finalReply.replace(/\*\*(.+?)\*\*/g, '$1');
       // Monthly VoC Digest: a 📄 reaction on the posted digest dispatches the
@@ -5044,14 +5043,10 @@ async function runMondayGapDetection(correlationId) {
       return;
     }
 
-    // Two newest lessons only — the lesson block is a report surface too and
-    // was stacking five bullets on top of an already-long post.
-    const gapLessons = (await getReportLessons('gap-detection')).slice(0, 2);
-    const lessonNote = gapLessons.length
-      ? `[Corrections applied from team feedback]\n${gapLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
-      : '';
-    // Post directly — team reviews and threads corrections to Max for learning
-    const gapPosted = await executeChannelPost(OPS_CHANNEL, lessonNote + report, null, correlationId);
+    // Post directly — team reviews and threads corrections to Max for learning.
+    // The report is templated (formatGapReport), so stored lessons cannot change
+    // it; they used to be prepended as raw text, which only leaked them.
+    const gapPosted = await executeChannelPost(OPS_CHANNEL, report, null, correlationId);
     await registerPostedReport(gapPosted, 'gap-detection');
     if (gapPosted?.ts && salesDetailSections.length) {
       await postToSlack(OPS_CHANNEL, `*Sales gap detail*\n\n${salesDetailSections.join('\n\n')}`, gapPosted.ts);
@@ -9911,14 +9906,9 @@ async function runSalesStandup(_correlationId) {
     const totalClaimed   = sumField(setterYesterday, 'leads_claimed');
     const weeklyScheduled = sumField(setterWeek, 'calls_booked');
 
-    const setterLessons = await getReportLessons('sales-standup-setter');
-    const setterLessonNote = setterLessons.length
-      ? `[Corrections applied from feedback]\n${setterLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
-      : '';
-
     for (const setter of setters) {
       try {
-        const lines = [`${setterLessonNote}Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
+        const lines = [`Good morning ${setter.name}! Here's your setter brief for ${today}:\n`];
 
         // Yesterday stats — omitted entirely when the stats lookup failed
         if (setterYesterday) {
@@ -9989,11 +9979,6 @@ async function runSalesStandup(_correlationId) {
       .filter(([email, slackId]) => slackId && email.includes('@') && slackId !== RON_SLACK_ID)
       .map(([email, slackId]) => ({ email, slackId, name: resolveSalesMember(email) }));
 
-    const closerLessons = await getReportLessons('sales-standup-closer');
-    const closerLessonNote = closerLessons.length
-      ? `[Corrections applied from feedback]\n${closerLessons.map(l => `• ${l.value}`).join('\n')}\n\n`
-      : '';
-
     for (const closer of closers) {
       try {
         const cs            = closerYesterday ? (closerYesterday[closer.name] || null) : null;
@@ -10005,7 +9990,7 @@ async function runSalesStandup(_correlationId) {
 
         const myTodayCalls = (todayCalls || []).filter(a => a.closer_id === closer.email);
 
-        const lines = [`${closerLessonNote}Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
+        const lines = [`Good morning ${closer.name.split(' ')[0]}! Here's your closer brief for ${today}:\n`];
 
         // Yesterday stats — omitted when the stats lookup failed; "awaiting
         // outcome" keeps a 0-held day with pending calls from reading as dead.
@@ -12251,12 +12236,6 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
       unlogged.map(a => (a.prospect?.email || '')),
     );
 
-    // Feedback-loop lessons ───────────────────────────────────────────────────
-    const lessons = await getReportLessons('unlogged-outcome-reminder');
-    const lessonNote = lessons.length
-      ? `[Corrections applied from feedback]\n${lessons.map(l => `• ${l.value}`).join('\n')}\n\n`
-      : '';
-
     // DM each closer: pre-filled proposal per recording-verified call (capped),
     // then the classic aggregate list for the rest ────────────────────────────
     const PROPOSALS_PER_CLOSER_PER_RUN = typeof opts.perCloserCap === 'number' && opts.perCloserCap > 0
@@ -12392,7 +12371,7 @@ async function runUnloggedOutcomeReminders(_correlationId, opts = {}) {
 
       if (aggregate.length) {
         try {
-          const lines = [`${lessonNote}Hey ${firstName} — these calls are still missing an outcome in GHL:\n`];
+          const lines = [`Hey ${firstName} — these calls are still missing an outcome in GHL:\n`];
           lines.push(`⚠️ Outcome not logged (${aggregate.length}):`);
           aggregate.forEach(({ appt, count, proposalPending }) => {
             const pName = appt.prospect?.full_name || 'Unknown';
