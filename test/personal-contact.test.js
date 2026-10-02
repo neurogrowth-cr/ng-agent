@@ -73,6 +73,26 @@ const markAt  = handler.indexOf('PERSONAL_MARK_EMOJIS.has(baseEmoji)');
 const claimAt = handler.indexOf('LEAD_CLAIM_EMOJIS.has(baseEmoji)');
 check('personal mark route runs before the lead-claim route', markAt > -1 && claimAt > -1 && markAt < claimAt, true);
 
+// Card removal policy: early Appointment Setting stages are deleted, anything
+// that reached a booked call (or any VSL stage) is only abandoned.
+const stageBlock  = SRC.match(/const STRIKE_STAGE = \{[\s\S]*?\n\};\n/);
+const deletable   = SRC.match(/const PERSONAL_DELETABLE_STAGE_IDS = new Set\(\[[\s\S]*?\]\);\n/);
+const actionFn    = SRC.match(/function personalCardAction\(stageId\) \{[\s\S]*?\n\}\n/);
+check('card policy pieces found in index.js', !!(stageBlock && deletable && actionFn), true);
+if (stageBlock && deletable && actionFn) {
+  const personalCardAction = new Function(`${stageBlock[0]}${deletable[0]}${actionFn[0]}; return personalCardAction;`)();
+  const NL = '93de6a09-78a4-4253-bea4-c1528ed6f2b3', IC = '4b936528-794e-40ab-812d-144b9d5e8128',
+        S3 = 'e639662d-6b1b-42b5-a89d-7ebd70ca97e3', CALL_BOOKED = 'dc1fba03-abeb-4b47-9d29-6c308002b6c1',
+        OPEN_DEAL = '63d30181-4ec0-4daa-8832-a8eebe1afbeb', VSL_BOOKED = '0315ac38-dd43-479b-ad99-aee8b4334bd5';
+  check('New Lead friend card is deleted', personalCardAction(NL), 'delete');
+  check('Initial Contact friend card is deleted', personalCardAction(IC), 'delete');
+  check('Strike 3 friend card is deleted', personalCardAction(S3), 'delete');
+  check('Call Booked card is only abandoned', personalCardAction(CALL_BOOKED), 'abandon');
+  check('Open Deal card is only abandoned', personalCardAction(OPEN_DEAL), 'abandon');
+  check('VSL card is only abandoned', personalCardAction(VSL_BOOKED), 'abandon');
+  check('unknown stage is only abandoned', personalCardAction(undefined), 'abandon');
+}
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);

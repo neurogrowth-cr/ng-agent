@@ -15683,13 +15683,13 @@ async function ghlFetchJson(url) {
 
 // Pages a whole stage. Uses the meta.startAfter/startAfterId cursor rather than
 // meta.nextPageUrl so the location/pipeline filters can't drift between pages.
-async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40 } = {}) {
+async function ghlSearchOppsByStage(stageId, { limit = 100, maxPages = 40, status = 'open' } = {}) {
   const locationId = process.env.GHL_LOCATION_ID;
   const out = [];
   let startAfter = null, startAfterId = null;
   for (let page = 0; page < maxPages; page++) {
     let url = `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}`
-            + `&pipeline_id=${STRIKE_PIPELINE_ID}&pipeline_stage_id=${stageId}&status=open&limit=${limit}`;
+            + `&pipeline_id=${STRIKE_PIPELINE_ID}&pipeline_stage_id=${stageId}&status=${status}&limit=${limit}`;
     if (startAfter && startAfterId) url += `&startAfter=${startAfter}&startAfterId=${startAfterId}`;
     const data  = await ghlFetchJson(url);
     const batch = data.opportunities || [];
@@ -15864,7 +15864,7 @@ async function runAutoStrikeMover(correlationId) {
       if (isPersonalContact(opp.contact?.tags)) {
         bump('personal_contact');
         if (isLive) {
-          await excludePersonalContact({ contactId: opp.contactId, oppId: opp.id, name: opp.contact?.name || opp.name || '', via: 'strike_sweep' });
+          await excludePersonalContact({ contactId: opp.contactId, opp: { id: opp.id, pipelineStageId: opp.pipelineStageId }, name: opp.contact?.name || opp.name || '', via: 'strike_sweep' });
           personalExcluded.push(opp.contact?.name || opp.name || opp.id);
         }
         continue;
@@ -15895,6 +15895,24 @@ async function runAutoStrikeMover(correlationId) {
     if (throttleMs > 0) await new Promise(r => setTimeout(r, throttleMs));
   }
 
+  // Friend cards abandoned before cards were deleted (or by hand in GHL) still
+  // sit in the early columns. Delete the ones whose contact is tagged personal.
+  // Live only; untagged abandoned cards are never touched.
+  let personalCardsDeleted = 0;
+  if (isLive) {
+    for (const stageId of PERSONAL_DELETABLE_STAGE_IDS) {
+      try {
+        const abandoned = await ghlSearchOppsByStage(stageId, { status: 'abandoned' });
+        for (const o of abandoned) {
+          if (!isPersonalContact(o.contact?.tags)) continue;
+          try { await ghlDeleteOpportunity(o.id); personalCardsDeleted++; }
+          catch (e) { failures.push(`personal cleanup ${o.contact?.name || o.id}: ${e.message}`); }
+          if (throttleMs > 0) await new Promise(r => setTimeout(r, throttleMs));
+        }
+      } catch (e) { failures.push(`personal cleanup search ${STRIKE_STAGE_NAME[stageId] || stageId}: ${e.message}`); }
+    }
+  }
+
   // Per-sweep stats persist to agent_activity so the nightly learning report can
   // roll up the day (strikeBuildDailyDigest). Transient GHL 401/503 failures stay
   // in metadata, not status — they self-heal next sweep and shouldn't trip the
@@ -15903,7 +15921,7 @@ async function runAutoStrikeMover(correlationId) {
     event_type: 'strike_sweep', event_source: 'cron', action: 'runAutoStrikeMover',
     correlation_id: correlationId,
     metadata: { mode, scanned: cards.length, moved: moves.length, capped, emailTouchCards,
-                personalExcluded: personalExcluded.slice(0, 20), skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
+                personalExcluded: personalExcluded.slice(0, 20), personalCardsDeleted, skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
   });
 
   // Per-run Slack posts are dry-run-only (testing visibility). Live mode is
@@ -15973,9 +15991,13 @@ async function strikeLoadEmailTouches(sinceIso) {
 // Slack lead post, setter nags, strike moves and a place in the lead counts.
 // Tagging the GHL contact `personal` (PERSONAL_CONTACT_TAG) takes them out of
 // all of it: if the tag is already there when the lead arrives, the intake
-// webhook drops it before Slack; otherwise the next strike sweep (within 2h)
-// abandons the open card, flags its lead_posts rows (migration 015) so counts
-// and nags skip them, and swaps the Slack lead post for a one-line note.
+// webhook drops it before Slack; otherwise 🫂 in Slack (at once) or the next
+// strike sweep (within 2h) removes the open card, flags its lead_posts rows
+// (migration 015) so counts and nags skip them, and swaps the Slack lead post
+// for a one-line note. Early-stage friend cards are DELETED (Ron, 2026-10-02:
+// abandoned cards still cluttered the New Lead column for setters); a card
+// that reached Call Booked or later is only abandoned, never deleted. The
+// contact and its tag always stay, so a repeat DM never creates a new card.
 // No GHL workflow edits needed: the opportunity search already returns each
 // card's contact tags, and the intake webhook already fetches the contact.
 const PERSONAL_CONTACT_TAG = String(process.env.PERSONAL_CONTACT_TAG || 'personal').trim().toLowerCase();
@@ -15985,8 +16007,8 @@ function isPersonalContact(tags) {
 }
 
 // Open cards on the two sales pipelines for one contact. Closed cards (won,
-// lost) are never touched: abandoning is only for leads still in play.
-async function ghlOpenSalesOppIds(contactId) {
+// lost) are never touched: removal is only for leads still in play.
+async function ghlOpenSalesOpps(contactId) {
   const res = await ghlFetch(
     `https://services.leadconnectorhq.com/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&contact_id=${contactId}`,
     { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
@@ -15995,7 +16017,26 @@ async function ghlOpenSalesOppIds(contactId) {
   if (!res.ok) throw new Error(`opp search ${contactId} → ${res.status}`);
   return ((await res.json()).opportunities || [])
     .filter(o => o.status === 'open' && GHL_OUTCOME_STAGES[o.pipelineId])
-    .map(o => o.id);
+    .map(o => ({ id: o.id, pipelineStageId: o.pipelineStageId }));
+}
+
+// Appointment Setting stages before any call was booked. A friend's card here
+// has no calls, outcomes or reports hanging off it, so it is deleted outright.
+// Every other stage (Call Booked onward, or any VSL stage) is only abandoned.
+const PERSONAL_DELETABLE_STAGE_IDS = new Set([
+  STRIKE_STAGE.NEW_LEAD, STRIKE_STAGE.INITIAL_CONTACT,
+  STRIKE_STAGE.STRIKE_1, STRIKE_STAGE.STRIKE_2, STRIKE_STAGE.STRIKE_3,
+]);
+function personalCardAction(stageId) {
+  return PERSONAL_DELETABLE_STAGE_IDS.has(stageId) ? 'delete' : 'abandon';
+}
+
+async function ghlDeleteOpportunity(oppId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  }, { label: `DELETE /opportunities/${oppId}` });
+  if (!res.ok) throw new Error(`opp DELETE ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
 async function ghlAbandonOpportunity(oppId) {
@@ -16025,11 +16066,14 @@ async function ghlAddContactTag(contactId, tag) {
 
 // Takes one contact out of the sales flow. Each step is independent and
 // best-effort; it never throws, and the audit row says what happened.
-async function excludePersonalContact({ contactId, oppId = null, name = '', via }) {
-  const done = { contact_id: contactId, name, via, abandoned: [], lead_posts_flagged: 0, slack_updated: 0, errors: [] };
+async function excludePersonalContact({ contactId, opp = null, name = '', via }) {
+  const done = { contact_id: contactId, name, via, deleted: [], abandoned: [], lead_posts_flagged: 0, slack_updated: 0, errors: [] };
   try {
-    const ids = oppId ? [oppId] : await ghlOpenSalesOppIds(contactId);
-    for (const id of ids) { await ghlAbandonOpportunity(id); done.abandoned.push(id); }
+    const opps = opp ? [opp] : await ghlOpenSalesOpps(contactId);
+    for (const o of opps) {
+      if (personalCardAction(o.pipelineStageId) === 'delete') { await ghlDeleteOpportunity(o.id); done.deleted.push(o.id); }
+      else { await ghlAbandonOpportunity(o.id); done.abandoned.push(o.id); }
+    }
   } catch (e) { done.errors.push(`opportunity: ${e.message}`); }
   try {
     const { data, error } = await supabase.rpc('mark_lead_posts_personal', { p_contact_id: contactId });
@@ -16055,7 +16099,7 @@ async function excludePersonalContact({ contactId, oppId = null, name = '', via 
     event_type: 'personal_contact_excluded', event_source: via === 'intake' ? 'ghl' : 'cron',
     action: 'excludePersonalContact', correlation_id: newCorrelationId(), output: done,
   });
-  console.log(`personal contact excluded (${via}): ${name || contactId}, abandoned ${done.abandoned.length}, flagged ${done.lead_posts_flagged}, slack ${done.slack_updated}${done.errors.length ? `, errors: ${done.errors.join(' | ')}` : ''}`);
+  console.log(`personal contact excluded (${via}): ${name || contactId}, deleted ${done.deleted.length}, abandoned ${done.abandoned.length}, flagged ${done.lead_posts_flagged}, slack ${done.slack_updated}${done.errors.length ? `, errors: ${done.errors.join(' | ')}` : ''}`);
   return done;
 }
 
@@ -19534,7 +19578,7 @@ slack.event('reaction_added', async ({ event }) => {
       const done = await excludePersonalContact({ contactId: meta.contact_id, name: meta.full_name || '', via: `slack:${event.user}` });
       await slack.client.chat.postMessage({
         channel, thread_ts: timestamp,
-        text: `Marked personal by <@${event.user}>: tagged \`${PERSONAL_CONTACT_TAG}\` in GHL, ${done.abandoned.length ? 'card abandoned' : 'no open card'}, out of lead counts and nags. To undo, remove the tag in GHL.${done.errors.length ? ` (partial: ${done.errors.join(' | ').slice(0, 200)})` : ''}`,
+        text: `Marked personal by <@${event.user}>: tagged \`${PERSONAL_CONTACT_TAG}\` in GHL, ${done.deleted.length ? 'card deleted' : done.abandoned.length ? 'card abandoned' : 'no open card'}, out of lead counts and nags. To undo, remove the tag in GHL.${done.errors.length ? ` (partial: ${done.errors.join(' | ').slice(0, 200)})` : ''}`,
       });
       return;
     }
