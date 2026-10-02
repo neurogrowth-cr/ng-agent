@@ -56,6 +56,23 @@ lines.forEach((line, i) => {
 check('every lead count / nag query skips personal contacts', missing, []);
 check('the guard actually found the lead_posts reads', checked >= 7, true);
 
+// The 🫂 Slack route must not collide with any other reaction set, and must
+// run before the lead-claim route in the reaction_added handler.
+const setOf = (name) => {
+  const m = SRC.match(new RegExp(`const ${name}\\s*=\\s*new Set\\((\\[[^\\]]*\\])\\)`));
+  return m ? new Set(JSON.parse(m[1].replace(/'/g, '"'))) : null;
+};
+const mark = setOf('PERSONAL_MARK_EMOJIS');
+const others = ['LEAD_CLAIM_EMOJIS', 'CAMPAIGN_APPROVE_EMOJIS', 'CAMPAIGN_SKIP_EMOJIS'].map(n => [n, setOf(n)]);
+check('personal mark emoji set found', !!mark && mark.size > 0, true);
+check('every other reaction set found', others.every(([, set]) => !!set), true);
+check('personal mark emoji collides with no other reaction set',
+  others.flatMap(([n, set]) => [...(mark || [])].filter(e => set && set.has(e)).map(e => `${e} in ${n}`)), []);
+const handler = SRC.slice(SRC.indexOf("slack.event('reaction_added'"));
+const markAt  = handler.indexOf('PERSONAL_MARK_EMOJIS.has(baseEmoji)');
+const claimAt = handler.indexOf('LEAD_CLAIM_EMOJIS.has(baseEmoji)');
+check('personal mark route runs before the lead-claim route', markAt > -1 && claimAt > -1 && markAt < claimAt, true);
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);
