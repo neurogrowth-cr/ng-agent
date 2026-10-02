@@ -33,16 +33,28 @@ const writeIds = ids(/registerPostedReport\(\s*[A-Za-z_$][\w$]*\s*,\s*(reportIdF
 const orphanReads  = [...new Set(readIds)].filter(i => !writeIds.includes(i));
 const orphanWrites = [...new Set(writeIds)].filter(i => !readIds.includes(i));
 
-check('at least the 6 known reports are read', readIds.length >= 6, true);
-// Set-comparison alone misses a single read regressing to channel scope, since
-// the other dynamic-cron read keeps the task id in the set. Pin the count and
-// ban channel variables outright.
-check('BOTH dynamic-cron reads are scoped to the task, not the channel',
-  (SRC.match(/getReportLessons\(reportIdForTask\(task\.name\)\)/g) || []).length, 2);
+// Only reports written by a model READ lessons (into the prompt). Templated
+// reports still REGISTER, so feedback on them is attributed and stored, but
+// they have no model to apply it, so they do not read. Until 2026-10-01 they
+// read lessons just to print them on top of the post, which leaked raw lesson
+// text ("[Corrections applied from team feedback] ...") to the team.
+const TEMPLATED = ["'gap-detection'", "'sales-standup-setter'", "'sales-standup-closer'", "'unlogged-outcome-reminder'"];
+check('the model-written reports are read', readIds.length >= 2, true);
+// Pin the count and ban channel variables outright.
+check('the dynamic-cron read is scoped to the task, not the channel',
+  (SRC.match(/getReportLessons\(reportIdForTask\(task\.name\)\)/g) || []).length, 1);
 check('no getReportLessons call takes a channel',
   /getReportLessons\(\s*(taskChannel|targetChannel|channelName)/.test(SRC), false);
 check('DEFECT B — no read id lacks a writer', orphanReads, []);
-check('no write id is never read (dead registration)', orphanWrites, []);
+check('every unread write is a known templated report', orphanWrites.filter(i => !TEMPLATED.includes(i)), []);
+
+console.log('\nlessons never print on a report');
+check('no "[Corrections applied" header is built anywhere',
+  SRC.split('\n').filter(l => l.includes('[Corrections applied') && !l.trim().startsWith('//')), []);
+check('the dynamic cron posts the reply, not lessons + reply',
+  /finalReply = lessonNote \+ reply/.test(SRC), false);
+check('the dynamic cron still injects lessons into the prompt',
+  /PREVIOUS FEEDBACK FROM TEAM \(apply these corrections to this report\)/.test(SRC), true);
 for (const id of ["'sales-standup-setter'", "'sales-standup-closer'"]) {
   check(`${id} (a DM brief) now has a registered writer`, writeIds.includes(id), true);
 }
