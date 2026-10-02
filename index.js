@@ -16028,6 +16028,22 @@ async function ghlAbandonOpportunity(oppId) {
   if (!res.ok) throw new Error(`opp status PUT ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
+// 🫂 ("friend") on a lead post in #ng-sales-goats marks the contact personal
+// straight from Slack: Max adds the GHL tag and runs the exclusion at once, no
+// 2h wait for the strike sweep. Deliberately NOT 🚫: that is already a skip
+// emoji for campaign approvals and outcome cards. Ron and anyone in the setter
+// map may use it; every use is named in the thread.
+const PERSONAL_MARK_EMOJIS = new Set(['people_hugging']);
+
+async function ghlAddContactTag(contactId, tag) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tags: [tag] }),
+  }, { label: `POST /contacts/${contactId}/tags` });
+  if (!res.ok) throw new Error(`tag POST ${contactId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+}
+
 // Takes one contact out of the sales flow. Each step is independent and
 // best-effort; it never throws, and the audit row says what happened.
 async function excludePersonalContact({ contactId, oppId = null, name = '', via }) {
@@ -19504,6 +19520,44 @@ slack.event('reaction_added', async ({ event }) => {
         return true;   // it WAS ours and it blew up — do not fall through to lead-claim
       });
       if (handled) return;
+    }
+
+    // Route 1b: 🫂 on a lead post marks the contact personal (a friend writing
+    // to the brand account). Ron or anyone in the setter map; others get a
+    // thread note. Tags the GHL contact, then excludes it right away.
+    if (event.item.channel === LEAD_CHANNEL_ID && PERSONAL_MARK_EMOJIS.has(baseEmoji)) {
+      const channel = event.item.channel;
+      const timestamp = event.item.ts;
+      const hist = await slack.client.conversations.history({
+        channel, latest: timestamp, limit: 1, inclusive: true, include_all_metadata: true,
+      });
+      const msg = hist.messages && hist.messages[0];
+      if (!msg || msg.ts !== timestamp) return;
+      const meta = msg.metadata && msg.metadata.event_type === 'ghl_lead' ? msg.metadata.event_payload : null;
+      if (!meta || !meta.contact_id) return;
+      if (event.user !== RON_SLACK_ID && !SLACK_TO_GHL_USER[event.user]) {
+        await slack.client.chat.postMessage({
+          channel, thread_ts: timestamp,
+          text: `<@${event.user}> only Ron and setters can mark a lead as personal. Ping Ron if this is a friend, not a lead.`,
+        });
+        return;
+      }
+      try {
+        await ghlAddContactTag(meta.contact_id, PERSONAL_CONTACT_TAG);
+      } catch (err) {
+        console.error('personal mark: GHL tag failed:', err.message);
+        await slack.client.chat.postMessage({
+          channel, thread_ts: timestamp,
+          text: `<@${event.user}> couldn't tag this contact in GHL (${err.message.slice(0, 120)}). Nothing changed. Tag it \`${PERSONAL_CONTACT_TAG}\` by hand in GHL or try again.`,
+        });
+        return;
+      }
+      const done = await excludePersonalContact({ contactId: meta.contact_id, name: meta.full_name || '', via: `slack:${event.user}` });
+      await slack.client.chat.postMessage({
+        channel, thread_ts: timestamp,
+        text: `Marked personal by <@${event.user}>: tagged \`${PERSONAL_CONTACT_TAG}\` in GHL, ${done.abandoned.length ? 'card abandoned' : 'no open card'}, out of lead counts and nags. To undo, remove the tag in GHL.${done.errors.length ? ` (partial: ${done.errors.join(' | ').slice(0, 200)})` : ''}`,
+      });
+      return;
     }
 
     // Route 2: lead-claim in #ng-sales-goats (existing flow)
