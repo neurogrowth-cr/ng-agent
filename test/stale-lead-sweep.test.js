@@ -28,7 +28,7 @@ function check(label, actual, expected) {
 // method returns `this`, and awaiting it yields { data, error }.
 function table(rows, error = null) {
   const b = {
-    select: () => b, gte: () => b, order: () => b, in: () => b,
+    select: () => b, gte: () => b, order: () => b, in: () => b, is: () => b,
     then: (res) => res({ data: rows, error }),
   };
   return b;

@@ -3651,6 +3651,7 @@ async function getLeadClaimPairs(startDate, endDate) {
   const { data: leadRows, error: leadErr } = await supabase
     .from('lead_posts')
     .select('slack_message_ts, contact_id, posted_at')
+    .is('personal_excluded_at', null)
     .gte('posted_at', startDate.toISOString())
     .lt('posted_at', endDate.toISOString())
     .order('posted_at', { ascending: true });
@@ -3723,6 +3724,7 @@ async function getSalesIntelligence(query) {
       const { data: leadRows, error: leadErr } = await supabase
         .from('lead_posts')
         .select('slack_message_ts, contact_id, full_name, source, posted_at')
+        .is('personal_excluded_at', null)
         .gte('posted_at', dayStartUtc.toISOString())
         .lt('posted_at', dayEndUtc.toISOString())
         .order('posted_at', { ascending: true });
@@ -6032,6 +6034,7 @@ async function _scrapeGhlNewContactsToday() {
   const { data, error } = await supabase
     .from('lead_posts')
     .select('slack_message_ts')
+    .is('personal_excluded_at', null)
     .gte('posted_at', day.start)
     .lt('posted_at',  day.end);
   if (error) throw new Error(error.message);
@@ -7101,6 +7104,7 @@ async function _scrapeLeadsTotal7d() {
   const { data: leads, error } = await supabase
     .from('lead_posts')
     .select('slack_message_ts')
+    .is('personal_excluded_at', null)
     .gte('posted_at', w.start)
     .lt('posted_at',  w.end);
   if (error) throw new Error(error.message);
@@ -7184,6 +7188,7 @@ async function _scrapeBookingRate7d() {
   const { data: leads, error } = await supabase
     .from('lead_posts')
     .select('slack_message_ts')
+    .is('personal_excluded_at', null)
     .gte('posted_at', w.start)
     .lt('posted_at',  w.end);
   if (error) throw new Error(error.message);
@@ -12668,9 +12673,11 @@ async function runAppointmentStatusSync(_correlationId) {
 // to scroll past it, which is exactly how the original 11-day Adrian RM lead was
 // missed. Tag names verified against the live location tag list on 2026-08-19 —
 // `cancelled` is deliberately NOT terminal on its own (a cancelled call still
-// deserves a human), it only lands here alongside `no-fit`.
+// deserves a human), it only lands here alongside `no-fit`. `personal` (a
+// friend writing to the brand account, see PERSONAL CONTACTS) is here so a nag
+// stops the moment the tag lands, not at the next strike sweep.
 const TERMINAL_LEAD_TAGS = new Set(
-  (process.env.STALE_LEAD_TERMINAL_TAGS || 'won-deal,no-fit,generic-lost,activation-done,call-showed')
+  (process.env.STALE_LEAD_TERMINAL_TAGS || 'won-deal,no-fit,generic-lost,activation-done,call-showed,personal')
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
 );
 
@@ -12741,6 +12748,7 @@ async function getUnclaimedLeads(sinceMs) {
   const { data: leadRows, error: leadErr } = await supabase
     .from('lead_posts')
     .select('slack_message_ts, slack_channel_id, contact_id, full_name, source, posted_at')
+    .is('personal_excluded_at', null)
     .gte('posted_at', new Date(sinceMs).toISOString())
     .order('posted_at', { ascending: true });
   // Throw rather than swallow-and-return-[] — both callers treat an empty
@@ -12957,6 +12965,7 @@ async function getWeeklyLeadStats(startIso, endIso) {
   const { data, error } = await supabase
     .from('lead_posts')
     .select('slack_message_ts, source, posted_at')
+    .is('personal_excluded_at', null)
     .gte('posted_at', startIso)
     .lt('posted_at', endIso);
   if (error) throw new Error(error.message);
@@ -14289,6 +14298,14 @@ async function handleGHLWebhook(req, res) {
             correlation_id: newCorrelationId(),
             output: { contact_id: contactId, full_name: fullName, reason: clientCallReason, source: sourceRaw || null },
           });
+          return;
+        }
+        // A contact Ron tagged `personal` (a friend writing to the brand
+        // account) is not a lead. Same drop point as client calls, plus the
+        // card is abandoned in case the intake workflow already created one.
+        if (contactId && isPersonalContact(ghlContact?.tags)) {
+          console.log(`GHL lead ${contactId} ("${fullName}") DROPPED: tagged "${PERSONAL_CONTACT_TAG}". No Slack post, no setter DM, no lead_posts row.`);
+          await excludePersonalContact({ contactId, name: fullName, via: 'intake' });
           return;
         }
         const isSelfServe = SELF_SERVE_SOURCE_RE.test(sourceRaw || '')
@@ -15741,10 +15758,19 @@ async function runAutoStrikeMover(correlationId) {
   const bump = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
   const moves = [], failures = [];
   let capped = 0, emailTouchCards = 0;
+  const personalExcluded = [];
 
   for (const opp of cards) {
     try {
       if (!opp.contactId) { bump('no_contact'); continue; }
+      if (isPersonalContact(opp.contact?.tags)) {
+        bump('personal_contact');
+        if (isLive) {
+          await excludePersonalContact({ contactId: opp.contactId, oppId: opp.id, name: opp.contact?.name || opp.name || '', via: 'strike_sweep' });
+          personalExcluded.push(opp.contact?.name || opp.name || opp.id);
+        }
+        continue;
+      }
       const convoId = await ghlFindConversationId(opp.contactId);
       if (!convoId) { bump('no_conversation'); continue; }
       const messages = await ghlGetConversationMessages(convoId);
@@ -15779,7 +15805,7 @@ async function runAutoStrikeMover(correlationId) {
     event_type: 'strike_sweep', event_source: 'cron', action: 'runAutoStrikeMover',
     correlation_id: correlationId,
     metadata: { mode, scanned: cards.length, moved: moves.length, capped, emailTouchCards,
-                skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
+                personalExcluded: personalExcluded.slice(0, 20), skips: skipCounts, moves: moves.slice(0, 50), failures: failures.slice(0, 10) },
   });
 
   // Per-run Slack posts are dry-run-only (testing visibility). Live mode is
@@ -15841,6 +15867,82 @@ async function strikeLoadEmailTouches(sinceIso) {
     console.error('strikeLoadEmailTouches failed (sweep continues without Max email touches):', err.message);
   }
   return map;
+}
+
+// ─── PERSONAL CONTACTS ───────────────────────────────────────────────────────
+// Ron's brand accounts (Messenger, Instagram) also get DMs from friends. GHL
+// turns every first DM into a contact + New Lead card, so a friend would get a
+// Slack lead post, setter nags, strike moves and a place in the lead counts.
+// Tagging the GHL contact `personal` (PERSONAL_CONTACT_TAG) takes them out of
+// all of it: if the tag is already there when the lead arrives, the intake
+// webhook drops it before Slack; otherwise the next strike sweep (within 2h)
+// abandons the open card, flags its lead_posts rows (migration 015) so counts
+// and nags skip them, and swaps the Slack lead post for a one-line note.
+// No GHL workflow edits needed: the opportunity search already returns each
+// card's contact tags, and the intake webhook already fetches the contact.
+const PERSONAL_CONTACT_TAG = String(process.env.PERSONAL_CONTACT_TAG || 'personal').trim().toLowerCase();
+function isPersonalContact(tags) {
+  return (Array.isArray(tags) ? tags : [])
+    .some(t => String(t || '').trim().toLowerCase() === PERSONAL_CONTACT_TAG);
+}
+
+// Open cards on the two sales pipelines for one contact. Closed cards (won,
+// lost) are never touched: abandoning is only for leads still in play.
+async function ghlOpenSalesOppIds(contactId) {
+  const res = await ghlFetch(
+    `https://services.leadconnectorhq.com/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&contact_id=${contactId}`,
+    { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } },
+    { label: `open-opps ${contactId}` },
+  );
+  if (!res.ok) throw new Error(`opp search ${contactId} → ${res.status}`);
+  return ((await res.json()).opportunities || [])
+    .filter(o => o.status === 'open' && GHL_OUTCOME_STAGES[o.pipelineId])
+    .map(o => o.id);
+}
+
+async function ghlAbandonOpportunity(oppId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}/status`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'abandoned' }),
+  }, { label: `PUT /opportunities/${oppId}/status` });
+  if (!res.ok) throw new Error(`opp status PUT ${oppId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
+}
+
+// Takes one contact out of the sales flow. Each step is independent and
+// best-effort; it never throws, and the audit row says what happened.
+async function excludePersonalContact({ contactId, oppId = null, name = '', via }) {
+  const done = { contact_id: contactId, name, via, abandoned: [], lead_posts_flagged: 0, slack_updated: 0, errors: [] };
+  try {
+    const ids = oppId ? [oppId] : await ghlOpenSalesOppIds(contactId);
+    for (const id of ids) { await ghlAbandonOpportunity(id); done.abandoned.push(id); }
+  } catch (e) { done.errors.push(`opportunity: ${e.message}`); }
+  try {
+    const { data, error } = await supabase.rpc('mark_lead_posts_personal', { p_contact_id: contactId });
+    if (error) throw new Error(error.message);
+    done.lead_posts_flagged = (data || []).length;
+    for (const row of data || []) {
+      if (!row.slack_message_ts || !row.slack_channel_id) continue;
+      // The duplicate-contact path reuses the original lead's Slack post. Leave
+      // a post alone while another unflagged lead still points at it.
+      const { data: others } = await supabase.from('lead_posts').select('contact_id')
+        .eq('slack_message_ts', row.slack_message_ts).is('personal_excluded_at', null).limit(1);
+      if (others && others.length) continue;
+      try {
+        await slack.client.chat.update({
+          channel: row.slack_channel_id, ts: row.slack_message_ts,
+          text: `_Personal contact (tagged \`${PERSONAL_CONTACT_TAG}\` in GHL): removed from the sales flow. Nothing to do here._`,
+        });
+        done.slack_updated++;
+      } catch (e) { done.errors.push(`slack: ${e.message}`); }
+    }
+  } catch (e) { done.errors.push(`lead_posts: ${e.message}`); }
+  logActivity({
+    event_type: 'personal_contact_excluded', event_source: via === 'intake' ? 'ghl' : 'cron',
+    action: 'excludePersonalContact', correlation_id: newCorrelationId(), output: done,
+  });
+  console.log(`personal contact excluded (${via}): ${name || contactId}, abandoned ${done.abandoned.length}, flagged ${done.lead_posts_flagged}, slack ${done.slack_updated}${done.errors.length ? `, errors: ${done.errors.join(' | ')}` : ''}`);
+  return done;
 }
 
 // Daily roll-up of strike_sweep audit rows for the nightly learning report.
