@@ -14,8 +14,8 @@ const block = SRC.slice(
 );
 if (!block) { console.error('FAIL: could not extract the ICM pure block'); process.exit(1); }
 
-const { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection } =
-  new Function(`${block}; return { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection };`)();
+const { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection, icmCrYesterday, icmSpendFlag, icmDailySpendLines } =
+  new Function(`${block}; return { icmRates, icmCostUsd, icmSummarize, icmBySite, fmtUsd, fmtPct, icmBudgetThreshold, icmMonthProjection, icmCrYesterday, icmSpendFlag, icmDailySpendLines };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -109,6 +109,44 @@ check('6a  kai sites carry readable labels',
   ['Reply drafts', 'Intent classifier', 'Voice preview drafts', 'Voice preview classifier']);
 check('6b  kai classifier prices at haiku rates ($0.015 in + $0.004 out)', near(kaiSites.kai_classify.actual, 0.019), true);
 check('6c  kai drafter prices at sonnet-4-6 rates ($0.06 in + $0.045 out)', near(kaiSites.kai_draft.actual, 0.105), true);
+
+
+// ── 7. Daily AI SPEND post. Costa Rica is UTC-6 all year: "yesterday" is the
+// CR calendar day, and "usual" compares against the 7 CR days before it.
+const w1 = icmCrYesterday(new Date('2026-09-30T14:05:00Z'));
+check('7a  yesterday label is the CR date', w1.label, '2026-09-29');
+check('7b  window is CR midnight to CR midnight (06:00 UTC)', [w1.yStart, w1.yEnd], ['2026-09-29T06:00:00.000Z', '2026-09-30T06:00:00.000Z']);
+check('7c  prior window is the 7 days before', w1.priorStart, '2026-09-22T06:00:00.000Z');
+check('7d  late CR evening still counts the CR day, not the UTC day', icmCrYesterday(new Date('2026-10-01T03:00:00Z')).label, '2026-09-29');
+check('7e  1.5x and $0.50 over is flagged', icmSpendFlag(3.4, 1.6), '2.1x usual');
+check('7f  tiny agent doubling is NOT flagged (under $0.50 over)', icmSpendFlag(0.6, 0.28), null);
+check('7g  +$1 at 1.3x is NOT flagged', icmSpendFlag(4.3, 3.3), null);
+check('7h  new spend with no usual is flagged once it reaches $0.50', [icmSpendFlag(0.7, 0), icmSpendFlag(0.3, 0)], ['new spend', null]);
+check('7i  a quiet day is never flagged', icmSpendFlag(0.1, 2), null);
+const sum = (actual, calls, hitRate = 0) => ({ actual, calls, hitRate });
+const post = icmDailySpendLines({
+  date: '2026-09-29',
+  agents: [
+    { label: 'Max', y: sum(3.4, 212, 0.71), usual: 1.6, sites: [{ label: 'agent_loop', actual: 2.1 }, { label: 'lead_briefing', actual: 0.6 }] },
+    { label: 'Kai', y: sum(0.31, 38), usual: 0.28, sites: [] },
+    { label: 'REVI', y: sum(0, 0), usual: 0.15, sites: [] },
+  ],
+  mtd: { logged: 41.68, pad: 1.25, est: 52.1, budget: 70, projection: 64 },
+}).join('\n');
+check('7j  header names the date', post.startsWith('`AI SPEND: 2026-09-29`'), true);
+check('7k  issues line names only the flagged agent', post.includes('⚠️ ISSUES: Max 2.1x usual') && !/ISSUES:.*Kai/.test(post), true);
+check('7l  per-agent line carries yesterday, usual, calls and cache', post.includes('• Max: $3.40 (usual $1.60) · 212 calls · cache 71% ⚠️'), true);
+check('7m  top call sites listed under the agent', post.includes('top: agent_loop $2.10 · lead_briefing $0.60'), true);
+check('7n  an agent with no calls shows no cache figure', post.includes('• REVI: $0.00 (usual $0.15) · 0 calls\n'), true);
+check('7o  month to date against the budget', post.includes('• $52.10 of $70.00 budget (74%) · on pace for $64.00 by month end'), true);
+check('7p  total line sums every agent', post.includes('• Total: $3.71 (usual $2.03)'), true);
+const quiet = icmDailySpendLines({ date: 'd', agents: [{ label: 'Kai', y: sum(0.3, 30), usual: 0.28, sites: [] }], mtd: null }).join('\n');
+check('7q  quiet day says so and has no issues line', quiet.includes('✅ Every agent within its usual range') && !quiet.includes('ISSUES'), true);
+const noBudget = icmDailySpendLines({ date: 'd', agents: [], mtd: { logged: 8, pad: 1.25, est: 10, budget: 0, projection: 30 } }).join('\n');
+check('7r  no budget set still shows month to date', noBudget.includes('• $10.00 · on pace for $30.00 by month end (no budget set)'), true);
+const broken = icmDailySpendLines({ date: 'd', agents: [], mtd: null, problems: ['REVI: timeout'] }).join('\n');
+check('7s  an unreachable source is named, never silently dropped', broken.includes('⚠️ Sources unreachable: REVI: timeout'), true);
+check('7t  no em dashes in the post', /—/.test(post + quiet + noBudget), false);
 
 // ── 4. Formatting. Slack lines Ron reads.
 check('4a  usd', fmtUsd(1.005), '$1.00');

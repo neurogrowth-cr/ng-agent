@@ -13745,6 +13745,7 @@ const ICM_SITE_LABELS = {
   chat_loop: 'Chat/crons', copy_lab: 'Copy lab (manual)',
   kai_draft: 'Reply drafts', kai_classify: 'Intent classifier',
   kai_preview_draft: 'Voice preview drafts', kai_preview_classify: 'Voice preview classifier',
+  factory: 'Factory',
 };
 function icmBySite(rows) {
   const groups = {};
@@ -13774,6 +13775,62 @@ function icmMonthProjection(spent, now) {
   const elapsed = Math.max(now.getTime() - start, 3600e3); // floor at 1h so day-1 math stays sane
   return spent * ((end - start) / elapsed);
 }
+// Daily AI SPEND post: yesterday per agent vs its usual day. Costa Rica has no
+// DST, so CR midnight is always 06:00 UTC.
+const CR_OFFSET_MS = 6 * 3600e3;
+function icmCrYesterday(now) {
+  const crNow = new Date(now.getTime() - CR_OFFSET_MS);
+  const todayStart = Date.UTC(crNow.getUTCFullYear(), crNow.getUTCMonth(), crNow.getUTCDate()) + CR_OFFSET_MS;
+  const yStart = todayStart - 864e5;
+  return {
+    label: new Date(yStart - CR_OFFSET_MS + 12 * 3600e3).toISOString().slice(0, 10),
+    yStart: new Date(yStart).toISOString(),
+    yEnd: new Date(todayStart).toISOString(),
+    priorStart: new Date(yStart - 7 * 864e5).toISOString(),
+  };
+}
+// Unusual = at least 1.5x the 7-day daily average AND at least $0.50 above it,
+// so a $0.02 → $0.05 Kai day never reads as an incident. Spend from an agent
+// with no usual (new or revived) counts once it reaches $0.50.
+const DAILY_SPEND_RATIO = 1.5;
+const DAILY_SPEND_MIN_USD = 0.5;
+function icmSpendFlag(yesterdayUsd, usualUsd) {
+  if (yesterdayUsd - usualUsd < DAILY_SPEND_MIN_USD) return null;
+  if (usualUsd <= 0) return 'new spend';
+  const ratio = yesterdayUsd / usualUsd;
+  return ratio >= DAILY_SPEND_RATIO ? `${ratio.toFixed(1)}x usual` : null;
+}
+// agents: [{ label, y: icmSummarize(), usual: number (USD/day), sites: [{label, actual}], extra?: string }]
+// mtd: { logged, est, budget, projection } | null. problems: string[].
+function icmDailySpendLines({ date, agents, mtd, problems = [] }) {
+  const flagged = [];
+  const body = [];
+  for (const a of agents) {
+    const flag = icmSpendFlag(a.y.actual, a.usual);
+    if (flag) flagged.push(`${a.label} ${flag}`);
+    const cache = a.y.calls ? ` · cache ${fmtPct(a.y.hitRate)}` : '';
+    body.push(`• ${a.label}: ${fmtUsd(a.y.actual)} (usual ${fmtUsd(a.usual)}) · ${a.y.calls} calls${cache}${flag ? ' ⚠️' : ''}`);
+    const top = (a.sites || []).filter((x) => x.actual >= 0.01).slice(0, 3);
+    if (top.length) body.push(`    top: ${top.map((x) => `${x.label} ${fmtUsd(x.actual)}`).join(' · ')}`);
+    if (a.extra) body.push(`    ${a.extra}`);
+  }
+  const total = agents.reduce((t, a) => t + a.y.actual, 0);
+  const usualTotal = agents.reduce((t, a) => t + a.usual, 0);
+  const lines = [`\`AI SPEND: ${date}\``];
+  lines.push(flagged.length ? `⚠️ ISSUES: ${flagged.join(' · ')}` : '✅ Every agent within its usual range');
+  lines.push('', '`YESTERDAY`');
+  lines.push(`• Total: ${fmtUsd(total)} (usual ${fmtUsd(usualTotal)})`);
+  lines.push(...body);
+  if (mtd) {
+    lines.push('', '`MONTH TO DATE`');
+    lines.push(mtd.budget > 0
+      ? `• ${fmtUsd(mtd.est)} of ${fmtUsd(mtd.budget)} budget (${fmtPct(mtd.est / mtd.budget)}) · on pace for ${fmtUsd(mtd.projection)} by month end`
+      : `• ${fmtUsd(mtd.est)} · on pace for ${fmtUsd(mtd.projection)} by month end (no budget set)`);
+    lines.push(`• Logged ${fmtUsd(mtd.logged)}, plus ${fmtPct(mtd.pad - 1)} for spend the usage tables miss`);
+  }
+  if (problems.length) lines.push('', `⚠️ Sources unreachable: ${problems.join(' | ')}`);
+  return lines;
+}
 // ── end ICM pure block ──────────────────────────────────────────────────────
 
 // agent_activity is shared: Kai (ng-automation) logs its llm_call rows there
@@ -13791,18 +13848,22 @@ async function icmAgentAggregates(agent, sinceIso, untilIso) {
   return rows.map((r) => ({ model: r.model, site: r.site, calls: Number(r.calls), tin: Number(r.tin), tout: Number(r.tout), cw: Number(r.cw), cr: Number(r.cr) }));
 }
 
-async function icmLlmUsageRows(client, sinceIso) {
-  const { data, error } = await client.from('llm_usage')
+async function icmLlmUsageRows(client, sinceIso, untilIso) {
+  let q = client.from('llm_usage')
     .select('model, call_site, tokens_in, tokens_out, tokens_cache_write, tokens_cache_read')
-    .gte('created_at', sinceIso).limit(10000);
+    .gte('created_at', sinceIso);
+  if (untilIso) q = q.lt('created_at', untilIso);
+  const { data, error } = await q.limit(10000);
   if (error) throw new Error(error.message);
   return (data || []).map((r) => ({ model: r.model, site: r.call_site || 'untagged', calls: 1, tin: r.tokens_in || 0, tout: r.tokens_out || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
 
-async function icmFactoryRows(sinceIso) {
-  const { data, error } = await axonSupabase.from('factory_runs')
+async function icmFactoryRows(sinceIso, untilIso) {
+  let q = axonSupabase.from('factory_runs')
     .select('model, service_tier, tokens_input, tokens_output, tokens_cache_write, tokens_cache_read')
-    .gte('created_at', sinceIso).limit(500);
+    .gte('created_at', sinceIso);
+  if (untilIso) q = q.lt('created_at', untilIso);
+  const { data, error } = await q.limit(500);
   if (error) throw new Error(error.message);
   return (data || []).map((r) => ({ model: r.model || 'claude-sonnet-5', tier: r.service_tier || 'realtime', calls: 1, tin: r.tokens_input || 0, tout: r.tokens_output || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
@@ -13945,6 +14006,64 @@ async function runApiBudgetCheck(correlationId) {
 }
 // 9 AM CR daily.
 cron.schedule('0 9 * * *', wrapCronJob('runApiBudgetCheck', async (c) => { await runApiBudgetCheck(c); }), { timezone: 'America/Costa_Rica' });
+
+// ── DAILY AI SPEND — 8:05 AM CR, every day ─────────────────────────────────
+// Ron (2026-09-29): a daily per-agent usage breakdown in the style of the Kai
+// daily health post, for every agent including Max. Zero LLM calls; same usage
+// tables and pricing as the weekly ICM COST REPORT, which stays the deep dive.
+// Recipe criteria: posts once a day to AGENT_CHANNEL (operational API cost, not
+// company financials); "usual" = the 7 CR days before yesterday / 7; an agent
+// is flagged only at >=1.5x usual AND >=$0.50 over it; every unreachable source
+// is named in the post, never silently dropped (a dropped agent would read as
+// $0); month to date uses the same pad as the budget alert so both agree.
+// Kill switch: DAILY_SPEND_POST=off.
+async function runDailySpendPost(correlationId) {
+  if (String(process.env.DAILY_SPEND_POST || '') === 'off') return;
+  const now = new Date();
+  const w = icmCrYesterday(now);
+  const problems = [];
+  const agents = [];
+  const add = async (label, readY, readPrior, extraFn) => {
+    try {
+      const yRows = await readY();
+      const prior = icmSummarize(await readPrior());
+      const agent = { label, y: icmSummarize(yRows), usual: prior.actual / 7, sites: icmBySite(yRows) };
+      if (extraFn) agent.extra = await extraFn();
+      agents.push(agent);
+    } catch (e) { problems.push(`${label}: ${e.message}`); }
+  };
+  await add('Max', () => icmAgentAggregates('max', w.yStart, w.yEnd), () => icmAgentAggregates('max', w.priorStart, w.yStart));
+  await add('Kai', () => icmAgentAggregates('kai', w.yStart, w.yEnd), () => icmAgentAggregates('kai', w.priorStart, w.yStart));
+  await add('AXON', async () => [
+    ...(await icmLlmUsageRows(axonSupabase, w.yStart, w.yEnd)),
+    ...(await icmFactoryRows(w.yStart, w.yEnd)).map((r) => ({ ...r, site: 'factory' })),
+  ], async () => [
+    ...(await icmLlmUsageRows(axonSupabase, w.priorStart, w.yStart)),
+    ...(await icmFactoryRows(w.priorStart, w.yStart)),
+  ]);
+  await add('REVI', () => icmLlmUsageRows(reviSupabase, w.yStart, w.yEnd), () => icmLlmUsageRows(reviSupabase, w.priorStart, w.yStart));
+
+  // Month to date matches runApiBudgetCheck: UTC month, same pad.
+  let mtd = null;
+  try {
+    const pad = Number(process.env.API_BUDGET_UNLOGGED_PAD || 1.25);
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const rows = [
+      ...(await icmAgentAggregates('max', monthStart, now.toISOString())),
+      ...(await icmAgentAggregates('kai', monthStart, now.toISOString())),
+      ...(await icmLlmUsageRows(axonSupabase, monthStart)),
+      ...(await icmFactoryRows(monthStart)),
+      ...(await icmLlmUsageRows(reviSupabase, monthStart)),
+    ];
+    const logged = icmSummarize(rows).actual;
+    mtd = { logged, pad, est: logged * pad, budget: Number(process.env.MONTHLY_API_BUDGET_USD || 0), projection: icmMonthProjection(logged * pad, now) };
+  } catch (e) { problems.push(`month to date: ${e.message}`); }
+
+  const text = icmDailySpendLines({ date: w.label, agents, mtd, problems }).join('\n');
+  await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text });
+  console.log(`Daily AI spend posted to ${AGENT_CHANNEL} (${correlationId})`);
+}
+cron.schedule('5 8 * * *', wrapCronJob('runDailySpendPost', async (c) => { await runDailySpendPost(c); }), { timezone: 'America/Costa_Rica' });
 
 // Open-deal follow-up sweep — 9 PM CR every day (deals go stale on weekends
 // too — Ron, 2026-08-23; moved from 10am to the evening outcome-reminder slot
@@ -18477,6 +18596,8 @@ const STATIC_CRON_SCHEDULES = {
   runOpenDealFollowupSweep:     '0 21 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runIcmCostReport:             '45 7 * * 3',
+  runApiBudgetCheck:            '0 9 * * *',
+  runDailySpendPost:            '5 8 * * *',
   runKaiHealthDigest:           '0 8 * * 1-5',
   runClientAttentionReport:     '30 8 * * 1,4',
   runWeeklyReportStatusPost:    '0 11 * * 1',
