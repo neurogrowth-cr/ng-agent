@@ -14301,6 +14301,52 @@ async function postSelfServeLeadFyi({ text, contactId, correlationId }) {
   return threadTs || posted.ts;
 }
 
+// Bulk-import guard. Reconnecting WhatsApp coexistence on 2026-10-03 synced 609
+// phone contacts into GHL in two minutes; every one got a New Lead card and Max
+// posted 601 of them to #ng-sales-goats. Real leads never arrive like that.
+// Past `limit` leads inside a rolling window the gate closes and stays closed
+// until arrivals go quiet for a full window; held leads become one summary.
+function createLeadBurstGate({ limit, windowMs }) {
+  const times = [];
+  let lastHeldAt = 0;
+  return {
+    admit(now) {
+      while (times.length && now - times[0] > windowMs) times.shift();
+      times.push(now);
+      if (lastHeldAt && now - lastHeldAt <= windowMs) { lastHeldAt = now; return false; }
+      if (times.length > limit) { lastHeldAt = now; return false; }
+      lastHeldAt = 0;
+      return true;
+    },
+  };
+}
+const LEAD_BURST_LIMIT = parseInt(process.env.LEAD_BURST_LIMIT || '8', 10);
+const LEAD_BURST_SUMMARY_DELAY_MS = 2 * 60 * 1000;
+const _leadBurstGate = createLeadBurstGate({ limit: LEAD_BURST_LIMIT, windowMs: 60 * 1000 });
+const _leadBurstHeld = [];
+let _leadBurstTimer = null;
+
+// Debounced: posts once arrivals have been quiet for two minutes.
+function holdBurstLead({ fullName, ghlLink }) {
+  _leadBurstHeld.push({ fullName, ghlLink });
+  if (_leadBurstTimer) clearTimeout(_leadBurstTimer);
+  _leadBurstTimer = setTimeout(async () => {
+    const held = _leadBurstHeld.splice(0);
+    _leadBurstTimer = null;
+    const sample = held.slice(0, 15).map(h => `• <${h.ghlLink}|${h.fullName || 'unknown'}>`).join('\n');
+    const text = [
+      `⚠️ *${held.length} new contacts arrived in a burst*, so I held their lead cards. This usually means a bulk import or sync (a WhatsApp reconnect, a CSV upload), not real leads.`,
+      sample,
+      held.length > 15 ? `_…and ${held.length - 15} more._` : null,
+      `_If any of these are real, work them from GHL. Tag the rest \`${PERSONAL_CONTACT_TAG}\` and the strike sweep clears their cards._`,
+    ].filter(Boolean).join('\n');
+    try {
+      await slack.client.chat.postMessage({ channel: LEAD_CHANNEL_ID, text });
+    } catch (e) { console.error('lead burst summary post failed:', e.message); }
+    logActivity({ event_type: 'ghl_webhook', event_source: 'ghl', action: 'lead_burst_held', correlation_id: newCorrelationId(), output: { held: held.length, sample: held.slice(0, 20).map(h => h.fullName) } });
+  }, LEAD_BURST_SUMMARY_DELAY_MS);
+}
+
 async function handleGHLWebhook(req, res) {
   // Auth check — reject requests that don't include the correct secret header
   // Set GHL_WEBHOOK_SECRET in env vars and configure GHL to send it as x-ghl-secret
@@ -14569,6 +14615,12 @@ async function handleGHLWebhook(req, res) {
               console.error('self-serve FYI post failed:', fyiErr.message);
             }
           }, SELF_SERVE_FYI_DELAY_MS);
+          return;
+        }
+
+        if (!_leadBurstGate.admit(Date.now())) {
+          console.log(`GHL lead ${contactId} ("${fullName}") HELD: more than ${LEAD_BURST_LIMIT} leads in a minute. No card, no setter DM; rolled into the burst summary.`);
+          holdBurstLead({ fullName, ghlLink });
           return;
         }
 
