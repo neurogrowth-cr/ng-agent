@@ -4040,22 +4040,34 @@ function classifyUnheldAppt(appt, outcomeRow, latestStartByProspect) {
   return null;
 }
 
-// prospect_id -> latest scheduled_start over every appointment that prospect
-// has, in or out of any report window. Chunked so a 90-day id list never
-// outgrows the request URL.
+// Pure: folds appointment rows into prospect_id -> latest scheduled_start.
+// A row deleted in GHL never counts as the "later appointment": it is not a
+// call, so it cannot supersede one. Juan Jose Hernandez, 2026-09-30: his
+// self-serve duplicate (deleted) sat 30 min after the setter's real call, so
+// the real call read as superseded. It vanished from both boards and the closer
+// was never asked for its outcome.
+function latestStartFromRows(rows, latest = {}) {
+  for (const r of (rows || [])) {
+    if (!r?.prospect_id || isAppointmentDeleted(r)) continue;
+    const cur = latest[r.prospect_id];
+    if (!cur || String(r.scheduled_start) > cur) latest[r.prospect_id] = String(r.scheduled_start);
+  }
+  return latest;
+}
+
+// prospect_id -> latest scheduled_start over every live appointment that
+// prospect has, in or out of any report window. Chunked so a 90-day id list
+// never outgrows the request URL.
 async function fetchLatestStartByProspect(prospectIds) {
   const ids = [...new Set((prospectIds || []).filter(Boolean))];
   const latest = {};
   for (let i = 0; i < ids.length; i += 100) {
     const { data, error } = await portalSupabase
       .from('revops_appointments')
-      .select('prospect_id, scheduled_start')
+      .select('prospect_id, scheduled_start, qualification_snapshot')
       .in('prospect_id', ids.slice(i, i + 100));
     if (error) throw error;
-    for (const r of (data || [])) {
-      const cur = latest[r.prospect_id];
-      if (!cur || String(r.scheduled_start) > cur) latest[r.prospect_id] = String(r.scheduled_start);
-    }
+    latestStartFromRows(data, latest);
   }
   return latest;
 }
