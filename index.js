@@ -13724,6 +13724,7 @@ const ICM_SITE_LABELS = {
   chat_loop: 'Chat/crons', copy_lab: 'Copy lab (manual)',
   kai_draft: 'Reply drafts', kai_classify: 'Intent classifier',
   kai_preview_draft: 'Voice preview drafts', kai_preview_classify: 'Voice preview classifier',
+  kai_follow_up: 'Follow-up drafts', kai_follow_up_check: 'Follow-up thread check',
   factory: 'Factory',
 };
 function icmBySite(rows) {

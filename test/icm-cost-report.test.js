@@ -107,6 +107,11 @@ const kaiSites = Object.fromEntries(icmBySite([
 check('6a  kai sites carry readable labels',
   [kaiSites.kai_draft.label, kaiSites.kai_classify.label, kaiSites.kai_preview_draft.label, kaiSites.kai_preview_classify.label],
   ['Reply drafts', 'Intent classifier', 'Voice preview drafts', 'Voice preview classifier']);
+check('6d  kai follow-up sites carry readable labels (ng-automation #31)',
+  icmBySite([
+    { model: 'claude-sonnet-4-6', site: 'kai_follow_up', calls: 1, tin: 100, tout: 10, cw: 0, cr: 0 },
+    { model: 'claude-haiku-4-5-20251001', site: 'kai_follow_up_check', calls: 1, tin: 100, tout: 10, cw: 0, cr: 0 },
+  ]).map((s) => s.label).sort(), ['Follow-up drafts', 'Follow-up thread check']);
 check('6b  kai classifier prices at haiku rates ($0.015 in + $0.004 out)', near(kaiSites.kai_classify.actual, 0.019), true);
 check('6c  kai drafter prices at sonnet-4-6 rates ($0.06 in + $0.045 out)', near(kaiSites.kai_draft.actual, 0.105), true);
 
