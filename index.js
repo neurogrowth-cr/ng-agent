@@ -17744,6 +17744,10 @@ const clientAttention = require('./lib/clientAttention');
 const DASH_API_URL = (process.env.DASH_API_URL || 'https://dash.neurogrowth.io').replace(/\/$/, '');
 const CLIENT_ATTENTION_CHANNEL = process.env.CLIENT_ATTENTION_CHANNEL || OPS_CHANNEL;
 const CLIENT_ATTENTION_SEED_KEY = 'attention:alerts-armed';
+// The @fulfillment Slack user group, mentioned once per report. Usergroups
+// notify only as <!subteam^ID|@handle>; a plain <@S...> does not.
+const FULFILLMENT_USERGROUP_ID = String(process.env.FULFILLMENT_USERGROUP_ID || '').trim();
+const fulfillmentMention = () => (FULFILLMENT_USERGROUP_ID ? `<!subteam^${FULFILLMENT_USERGROUP_ID}|@fulfillment>` : '');
 const CLIENT_ATTENTION_FAILURE_DM_MS = 3 * 60 * 60 * 1000;
 let lastClientAttentionFailureDm = 0;
 
@@ -17770,9 +17774,15 @@ async function fetchClientAttentionFeed() {
   }
 }
 
-async function postClientAttention(text) {
-  if (clientAttentionLive()) return postToSlack(CLIENT_ATTENTION_CHANNEL, text);
-  return slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${CLIENT_ATTENTION_CHANNEL}]\n${text}` });
+// Alerts carry Slack message metadata so a ✅ on them maps back to the item
+// (the reaction handler reads the message). The dry run keeps the metadata on
+// Ron's DM so the ✅ path can be tested before going live.
+async function postClientAttention(text, metadata = null) {
+  const extra = metadata ? { metadata } : {};
+  if (clientAttentionLive()) {
+    return slack.client.chat.postMessage({ channel: CLIENT_ATTENTION_CHANNEL.replace(/^#/, ''), text, ...extra });
+  }
+  return slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${CLIENT_ATTENTION_CHANNEL}]\n${text}`, ...extra });
 }
 
 async function reportClientAttentionFailure(context, reason, { throttle = false } = {}) {
@@ -17810,15 +17820,16 @@ async function runClientAttentionReport() {
   if (clientAttentionDisabled()) return;
   const feed = await loadClientAttentionFeed('report');
   if (!feed) return;
-  const text = clientAttention.formatReport(feed, new Date());
-  const verdict = clientAttention.validateReport(text, feed);
+  const mention = fulfillmentMention();
+  const text = clientAttention.formatReport(feed, new Date(), { mention });
+  const verdict = clientAttention.validateReport(text, feed, { mention });
   if (!verdict.ok) {
     await reportClientAttentionFailure('report', verdict.problems.join('; '));
     return;
   }
   await postClientAttention(text);
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runClientAttentionReport', status: 'ok',
-    output: { items: feed.items.length, inBand: feed.inBand, live: clientAttentionLive() } });
+    output: { items: feed.items.length, inBand: feed.inBand, adminOnly: feed.counts ? feed.counts.adminOnly : null, live: clientAttentionLive() } });
 }
 
 async function alertedClientAttentionKeys(keys) {
@@ -17828,9 +17839,15 @@ async function alertedClientAttentionKeys(keys) {
   return new Set((data || []).map((r) => r.key));
 }
 
-async function markClientAttentionAlerted(item) {
-  const saved = await upsertKnowledge('alert', clientAttention.alertKey(item), `${item.clientName.trim()} · ${item.code}`);
-  if (!String(saved).startsWith('Knowledge saved')) throw new Error(saved);
+// One record per alert key (JSON: name, code, fingerprint, channel, ts, post
+// time). A fleet alert also marks every member's own key, so the per-client
+// items it covers never alert again on their own.
+async function markClientAttentionAlerted(item, posted = null) {
+  const record = clientAttention.alertRecord(item, posted);
+  for (const key of [clientAttention.alertKey(item), ...clientAttention.memberKeys(item)]) {
+    const saved = await upsertKnowledge('alert', key, record);
+    if (!String(saved).startsWith('Knowledge saved')) throw new Error(saved);
+  }
 }
 
 async function runClientAttentionAlerts() {
@@ -17871,8 +17888,8 @@ async function runClientAttentionAlerts() {
       continue;
     }
     try {
-      await postClientAttention(text);
-      await markClientAttentionAlerted(item);
+      const posted = await postClientAttention(text, clientAttention.alertMetadata(item));
+      await markClientAttentionAlerted(item, posted);
     } catch (err) {
       await reportClientAttentionFailure('alerts', err.message, { throttle: true });
       return;

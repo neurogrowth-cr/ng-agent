@@ -1,0 +1,93 @@
+{
+ "contractVersion": 2,
+ "generatedAt": "2026-10-08T14:30:00.000Z",
+ "counts": { "urgent": 4, "watch": 2, "adminOnly": 12 },
+ "inBand": 10,
+ "adminUrl": "https://dash.neurogrowth.io/admin/campaign-health",
+ "items": [
+  {
+   "clientId": "fleet",
+   "clientName": "Fleet",
+   "code": "sending_stopped",
+   "level": "urgent",
+   "owner": "ours",
+   "reason": "4 clients stopped sending on 2026-10-06: Action Coach, Factory, Licita CR, UMC de Costa Rica",
+   "firstMove": "Check Prosp or a shared cause before each client.",
+   "fingerprint": "f1ee7c0ffee1",
+   "tier": "other",
+   "count": 4,
+   "triggerDay": "2026-10-06",
+   "members": [
+    { "clientId": "c-action", "clientName": "Action Coach - Jacobo Lau", "fingerprint": "aa0000000001" },
+    { "clientId": "c-factory", "clientName": "Factory - William Umaña", "fingerprint": "aa0000000002" },
+    { "clientId": "c-licita", "clientName": "Licita CR - Kenneth Ramirez", "fingerprint": "aa0000000003" },
+    { "clientId": "c-umc", "clientName": "UMC de Costa Rica - Carmen Mora", "fingerprint": "aa0000000004" }
+   ]
+  },
+  {
+   "clientId": "c-uslegal",
+   "clientName": "US Legal - Guido Soto",
+   "code": "linkedin_disconnected",
+   "level": "urgent",
+   "owner": "client",
+   "reason": "Prosp says guido-soto-9733b0159 is not connected (\"Account not found\"), checked 1h ago",
+   "firstMove": "Reconnect the LinkedIn account in the client's Prosp workspace (Settings, Accounts). Until then nothing sends and no reply can be read.",
+   "fingerprint": "bb0000000001",
+   "tier": "rolex",
+   "count": 1,
+   "triggerDay": "2026-10-08"
+  },
+  {
+   "clientId": "c-uslegal",
+   "clientName": "US Legal - Guido Soto",
+   "code": "unlinked",
+   "level": "watch",
+   "owner": "ours",
+   "reason": "No LinkedIn account linked to this client",
+   "firstMove": "Add the rep's LinkedIn profile URL to the client's LinkedIn handlers.",
+   "fingerprint": "bb0000000002",
+   "tier": "rolex",
+   "count": null,
+   "triggerDay": null
+  },
+  {
+   "clientId": "c-palantier",
+   "clientName": "Palantier AI - Carlos Jimenez",
+   "code": "prosp_billing_failed",
+   "level": "urgent",
+   "owner": "client",
+   "reason": "Prosp refused 11 thread reads with payment_failed in the last 48h: the client's Prosp subscription is not paid, so nothing sends and no reply can be read",
+   "firstMove": "Settle the client's Prosp billing, or mark them Prosp unpaid in Admin (Edit client, Prosp tab) so the account manager follows up.",
+   "fingerprint": "cc0000000001",
+   "tier": "patek",
+   "count": 11,
+   "triggerDay": "2026-10-08"
+  },
+  {
+   "clientId": "c-strategia",
+   "clientName": "Strategia - Andrés Morera",
+   "code": "acceptance_drop",
+   "level": "urgent",
+   "owner": "ours",
+   "reason": "Acceptance fell to 13.0% this week from 28.2% over the prior four weeks",
+   "firstMove": "Check suppression first, then pending invites, then sending pace.",
+   "fingerprint": "dd0000000001",
+   "tier": "other",
+   "count": null,
+   "triggerDay": null
+  },
+  {
+   "clientId": "c-flor",
+   "clientName": "Flor Lizano Bolaños",
+   "code": "kai_not_classifying",
+   "level": "watch",
+   "owner": "ours",
+   "reason": "Kai is on but classified none of 114 replies in 30 days",
+   "firstMove": "Check the client's Kai workspace and its Prosp webhook.",
+   "fingerprint": "ee0000000001",
+   "tier": "other",
+   "count": null,
+   "triggerDay": null
+  }
+ ]
+}
