@@ -150,5 +150,18 @@ for (const failed of [true, true, true, true, false, true]) { const s = hr.nextF
 check('8a one broken post on the third failure in a row, reset by a good run',
   seen, [[1, false], [2, false], [3, true], [4, false], [0, false], [1, false]]);
 
+// ── 9. Reporting rows (lead_reply_signals) ──────────────────────────────────
+check('9a first answer after the lead message is the phone-app reply, not the stage change',
+  hr.firstAnswerAfter(answered, a1.anchorAt, isAuto), t0 + 265 * MIN);
+check('9b no answer yet is null', hr.firstAnswerAfter(alejandro, a1.anchorAt, isAuto), null);
+check('9c a workflow send never counts as the answer', hr.firstAnswerAfter([inMsg(t0, 'hola'), wf(t0 + MIN, 'auto')], t0, isAuto), null);
+const row = hr.signalRow({ convo: convo({ lastMessageType: 'TYPE_INSTAGRAM' }), analysis: ab, verdict: { verdict: 'normal', reason_es: 'r', summary_es: 's' }, ownerLabel: 'Sebastian', mode: 'dry_run', now: NOW, existing: { ever_hot: true } });
+check('9d row keys the run on its first message, counts all three',
+  [row.anchor_message_id, row.newest_message_id, row.message_count, row.lead_message_at], [burst[1].id, burst[3].id, 3, new Date(burst[1].dateAdded).toISOString()]);
+check('9e channel comes from the lead message, ever_hot is sticky', [row.channel, row.verdict, row.ever_hot], ['whatsapp', 'normal', true]);
+check('9f a hot verdict sets ever_hot on a new row',
+  hr.signalRow({ convo: convo(), analysis: a1, verdict: { verdict: 'hot' }, mode: 'live', now: NOW }).ever_hot, true);
+check('9g row carries no raw message text', Object.values(row).some(v => typeof v === 'string' && /sesiones|terapias/.test(v)), false);
+
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall hot reply checks passed');

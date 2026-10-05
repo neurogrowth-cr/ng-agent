@@ -18501,6 +18501,7 @@ const _hotThreadCache = new Map();  // conversationId → { lastMessageDate, ana
 const _hotVerdictCache = new Map(); // newest inbound message id → verdict
 const _hotSentGuard = new Set();    // keys posted this process, in case the knowledge write fails
 const _hotIntakeClear = new Map();  // conversationId → lastMessageDate already checked with no gap
+const _hotAnswerChecked = new Map(); // anchor message id → last time its answer was looked for
 
 function hotReplyMode() {
   if (process.env.HOT_REPLY_DISABLED === 'true') return 'off';
@@ -18567,6 +18568,40 @@ async function hotClassify(convo, analysis, correlationId) {
   return verdict;
 }
 
+// Reporting writes (migration 017). Never allowed to block or fail an alert: a
+// failed write is logged and counted, and the run carries on.
+async function hotReportUpsert(row, stats) {
+  const { error } = await supabase.from('lead_reply_signals').upsert(row, { onConflict: 'anchor_message_id' });
+  if (error) { stats.reportErrors++; console.warn(`hot-reply: lead_reply_signals write failed: ${error.message}`); }
+}
+async function hotReportUpdate(anchorId, patch, stats) {
+  const { error } = await supabase.from('lead_reply_signals').update({ ...patch, updated_at: new Date().toISOString() }).eq('anchor_message_id', anchorId);
+  if (error) { stats.reportErrors++; console.warn(`hot-reply: lead_reply_signals update failed: ${error.message}`); }
+}
+
+// Fills answered_at for runs that are no longer waiting. Looked up at most once
+// an hour per run, for 7 days; still null after that means never answered.
+async function hotTrackAnswers(now, waitingAnchors, stats) {
+  const { data, error } = await supabase.from('lead_reply_signals')
+    .select('anchor_message_id, conversation_id, lead_message_at')
+    .is('answered_at', null)
+    .gte('lead_message_at', new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString())
+    .limit(500);
+  if (error) { stats.reportErrors++; console.warn(`hot-reply: answer tracking read failed: ${error.message}`); return; }
+  let reads = 0;
+  for (const r of data || []) {
+    if (waitingAnchors.has(r.anchor_message_id)) continue; // still waiting right now
+    if (now - (_hotAnswerChecked.get(r.anchor_message_id) || 0) < 60 * 60 * 1000) continue;
+    if (reads >= 30) break;
+    _hotAnswerChecked.set(r.anchor_message_id, now);
+    reads++;
+    const msgs = await ghlGetConversationMessages(r.conversation_id).catch(() => null);
+    if (!msgs) continue;
+    const at = hotReplies.firstAnswerAfter(msgs, Date.parse(r.lead_message_at), strikeIsAutomatedBody);
+    if (at) { await hotReportUpdate(r.anchor_message_id, { answered_at: new Date(at).toISOString() }, stats); stats.answersTracked++; }
+  }
+}
+
 async function hotPostPoke({ step, convo, analysis, verdict, owner, mode, now }) {
   const item = {
     contactName: convo.contactName || convo.fullName || 'Sin nombre',
@@ -18611,6 +18646,15 @@ async function runHotReplyLadder(now, correlationId, stats) {
     work.push({ convo: c, owner, analysis });
   }
 
+  // Reporting rows already stored for these runs (sticky ever_hot, and whether a
+  // row still needs writing). A failed read only costs reporting, never alerts.
+  const existingRows = new Map();
+  if (work.length) {
+    const { data, error } = await supabase.from('lead_reply_signals').select('anchor_message_id, ever_hot').in('anchor_message_id', work.map(w => w.analysis.anchorId));
+    if (error) { stats.reportErrors++; console.warn(`hot-reply: lead_reply_signals read failed: ${error.message}`); }
+    for (const r of data || []) existingRows.set(r.anchor_message_id, r);
+  }
+
   const known = await hotReadKnowledge(work.flatMap(w => [
     `${HOT_REPLY_KEY}:verdict:${w.analysis.newestId}`,
     `${HOT_REPLY_KEY}:poke1:${w.analysis.anchorId}`,
@@ -18620,16 +18664,26 @@ async function runHotReplyLadder(now, correlationId, stats) {
   for (const w of work) {
     const vKey = `${HOT_REPLY_KEY}:verdict:${w.analysis.newestId}`;
     let verdict = _hotVerdictCache.get(w.analysis.newestId) || hotParse(known.get(vKey));
+    let classifiedNow = false;
     if (!verdict) {
       if (stats.classified >= HOT_REPLY_MAX_CLASSIFY_PER_RUN) { stats.skips.classify_cap = (stats.skips.classify_cap || 0) + 1; continue; }
       verdict = await hotClassify(w.convo, w.analysis, correlationId);
       stats.classified++;
+      classifiedNow = true;
       // Stored without the summary: a quote can carry an email or phone, which
       // the knowledge store refuses, and the verdict is all the next run needs.
       await hotRemember(vKey, JSON.stringify({ verdict: verdict.verdict, reason_es: verdict.reason_es }));
     }
     _hotVerdictCache.set(w.analysis.newestId, verdict);
     stats.verdicts[verdict.verdict] = (stats.verdicts[verdict.verdict] || 0) + 1;
+    const ownerSetter = HOT_REPLY_SETTERS[String(w.convo.assignedTo || '').toLowerCase()];
+    if (classifiedNow || !existingRows.has(w.analysis.anchorId)) {
+      await hotReportUpsert(hotReplies.signalRow({
+        convo: w.convo, analysis: w.analysis, verdict, mode, now,
+        ownerLabel: ownerSetter ? ownerSetter.label : 'Unassigned',
+        existing: existingRows.get(w.analysis.anchorId),
+      }), stats);
+    }
 
     const p1Key = `${HOT_REPLY_KEY}:poke1:${w.analysis.anchorId}`;
     const p2Key = `${HOT_REPLY_KEY}:poke2:${w.analysis.anchorId}`;
@@ -18656,7 +18710,10 @@ async function runHotReplyLadder(now, correlationId, stats) {
       ownerLabel: setter ? setter.label : 'Unassigned', mode,
     }));
     stats.pokes[step]++;
+    await hotReportUpdate(w.analysis.anchorId, { [step === 'poke1' ? 'poke1_at' : 'poke2_at']: new Date(now).toISOString(), mode }, stats);
   }
+
+  await hotTrackAnswers(now, new Set(work.map(w => w.analysis.anchorId)), stats);
 }
 
 async function runSocialIntakeGapCheck(now, stats) {
@@ -18703,20 +18760,28 @@ async function runSocialIntakeGapCheck(now, stats) {
       if (!firstInboundAt || now - firstInboundAt >= hotReplies.CONFIG.intakeMinAgeMs) _hotIntakeClear.set(c.id, c.lastMessageDate);
       continue;
     }
-    found.push({ key, code: v.code, contactName: c.contactName || c.fullName || c.contactId, channel: c.lastMessageType, firstInboundAt, link: ghlContactLink(c.contactId) });
+    found.push({ key, code: v.code, contactId: c.contactId, conversationId: c.id, contactName: c.contactName || c.fullName || c.contactId, channel: c.lastMessageType, firstInboundAt, link: ghlContactLink(c.contactId) });
   }
   if (!found.length) return;
 
   const text = hotReplies.formatIntakeGapAlert(found, { now });
   if (mode === 'live') await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: `${text}\n<@${RON_SLACK_ID}>` });
   else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN] would post in ${AGENT_CHANNEL}:\n${text}` });
-  for (const f of found) await hotRemember(f.key, JSON.stringify({ at: now, code: f.code, mode }));
+  for (const f of found) {
+    await hotRemember(f.key, JSON.stringify({ at: now, code: f.code, mode }));
+    const { error } = await supabase.from('social_intake_gaps').upsert({
+      contact_id: f.contactId, conversation_id: f.conversationId, contact_name: f.contactName,
+      channel: f.channel === 'TYPE_FACEBOOK' ? 'messenger' : 'instagram', code: f.code,
+      first_inbound_at: f.firstInboundAt ? new Date(f.firstInboundAt).toISOString() : null, mode,
+    }, { onConflict: 'contact_id', ignoreDuplicates: true });
+    if (error) { stats.reportErrors++; console.warn(`hot-reply: social_intake_gaps write failed: ${error.message}`); }
+  }
   stats.intakeAlerts = found.length;
 }
 
 async function runHotReplyCheck(correlationId, { now = Date.now() } = {}) {
   if (hotReplyMode() === 'off') { console.log('Hot reply check disabled (HOT_REPLY_DISABLED=true).'); return { ok: true, disabled: true }; }
-  const stats = { inboundConvos: 0, threadReads: 0, classified: 0, verdicts: {}, pokes: { poke1: 0, poke2: 0 }, postFailures: 0, skips: {}, intakeConvos: 0, intakeReads: 0, intakeAlerts: 0 };
+  const stats = { inboundConvos: 0, threadReads: 0, classified: 0, verdicts: {}, pokes: { poke1: 0, poke2: 0 }, postFailures: 0, skips: {}, intakeConvos: 0, intakeReads: 0, intakeAlerts: 0, answersTracked: 0, reportErrors: 0 };
   const errors = [];
   try { await runHotReplyLadder(now, correlationId, stats); } catch (err) { errors.push(`hot replies: ${err.message}`); }
   try { await runSocialIntakeGapCheck(now, stats); } catch (err) { errors.push(`intake gap: ${err.message}`); }
@@ -18732,7 +18797,7 @@ async function runHotReplyCheck(correlationId, { now = Date.now() } = {}) {
     await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: `⚠️ *CHECK BROKEN*: hot reply alerts and the social intake gap check failed ${state.count} runs in a row. Nothing was checked; this is not an all-clear.\n${errors.join('\n')}\n<@${RON_SLACK_ID}>` }).catch(e => console.error('hot-reply broken post failed:', e.message));
   }
 
-  console.log(`Hot reply check (${hotReplyMode()}, intake ${intakeGapMode()}): ${stats.inboundConvos} inbound chats, ${stats.threadReads} read, ${stats.classified} classified ${JSON.stringify(stats.verdicts)}, pokes ${JSON.stringify(stats.pokes)}, intake ${stats.intakeAlerts}/${stats.intakeConvos}${errors.length ? ` · ERRORS: ${errors.join(' | ')}` : ''}`);
+  console.log(`Hot reply check (${hotReplyMode()}, intake ${intakeGapMode()}): ${stats.inboundConvos} inbound chats, ${stats.threadReads} read, ${stats.classified} classified ${JSON.stringify(stats.verdicts)}, pokes ${JSON.stringify(stats.pokes)}, intake ${stats.intakeAlerts}/${stats.intakeConvos}, answers tracked ${stats.answersTracked}${stats.reportErrors ? `, report write errors ${stats.reportErrors}` : ''}${errors.length ? ` · ERRORS: ${errors.join(' | ')}` : ''}`);
   await logActivity({
     event_type: 'audit', event_source: 'cron', action: 'hot_reply_check',
     status: errors.length ? 'degraded' : 'ok',
