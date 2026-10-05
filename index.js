@@ -18767,7 +18767,21 @@ async function runSocialIntakeGapCheck(now, stats) {
       const opp = await ghlFetchJson(`https://services.leadconnectorhq.com/opportunities/${opps[opps.length - 1].id}`);
       oppCreatedAt = Date.parse(opp?.opportunity?.createdAt) || null;
     }
-    const v = hotReplies.intakeGapVerdict({ convo: c, firstInboundAt, hasLeadPost: false, oppCreatedAt, now, personalTag: PERSONAL_CONTACT_TAG });
+    // A merged-away duplicate contact keeps the Slack post under its old id
+    // (lib/hotReplies.js MERGED_POST_WINDOW); match it by name prefix and time.
+    let hasLeadPost = false;
+    const prefix = hotReplies.namePrefix3(c.contactName || c.fullName);
+    if (firstInboundAt && prefix) {
+      const { data: near, error: nearErr } = await supabase.from('lead_posts').select('contact_id')
+        .is('personal_excluded_at', null)
+        .eq('name_prefix3', prefix)
+        .gte('posted_at', new Date(firstInboundAt - hotReplies.MERGED_POST_WINDOW.beforeMs).toISOString())
+        .lte('posted_at', new Date(firstInboundAt + hotReplies.MERGED_POST_WINDOW.afterMs).toISOString())
+        .limit(1);
+      if (nearErr) throw new Error(`lead_posts read failed: ${nearErr.message}`);
+      hasLeadPost = !!(near && near.length);
+    }
+    const v = hotReplies.intakeGapVerdict({ convo: c, firstInboundAt, hasLeadPost, oppCreatedAt, now, personalTag: PERSONAL_CONTACT_TAG });
     if (!v) {
       if (!firstInboundAt || now - firstInboundAt >= hotReplies.CONFIG.intakeMinAgeMs) _hotIntakeClear.set(c.id, c.lastMessageDate);
       continue;
