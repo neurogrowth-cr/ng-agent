@@ -162,5 +162,52 @@ const route0 = handler.indexOf('Route 0:');
 check('7g  the client attention route runs before Route 0 in the reaction handler', caRoute > -1 && route0 > -1 && caRoute < route0, true);
 check('7h  the handler never marks anything on its own (only on a human reaction)', /handleClientAttentionReaction\(event, baseEmoji, msg/.test(handler), true);
 
+// ── 8. Friday still-open digest.
+const FRI = new Date('2026-10-09T16:00:00Z'); // Fri 10:00 CR
+const records = new Map([[ca.alertKey(FEED.items[1]), { postedAt: '2026-10-01T13:00:00Z' }], [ca.alertKey(FEED.items[0]), { postedAt: '2026-10-07T13:00:00Z' }]]);
+const digest = ca.formatOpenDigest(FEED, records, FRI, { mention: MENTION });
+const digestLines = digest.split('\n');
+console.log('\n----- digest preview -----\n' + digest + '\n--------------------------\n');
+check('8a  digest passes its criteria', ca.validateOpenDigest(digest, FEED, { mention: MENTION }), { ok: true, problems: [] });
+check('8b  header with the mention once', digestLines[0], `*Client attention · still open · Fri, Oct 9* ${MENTION}`);
+check('8c  one line per urgent item, with age since the alert', digestLines[1].endsWith('→ open 2 days (alerted Oct 7)') && digestLines[2].endsWith('→ open 8 days (alerted Oct 1)'), true);
+check('8d  an item never alerted says so', digestLines.filter((l) => l.endsWith('→ in the report, never alerted')).length, 2);
+check('8e  fleet line names the count', digestLines[1].startsWith('🔴 [ours] Fleet (4 clients):'), true);
+const quietFeed = { ...clone(FEED), items: FEED.items.filter((i) => i.level !== 'urgent') };
+const quietDigest = ca.formatOpenDigest(quietFeed, new Map(), FRI);
+check('8f  nothing open reads as a good week', quietDigest.includes('No urgent item is open. Good week.') && ca.validateOpenDigest(quietDigest, quietFeed).ok, true);
+check('8g  a dropped digest line fails', ca.validateOpenDigest(digestLines.filter((l) => !l.startsWith('🔴 [ours] Fleet')).join('\n'), FEED, { mention: MENTION }).ok, false);
+
+// ── 9. Monday scorecard.
+const sentKeys = [
+  { key: 'attention:c-uslegal:linkedin_disconnected:bb0000000001', record: {} },
+  { key: 'attention:c-x:sending_stopped:f1', record: {} },
+  { key: 'attention:c-y:sending_stopped:f2', record: {} },
+  { key: 'attention:c-z:sending_stopped:f3', record: {} },
+  { key: 'attention:c-w:acceptance_drop:f4', record: {} },
+  { key: 'attention:alerts-armed', record: {} },
+];
+const actions = [
+  { customerId: 'c-x', signalCode: 'sending_stopped', fingerprint: 'f1', action: 'handled', actorUserId: 'slack:U1' },
+  { customerId: 'c-x', signalCode: 'sending_stopped', fingerprint: 'f1', action: 'handled', actorUserId: 'user_2' },
+  { customerId: 'c-y', signalCode: 'sending_stopped', fingerprint: 'f2', action: 'snoozed', actorUserId: 'user_2' },
+  { customerId: 'c-q', signalCode: 'sending_stopped', fingerprint: 'other', action: 'handled', actorUserId: 'user_2' },
+];
+const rows = ca.buildScorecard({ sent: sentKeys, actions, feed: FEED });
+check('9a  rows per code, most sent first, armed key ignored', rows.map((r) => r.code), ['sending_stopped', 'acceptance_drop', 'linkedin_disconnected']);
+check('9b  handled counted once per alert, Slack split, snoozed, actions on unsent alerts ignored', rows[0], { code: 'sending_stopped', sent: 3, handled: 1, handledSlack: 1, snoozed: 1, open: 0 });
+check('9c  still open comes from the feed', rows.find((r) => r.code === 'linkedin_disconnected').open, 1);
+const card = ca.formatScorecard(rows, { days: 28 });
+console.log('\n----- scorecard preview -----\n' + card + '\n-----------------------------\n');
+check('9d  per-code line', card.split('\n')[1], '• sending_stopped: 3 alerts · 1 handled (1 from Slack) · 1 snoozed · 0 still open');
+check('9e  totals line', card.includes('Total: 5 alerts · 1 handled · 1 snoozed · 1 still open'), true);
+check('9f  never-acted-on signals named only at 3+ alerts', card.includes('Never acted on') === false, true);
+const ignoredRows = ca.buildScorecard({ sent: sentKeys, actions: [], feed: null });
+const ignoredCard = ca.formatScorecard(ignoredRows, { feedKnown: false });
+check('9g  zero handled across the window is called out', ignoredCard.includes('Nothing was handled or snoozed in this window'), true);
+check('9h  unknown feed reads as open unknown', ignoredCard.includes('open unknown'), true);
+check('9i  no alerts in the window', ca.formatScorecard([], {}).includes('No alerts were sent in this window.'), true);
+check('9j  no em dashes in the digest or scorecard', /\u2014/.test(digest + card + ignoredCard), false);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall checks passed');
