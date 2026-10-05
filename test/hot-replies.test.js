@@ -144,6 +144,8 @@ const alert = hr.formatIntakeGapAlert([
 ], { now: NOW });
 check('7k alert names both cases and where to look', [/NO GHL card/.test(alert), /Social DM Intake \(on reply\)\./.test(alert), /NO Slack lead post/.test(alert), /ghl-lead/.test(alert)], [true, true, true, true]);
 
+check('7l name prefix matches the intake derivation (Daniela vs Dani)', [hr.namePrefix3('Daniela Tenorio Consultora'), hr.namePrefix3('Dani Tenorio'), hr.namePrefix3('Jo'), hr.namePrefix3('')], ['dan', 'dan', null, null]);
+
 // ── 8. Fail closed ──────────────────────────────────────────────────────────
 let c = 0; const seen = [];
 for (const failed of [true, true, true, true, false, true]) { const s = hr.nextFailureState(c, failed); c = s.count; seen.push([s.count, s.postBroken]); }
