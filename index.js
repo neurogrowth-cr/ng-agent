@@ -3423,8 +3423,8 @@ const SALES_TEAM_MAP = {
 
   // ── CLOSERS — roster emails (GHL rows carry these in closer_id) ─────────
   'ronny.duarte@neurogrowth.io':  'Ron Duarte',
-  'jose.neurogrowth@gmail.com':   'Jose Carranza',
-  'jose.carranza@neurogrowth.io': 'Jose Carranza', // company domain, dominant since 2026-08-31 (see CLOSER_SLACK)
+  'jose.carranza@neurogrowth.io': 'Jose Carranza', // OFFICIAL (Ron, 2026-10-05): dash admin_users + closer alias canonical
+  'jose.neurogrowth@gmail.com':   'Jose Carranza', // pre-Aug-2026 GHL identity, still his Fathom host; history only
   'jonathan.madriz.neurogrowth@gmail.com': 'Jonathan Madriz', // departed 2026-07-19 — see DEPARTED_MEMBERS; kept so past reports still name him
 
   // ── SETTERS — roster emails (GHL rows carry these in setter_id) ─────────
@@ -9046,7 +9046,7 @@ const DEPARTED_MEMBERS = {
     name: 'Jonathan Madriz',
     since: '2026-07-19',                       // last call taken
     aliases: ['gqymykpddltdxvbkfl2c', 'U0APYAE0999'],
-    coverage: 'jose.neurogrowth@gmail.com',    // inherits open-deal follow-up (Ron, 2026-08-24)
+    coverage: 'jose.carranza@neurogrowth.io',  // inherits open-deal follow-up (Ron, 2026-08-24); official email since 2026-10-05
   },
 };
 // GHL rows carry a person as a roster email, a raw user id, or a Slack id —
@@ -14179,7 +14179,10 @@ const EMAIL_TO_GHL_USER_ID = {
   'william.neurogrowth@gmail.com': 'N8mvtuHbbbY7QppqNMr7',
   'sebastian.neurogrowth@gmail.com': 'Wdjte1temxfR0lpi5RGV',
   'jonathan.neurogrowth@gmail.com': 'gqYMYkpDDlTdxvBkfl2C',
-  'jose.neurogrowth@gmail.com': 'izLTA0jy5OrKyMvyltjV',
+  // Both of Jose's emails. The old entry had a typo in the id (lowercase l for I),
+  // so this fallback never resolved him. Verified id via GET /users 2026-10-05.
+  'jose.carranza@neurogrowth.io': 'izLTA0jy5OrKyMvyItjV',
+  'jose.neurogrowth@gmail.com': 'izLTA0jy5OrKyMvyItjV',
   'ronny.duarte@neurogrowth.io': 'zoGW530iDnPOFqQNfssc',
 };
 
