@@ -17961,6 +17961,69 @@ async function runClientAttentionAlerts() {
 
 cron.schedule('30 8 * * 1,4', wrapCronJob('runClientAttentionReport', async () => { await runClientAttentionReport(); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('*/30 7-19 * * 1-6', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
+
+// Friday "still open" digest: every urgent item still in the feed, with how
+// long it has been open (from the alert record). Same channel and dry-run
+// rules as the report. Zero LLM calls.
+async function runClientAttentionOpenDigest() {
+  if (clientAttentionDisabled()) return;
+  const feed = await loadClientAttentionFeed('digest');
+  if (!feed) return;
+  const keys = feed.items.filter((i) => i.level === 'urgent').map(clientAttention.alertKey);
+  const records = new Map();
+  if (keys.length > 0) {
+    const { data, error } = await supabase.from('agent_knowledge').select('key, value').in('key', keys);
+    if (error) { await reportClientAttentionFailure('digest', `agent_knowledge read failed: ${error.message}`); return; }
+    for (const r of data || []) records.set(r.key, clientAttention.parseAlertRecord(r.value));
+  }
+  const mention = fulfillmentMention();
+  const text = clientAttention.formatOpenDigest(feed, records, new Date(), { mention });
+  const verdict = clientAttention.validateOpenDigest(text, feed, { mention });
+  if (!verdict.ok) { await reportClientAttentionFailure('digest', verdict.problems.join('; ')); return; }
+  await postClientAttention(text);
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runClientAttentionOpenDigest', status: 'ok',
+    output: { open: keys.length, live: clientAttentionLive() } });
+}
+
+// Monday scorecard to Ron only: per signal, alerts sent in the last 28 days
+// vs handled, snoozed (the dash's actions table, which the admin page and the
+// ✅ handler both write) and still open. Ron decides what to retire; Max only
+// reports. Zero LLM calls.
+const CLIENT_ATTENTION_SCORECARD_DAYS = 28;
+async function runClientAttentionScorecard() {
+  if (clientAttentionDisabled()) return;
+  const since = new Date(Date.now() - CLIENT_ATTENTION_SCORECARD_DAYS * 864e5).toISOString();
+  const { data: sentRows, error: sentErr } = await supabase.from('agent_knowledge')
+    .select('key, value').eq('category', 'alert').like('key', 'attention:%').gte('updated_at', since).limit(5000);
+  if (sentErr) { await reportClientAttentionFailure('scorecard', `agent_knowledge read failed: ${sentErr.message}`); return; }
+  const sent = (sentRows || []).map((r) => ({ key: r.key, record: clientAttention.parseAlertRecord(r.value) }));
+
+  let actions = [];
+  try {
+    const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+    const res = await fetch(`${DASH_API_URL}/api/ops/client-attention/actions?days=${CLIENT_ATTENTION_SCORECARD_DAYS}`, {
+      headers: { 'x-agent-secret': secret }, signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) throw new Error(`actions HTTP ${res.status}`);
+    actions = (await res.json()).actions || [];
+  } catch (err) {
+    await reportClientAttentionFailure('scorecard', err.message);
+    return;
+  }
+
+  let feed = null;
+  try { feed = await fetchClientAttentionFeed(); } catch (err) { console.warn('[client-attention] scorecard without the feed:', err.message); }
+  if (feed && !clientAttention.checkFeed(feed, new Date()).ok) feed = null;
+
+  const rows = clientAttention.buildScorecard({ sent, actions, feed });
+  const text = clientAttention.formatScorecard(rows, { days: CLIENT_ATTENTION_SCORECARD_DAYS, feedKnown: !!feed });
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runClientAttentionScorecard', status: 'ok',
+    output: { sent: sent.length, actions: actions.length, feed: !!feed } });
+}
+
+cron.schedule('0 10 * * 5', wrapCronJob('runClientAttentionOpenDigest', async () => { await runClientAttentionOpenDigest(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 9 * * 1', wrapCronJob('runClientAttentionScorecard', async () => { await runClientAttentionScorecard(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: client attention report (30 8 * * 1,4 CR) + urgent alerts (*/30 7-19 * * 1-6 CR)');
 
 // ─── WEEKLY PERFORMANCE REPORT STATUS ────────────────────────────────────────
@@ -19273,6 +19336,8 @@ const STATIC_CRON_SCHEDULES = {
   checkAxonHealth:              '*/10 * * * *',
   checkKaiHealth:              '*/15 * * * *',
   runClientAttentionAlerts:     '*/30 7-19 * * 1-6',
+  runClientAttentionOpenDigest: '0 10 * * 5',
+  runClientAttentionScorecard:  '0 9 * * 1',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
