@@ -17832,6 +17832,67 @@ async function runClientAttentionReport() {
     output: { items: feed.items.length, inBand: feed.inBand, adminOnly: feed.counts ? feed.counts.adminOnly : null, live: clientAttentionLive() } });
 }
 
+// A human reacted ✅ (handled) or 💤 (snoozed 3 days) to a client attention
+// alert. Max records it in the dash (POST /api/ops/client-attention/actions,
+// same table as the admin page) with that person as the actor, stamps the
+// message and replies in its thread. Max never marks anything handled on his
+// own. Idempotent: a message Max already stamped is ignored. Any failure
+// leaves the message unstamped so a second tap retries.
+const CLIENT_ATTENTION_HANDLED_EMOJI = 'white_check_mark';
+async function handleClientAttentionReaction(event, baseEmoji, msg, payload) {
+  const botId = process.env.SLACK_BOT_USER_ID;
+  const stamped = (msg.reactions || []).some((r) => (r.name === CLIENT_ATTENTION_HANDLED_EMOJI || r.name === OPEN_DEAL_SNOOZE_EMOJI) && (r.users || []).includes(botId));
+  if (stamped) { console.log('[client-attention] reaction on an alert already recorded, ignoring'); return; }
+  const action = baseEmoji === OPEN_DEAL_SNOOZE_EMOJI ? 'snoozed' : 'handled';
+  const targets = clientAttention.handledTargets(payload);
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+  if (targets.length === 0) {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: '⚠️ Could not read which item this alert is for. Mark it on the admin page.' }).catch(() => {});
+    return;
+  }
+
+  let actor = { slackUserId: event.user };
+  try {
+    const info = await slack.client.users.info({ user: event.user });
+    const email = info.user?.profile?.email;
+    const name = info.user?.real_name || info.user?.name;
+    actor = { slackUserId: event.user, ...(email ? { email } : {}), ...(name ? { name } : {}) };
+  } catch (err) {
+    console.warn('[client-attention] users.info failed, recording the Slack id only:', err.message);
+  }
+
+  const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+  const failures = [];
+  for (const t of targets) {
+    try {
+      const res = await fetch(`${DASH_API_URL}/api/ops/client-attention/actions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-agent-secret': secret },
+        body: JSON.stringify({ ...t, action, actor }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) failures.push(`${t.customerId.slice(0, 8)} HTTP ${res.status}`);
+    } catch (err) {
+      failures.push(`${t.customerId.slice(0, 8)} ${err.message}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `⚠️ Not recorded (${failures.join('; ')}). Tap again to retry, or mark it on the admin page.` }).catch(() => {});
+    logActivity({ event_type: 'client_attention_handled', event_source: 'slack', action: `clientAttention:${action}`, status: 'error', actor_user_id: event.user, error_message: failures.join('; ') });
+    return;
+  }
+
+  await slack.client.reactions.add({ channel, timestamp: ts, name: action === 'snoozed' ? OPEN_DEAL_SNOOZE_EMOJI : CLIENT_ATTENTION_HANDLED_EMOJI }).catch(() => {});
+  await slack.client.chat.postMessage({ channel, thread_ts: ts, text: clientAttention.handledReply(`<@${event.user}>`, action, targets.length) }).catch(() => {});
+  const key = `attention:${payload.client_id}:${payload.code}:${payload.fingerprint}`;
+  await upsertKnowledge('alert', `attention-handled:${key}`, JSON.stringify({ action, by: event.user, at: new Date().toISOString(), targets: targets.length })).catch(() => {});
+  logActivity({ event_type: 'client_attention_handled', event_source: 'slack', action: `clientAttention:${action}`, status: 'ok', actor_user_id: event.user,
+    output: { code: payload.code, client: payload.client_name, targets: targets.length } });
+}
+
 async function alertedClientAttentionKeys(keys) {
   if (keys.length === 0) return new Set();
   const { data, error } = await supabase.from('agent_knowledge').select('key').in('key', keys);
@@ -19988,6 +20049,26 @@ slack.event('reaction_added', async ({ event }) => {
       } catch (wpErr) {
         console.log('weekly-proposal pre-route miss:', wpErr.message);
         // fall through — this reaction belongs to another route
+      }
+    }
+
+    // Route -0.5: client attention alert (✅ handled, 💤 snoozed), channel or
+    // DM (dry-run alerts land in Ron's DMs), identified by message metadata.
+    // Sits ahead of Route 0 because Route 0/1 swallow DM ✅ with no matching
+    // metadata. Falls through untouched on any miss.
+    if (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || baseEmoji === OPEN_DEAL_SNOOZE_EMOJI) {
+      try {
+        const hist = await slack.client.conversations.history({
+          channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
+        });
+        const msg = hist.messages && hist.messages[0];
+        if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === 'client_attention_alert' && msg.metadata.event_payload) {
+          await handleClientAttentionReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+      } catch (caErr) {
+        if (!String(caErr.message || '').includes('channel_not_found')) console.log('client-attention reaction pre-route miss:', caErr.message);
+        // fall through: this reaction belongs to another route
       }
     }
 

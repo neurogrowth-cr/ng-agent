@@ -141,5 +141,26 @@ check('6u  legacy record "name · code" is tolerated', ca.parseAlertRecord('US L
 check('6v  record without a post keeps nulls', JSON.parse(ca.alertRecord(FEED.items[1], null, NOW)).ts, null);
 check('6w  no em dashes anywhere in the output', /\u2014/.test(report + reportV1 + alert + fleetAlert), false);
 
+// ── 7. ✅ on an alert: targets from the message metadata, the thread reply,
+// and the route's place in index.js (before Route 0, which swallows DM ✅).
+const fs = require('fs');
+const path = require('path');
+const metaItem = ca.alertMetadata(FEED.items[1]).event_payload;
+check('7a  per-client target from metadata', ca.handledTargets(metaItem), [{ customerId: 'c-uslegal', signalCode: 'linkedin_disconnected', fingerprint: 'bb0000000001' }]);
+const metaFleet = ca.alertMetadata(FEED.items[0]).event_payload;
+check('7b  fleet targets are every member with the fleet code', ca.handledTargets(metaFleet).map((t) => `${t.customerId}:${t.signalCode}:${t.fingerprint}`), [
+  'c-action:sending_stopped:aa0000000001', 'c-factory:sending_stopped:aa0000000002', 'c-licita:sending_stopped:aa0000000003', 'c-umc:sending_stopped:aa0000000004',
+]);
+check('7c  broken metadata gives no targets', [ca.handledTargets(null), ca.handledTargets({ code: 'x' }), ca.handledTargets({ client_id: 'fleet', code: 'x', members: 'not json' })], [[], [], []]);
+check('7d  thread reply for one client', ca.handledReply('<@U1>', 'handled', 1), 'Marked handled by <@U1>. It comes back if the evidence changes.');
+check('7e  thread reply for a fleet', ca.handledReply('<@U1>', 'handled', 4), 'Marked handled by <@U1> for 4 clients. It comes back if the evidence changes.');
+check('7f  thread reply for a snooze', ca.handledReply('<@U1>', 'snoozed', 1), 'Snoozed 3 days by <@U1>. It comes back after that.');
+const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+const handler = SRC.slice(SRC.indexOf("slack.event('reaction_added'"));
+const caRoute = handler.indexOf("event_type === 'client_attention_alert'");
+const route0 = handler.indexOf('Route 0:');
+check('7g  the client attention route runs before Route 0 in the reaction handler', caRoute > -1 && route0 > -1 && caRoute < route0, true);
+check('7h  the handler never marks anything on its own (only on a human reaction)', /handleClientAttentionReaction\(event, baseEmoji, msg/.test(handler), true);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall checks passed');
