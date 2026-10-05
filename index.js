@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
+const leadVolume = require('./lib/leadVolume');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -14427,6 +14428,14 @@ async function handleGHLWebhook(req, res) {
         // on some payloads, and a contact created long before the VSL launched keeps
         // its original source but still books on the self-serve calendar.
         const attributionMediumIds = [ghlContact?.attributionSource?.mediumId, ghlContact?.lastAttributionSource?.mediumId].filter(Boolean);
+        // Channel (fb_form / whatsapp / instagram / messenger) for the lead
+        // volume watchdog. `source` alone lumps WhatsApp, Instagram and
+        // Messenger together as "Social media"; the contact's attribution
+        // medium is what tells them apart (lib/leadVolume.js).
+        const leadChannelKey = leadVolume.leadChannel({
+          source,
+          medium: ghlContact?.attributionSource?.medium || contactAttr.medium || attrSource.medium || '',
+        });
 
         // A client booking an activation call / quick sync / 1:1 is not a new
         // lead. Dropped BEFORE the Slack card, the setter DM, the phone
@@ -14577,6 +14586,7 @@ async function handleGHLWebhook(req, res) {
               phone_last10: phoneLast10,
               email_lower: emailLower,
               source: source || null,
+              channel: leadChannelKey,
               full_name: fullName || null,
               name_prefix3: namePrefix3,
             }, { onConflict: 'contact_id' });
@@ -14608,6 +14618,7 @@ async function handleGHLWebhook(req, res) {
                   phone_last10: phoneLast10,
                   email_lower: emailLower,
                   source: source || null,
+                  channel: leadChannelKey,
                   full_name: fullName || null,
                   name_prefix3: namePrefix3,
                 }, { onConflict: 'contact_id' });
@@ -14678,6 +14689,7 @@ async function handleGHLWebhook(req, res) {
               phone_last10: phoneLast10,
               email_lower: emailLower,
               source: source || null,
+              channel: leadChannelKey,
               full_name: fullName || null,
               name_prefix3: namePrefix3,
             }, { onConflict: 'contact_id' });
@@ -18335,6 +18347,113 @@ async function runGhlWorkflowDriftCheck(correlationId) {
 cron.schedule('45 7 * * *', wrapCronJob('runGhlWorkflowDriftCheck', async (c) => { await runGhlWorkflowDriftCheck(c); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: GHL workflow drift check (45 7 * * *)');
 
+// ─── LEAD VOLUME WATCHDOG (per channel) ─────────────────────────────────────
+// The drift check above sees a workflow that stops being published. It cannot
+// see a published workflow that silently stops creating cards for ONE channel,
+// which is exactly what happened 2026-10-02/03: organic Instagram DMs got no
+// card and no Slack post for about 21h while WhatsApp, the Facebook form and
+// paid Instagram kept flowing. This watches what actually reached Slack
+// (lead_posts) per channel and alerts when a channel's silence is too long to
+// be chance given its own trailing week. Pure logic and thresholds live in
+// lib/leadVolume.js; this owns the I/O.
+//
+// Spec: ~/automations/ops/recipes/lead-volume-watchdog.md
+async function fetchLeadVolumeRows(sinceIso) {
+  const rows = [];
+  // Paged: PostgREST caps a response at 1000 rows, and a short page read as
+  // "all of it" would fake a silence on whichever channel got cut off.
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from('lead_posts')
+      .select('posted_at, channel, source')
+      .is('personal_excluded_at', null)
+      .gte('posted_at', sinceIso)
+      .order('posted_at', { ascending: true })
+      .range(from, from + 999);
+    if (error) throw new Error(`lead_posts read failed: ${error.message}`);
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) return rows;
+  }
+}
+
+async function runLeadVolumeWatchdog(correlationId, { now = Date.now() } = {}) {
+  let rows;
+  try {
+    // 14 days: a 7-day baseline before the silence plus up to 7 days of silence.
+    rows = await fetchLeadVolumeRows(new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString());
+  } catch (err) {
+    // Fail closed. An empty read must never be evaluated: it would look like
+    // every channel went silent at once.
+    console.error('Lead volume watchdog: read failed:', err.message);
+    await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: `⚠️ *CHECK BROKEN*: lead volume watchdog could not read lead_posts (${err.message}). No channel was evaluated; this is not an all-clear. <@${RON_SLACK_ID}>` }).catch(e => console.error('Lead volume watchdog: alert post failed:', e.message));
+    await logActivity({ event_type: 'audit', event_source: 'cron', action: 'lead_volume_watchdog', status: 'degraded', error_message: String(err.message).slice(0, 2000), correlation_id: correlationId });
+    return { ok: false, reason: err.message };
+  }
+
+  const findings = leadVolume.evaluateLeadVolume(rows, now);
+  const firing = findings.filter(f => f.firing);
+
+  // Episodes already alerted, newest per channel, to dedupe and to notice recovery.
+  const { data: known, error: knownErr } = await supabase
+    .from('agent_knowledge').select('key').like('key', 'lead-volume%').limit(1000);
+  if (knownErr) {
+    console.error('Lead volume watchdog: could not read alert history:', knownErr.message);
+    await logActivity({ event_type: 'audit', event_source: 'cron', action: 'lead_volume_watchdog', status: 'degraded', error_message: String(knownErr.message).slice(0, 2000), correlation_id: correlationId });
+    return { ok: false, reason: knownErr.message };
+  }
+  const keys = new Set((known || []).map(k => k.key));
+
+  const alerted = [];
+  for (const f of firing) {
+    const key = leadVolume.alertKey(f);
+    if (keys.has(key)) continue;
+    const text = leadVolume.renderLeadVolumeAlert(f);
+    await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: `${text}\n<@${RON_SLACK_ID}>` });
+    await upsertKnowledge('alert', key, text, 'lead-volume-watchdog');
+    alerted.push(f.channel);
+  }
+
+  // Recovery: a channel with an alerted episode whose silence has since ended.
+  const recovered = [];
+  const latestAlert = {};
+  for (const k of keys) {
+    const parsed = leadVolume.parseAlertKey(k);
+    if (parsed && (!latestAlert[parsed.channel] || parsed.lastAt > latestAlert[parsed.channel].lastAt)) latestAlert[parsed.channel] = parsed;
+  }
+  for (const f of findings) {
+    const open = latestAlert[f.channel];
+    if (!open || !f.lastAt || f.lastAt <= open.lastAt) continue;
+    const okKey = leadVolume.recoveryKey(f.channel, open.lastAtIso);
+    if (keys.has(okKey)) continue;
+    const resumedAt = rows
+      .filter(r => (r.channel || leadVolume.leadChannel({ source: r.source })) === f.channel)
+      .map(r => Date.parse(r.posted_at))
+      .find(t => t > open.lastAt);
+    if (!resumedAt) continue;
+    const text = leadVolume.renderLeadVolumeRecovery({ channel: f.channel, lastAt: open.lastAt, resumedAt });
+    await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text });
+    await upsertKnowledge('alert', okKey, text, 'lead-volume-watchdog');
+    recovered.push(f.channel);
+  }
+
+  const summary = findings.map(f => `${f.channel}:${f.firing ? 'SILENT' : f.reason}${f.lastAt ? `(${(f.silentHours || 0).toFixed(0)}h, exp ${(f.expected || 0).toFixed(1)})` : ''}`).join(' ');
+  console.log(`Lead volume watchdog: ${rows.length} posts read. ${summary}${alerted.length ? ` · alerted ${alerted.join(',')}` : ''}${recovered.length ? ` · recovered ${recovered.join(',')}` : ''}`);
+  await logActivity({
+    event_type: 'audit', event_source: 'cron', action: 'lead_volume_watchdog',
+    status: firing.length ? 'silent' : 'ok',
+    output: { rows: rows.length, findings: findings.map(f => ({ ...f, lastAt: f.lastAt ? new Date(f.lastAt).toISOString() : null })), alerted, recovered },
+    correlation_id: correlationId,
+  });
+  return { ok: true, findings, alerted, recovered };
+}
+
+// Hourly at :05 CR. Silence only accrues during CR waking hours (08:00 to
+// midnight), so the overnight runs are cheap no-ops for alerting but keep the
+// liveness audit honest. Declared in STATIC_CRON_SCHEDULES.
+cron.schedule('5 * * * *', wrapCronJob('runLeadVolumeWatchdog', async (c) => { await runLeadVolumeWatchdog(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: lead volume watchdog (5 * * * *)');
+// ─── end lead volume watchdog ───────────────────────────────────────────────
+
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
 // The customer lifecycle alerts (Make 4356754 + 5975679) had no criteria at all.
 // See ~/automations/ops/recipes/customer-alert-fanout.md.
@@ -18679,6 +18798,7 @@ const STATIC_CRON_SCHEDULES = {
   // in-process can — which is the standing limitation noted in the spec.
   runCronLivenessAudit:         '30 7 * * *',
   runGhlWorkflowDriftCheck:     '45 7 * * *',
+  runLeadVolumeWatchdog:        '5 * * * *',
   runEmailReplyPoller:          '0 8-20 * * 1-5',
   runFulfillmentStandup:        '0 9 * * 1-5',
   runGhlRevopsReconciliation:   '30 20 * * *',
