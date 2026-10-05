@@ -139,7 +139,7 @@ const parsed = ca.parseAlertRecord(record);
 check('6t  alert record round-trips with channel, ts and post time', [parsed.clientName, parsed.code, parsed.fingerprint, parsed.channel, parsed.ts, parsed.postedAt], ['US Legal - Guido Soto', 'linkedin_disconnected', 'bb0000000001', 'C123', '1700000000.000100', NOW.toISOString()]);
 check('6u  legacy record "name · code" is tolerated', ca.parseAlertRecord('US Legal - Guido Soto · sending_stopped'), { clientName: 'US Legal - Guido Soto', code: 'sending_stopped', fingerprint: null, channel: null, ts: null, postedAt: null });
 check('6v  record without a post keeps nulls', JSON.parse(ca.alertRecord(FEED.items[1], null, NOW)).ts, null);
-check('6w  no em dashes anywhere in the output', /—/.test(report + reportV1 + alert + fleetAlert), false);
+check('6w  no em dashes anywhere in the output', /\u2014/.test(report + reportV1 + alert + fleetAlert), false);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall checks passed');
