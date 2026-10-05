@@ -25,9 +25,9 @@ const block = [
   slice('function _newSetterSlot', '// ─── SETTER ATTRIBUTION RECONCILER'),
 ].join('\n');
 const ROSTER = { 'seb@x.com': 'Sebastian S', 'oscar@x.com': 'Oscar M' };
-const { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt } = new Function(
+const { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows } = new Function(
   'resolveSalesMember', 'isUnresolvedSalesId',
-  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt };`,
+  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows };`,
 )(id => ROSTER[id] || id, () => false);
 
 const cases = [];
@@ -127,6 +127,25 @@ const appt = (o = {}) => ({
   ];
   const { stats } = tallySetterStats(appts, {}, [], START, END, NOW);
   check('4 calls from 3 distinct leads (not 1)', stats['Sebastian S'].calls_booked === 4 && stats['Sebastian S'].distinct_leads === 3, stats);
+}
+
+// 5. A deleted duplicate never supersedes the real call (Juan Jose Hernandez,
+//    2026-09-30): setter call at 17:30, self-serve duplicate at 18:00 deleted.
+{
+  const DEL = { cancelled: true, reason: 'deleted_in_ghl' };
+  const rows = [
+    { prospect_id: 'pJJ', scheduled_start: '2026-09-30 17:30:00+00', qualification_snapshot: {} },
+    { prospect_id: 'pJJ', scheduled_start: '2026-09-30 18:00:00+00', qualification_snapshot: DEL },
+    { prospect_id: 'pR',  scheduled_start: '2026-09-10 16:00:00+00', qualification_snapshot: { ghl: { cancelled: true } } },
+    { prospect_id: 'pR',  scheduled_start: '2026-09-12 16:00:00+00', qualification_snapshot: {} },
+  ];
+  const latest = latestStartFromRows(rows);
+  check('deleted later row is ignored for the latest start', latest.pJJ === '2026-09-30 17:30:00+00', latest);
+  check('a live rebook still supersedes', latest.pR === '2026-09-12 16:00:00+00', latest);
+  const real = appt({ id: 'jj-real', prospect_id: 'pJJ', scheduled_start: '2026-09-30 17:30:00+00' });
+  const dup  = appt({ id: 'jj-dup',  prospect_id: 'pJJ', scheduled_start: '2026-09-30 18:00:00+00', qualification_snapshot: DEL });
+  const { stats } = tallySetterStats([real, dup], {}, [], START, '2026-10-02T00:00:00.000Z', Date.parse('2026-10-02T00:00:00.000Z'), latest);
+  check('the real call counts once and is pending', stats['Sebastian S']?.calls_booked === 1 && stats['Sebastian S'].pending === 1, stats);
 }
 
 const failed = cases.filter(c => !c.ok);
