@@ -14355,6 +14355,38 @@ const _leadBurstGate = createLeadBurstGate({ limit: LEAD_BURST_LIMIT, windowMs: 
 const _leadBurstHeld = [];
 let _leadBurstTimer = null;
 
+// ─── SAME-CONTACT REPEAT INTAKE ──────────────────────────────────────────────
+// GHL's "Social DM Intake (on reply)" workflow fires on every inbound message,
+// and its "Has Existing Opportunity?" guard did not hold: on 2026-10-05 (Mau
+// Vargas) and 2026-10-06 (Andres Hernandez Chaves) a second DM 70s after the
+// first ran the whole workflow again, created a second opportunity, and sent
+// Max a second webhook for the SAME contact id. The cross-contact dedup below
+// deliberately excludes the same contact id, so Max posted a second card and
+// DM'd the setter a "new lead assigned to you" for a lead he had already
+// claimed. The fix in GHL is tagging `intake-done` before the Wait; this is
+// the Max-side guard so a workflow misconfiguration never spams the channel.
+//
+// Any lead_posts row for this contact posted inside the window means the card
+// already exists: no new card, no setter DM, a thread note on the original so
+// the repeat is visible, and the lead_posts row is left pointing at the first
+// card (claims and 🫂 keep working). Older than the window is a returning lead
+// and gets a fresh card. Pure so test/repeat-intake.test.js can slice it.
+const REPEAT_INTAKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+function repeatIntakeDecision({ existing, nowMs = Date.now(), windowMs = REPEAT_INTAKE_WINDOW_MS } = {}) {
+  if (!existing || !existing.slack_message_ts) return null;
+  const postedMs = Date.parse(existing.posted_at || '');
+  if (!Number.isFinite(postedMs)) return null;
+  const ageMs = nowMs - postedMs;
+  if (ageMs < 0 || ageMs > windowMs) return null;
+  return {
+    ts: existing.slack_message_ts,
+    channel: existing.slack_channel_id || null,
+    ageMinutes: Math.round(ageMs / 60000),
+    // A card Ron already 🫂'd is gone from the channel: skip silently.
+    thread: !existing.personal_excluded_at,
+  };
+}
+
 // Debounced: posts once arrivals have been quiet for two minutes.
 function holdBurstLead({ fullName, ghlLink }) {
   _leadBurstHeld.push({ fullName, ghlLink });
@@ -14420,6 +14452,48 @@ async function handleGHLWebhook(req, res) {
         const contactId   = cd.contactId  || payload.contactId  || payload.contact_id || ct.id || payload.id || '';
         const locationId  = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
         const leadContext = cd.context || payload.context || '';
+
+        // Same contact, second webhook (see REPEAT_INTAKE_WINDOW_MS). Checked
+        // before the GHL contact fetch and phone writeback: a repeat has
+        // nothing new for us. Degrades OPEN: a lookup error means "new lead".
+        if (contactId) {
+          let repeat = null;
+          try {
+            const { data: priorRow, error: priorErr } = await supabase
+              .from('lead_posts')
+              .select('contact_id, slack_message_ts, slack_channel_id, posted_at, personal_excluded_at')
+              .eq('contact_id', contactId)
+              .maybeSingle();
+            if (priorErr) console.error('lead_posts repeat lookup failed:', priorErr.message);
+            else repeat = repeatIntakeDecision({ existing: priorRow });
+          } catch (priorThrow) {
+            console.error('lead_posts repeat lookup threw:', priorThrow.message);
+          }
+          if (repeat) {
+            // The repeat payload carries the assignee as `user` once the claim landed.
+            const payloadUserName = payload.user ? [payload.user.firstName, payload.user.lastName].filter(Boolean).join(' ') : '';
+            const assignedName = GHL_USER_NAMES[assignedTo] || GHL_USER_NAMES[String(assignedTo).toLowerCase()] || payloadUserName || null;
+            console.log(`GHL lead ${contactId} ("${fullName}") REPEAT intake webhook ${repeat.ageMinutes} min after its card (ts ${repeat.ts}). No new card, no setter DM.`);
+            logActivity({
+              event_type: 'ghl_webhook', event_source: 'ghl', action: 'repeat_intake_skipped',
+              correlation_id: newCorrelationId(),
+              output: { contact_id: contactId, full_name: fullName, age_minutes: repeat.ageMinutes, original_ts: repeat.ts, assigned_to: assignedName || assignedTo || null, source: sourceRaw || null },
+            });
+            if (repeat.thread) {
+              const repeatNote = [
+                `🔁 GHL ran intake again for *${fullName}* (${repeat.ageMinutes} min after this card). No new card, no setter DM.`,
+                assignedName ? `👤 Now assigned to: ${assignedName}` : null,
+                `_If GHL created a second opportunity, delete the duplicate in the Appointment Setting Pipeline._`,
+              ].filter(Boolean).join('\n');
+              try {
+                await slack.client.chat.postMessage({ channel: repeat.channel || LEAD_CHANNEL_ID, thread_ts: repeat.ts, text: repeatNote });
+              } catch (repeatPostErr) {
+                console.error('repeat intake thread note failed:', repeatPostErr.message);
+              }
+            }
+            return;
+          }
+        }
 
         let resolvedAssignedTo = assignedTo;
         // Fetched once and reused: the webhook payload alone can't tell us whether
