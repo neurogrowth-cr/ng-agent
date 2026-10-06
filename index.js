@@ -32,6 +32,16 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ICM model tiers — the only place model ids may appear (env-overridable, no redeploy to switch)
 const MODEL_AGENT = process.env.NG_AGENT_MODEL || 'claude-sonnet-4-6';
 const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-4-5-20251001';
+// Pinned off on EVERY Claude call. Sonnet 4.6 runs thinking-off when `thinking` is
+// omitted; Sonnet 5 runs ADAPTIVE thinking on the same request, and thinking tokens
+// count against max_tokens. The Sonnet 5 shadow (PR #234, 2026-09-30 to 10-05) lost
+// every Sales EOD Report to this: the final call hit the 4096 cap with no text block,
+// callClaude returned null, the format check saw an empty report. Output tokens ran
+// 4.4x and the cheaper model cost 30% MORE. With the pin a model switch keeps 4.6's
+// behaviour and cost shape. If quality ever needs thinking, the documented route is
+// `{ type: 'adaptive' }` plus `output_config: { effort: 'low' }` and a much larger
+// max_tokens, measured through the shadow first. test/thinking-pinned.test.js guards it.
+const THINKING_OFF = { type: 'disabled' };
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const portalSupabase = createClient(process.env.PORTAL_SUPABASE_URL, process.env.PORTAL_SUPABASE_ANON_KEY);
@@ -1040,6 +1050,7 @@ async function extractAndSaveReportLesson(originalReport, feedbackText, channelN
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1309,6 +1320,7 @@ async function detectAndSaveCorrection(userText, priorAssistantText, userId) {
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1357,6 +1369,7 @@ async function extractClientContext(threadMessages, mentionText, channelName, us
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 150,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1789,7 +1802,10 @@ function registerDynamicCron(task) {
         return;
       }
 
-      if (!reply || !reply.trim()) return;
+      if (!reply || !reply.trim()) {
+        console.error(`Cron "${task.name}": model returned an empty reply, nothing posted.`);
+        return;
+      }
 
       reply = trimToLeadAnchor(stripApprovalSentinel(reply), task.name);
 
@@ -1996,6 +2012,7 @@ Reply with ONLY the cron expression, nothing else. Examples:
     const tCronLlm = Date.now();
     const cronResponse = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 50,
       messages: [{ role: 'user', content: cronPrompt }]
     });
@@ -5155,7 +5172,7 @@ ${fmt(nightly).slice(0, 16000)}
 ${fmt(alerts).slice(0, 4000)}`;
 
   const tRef = Date.now();
-  const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
+  const res = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
   logLlmFromAnthropicResponse(res, Date.now() - tRef, correlationId, 'pattern_reflection');
   const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   if (text.includes('NO_PATTERNS')) {
@@ -5278,7 +5295,7 @@ ${nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${Str
   let patternsText = '', proposalLines = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     const tB = Date.now();
-    const res = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
+    const res = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 900, messages: [{ role: 'user', content: llmPrompt }] });
     logLlmFromAnthropicResponse(res, Date.now() - tB, correlationId, 'weekly_reflection');
     const text = res.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
     const lines = text.split('\n');
@@ -5459,7 +5476,7 @@ async function runNightlyLearning(correlationId) {
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
     const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${capText(digest, 30000)}`;
     const tNightly = Date.now();
-    const response = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
+    const response = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId, 'nightly_learning');
     const text  = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     const lines = text.split('\n').filter(l => l.includes('|'));
@@ -5511,6 +5528,7 @@ async function runNightlyLearning(correlationId) {
         const tSum = Date.now();
         const sumRes = await anthropic.messages.create({
           model: MODEL_AGENT,
+          thinking: THINKING_OFF,
           max_tokens: 350,
           messages: [{ role: 'user', content: `You are Max, NeuroGrowth's PM agent. You just saved these knowledge entries from tonight's learning cycle:\n\n${entryList}\n\nWrite a sneak-peek summary for the team Slack channel: 3-6 bullet lines giving a HIGH-LEVEL overview of what was learned today. Blend related entries into single surface-level statements — themes over details. Skip metrics, counts, and specifics unless one is essential to understand the point; a reader just wants to know what kinds of things were learned. Cover the breadth of every source (don't drop a whole topic area), most important first (alerts and decisions before general intel), each line under 14 words, plain direct language. Never mention company financial, banking, or billing details (balances, payments, invoices, subscription status) — those are confidential to Ron and must not appear in this team-facing summary. Start every line with "• ". Output ONLY the bullet lines — no intro, no headers, no bold, no markdown.` }],
         });
@@ -5569,7 +5587,7 @@ async function runProactiveAlerts(correlationId) {
     const alertText = staleAlerts.map(a => `${a.key}: ${a.value}`).join('\n\n');
     const prompt    = `You are the NeuroGrowth PM agent checking on unresolved alerts.\n\nThese items have been flagged as alerts and have not been updated in over 24 hours:\n\n${alertText}\n\nWrite a brief, direct message to Ron (2-4 sentences) summarizing what is still unresolved and what needs his attention today. No markdown formatting. Sound like a colleague, not a report.`;
     const tPa = Date.now();
-    const response  = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
+    const response  = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 256, messages: [{ role: 'user', content: prompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tPa, correlationId, 'proactive_alerts');
     const message   = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
     await postToSlack(AGENT_CHANNEL, message);
@@ -5930,6 +5948,7 @@ async function narrateAnomaly(snapshot) {
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 100,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -7522,7 +7541,7 @@ async function processFileWithClaude(fileBuffer, mimeType, userInstruction, syst
   }
   const t0 = Date.now();
   const response = await anthropic.messages.create({
-    model: MODEL_AGENT, max_tokens: 1024, system: systemPrompt,
+    model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 1024, system: systemPrompt,
     messages: [{ role: 'user', content: [contentBlock, { type: 'text', text: userInstruction || 'Analyze this file and provide a useful summary. Extract any action items, key information, or insights relevant to NeuroGrowth operations.' }] }],
   });
   logLlmFromAnthropicResponse(response, Date.now() - t0, correlationId, 'file_analysis');
@@ -7819,6 +7838,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
       const tInitial = Date.now();
       let response = await anthropic.messages.create({
         model: loopModel,
+        thinking: THINKING_OFF,
         max_tokens: 4096,
         system: fullSystemPrompt,
         messages: markCacheTail(messages),
@@ -7888,6 +7908,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
             const tFollow = Date.now();
             nextResponse = await anthropic.messages.create({
               model: loopModel,
+              thinking: THINKING_OFF,
               max_tokens: 4096,
               system: fullSystemPrompt,
               messages: markCacheTail(currentMessages),
@@ -7925,6 +7946,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         const tForce = Date.now();
         const forced = await anthropic.messages.create({
           model: loopModel,
+          thinking: THINKING_OFF,
           max_tokens: 4096,
           system: fullSystemPrompt,
           messages: markCacheTail(forceMsgs),
@@ -7936,6 +7958,12 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         if (fin) return { structured: fin.input };
       }
 
+      if (response.stop_reason === 'max_tokens') {
+        // A model that thinks inside the cap can spend it all before the text block
+        // (the Sonnet 5 shadow failure). Loud in the logs so a silent empty reply is not.
+        const hasText = response.content.some(b => b.type === 'text' && b.text);
+        console.error(`callClaude (${loopSite}, ${loopModel}): response stopped on max_tokens, text ${hasText ? 'truncated' : 'EMPTY'}.`);
+      }
       const responseText = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       return responseText || null;
 
@@ -9332,6 +9360,7 @@ async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa,
   const tLlm = Date.now();
   const res = await anthropic.messages.create({
     model: MODEL_AGENT,
+    thinking: THINKING_OFF,
     max_tokens: 300,
     messages: [{ role: 'user', content: buildReviGamePlanPrompt({ closerFirst, prospectLines, weeklyLines }) }],
   });
@@ -10593,6 +10622,7 @@ async function generateWonHandoffSummary({ prospectName, coaching }) {
   const tLlm = Date.now();
   const response = await anthropic.messages.create({
     model: MODEL_AGENT,
+    thinking: THINKING_OFF,
     max_tokens: 700,
     messages: [{ role: 'user', content: prompt }],
   });
@@ -13093,6 +13123,7 @@ async function composeRecapNarrative(statText, lessons) {
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 300,
       messages: [{ role: 'user', content: `You are Max, NeuroGrowth's ops agent, writing the executive takeaway for Ron's weekly sales & marketing recap. Below is the final stat block (all numbers are verified — copy any number verbatim, never recompute or rephrase a stat's meaning).\n\n${statText}${lessonBlock}\n\nWrite the takeaway: 2–3 SHORT sentences, 60 words max, plain text. Sentence 1: the single most important thing that happened this week. Sentence 2: the one thing to watch or act on. Restate at most two numbers total. No preamble, no markdown, no bullet points, no run-on sentences.` }],
     });
@@ -13377,6 +13408,7 @@ async function vocExtractOne(meeting) {
   const tLlm = Date.now();
   const res = await anthropic.messages.create({
     model: MODEL_AGENT,
+    thinking: THINKING_OFF,
     max_tokens: 1800,
     system: VOC_EXTRACT_PROMPT,
     messages: [{ role: 'user', content: 'TRANSCRIPT:\n' + transcriptText }],
@@ -14670,7 +14702,7 @@ async function handleGHLWebhook(req, res) {
           : `Their first action (reach out now, check GHL).`;
         const prompt = `You are Max, the NeuroGrowth PM Agent. A new lead just came in and was assigned to a setter.\n\nLead details:\n- Name: ${fullName}\n- Email: ${email || 'not provided'}\n- Phone: ${phone || 'not provided'}\n- Source: ${source}\n- Assigned to: ${resolvedAssignedTo || 'unassigned'}${contextLine}\n- GHL link: ${ghlLink}\n\nWrite a short, direct Slack DM to the setter (2-3 sentences max) telling them: 1. A new lead came in and was assigned to them. 2. Key lead details. 3. ${actionGuidance} Sound like a colleague, not a bot. No markdown. Include the GHL link.`;
         const tGhl = Date.now();
-        const briefingResponse = await anthropic.messages.create({ model: MODEL_AGENT, max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
+        const briefingResponse = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
         logLlmFromAnthropicResponse(briefingResponse, Date.now() - tGhl, ghlCorr, 'lead_briefing');
         const briefing = briefingResponse.content.filter(b => b.type === 'text').map(b => b.text).join('');
         if (!briefing || !briefing.trim()) { console.error('GHL webhook: empty briefing from Claude'); return; }
@@ -16430,6 +16462,7 @@ Output ONLY the message text. No preamble, no explanation.`;
   const corr = newCorrelationId();
   const res = await anthropic.messages.create({
     model: MODEL_AGENT,
+    thinking: THINKING_OFF,
     max_tokens: 200,
     messages: [{ role: 'user', content: prompt }],
   });
@@ -18717,7 +18750,7 @@ async function hotClassify(convo, analysis, correlationId) {
     callBooked: hotReplies.isCallBooked(convo),
   });
   const t0 = Date.now();
-  const res = await anthropic.messages.create({ model: MODEL_LIGHT, max_tokens: 200, messages: [{ role: 'user', content: prompt }] });
+  const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: 200, messages: [{ role: 'user', content: prompt }] });
   logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'hot_reply_classifier');
   const verdict = hotReplies.parseVerdict(res.content.filter(b => b.type === 'text').map(b => b.text).join(''));
   _hotVerdictCache.set(analysis.newestId, verdict);
@@ -20516,6 +20549,7 @@ slack.event('member_joined_channel', async ({ event }) => {
     const tGreet = Date.now();
     const mjRes = await anthropic.messages.create({
       model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
       max_tokens: 300,
       messages: [{ role: 'user', content: prompt }],
     });
