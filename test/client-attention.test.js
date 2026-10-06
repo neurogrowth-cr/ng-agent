@@ -97,7 +97,8 @@ check('5i  a v2 item line without an owner tag fails', ca.validateReport(untagge
 
 // ── 6. Alerts: owner tag, fleet shape, dedupe keys, metadata, records.
 const alert = ca.formatAlert(FEED.items[1], FEED.adminUrl);
-check('6a  alert line carries the owner and the ✅ hint', alert, `🔴 *Client attention* · [client] US Legal - Guido Soto: ${FEED.items[1].reason} → ${FEED.items[1].firstMove} <${FEED.adminUrl}|Open> · ✅ marks it handled`);
+check('6a  alert carries the owner and tells the team how to react', alert, `🔴 *Client attention* · [client] US Legal - Guido Soto: ${FEED.items[1].reason} → ${FEED.items[1].firstMove} <${FEED.adminUrl}|Open>\nReact ✅ here when it is handled, 💤 to snooze 3 days, or mark it in Campaign health.`);
+check('2o  report ends with the how-to-act line', lines[lines.length - 1], `[ours] = our team fixes it · [client] = ask the client. When an item is handled, react ✅ on its alert (💤 snoozes 3 days), or mark it in <${FEED.adminUrl}|Campaign health>.`);
 check('6b  alert passes its criteria', ca.validateAlert(alert), { ok: true, problems: [] });
 const fleetAlert = ca.formatAlert(FEED.items[0], FEED.adminUrl);
 check('6c  fleet alert names the count', fleetAlert.startsWith('🔴 *Client attention* · [ours] Fleet (4 clients): 4 clients stopped'), true);
@@ -176,6 +177,7 @@ check('8e  fleet line names the count', digestLines[1].startsWith('🔴 [ours] F
 const quietFeed = { ...clone(FEED), items: FEED.items.filter((i) => i.level !== 'urgent') };
 const quietDigest = ca.formatOpenDigest(quietFeed, new Map(), FRI);
 check('8f  nothing open reads as a good week', quietDigest.includes('No urgent item is open. Good week.') && ca.validateOpenDigest(quietDigest, quietFeed).ok, true);
+check('8h  digest ends with the how-to-act line', digestLines[digestLines.length - 1].startsWith('[ours] = our team fixes it'), true);
 check('8g  a dropped digest line fails', ca.validateOpenDigest(digestLines.filter((l) => !l.startsWith('🔴 [ours] Fleet')).join('\n'), FEED, { mention: MENTION }).ok, false);
 
 // ── 9. Monday scorecard.
