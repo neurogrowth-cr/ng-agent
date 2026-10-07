@@ -18345,6 +18345,131 @@ async function runReelsWeekly({ now = new Date() } = {}) {
 cron.schedule('0 8 * * 1', wrapCronJob('runReelsWeekly', async () => { await runReelsWeekly(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: reels weekly (0 8 * * 1 CR)');
 
+// ─── REELS BRIEFS (Ron's DM: daily 07:40, monthly day 1 08:00 CR) ───────────
+// Daily: what goes out today on @linkedin.papi, every reel of the week and the
+// month with reach/likes/comments/saves, and any scheduled post that never
+// published. Monthly: last month ranked by reach against the month before, plus
+// a snapshot in reel_stats (iso_week = 'YYYY-MM', kind = 'month'). Moved here
+// from two desktop scheduled tasks on 2026-10-07 so they no longer need the Mac
+// open. Metrics come from Meta only (GHL's per-post insights read 0 likes on
+// reels Meta counts likes on). Rules in lib/reelsBriefs.js, tested in
+// test/reels-briefs.test.js. Kill switch: REELS_BRIEFS_DISABLED=true.
+// Recipes: ~/automations/ops/recipes/ig-reels-daily-brief.md, ig-reels-monthly-report.md.
+const reelsBriefs = require('./lib/reelsBriefs');
+const reelsBriefsDisabled = () => String(process.env.REELS_BRIEFS_DISABLED || '') === 'true';
+const IG_REEL_FIELDS = 'id,timestamp,media_product_type,caption,permalink,like_count,comments_count';
+
+// Every Instagram post in GHL (any status) between two instants. The parent of a
+// published post stays `scheduled` forever; reelsBriefs.normalizeSchedule drops it.
+async function fetchReelsSchedule(from, to) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const body = { type: 'all', accounts: REELS_GHL_ACCOUNT_ID, skip: '0', limit: '100', includeUsers: 'false',
+    fromDate: from.toISOString(), toDate: to.toISOString() };
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/${locationId}/posts/list`,
+    { method: 'POST', headers, body: JSON.stringify(body) }, { label: 'social posts/list (briefs)' });
+  if (!res.ok) throw new Error(`GHL ${res.status} on social posts/list`);
+  const json = await res.json();
+  const posts = json.results && json.results.posts;
+  if (!Array.isArray(posts)) throw new Error('GHL posts/list returned no posts array');
+  return posts;
+}
+
+// All Instagram media published since `sinceMs`, newest first, with reach/saved/
+// shares through field expansion (one call per page instead of one per reel). If
+// Meta refuses the expansion, retry without it: reels then show "sin datos"
+// instead of the whole brief failing. A rejected token always throws.
+async function fetchIgReels(sinceMs) {
+  const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+  if (!token) throw new Error('META_IG_INSIGHTS_TOKEN is not set');
+  const page = async (withInsights) => {
+    const fields = withInsights ? `${IG_REEL_FIELDS},insights.metric(reach,saved,shares)` : IG_REEL_FIELDS;
+    let url = `https://graph.facebook.com/v21.0/${REELS_IG_USER_ID}/media?fields=${encodeURIComponent(fields)}&limit=100&access_token=${token}`;
+    const out = [];
+    for (let i = 0; i < 10 && url; i++) {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const code = json && json.error && json.error.code;
+        const err = new Error(`Meta ${res.status}${code ? ` code ${code}` : ''}: ${(json.error && json.error.message) || 'no body'}`);
+        err.tokenRejected = code === 190 || res.status === 401;
+        throw err;
+      }
+      const data = Array.isArray(json.data) ? json.data : [];
+      out.push(...data);
+      const oldest = data.length ? Date.parse(data[data.length - 1].timestamp) : 0;
+      url = json.paging && json.paging.next && oldest >= sinceMs ? json.paging.next : null;
+    }
+    return out.filter((m) => Date.parse(m.timestamp) >= sinceMs);
+  };
+  try {
+    return await page(true);
+  } catch (err) {
+    if (err.tokenRejected) throw err;
+    console.warn(`[reels-briefs] insights expansion refused, retrying without it: ${err.message}`);
+    return page(false);
+  }
+}
+
+async function reportReelsBriefFailure(action, reason) {
+  console.error(`[reels-briefs] ${action} did not send: ${reason}`);
+  logActivity({ event_type: 'alert', event_source: 'cron', action, status: 'error', error_message: reason });
+  try {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${action} no se envió: ${reason}` });
+  } catch (err) {
+    console.error('[reels-briefs] failure DM failed:', err.message);
+  }
+}
+
+async function runReelsDailyBrief({ now = new Date() } = {}) {
+  if (reelsBriefsDisabled()) return;
+  const w = reelsBriefs.dayWindows(now);
+  const errors = [];
+  let schedule = null;
+  let reels = null;
+  try {
+    const raw = await fetchReelsSchedule(new Date(w.weekStart.getTime() - 86400000), new Date(w.weekEnd.getTime() + 86400000));
+    schedule = reelsBriefs.normalizeSchedule(raw);
+  } catch (err) { errors.push(`ghl: ${err.message}`); }
+  try {
+    reels = reelsBriefs.normalizeMedia(await fetchIgReels(Math.min(w.prevWeekStart.getTime(), w.monthStart.getTime())));
+  } catch (err) { errors.push(`meta: ${err.message}`); }
+  const text = reelsBriefs.formatDaily({ now, schedule, reels });
+  const verdict = reelsBriefs.validateDaily(text);
+  if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text, unfurl_links: false, unfurl_media: false });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsDailyBrief', status: errors.length ? 'error' : 'ok',
+    error_message: errors.length ? errors.join(' | ') : null,
+    metadata: { reels: reels ? reels.length : null, scheduled: schedule ? schedule.length : null } });
+}
+
+async function runReelsMonthlyReport({ now = new Date() } = {}) {
+  if (reelsBriefsDisabled()) return;
+  const mw = reelsBriefs.monthWindows(now);
+  let reels = null;
+  let metaError = null;
+  try {
+    reels = reelsBriefs.normalizeMedia(await fetchIgReels(mw.previousStart.getTime()));
+  } catch (err) { metaError = err.message; }
+  const reportedCount = reels ? reels.filter((r) => r.publishedAt >= mw.reportedStart && r.publishedAt < mw.reportedEnd).length : 0;
+  const text = reelsBriefs.formatMonthly({ now, reels });
+  const verdict = reelsBriefs.validateMonthly(text, { reportedCount });
+  if (!verdict.ok) return reportReelsBriefFailure('runReelsMonthlyReport', `contrato: ${verdict.problems.join('; ')}`);
+  let note = '';
+  if (reels && reportedCount) {
+    const rows = reelsBriefs.monthRows(now, reels);
+    const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
+    if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
+  }
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: text + note, unfurl_links: false, unfurl_media: false });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
+    error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
+}
+
+cron.schedule('40 7 * * *', wrapCronJob('runReelsDailyBrief', async () => { await runReelsDailyBrief(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 8 1 * *', wrapCronJob('runReelsMonthlyReport', async () => { await runReelsMonthlyReport(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static crons: reels daily brief (40 7 * * *), reels monthly report (0 8 1 * *)');
+
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
 // the booking pipeline is broken upstream of it — if a GHL workflow stops firing
@@ -19570,6 +19695,8 @@ const STATIC_CRON_SCHEDULES = {
   runClientAttentionAlerts:     '*/30 7-19 * * 1-6',
   runClientAttentionOpenDigest: '0 10 * * 5',
   runReelsWeekly:               '0 8 * * 1',
+  runReelsDailyBrief:           '40 7 * * *',
+  runReelsMonthlyReport:        '0 8 1 * *',
   runClientAttentionScorecard:  '0 9 * * 1',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
