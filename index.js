@@ -19220,6 +19220,8 @@ async function runHotReplyLadder(now, correlationId, stats) {
     for (const r of data || []) existingRows.set(r.anchor_message_id, r);
   }
 
+  // Ron holds Instagram guide replies (ig_guide_drafts); the setter is the 12 h backstop.
+  const igHeld = work.length ? await igGuideHeldConversations(now) : new Set();
   const known = await hotReadKnowledge(work.flatMap(w => [
     `${HOT_REPLY_KEY}:verdict:${w.analysis.newestId}`,
     `${HOT_REPLY_KEY}:poke1:${w.analysis.anchorId}`,
@@ -19256,6 +19258,7 @@ async function runHotReplyLadder(now, correlationId, stats) {
       poke1At: hotParse(known.get(p1Key))?.at || (_hotSentGuard.has(p1Key) ? now : null),
       poke2At: hotParse(known.get(p2Key))?.at || (_hotSentGuard.has(p2Key) ? now : null),
     };
+    if (igHeld.has(w.convo.id)) { stats.skips.ig_guide_pending = (stats.skips.ig_guide_pending || 0) + 1; continue; }
     const step = hotReplies.nextAlertStep({ now, anchorAt: w.analysis.anchorAt, verdict: verdict.verdict, sent });
     if (!step) continue;
     const key = step === 'poke1' ? p1Key : p2Key;
@@ -19411,6 +19414,197 @@ async function getHotRepliesStillUnanswered(now = Date.now()) {
 cron.schedule('*/15 * * * *', wrapCronJob('runHotReplyCheck', async (c) => { await runHotReplyCheck(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: hot reply alerts + social intake gap (*/15 * * * *)');
 // ─── end hot reply alerts ───────────────────────────────────────────────────
+
+// ─── INSTAGRAM GUIDE REPLIES (phase A: draft, Ron approves) ─────────────────
+// The VSL reels close with "Comente LinkedIn"; a GHL workflow DMs the guide and
+// tags the contact `ig-guia-linkedin`. When that lead writes back by Instagram,
+// Max drafts the next reply in Ron's voice (Kai's intents, the chat triage of
+// the Triage Call Script v1.0) and DMs it to Ron. Nothing reaches the lead
+// until Ron reacts ✅ (his thread reply, if any, is sent instead of the draft);
+// ❌ archives it. One row per lead message in ig_guide_drafts (migration 019);
+// the send is claimed atomically on that row so a double tap never sends twice.
+// Meta allows replies only within 24 h of the lead's last message: drafts are
+// not made, and approvals not sent, once that window closes. While a draft
+// younger than 12 h waits for Ron, hot reply alerts do not poke the setter for
+// that conversation; after 12 h they resume as the backstop. Decision:
+// plan-of-record §1 UPDATE 2026-10-07. Rules in lib/igGuideReplies.js (tested
+// in test/ig-guide-replies.test.js). Kill switch IG_GUIDE_DISABLED=true.
+// Recipe: ~/automations/ops/recipes/ig-guide-replies.md.
+const igGuide = require('./lib/igGuideReplies');
+const IG_GUIDE_TAG = String(process.env.IG_GUIDE_TAG || 'ig-guia-linkedin').trim().toLowerCase();
+const IG_GUIDE_BOOKING_URL = process.env.IG_GUIDE_BOOKING_URL || 'https://api.leadconnectorhq.com/widget/bookings/linkedin-flywheel-appointment';
+const IG_GUIDE_URL = process.env.IG_GUIDE_URL || 'https://neurogrowth.io/recursos/plantillas';
+const IG_GUIDE_MAX_DRAFTS_PER_RUN = Number(process.env.IG_GUIDE_MAX_DRAFTS_PER_RUN || 8);
+const igGuideDisabled = () => String(process.env.IG_GUIDE_DISABLED || '') === 'true';
+const IG_GUIDE_SYSTEM = igGuide.buildSystemPrompt({ bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL });
+
+async function igGuideDraft(convo, messages, pending, correlationId) {
+  const user = igGuide.buildUserPrompt({
+    contactName: convo.fullName || convo.contactName || '',
+    thread: igGuide.threadForPrompt(messages),
+    pending: pending.text,
+  });
+  let feedback = '';
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const t0 = Date.now();
+    const res = await anthropic.messages.create({
+      model: MODEL_AGENT,
+      max_tokens: 700,
+      system: [{ type: 'text', text: IG_GUIDE_SYSTEM, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: user + feedback }],
+    });
+    logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'ig_guide_drafter');
+    const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+    const parsed = igGuide.parseDraft(text);
+    if (!parsed.ok) { last = { ...parsed, problems: [parsed.error] }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
+    const verdict = igGuide.validateDraft(parsed.draft, { bookingUrl: IG_GUIDE_BOOKING_URL, intent: parsed.intent });
+    last = { ...parsed, problems: verdict.problems };
+    if (verdict.ok) return last;
+    feedback = `\n\nSu borrador anterior rompió estas reglas: ${verdict.problems.join('; ')}. Corríjalo.`;
+  }
+  return last; // reaches Ron with the problems listed; he still decides
+}
+
+async function runIgGuideCheck(correlationId) {
+  if (igGuideDisabled()) return;
+  const now = Date.now();
+  const stats = { convos: 0, drafted: 0, skipped: 0, failures: 0 };
+  const convos = (await hotSearchConversations(now - igGuide.WINDOW_MS, '&lastMessageDirection=inbound&lastMessageType=TYPE_INSTAGRAM'))
+    .filter((c) => igGuide.isGuideConversation(c, { tag: IG_GUIDE_TAG, personalTag: PERSONAL_CONTACT_TAG }));
+  stats.convos = convos.length;
+  for (const c of convos) {
+    if (stats.drafted >= IG_GUIDE_MAX_DRAFTS_PER_RUN) break;
+    try {
+      const messages = await ghlGetConversationMessages(c.id);
+      const pending = igGuide.latestPendingInbound(messages, { now });
+      if (!pending) { stats.skipped++; continue; }
+      const { data: existing, error: readErr } = await supabase.from('ig_guide_drafts').select('message_id').eq('message_id', pending.id).maybeSingle();
+      if (readErr) throw new Error(`ig_guide_drafts read: ${readErr.message}`);
+      if (existing) { stats.skipped++; continue; }
+
+      const d = await igGuideDraft(c, messages, pending, correlationId);
+      if (!d) throw new Error('drafter returned nothing');
+      const row = {
+        message_id: pending.id, conversation_id: c.id, contact_id: c.contactId,
+        contact_name: c.fullName || c.contactName || null, lead_message: pending.text.slice(0, 2000),
+        lead_message_at: new Date(pending.at).toISOString(), intent: d.intent || 'other', stage: d.stage || 'discover',
+        collected: d.collected || {}, draft: d.draft || '', problems: (d.problems || []).join('; ') || null,
+        status: d.draft ? 'pending' : 'archived',
+      };
+      // Claim the message id first: two overlapping runs must not DM Ron twice.
+      const { data: claimed, error: insErr } = await supabase.from('ig_guide_drafts')
+        .upsert(row, { onConflict: 'message_id', ignoreDuplicates: true }).select('message_id');
+      if (insErr) throw new Error(`ig_guide_drafts insert: ${insErr.message}`);
+      if (!claimed || !claimed.length) { stats.skipped++; continue; }
+      // A newer lead message replaces an older draft still waiting on Ron.
+      await supabase.from('ig_guide_drafts').update({ status: 'superseded', decided_at: new Date().toISOString() })
+        .eq('conversation_id', c.id).eq('status', 'pending').neq('message_id', pending.id);
+
+      const text = igGuide.formatRonDm({
+        contactName: row.contact_name, intent: row.intent, stage: row.stage, collected: row.collected, draft: row.draft,
+        leadText: pending.text, remainingMs: igGuide.windowRemainingMs(row.lead_message_at, now), problems: d.problems, reason: d.reason_es,
+      });
+      const posted = await slack.client.chat.postMessage({
+        channel: RON_SLACK_ID, text,
+        metadata: { event_type: 'ig_guide_draft', event_payload: { message_id: pending.id } },
+      });
+      await supabase.from('ig_guide_drafts').update({ slack_channel: posted.channel, slack_ts: posted.ts }).eq('message_id', pending.id);
+      stats.drafted++;
+    } catch (err) {
+      stats.failures++;
+      console.error(`[ig-guide] ${c.contactId}: ${err.message}`);
+    }
+  }
+  // wrapCronJob already logs every run; only runs that did something get a report row.
+  if (stats.drafted || stats.failures) logActivity({ event_type: 'report', event_source: 'cron', action: 'runIgGuideCheck', status: stats.failures ? 'error' : 'ok', output: stats });
+  if (stats.failures && !stats.drafted) throw new Error(`${stats.failures} conversation(s) failed`);
+}
+
+async function igGuideThreadReply(channel, ts, text) {
+  try { await slack.client.chat.postMessage({ channel, thread_ts: ts, text }); } catch (e) { console.warn('[ig-guide] thread reply failed:', e.message); }
+}
+async function igGuideReact(channel, ts, name) {
+  try { await slack.client.reactions.add({ channel, timestamp: ts, name }); } catch (_) { /* already reacted */ }
+}
+
+async function handleIgGuideReaction(event, baseEmoji, msg, payload) {
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+  if (event.user !== RON_SLACK_ID) return;
+  const messageId = payload && payload.message_id;
+  if (!messageId) return;
+  const nowIso = new Date().toISOString();
+
+  if (CAMPAIGN_SKIP_EMOJIS.has(baseEmoji)) {
+    const { data } = await supabase.from('ig_guide_drafts').update({ status: 'skipped', decided_at: nowIso })
+      .eq('message_id', messageId).in('status', ['pending', 'archived']).select('message_id');
+    if (data && data.length) await igGuideReact(channel, ts, 'no_entry');
+    return;
+  }
+  if (!CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) return;
+
+  // Atomic claim: only one ✅ can move the row out of pending.
+  const { data: claimed, error } = await supabase.from('ig_guide_drafts').update({ status: 'sending', decided_at: nowIso })
+    .eq('message_id', messageId).eq('status', 'pending').select('*');
+  if (error) { await igGuideThreadReply(channel, ts, `⚠️ No pude reclamar el borrador: ${error.message}`); return; }
+  const row = claimed && claimed[0];
+  if (!row) {
+    const { data: cur } = await supabase.from('ig_guide_drafts').select('status').eq('message_id', messageId).maybeSingle();
+    await igGuideThreadReply(channel, ts, `Este borrador ya no está pendiente (${cur ? cur.status : 'no existe'}). No envié nada.`);
+    return;
+  }
+  if (igGuide.windowRemainingMs(row.lead_message_at, Date.now()) <= 0) {
+    await supabase.from('ig_guide_drafts').update({ status: 'expired' }).eq('message_id', messageId);
+    await igGuideThreadReply(channel, ts, 'La ventana de 24 h de Instagram ya cerró: Meta no deja enviar. No envié nada; queda para el setter.');
+    await igGuideReact(channel, ts, 'hourglass');
+    return;
+  }
+
+  let threadReplies = [];
+  try {
+    const r = await slack.client.conversations.replies({ channel, ts, limit: 50 });
+    threadReplies = (r.messages || []).filter((m) => m.ts !== ts);
+  } catch (e) { console.warn('[ig-guide] thread read failed:', e.message); }
+  const pick = igGuide.pickSendText({ draft: row.draft, threadReplies, ronUserId: RON_SLACK_ID });
+  if (!pick.text) {
+    await supabase.from('ig_guide_drafts').update({ status: 'pending' }).eq('message_id', messageId);
+    await igGuideThreadReply(channel, ts, 'No hay texto para enviar. Escriba la respuesta en este hilo y vuelva a marcar ✅.');
+    return;
+  }
+
+  try {
+    const res = await ghlFetch('https://services.leadconnectorhq.com/conversations/messages', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'IG', contactId: row.contact_id, message: pick.text }),
+    }, { retries: 0, label: 'ig guide send' });
+    if (!res.ok) throw new Error(`GHL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json().catch(() => ({}));
+    await supabase.from('ig_guide_drafts').update({
+      status: 'sent', sent_at: new Date().toISOString(), sent_text: pick.text, edited: pick.edited, ghl_message_id: data.messageId || null, last_error: null,
+    }).eq('message_id', messageId);
+    await igGuideReact(channel, ts, 'white_check_mark');
+    await igGuideThreadReply(channel, ts, pick.edited ? 'Enviado con su texto.' : 'Enviado.');
+  } catch (err) {
+    // Back to pending so a second ✅ retries; nothing reached the lead.
+    await supabase.from('ig_guide_drafts').update({ status: 'pending', last_error: err.message.slice(0, 300) }).eq('message_id', messageId);
+    await igGuideReact(channel, ts, 'warning');
+    await igGuideThreadReply(channel, ts, `⚠️ No se envió: ${err.message.slice(0, 200)}. Vuelva a marcar ✅ para reintentar.`);
+  }
+}
+
+// Conversations whose fresh draft is waiting on Ron: hot reply alerts hold off.
+async function igGuideHeldConversations(now) {
+  const { data, error } = await supabase.from('ig_guide_drafts').select('conversation_id')
+    .eq('status', 'pending').gte('created_at', new Date(now - igGuide.HOT_REPLY_HOLD_MS).toISOString());
+  if (error) { console.warn(`[ig-guide] held read failed: ${error.message}`); return new Set(); }
+  return new Set((data || []).map((r) => r.conversation_id));
+}
+
+cron.schedule('*/5 * * * *', wrapCronJob('runIgGuideCheck', async (c) => { await runIgGuideCheck(c); }, { timeoutMs: 4 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: Instagram guide replies (*/5 * * * *)');
+// ─── end Instagram guide replies ────────────────────────────────────────────
 
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
 // The customer lifecycle alerts (Make 4356754 + 5975679) had no criteria at all.
@@ -19784,6 +19978,7 @@ const STATIC_CRON_SCHEDULES = {
   runStaleLeadDailySweep:       '0 18 * * *',
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runHotReplyCheck:             '*/15 * * * *',
+  runIgGuideCheck:              '*/5 * * * *',
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
   runUnloggedOutcomeReminders:  '0 21 * * *',
@@ -20548,6 +20743,26 @@ slack.event('reaction_added', async ({ event }) => {
         }
       } catch (caErr) {
         if (!String(caErr.message || '').includes('channel_not_found')) console.log('client-attention reaction pre-route miss:', caErr.message);
+        // fall through: this reaction belongs to another route
+      }
+    }
+
+    // Route -0.4: Instagram guide reply draft in Ron's DM (✅ send, ❌ archive),
+    // identified by message metadata. Ahead of Route 0/1, which swallow DM ✅
+    // with no matching metadata. Falls through untouched on any miss.
+    if (String(event.item.channel || '').startsWith('D') &&
+        (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || CAMPAIGN_SKIP_EMOJIS.has(baseEmoji))) {
+      try {
+        const hist = await slack.client.conversations.history({
+          channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
+        });
+        const msg = hist.messages && hist.messages[0];
+        if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === 'ig_guide_draft' && msg.metadata.event_payload) {
+          await handleIgGuideReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+      } catch (igErr) {
+        if (!String(igErr.message || '').includes('channel_not_found')) console.log('ig-guide reaction pre-route miss:', igErr.message);
         // fall through: this reaction belongs to another route
       }
     }
