@@ -18488,13 +18488,35 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
   const text = reelsBriefs.formatMonthly({ now, reels });
   const verdict = reelsBriefs.validateMonthly(text, { reportedCount });
   if (!verdict.ok) return reportReelsBriefFailure('runReelsMonthlyReport', `contrato: ${verdict.problems.join('; ')}`);
+  // "Lectura": 2-3 lines on what the top reels share and one suggestion. Optional
+  // by design: any failure (API, empty, em dash, length, contract) ships the
+  // numbers without it instead of blocking the report.
+  let report = text;
+  if (reels && reportedCount >= 2) {
+    try {
+      const tLectura = Date.now();
+      const res = await anthropic.messages.create({
+        model: MODEL_AGENT,
+        thinking: THINKING_OFF,
+        max_tokens: 400,
+        messages: [{ role: 'user', content: reelsBriefs.lecturaPrompt(now, reels) }],
+      });
+      logLlmFromAnthropicResponse(res, Date.now() - tLectura, null, 'reels_monthly_lectura');
+      const lectura = reelsBriefs.cleanLectura(res.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n'));
+      const withRead = reelsBriefs.withLectura(text, lectura);
+      if (lectura && reelsBriefs.validateMonthly(withRead, { reportedCount }).ok) report = withRead;
+      else console.warn('[reels-briefs] lectura unusable, report sent without it');
+    } catch (err) {
+      console.warn(`[reels-briefs] lectura skipped: ${err.message}`);
+    }
+  }
   let note = '';
   if (reels && reportedCount) {
     const rows = reelsBriefs.monthRows(now, reels);
     const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
     if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
   }
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: text + note, unfurl_links: false, unfurl_media: false });
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: report + note, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
     error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
 }

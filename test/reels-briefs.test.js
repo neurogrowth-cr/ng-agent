@@ -139,5 +139,23 @@ check('validate catches a short top list', rb.validateMonthly('*Reels de octubre
 check('validate catches an em dash', rb.validateDaily(`${daily}\nx \u2014 y`).problems, ['contains an em dash']);
 check('validate catches undefined', rb.validateDaily(`${daily}\nundefined`).ok, false);
 
+// ── lectura ──────────────────────────────────────────────────────────────────
+const octReels = rb.normalizeMedia(OCT);
+const prompt = rb.lecturaPrompt(NOV1, octReels);
+check('lectura prompt names the month and the previous count', prompt.startsWith('Estos son los reels de Instagram de @linkedin.papi publicados en octubre 2026, ordenados por alcance (el mes anterior se publicaron 2).'), true);
+check('lectura prompt ranks only the reported month by reach', (prompt.match(/^\d+\. alcance \d+/gm) || []).map((l) => l.split(' ')[0]), ['1.', '2.', '3.', '4.', '5.']);
+check('lectura prompt carries no November reel', prompt.includes('Ya es noviembre'), false);
+check('cleanLectura strips bullets, header, exclamations and em dashes',
+  rb.cleanLectura('*Lectura*\n- Los reels en español ganaron \u2014 sobre todo los de mentalidad!\n- Sugerencia: publique 4 por semana con una idea concreta.'),
+  'Los reels en español ganaron, sobre todo los de mentalidad.\nSugerencia: publique 4 por semana con una idea concreta.');
+check('cleanLectura keeps at most 3 lines', rb.cleanLectura('Línea uno con suficiente texto para pasar.\nDos\nTres\nCuatro').split('\n').length, 3);
+check('cleanLectura rejects empty and too short output', [rb.cleanLectura(''), rb.cleanLectura('ok')], [null, null]);
+check('cleanLectura rejects output with undefined', rb.cleanLectura('El reel undefined tuvo el mayor alcance del mes entero.'), null);
+const withRead = rb.withLectura(monthly, 'Los de mayor alcance son frases en español con una idea.');
+const WR = withRead.split('\n');
+check('lectura sits right before the caveat line', WR.slice(-4), ['*Lectura*', 'Los de mayor alcance son frases en español con una idea.', '', '_Métricas acumuladas a hoy; un reel de fin de mes tuvo menos días para sumar._']);
+check('report with lectura still passes the contract', rb.validateMonthly(withRead, { reportedCount: 5 }).ok, true);
+check('no lectura leaves the report untouched', rb.withLectura(monthly, null), monthly);
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
