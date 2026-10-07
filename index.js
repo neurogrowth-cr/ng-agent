@@ -19451,6 +19451,9 @@ async function igGuideDraft(convo, messages, pending, correlationId) {
     const res = await anthropic.messages.create({
       model: MODEL_AGENT,
       max_tokens: 700,
+      // Off explicitly: on Sonnet 5 an omitted `thinking` runs adaptive and eats
+      // max_tokens (#270 pins every call the same way; switch to THINKING_OFF once it lands).
+      thinking: { type: 'disabled' },
       system: [{ type: 'text', text: IG_GUIDE_SYSTEM, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: user + feedback }],
     });
