@@ -5,6 +5,7 @@
 //   2026-09-16  11 replies failed on the Anthropic spending limit
 //   2026-09-14  channel_not_found on placeholder Slack channel IDs
 //   2026-09-23  Palantier auto-send held back because the client replied first
+//   2026-10-05  Cosiba: Prosp 401 "authentication has expired", fixed by the client in 6 minutes
 const kai = require('../lib/kaiHealth');
 
 let failures = 0;
@@ -20,7 +21,7 @@ const T0 = new Date('2026-09-23T16:00:00Z');
 const at = (m) => new Date(T0.getTime() + m * MIN);
 
 const HEALTHY = {
-  errors: [], stuck: { n: 0, oldest: null }, received: 12, threadCheckFails: 0,
+  errors: [], stuck: { n: 0, oldest: null }, received: 12, threadCheckFails: [],
   autoSend: { sent: 4, skipped: 0 }, doubleSends: [],
 };
 const USAGE_LIMIT_ROW = {
@@ -144,15 +145,61 @@ check('2d  Mon 08:00 CR is inside', kai.isIntakeWindow(new Date('2026-09-28T14:0
 
 // ── 10. Thread check failing and double sends
 {
-  const tc = (n) => kai.evaluateKaiChecks({ health: { ok: true }, snapshot: { ...HEALTHY, threadCheckFails: n }, now: T0 })
+  // A Prosp-side failure (timeout / 5xx) in one workspace, minutes before T0.
+  const down = (ws, m) => ({ workspace_id: ws, client_name: ws, created_at: at(-m).toISOString(), error_class: '', error: 'conversation_fetch_error: The operation was aborted due to timeout', last_ok_at: null });
+  const tc = (rows) => kai.evaluateKaiChecks({ health: { ok: true }, snapshot: { ...HEALTHY, threadCheckFails: rows }, now: T0 })
     .find((x) => x.id === 'thread_check').failing;
-  check('10a 2 fails in an hour: fine', tc(2), false);
-  check('10b 3 fails in an hour: red', tc(3), true);
+  check('10a 2 fails in an hour, one client: fine', tc([down('a', 5), down('a', 10)]), false);
+  check('10b 3 fails in an hour: red', tc([down('a', 5), down('a', 10), down('a', 15)]), true);
+  check('10b2 2 clients failing at once: red', tc([down('a', 5), down('b', 10)]), true);
+  check('10b3 older than an hour: not an outage', tc([down('a', 70), down('a', 80), down('a', 90)]), false);
 
   const dbl = { ...HEALTHY, doubleSends: [{ client_name: 'Palantier AI - Carlos Jimenez', prospect_name: 'Miguel Paredes, PhD', first_at: '2026-09-23T13:31:57Z', second_at: '2026-09-23T13:40:00Z' }] };
   const r = poll({}, { snapshot: dbl });
   check('10c double send alerts on first poll', r.alerts.map((a) => a.id), ['double_send']);
   check('10d names client and prospect', /PALANTIER AI.*Miguel Paredes/.test(r.alerts[0].reason), true);
+}
+
+// ── 10x. Thread check by workspace and error class (Cosiba 2026-10-05)
+{
+  const EXPIRED = 'conversation_http_401: {"message":"Your authentication has expired. Please reauthenticate in prosp to continue."}';
+  const cosiba = (m, extra = {}) => ({ workspace_id: 'ws-cosiba', client_name: 'Cosiba Inversiones ', created_at: at(-m).toISOString(), error_class: '', error: EXPIRED, last_ok_at: null, ...extra });
+  const four = [cosiba(10), cosiba(10.2), cosiba(10.3), cosiba(10.5)];
+
+  check('10e classify expired login', kai.classifyThreadCheckError(EXPIRED), 'login_expired');
+  check('10f classify 404 account', kai.classifyThreadCheckError('conversation_http_404: {"message":"Account not found"}'), 'account_not_found');
+  check('10g classify timeout', kai.classifyThreadCheckError('conversation_fetch_error: aborted'), 'prosp_unreachable');
+  check('10h Kai-stamped class wins over the text', kai.unresolvedThreadFailures([cosiba(1, { error_class: 'rate_limited' })])[0].cls, 'rate_limited');
+
+  // Unfixed: four clicks on one expired login are an account problem, not an outage.
+  const r1 = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: four } });
+  check('10i expired login is not "Prosp down"', failingIds(r1.results), ['thread_check_account']);
+  check('10j first poll waits for confirmation', r1.alerts, []);
+  const r2 = poll(r1.state, { snapshot: { ...HEALTHY, threadCheckFails: four }, now: at(15) });
+  check('10k second poll alerts the account check', r2.alerts.map((a) => a.id), ['thread_check_account']);
+  check('10l names the client, cause and count', /COSIBA INVERSIONES: LinkedIn login expired in Prosp \(4 tries/.test(r2.alerts[0].reason), true);
+  check('10m tells who has to act', /client has to fix this in Prosp/.test(r2.alerts[0].reason), true);
+
+  // What really happened: Oscar reconnected and a send went through 6 minutes later.
+  const fixed = four.map((r) => ({ ...r, last_ok_at: at(-4).toISOString() }));
+  const r3 = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: fixed } });
+  check('10n a later good read resolves it: nothing failing', failingIds(r3.results), []);
+  const r4 = poll(r2.state, { snapshot: { ...HEALTHY, threadCheckFails: fixed }, now: at(30) });
+  check('10o recovery posts once it is fixed', r4.recoveries.map((x) => x.id), ['thread_check_account']);
+  check('10p recovery wording does not overclaim', /nobody has tried in 24 hours/.test(kai.formatKaiRecovery(r4.recoveries[0])), true);
+
+  // A good read BEFORE the failure does not hide it.
+  const stale = four.map((r) => ({ ...r, last_ok_at: at(-60).toISOString() }));
+  check('10q an older good read does not resolve it', failingIds(poll({}, { snapshot: { ...HEALTHY, threadCheckFails: stale } }).results), ['thread_check_account']);
+
+  // Our own key problem goes to its own check.
+  const keyRow = { workspace_id: 'ws-x', client_name: 'Mind Lift', created_at: at(-5).toISOString(), error_class: '', error: 'conversation_http_401: {"message":"Invalid API key"}', last_ok_at: null };
+  const rk = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: [keyRow] } });
+  check('10r rejected key is ours, not the client\'s', failingIds(rk.results), ['thread_check_key']);
+
+  // Blind poll skips all three thread checks.
+  const blind = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: null, snapshotError: 'x', now: T0 });
+  check('10s blind poll skips the thread checks', ['thread_check', 'thread_check_account', 'thread_check_key'].every((id) => blind.find((b) => b.id === id)?.skip), true);
 }
 
 // ── 11. Stuck replies need 2 polls

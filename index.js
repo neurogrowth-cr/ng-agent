@@ -14387,6 +14387,38 @@ const _leadBurstGate = createLeadBurstGate({ limit: LEAD_BURST_LIMIT, windowMs: 
 const _leadBurstHeld = [];
 let _leadBurstTimer = null;
 
+// ─── SAME-CONTACT REPEAT INTAKE ──────────────────────────────────────────────
+// GHL's "Social DM Intake (on reply)" workflow fires on every inbound message,
+// and its "Has Existing Opportunity?" guard did not hold: on 2026-10-05 (Mau
+// Vargas) and 2026-10-06 (Andres Hernandez Chaves) a second DM 70s after the
+// first ran the whole workflow again, created a second opportunity, and sent
+// Max a second webhook for the SAME contact id. The cross-contact dedup below
+// deliberately excludes the same contact id, so Max posted a second card and
+// DM'd the setter a "new lead assigned to you" for a lead he had already
+// claimed. The fix in GHL is tagging `intake-done` before the Wait; this is
+// the Max-side guard so a workflow misconfiguration never spams the channel.
+//
+// Any lead_posts row for this contact posted inside the window means the card
+// already exists: no new card, no setter DM, a thread note on the original so
+// the repeat is visible, and the lead_posts row is left pointing at the first
+// card (claims and 🫂 keep working). Older than the window is a returning lead
+// and gets a fresh card. Pure so test/repeat-intake.test.js can slice it.
+const REPEAT_INTAKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+function repeatIntakeDecision({ existing, nowMs = Date.now(), windowMs = REPEAT_INTAKE_WINDOW_MS } = {}) {
+  if (!existing || !existing.slack_message_ts) return null;
+  const postedMs = Date.parse(existing.posted_at || '');
+  if (!Number.isFinite(postedMs)) return null;
+  const ageMs = nowMs - postedMs;
+  if (ageMs < 0 || ageMs > windowMs) return null;
+  return {
+    ts: existing.slack_message_ts,
+    channel: existing.slack_channel_id || null,
+    ageMinutes: Math.round(ageMs / 60000),
+    // A card Ron already 🫂'd is gone from the channel: skip silently.
+    thread: !existing.personal_excluded_at,
+  };
+}
+
 // Debounced: posts once arrivals have been quiet for two minutes.
 function holdBurstLead({ fullName, ghlLink }) {
   _leadBurstHeld.push({ fullName, ghlLink });
@@ -14452,6 +14484,48 @@ async function handleGHLWebhook(req, res) {
         const contactId   = cd.contactId  || payload.contactId  || payload.contact_id || ct.id || payload.id || '';
         const locationId  = payload.locationId || payload.location_id || process.env.GHL_LOCATION_ID || '';
         const leadContext = cd.context || payload.context || '';
+
+        // Same contact, second webhook (see REPEAT_INTAKE_WINDOW_MS). Checked
+        // before the GHL contact fetch and phone writeback: a repeat has
+        // nothing new for us. Degrades OPEN: a lookup error means "new lead".
+        if (contactId) {
+          let repeat = null;
+          try {
+            const { data: priorRow, error: priorErr } = await supabase
+              .from('lead_posts')
+              .select('contact_id, slack_message_ts, slack_channel_id, posted_at, personal_excluded_at')
+              .eq('contact_id', contactId)
+              .maybeSingle();
+            if (priorErr) console.error('lead_posts repeat lookup failed:', priorErr.message);
+            else repeat = repeatIntakeDecision({ existing: priorRow });
+          } catch (priorThrow) {
+            console.error('lead_posts repeat lookup threw:', priorThrow.message);
+          }
+          if (repeat) {
+            // The repeat payload carries the assignee as `user` once the claim landed.
+            const payloadUserName = payload.user ? [payload.user.firstName, payload.user.lastName].filter(Boolean).join(' ') : '';
+            const assignedName = GHL_USER_NAMES[assignedTo] || GHL_USER_NAMES[String(assignedTo).toLowerCase()] || payloadUserName || null;
+            console.log(`GHL lead ${contactId} ("${fullName}") REPEAT intake webhook ${repeat.ageMinutes} min after its card (ts ${repeat.ts}). No new card, no setter DM.`);
+            logActivity({
+              event_type: 'ghl_webhook', event_source: 'ghl', action: 'repeat_intake_skipped',
+              correlation_id: newCorrelationId(),
+              output: { contact_id: contactId, full_name: fullName, age_minutes: repeat.ageMinutes, original_ts: repeat.ts, assigned_to: assignedName || assignedTo || null, source: sourceRaw || null },
+            });
+            if (repeat.thread) {
+              const repeatNote = [
+                `🔁 GHL ran intake again for *${fullName}* (${repeat.ageMinutes} min after this card). No new card, no setter DM.`,
+                assignedName ? `👤 Now assigned to: ${assignedName}` : null,
+                `_If GHL created a second opportunity, delete the duplicate in the Appointment Setting Pipeline._`,
+              ].filter(Boolean).join('\n');
+              try {
+                await slack.client.chat.postMessage({ channel: repeat.channel || LEAD_CHANNEL_ID, thread_ts: repeat.ts, text: repeatNote });
+              } catch (repeatPostErr) {
+                console.error('repeat intake thread note failed:', repeatPostErr.message);
+              }
+            }
+            return;
+          }
+        }
 
         let resolvedAssignedTo = assignedTo;
         // Fetched once and reused: the webhook payload alone can't tell us whether
@@ -18149,6 +18223,286 @@ async function runWeeklyReportStatusPost() {
 cron.schedule('0 11 * * 1', wrapCronJob('runWeeklyReportStatusPost', async () => { await runWeeklyReportStatusPost(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: weekly report status post (0 11 * * 1 CR)');
 
+// ─── REELS WEEKLY ────────────────────────────────────────────────────────────
+// Monday 08:00 CR: last week's Instagram reels for #ng-content (Ron,
+// 2026-10-07). Sources: the GHL Social Planner (published child posts with
+// like/comment/share insights, plus account statistics for impressions, reach
+// and new followers) and the Instagram Graph API for per-reel reach, views and
+// saves when META_IG_INSIGHTS_TOKEN is set (system user ng-agent, no expiry).
+// Rules and formatting live in lib/reelsWeekly.js (tested in
+// test/reels-weekly.test.js); this block is only I/O. Each run upserts one row
+// per reel plus an `account` row into reel_stats (migration 018), and reads
+// last week's account row for the WoW deltas. Fails closed: an unreachable
+// feed, a malformed post or zero impressions with reels published posts
+// nothing to the channel and DMs Ron. REELS_WEEKLY_MODE=live posts to
+// REELS_CHANNEL; anything else is a dry run to Ron's DM. Kill switch:
+// REELS_WEEKLY_DISABLED=true. Recipe: ~/automations/ops/recipes/reels-weekly.md.
+const reelsWeekly = require('./lib/reelsWeekly');
+const REELS_CHANNEL = process.env.REELS_CHANNEL || '';
+const REELS_GHL_ACCOUNT_ID = process.env.REELS_GHL_ACCOUNT_ID || '6ac68206f0cd230dc3504b51_iUkpsgZqYJ1ftVxGsoXE_17841401814013602';
+const REELS_GHL_PROFILE_ID = process.env.REELS_GHL_PROFILE_ID || '6ac6820c0ff30c39b2b6ad1f';
+const REELS_IG_USER_ID = process.env.REELS_IG_USER_ID || '17841401814013602';
+const reelsWeeklyDisabled = () => String(process.env.REELS_WEEKLY_DISABLED || '') === 'true';
+const reelsWeeklyLive = () => String(process.env.REELS_WEEKLY_MODE || '') === 'live' && !!REELS_CHANNEL;
+const reelsMetaWired = () => !!String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+
+async function fetchReelsGhlPosts(window) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // The list endpoint takes the window with a day of slack on each side; the
+  // module filters on publishedAt, so over-fetching is harmless.
+  const body = {
+    type: 'published', accounts: REELS_GHL_ACCOUNT_ID, skip: '0', limit: '50', includeUsers: 'false',
+    fromDate: new Date(window.start.getTime() - 86400000).toISOString(),
+    toDate: new Date(window.end.getTime() + 86400000).toISOString(),
+  };
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/${locationId}/posts/list`,
+    { method: 'POST', headers, body: JSON.stringify(body) }, { label: 'social posts/list' });
+  if (!res.ok) throw new Error(`GHL ${res.status} on social posts/list`);
+  const json = await res.json();
+  return (json.results && json.results.posts) || [];
+}
+
+async function fetchReelsGhlStatistics() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // GHL returns the trailing 7 days; at Monday 08:00 that is last week.
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/statistics?locationId=${locationId}`,
+    { method: 'POST', headers, body: JSON.stringify({ profileIds: [REELS_GHL_PROFILE_ID], platforms: ['instagram'] }) },
+    { label: 'social statistics' });
+  if (!res.ok) throw new Error(`GHL ${res.status} on social statistics`);
+  return res.json();
+}
+
+// Per-reel insights from Meta, keyed by media id. A failing media id is
+// skipped (the GHL counts stay), a failing token fails the whole call so the
+// run can say so.
+async function fetchReelsMetaInsights(mediaIds) {
+  const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+  if (!token || !mediaIds.length) return null;
+  const out = {};
+  for (const id of mediaIds) {
+    const url = `https://graph.facebook.com/v21.0/${id}/insights?metric=views,reach,saved,shares,likes,comments&access_token=${token}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const code = json && json.error && json.error.code;
+      if (code === 190 || code === 10 || res.status === 401) throw new Error(`Meta token rejected (${code || res.status})`);
+      console.warn(`[reels-weekly] Meta insights skipped for ${id}: ${res.status} ${(json.error && json.error.message) || ''}`);
+      continue;
+    }
+    const m = {};
+    for (const row of json.data || []) m[row.name] = Number(row.values && row.values[0] && row.values[0].value);
+    out[id] = m;
+  }
+  return out;
+}
+
+async function reportReelsWeeklyFailure(reason) {
+  console.error(`[reels-weekly] did not post: ${reason}`);
+  logActivity({ event_type: 'alert', event_source: 'cron', action: 'runReelsWeekly', status: 'error', error_message: reason });
+  try {
+    await slack.client.chat.postMessage({
+      channel: RON_SLACK_ID,
+      text: `⚠️ Reels weekly did not post: ${reason}\nNothing was sent to ${REELS_CHANNEL || '(REELS_CHANNEL unset)'}.`,
+    });
+  } catch (err) {
+    console.error('[reels-weekly] failure DM failed:', err.message);
+  }
+}
+
+async function runReelsWeekly({ now = new Date() } = {}) {
+  if (reelsWeeklyDisabled()) return;
+  const window = reelsWeekly.weekWindow(now);
+  let ghlPosts, stats, meta = null;
+  try {
+    ghlPosts = await fetchReelsGhlPosts(window);
+    stats = await fetchReelsGhlStatistics();
+  } catch (err) {
+    await reportReelsWeeklyFailure(err.message);
+    return;
+  }
+  let posts = reelsWeekly.normalizePosts(ghlPosts, window);
+  let metaWired = reelsMetaWired();
+  if (metaWired) {
+    try {
+      meta = await fetchReelsMetaInsights(posts.map((p) => p.postId));
+      posts = reelsWeekly.mergeMetaInsights(posts, meta);
+    } catch (err) {
+      // A dead Meta token should not hide the GHL numbers; the post says reach is pending.
+      console.warn(`[reels-weekly] Meta insights unavailable: ${err.message}`);
+      logActivity({ event_type: 'alert', event_source: 'cron', action: 'runReelsWeekly', status: 'error', error_message: `meta: ${err.message}` });
+      metaWired = false;
+    }
+  }
+  const account = reelsWeekly.accountTotals(stats);
+
+  // Last week's account row gives the WoW deltas; the first run has none.
+  let prevAccount = null;
+  try {
+    const prevWeek = reelsWeekly.weekWindow(new Date(window.start.getTime() - 1000)).isoWeek;
+    const { data } = await supabase.from('reel_stats').select('views, reach, followers')
+      .eq('iso_week', prevWeek).eq('post_id', 'account').maybeSingle();
+    if (data) prevAccount = { impressions: data.views, reach: data.reach, followers: data.followers };
+  } catch (err) {
+    console.warn(`[reels-weekly] previous week read failed: ${err.message}`);
+  }
+
+  const text = reelsWeekly.formatPost({ window, posts, account, prevAccount, metaWired });
+  const verdict = reelsWeekly.validatePost(text, { posts, account });
+  if (!verdict.ok) {
+    await reportReelsWeeklyFailure(verdict.problems.join('; '));
+    return;
+  }
+
+  // History first, so a Slack hiccup never costs the numbers.
+  const rows = reelsWeekly.buildRows(posts, account, window, now);
+  let written = 0;
+  if (rows.length) {
+    const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
+    if (error) console.warn(`[reels-weekly] reel_stats upsert failed: ${error.message}`);
+    else written = rows.length;
+  }
+  const divergence = rows.length && written !== rows.length ? ` ⚠️ reel_stats guardó ${written}/${rows.length} filas.` : '';
+
+  if (reelsWeeklyLive()) {
+    await postToSlack(REELS_CHANNEL, text + divergence);
+  } else {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${REELS_CHANNEL || 'REELS_CHANNEL unset'}]\n${text}${divergence}` });
+  }
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsWeekly', status: 'ok',
+    output: { week: window.isoWeek, reels: posts.length, impressions: account && account.impressions, reach: account && account.reach,
+      meta: metaWired, rowsWritten: written, live: reelsWeeklyLive() } });
+}
+
+cron.schedule('0 8 * * 1', wrapCronJob('runReelsWeekly', async () => { await runReelsWeekly(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: reels weekly (0 8 * * 1 CR)');
+
+// ─── REELS BRIEFS (Ron's DM: daily 07:40, monthly day 1 08:00 CR) ───────────
+// Daily: what goes out today on @linkedin.papi, every reel of the week and the
+// month with reach/likes/comments/saves, and any scheduled post that never
+// published. Monthly: last month ranked by reach against the month before, plus
+// a snapshot in reel_stats (iso_week = 'YYYY-MM', kind = 'month'). Moved here
+// from two desktop scheduled tasks on 2026-10-07 so they no longer need the Mac
+// open. Metrics come from Meta only (GHL's per-post insights read 0 likes on
+// reels Meta counts likes on). Rules in lib/reelsBriefs.js, tested in
+// test/reels-briefs.test.js. Kill switch: REELS_BRIEFS_DISABLED=true.
+// Recipes: ~/automations/ops/recipes/ig-reels-daily-brief.md, ig-reels-monthly-report.md.
+const reelsBriefs = require('./lib/reelsBriefs');
+const reelsBriefsDisabled = () => String(process.env.REELS_BRIEFS_DISABLED || '') === 'true';
+const IG_REEL_FIELDS = 'id,timestamp,media_product_type,caption,permalink,like_count,comments_count';
+
+// Every Instagram post in GHL (any status) between two instants. The parent of a
+// published post stays `scheduled` forever; reelsBriefs.normalizeSchedule drops it.
+async function fetchReelsSchedule(from, to) {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const body = { type: 'all', accounts: REELS_GHL_ACCOUNT_ID, skip: '0', limit: '100', includeUsers: 'false',
+    fromDate: from.toISOString(), toDate: to.toISOString() };
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/${locationId}/posts/list`,
+    { method: 'POST', headers, body: JSON.stringify(body) }, { label: 'social posts/list (briefs)' });
+  if (!res.ok) throw new Error(`GHL ${res.status} on social posts/list`);
+  const json = await res.json();
+  const posts = json.results && json.results.posts;
+  if (!Array.isArray(posts)) throw new Error('GHL posts/list returned no posts array');
+  return posts;
+}
+
+// All Instagram media published since `sinceMs`, newest first, with reach/saved/
+// shares through field expansion (one call per page instead of one per reel). If
+// Meta refuses the expansion, retry without it: reels then show "sin datos"
+// instead of the whole brief failing. A rejected token always throws.
+async function fetchIgReels(sinceMs) {
+  const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+  if (!token) throw new Error('META_IG_INSIGHTS_TOKEN is not set');
+  const page = async (withInsights) => {
+    const fields = withInsights ? `${IG_REEL_FIELDS},insights.metric(reach,saved,shares)` : IG_REEL_FIELDS;
+    let url = `https://graph.facebook.com/v21.0/${REELS_IG_USER_ID}/media?fields=${encodeURIComponent(fields)}&limit=100&access_token=${token}`;
+    const out = [];
+    for (let i = 0; i < 10 && url; i++) {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const code = json && json.error && json.error.code;
+        const err = new Error(`Meta ${res.status}${code ? ` code ${code}` : ''}: ${(json.error && json.error.message) || 'no body'}`);
+        err.tokenRejected = code === 190 || res.status === 401;
+        throw err;
+      }
+      const data = Array.isArray(json.data) ? json.data : [];
+      out.push(...data);
+      const oldest = data.length ? Date.parse(data[data.length - 1].timestamp) : 0;
+      url = json.paging && json.paging.next && oldest >= sinceMs ? json.paging.next : null;
+    }
+    return out.filter((m) => Date.parse(m.timestamp) >= sinceMs);
+  };
+  try {
+    return await page(true);
+  } catch (err) {
+    if (err.tokenRejected) throw err;
+    console.warn(`[reels-briefs] insights expansion refused, retrying without it: ${err.message}`);
+    return page(false);
+  }
+}
+
+async function reportReelsBriefFailure(action, reason) {
+  console.error(`[reels-briefs] ${action} did not send: ${reason}`);
+  logActivity({ event_type: 'alert', event_source: 'cron', action, status: 'error', error_message: reason });
+  try {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ ${action} no se envió: ${reason}` });
+  } catch (err) {
+    console.error('[reels-briefs] failure DM failed:', err.message);
+  }
+}
+
+async function runReelsDailyBrief({ now = new Date() } = {}) {
+  if (reelsBriefsDisabled()) return;
+  const w = reelsBriefs.dayWindows(now);
+  const errors = [];
+  let schedule = null;
+  let reels = null;
+  try {
+    const raw = await fetchReelsSchedule(new Date(w.weekStart.getTime() - 86400000), new Date(w.weekEnd.getTime() + 86400000));
+    schedule = reelsBriefs.normalizeSchedule(raw);
+  } catch (err) { errors.push(`ghl: ${err.message}`); }
+  try {
+    reels = reelsBriefs.normalizeMedia(await fetchIgReels(Math.min(w.prevWeekStart.getTime(), w.monthStart.getTime())));
+  } catch (err) { errors.push(`meta: ${err.message}`); }
+  const text = reelsBriefs.formatDaily({ now, schedule, reels });
+  const verdict = reelsBriefs.validateDaily(text);
+  if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text, unfurl_links: false, unfurl_media: false });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsDailyBrief', status: errors.length ? 'error' : 'ok',
+    error_message: errors.length ? errors.join(' | ') : null,
+    metadata: { reels: reels ? reels.length : null, scheduled: schedule ? schedule.length : null } });
+}
+
+async function runReelsMonthlyReport({ now = new Date() } = {}) {
+  if (reelsBriefsDisabled()) return;
+  const mw = reelsBriefs.monthWindows(now);
+  let reels = null;
+  let metaError = null;
+  try {
+    reels = reelsBriefs.normalizeMedia(await fetchIgReels(mw.previousStart.getTime()));
+  } catch (err) { metaError = err.message; }
+  const reportedCount = reels ? reels.filter((r) => r.publishedAt >= mw.reportedStart && r.publishedAt < mw.reportedEnd).length : 0;
+  const text = reelsBriefs.formatMonthly({ now, reels });
+  const verdict = reelsBriefs.validateMonthly(text, { reportedCount });
+  if (!verdict.ok) return reportReelsBriefFailure('runReelsMonthlyReport', `contrato: ${verdict.problems.join('; ')}`);
+  let note = '';
+  if (reels && reportedCount) {
+    const rows = reelsBriefs.monthRows(now, reels);
+    const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
+    if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
+  }
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: text + note, unfurl_links: false, unfurl_media: false });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
+    error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
+}
+
+cron.schedule('40 7 * * *', wrapCronJob('runReelsDailyBrief', async () => { await runReelsDailyBrief(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 8 1 * *', wrapCronJob('runReelsMonthlyReport', async () => { await runReelsMonthlyReport(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static crons: reels daily brief (40 7 * * *), reels monthly report (0 8 1 * *)');
+
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
 // the booking pipeline is broken upstream of it — if a GHL workflow stops firing
@@ -19373,6 +19727,9 @@ const STATIC_CRON_SCHEDULES = {
   checkKaiHealth:              '*/15 * * * *',
   runClientAttentionAlerts:     '*/30 7-19 * * 1-6',
   runClientAttentionOpenDigest: '0 10 * * 5',
+  runReelsWeekly:               '0 8 * * 1',
+  runReelsDailyBrief:           '40 7 * * *',
+  runReelsMonthlyReport:        '0 8 1 * *',
   runClientAttentionScorecard:  '0 9 * * 1',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
