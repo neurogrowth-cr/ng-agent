@@ -39,7 +39,8 @@ check('window remaining', ig.fmtRemaining(ig.windowRemainingMs(at(60), NOW)), '2
 check('window closed label', ig.fmtRemaining(ig.windowRemainingMs(at(25 * 60), NOW)), 'cerrada');
 
 // ── prompt ──
-const sys = ig.buildSystemPrompt({ bookingUrl: BOOK, guideUrl: 'https://neurogrowth.io/recursos/plantillas' });
+const DOC = 'https://docs.google.com/document/d/DOCID/edit?usp=sharing';
+const sys = ig.buildSystemPrompt({ bookingUrl: BOOK, guideUrl: 'https://neurogrowth.io/recursos/plantillas', docUrl: DOC });
 check('system prompt carries the booking link', sys.includes(BOOK), true);
 check('system prompt keeps usted and the casual voice', [sys.includes('Trata de usted'), sys.includes('close friend')], [true, true]);
 check('thread labels the guide DM as automatic', ig.threadForPrompt(thread).includes('NOSOTROS (automático): Aquí tiene la guía...'), true);
@@ -71,6 +72,12 @@ check('word containing a banned word is fine', v('y cómo le llega la clientela 
 check('booking link is allowed once the lead said yes', ig.validateDraft(`listo, aquí puede agendar: ${BOOK}`, { bookingUrl: BOOK, intent: 'interested', stage: 'booking' }).ok, true);
 check('booking link before the yes fails', ig.validateDraft(`agende aquí: ${BOOK}`, { bookingUrl: BOOK, intent: 'interested', stage: 'qualified' }).problems.includes('calendar link before the lead confirmed the call'), true);
 check('prompt asks for the yes before the calendar', [sys.includes('PASO 1'), sys.includes('Nunca mande el enlace antes de ese sí')], [true, true]);
+check('step 2 asks to confirm the booking for the document', sys.includes('me confirma por acá cuando agende'), true);
+check('doc link only once booked', [
+  ig.validateDraft(`listo, aquí está el documento: ${DOC}`, { bookingUrl: BOOK, docUrl: DOC, intent: 'interested', stage: 'booked' }).ok,
+  ig.validateDraft(`le paso el documento: ${DOC}`, { bookingUrl: BOOK, docUrl: DOC, intent: 'interested', stage: 'booking' }).problems.includes('system document before the lead booked'),
+], [true, true]);
+check('booked is a known stage', ig.parseDraft('{"intent":"interested","stage":"booked","draft":"x"}').stage, 'booked');
 check('booking is a known stage', ig.parseDraft('{"intent":"interested","stage":"booking","draft":"x"}').stage, 'booking');
 check('any other link fails', v('Mire https://example.com').problems[0].startsWith('unexpected link'), true);
 check('empty draft fails unless not interested', [v('').ok, v('', 'not_interested').ok], [false, true]);
