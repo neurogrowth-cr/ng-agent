@@ -3431,6 +3431,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
 // iClosed rows (source='iclosed', iclosed_call_id) are frozen history.
 const SALES_TEAM_MAP = {
   // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
+  'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // Max owns reel guide leads (2026-10-07); its bookings are its own leaderboard row
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
@@ -14170,6 +14171,7 @@ if (EMAIL_PROXY_LIVE) {
 // The action maps below decide who gets DM'd, nudged and can claim leads — that is
 // where a stale entry does damage.
 const GHL_USER_NAMES = {
+  'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // GHL user "Max AI": owns reel guide leads (2026-10-07)
   'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — rolled off 2026-07
   'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
@@ -14887,6 +14889,13 @@ async function handleGHLClaimWebhook(req, res) {
         if (!contactId) { console.warn('ghl-claim webhook: no contact_id in payload'); return; }
         if (!assignedTo) { console.warn(`ghl-claim webhook: no assigned_to for contact ${contactId} (unassign event, or GHL token + user.email both empty/unmapped — user.email='${payload.user?.email || ''}')`); return; }
 
+        // Max assigns reel guide leads to itself and records that claim itself
+        // (igGuideClaimForMax). Mirroring it here would ✅ the card as a raw id and
+        // block the setter who takes it on handback from ever getting the credit.
+        if (assignedTo.toLowerCase() === IG_GUIDE_MAX_GHL_USER_ID.toLowerCase()) {
+          console.log(`ghl-claim webhook: contact ${contactId} assigned to Max (reel guide) — handled by Max, skipping`);
+          return;
+        }
         const claimCorr = newCorrelationId();
         console.log(`ghl-claim webhook: contact=${contactId} assignedTo=${assignedTo}`);
 
@@ -19057,8 +19066,8 @@ const HOT_REPLY_KEY = 'hot-reply';
 const HOT_REPLY_SETTERS = {
   'zcmdiz2eerapd80w2zop': { slackId: 'U0B1S1UMH9P', label: 'Oscar' },
   'wdjte1temxfr0lpi5rgv': { slackId: 'U0BFA4SRVQC', label: 'Sebastian' },
-  'n8mvtuhbbby7qppqnmr7': { slackId: 'U0B16P6DQ2F', label: 'William' },
 };
+// William left the roster (Ron, 2026-10-07: active setters are Sebastian and Oscar).
 const HOT_REPLY_SETTER_SLACK = Object.fromEntries(Object.entries(HOT_REPLY_SETTERS).map(([g, s]) => [g, s.slackId]));
 const HOT_REPLY_MAX_CLASSIFY_PER_RUN = Number(process.env.HOT_REPLY_MAX_CLASSIFY_PER_RUN || 40);
 // In-process caches. Losing them on a redeploy only costs one extra read each.
@@ -19435,6 +19444,8 @@ const IG_GUIDE_TAG = String(process.env.IG_GUIDE_TAG || 'ig-guia-linkedin').trim
 const IG_GUIDE_BOOKING_URL = process.env.IG_GUIDE_BOOKING_URL || 'https://api.leadconnectorhq.com/widget/bookings/linkedin-flywheel-appointment';
 const IG_GUIDE_URL = process.env.IG_GUIDE_URL || 'https://neurogrowth.io/recursos/plantillas';
 const IG_GUIDE_MAX_DRAFTS_PER_RUN = Number(process.env.IG_GUIDE_MAX_DRAFTS_PER_RUN || 8);
+// GHL user "Max AI" (contact@neurogrowthconsulting.com), created by Ron 2026-10-07.
+const IG_GUIDE_MAX_GHL_USER_ID = process.env.IG_GUIDE_MAX_GHL_USER_ID || 'cfLku0XE7BznqtmBSDmX';
 const igGuideDisabled = () => String(process.env.IG_GUIDE_DISABLED || '') === 'true';
 const IG_GUIDE_SYSTEM = igGuide.buildSystemPrompt({ bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL });
 
@@ -19470,7 +19481,20 @@ async function igGuideDraft(convo, messages, pending, correlationId) {
 async function runIgGuideCheck(correlationId) {
   if (igGuideDisabled()) return;
   const now = Date.now();
-  const stats = { convos: 0, drafted: 0, skipped: 0, failures: 0 };
+  const stats = { convos: 0, drafted: 0, skipped: 0, failures: 0, claimed: 0, handedBack: 0, humanOwned: 0 };
+
+  // 12 h without Ron's ✅: hand the card back before Meta's 24 h window is at risk.
+  const { data: waiting, error: waitErr } = await supabase.from('ig_guide_drafts')
+    .select('message_id, conversation_id, contact_id, contact_name, status, created_at, handed_back_at, slack_channel, slack_ts')
+    .eq('status', 'pending').is('handed_back_at', null).lt('created_at', new Date(now - igGuide.HOT_REPLY_HOLD_MS).toISOString());
+  if (waitErr) throw new Error(`ig_guide_drafts handback read: ${waitErr.message}`);
+  for (const r of igGuide.dueForHandback(waiting, now)) {
+    try {
+      await igGuideHandBack({ conversationId: r.conversation_id, contactId: r.contact_id, contactName: r.contact_name,
+        reason: { kind: 'timeout' }, ronDm: r.slack_ts ? { channel: r.slack_channel, ts: r.slack_ts } : null });
+      stats.handedBack++;
+    } catch (err) { stats.failures++; console.error(`[ig-guide] handback ${r.contact_id}: ${err.message}`); }
+  }
   const convos = (await hotSearchConversations(now - igGuide.WINDOW_MS, '&lastMessageDirection=inbound&lastMessageType=TYPE_INSTAGRAM'))
     .filter((c) => igGuide.isGuideConversation(c, { tag: IG_GUIDE_TAG, personalTag: PERSONAL_CONTACT_TAG }));
   stats.convos = convos.length;
@@ -19483,6 +19507,9 @@ async function runIgGuideCheck(correlationId) {
       const { data: existing, error: readErr } = await supabase.from('ig_guide_drafts').select('message_id').eq('message_id', pending.id).maybeSingle();
       if (readErr) throw new Error(`ig_guide_drafts read: ${readErr.message}`);
       if (existing) { stats.skipped++; continue; }
+      const { data: back } = await supabase.from('ig_guide_drafts').select('message_id').eq('conversation_id', c.id).not('handed_back_at', 'is', null).limit(1);
+      const ownership = igGuide.ownershipDecision({ latestClaimName: await igGuideLatestClaim(c.contactId), handedBack: !!(back && back.length) });
+      if (ownership === 'skip_human' || ownership === 'skip_handed_back') { stats.humanOwned++; continue; }
 
       const d = await igGuideDraft(c, messages, pending, correlationId);
       if (!d) throw new Error('drafter returned nothing');
@@ -19512,14 +19539,116 @@ async function runIgGuideCheck(correlationId) {
       });
       await supabase.from('ig_guide_drafts').update({ slack_channel: posted.channel, slack_ts: posted.ts }).eq('message_id', pending.id);
       stats.drafted++;
+      if (ownership === 'claim') {
+        try { await igGuideClaimForMax(c, { channel: posted.channel, ts: posted.ts }); stats.claimed++; }
+        catch (err) { console.error(`[ig-guide] claim for Max failed ${c.contactId}: ${err.message}`); }
+      }
+      if (d.handoff) {
+        await igGuideHandBack({ conversationId: c.id, contactId: c.contactId, contactName: row.contact_name,
+          reason: { kind: 'handoff', detail: d.handoff_reason }, suggestion: d.draft, ronDm: { channel: posted.channel, ts: posted.ts } });
+        stats.handedBack++;
+      }
     } catch (err) {
       stats.failures++;
       console.error(`[ig-guide] ${c.contactId}: ${err.message}`);
     }
   }
   // wrapCronJob already logs every run; only runs that did something get a report row.
-  if (stats.drafted || stats.failures) logActivity({ event_type: 'report', event_source: 'cron', action: 'runIgGuideCheck', status: stats.failures ? 'error' : 'ok', output: stats });
+  if (stats.drafted || stats.failures || stats.handedBack) logActivity({ event_type: 'report', event_source: 'cron', action: 'runIgGuideCheck', status: stats.failures ? 'error' : 'ok', output: stats });
   if (stats.failures && !stats.drafted) throw new Error(`${stats.failures} conversation(s) failed`);
+}
+
+// ── Max owns the card (plan-of-record §1 UPDATE 2026-10-07, later) ──────────
+// Max takes unclaimed reel guide leads: contact + setter-pipeline opps assigned
+// to the GHL user "Max AI", the #ng-sales-goats card ✅'d by Max with a thread
+// note, and a setter_claims row named "Max · Instagram" so a booking counts for
+// Max on the leaderboard and for no human setter. Handback (12 h without Ron's
+// ✅, or the lead needs a person) removes Max's ✅ and pings the setters in the
+// card thread: the first ✅ claims it through the normal flow, reassigns it in
+// GHL and gets the credit (latest claim wins in tallySetterStats).
+async function igGuideLatestClaim(contactId) {
+  const { data, error } = await supabase.from('setter_claims').select('claimed_by_setter_name, created_at')
+    .eq('ghl_contact_id', contactId).order('created_at', { ascending: false }).limit(1);
+  if (error) throw new Error(`setter_claims read: ${error.message}`);
+  return data && data[0] ? data[0].claimed_by_setter_name : null;
+}
+
+async function igGuideLeadCard(contactId) {
+  const { data } = await supabase.from('lead_posts').select('slack_message_ts, slack_channel_id').eq('contact_id', contactId).is('personal_excluded_at', null).maybeSingle();
+  return data && data.slack_message_ts ? data : null;
+}
+
+async function igGuideAssignInGhl(contactId, ghlUserId) {
+  const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const putRes = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
+  }, { label: `PUT /contacts/${contactId} (ig guide)` });
+  if (!putRes.ok) throw new Error(`GHL PUT /contacts/${contactId} → ${putRes.status}: ${(await putRes.text()).slice(0, 200)}`);
+  // Setter-pipeline opportunities only, like the Slack claim (VSL self-bookings stay put).
+  const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4').split(',').map((x) => x.trim()).filter(Boolean);
+  const oppsRes = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&contact_id=${contactId}`,
+    { headers: ghlAuth }, { label: `GET /opportunities/search (ig guide ${contactId})` });
+  const opps = ((oppsRes.ok ? await oppsRes.json() : {}).opportunities || []).filter((o) => setterPipelineIds.includes(o.pipelineId));
+  let ok = 0;
+  for (const opp of opps) {
+    const r = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
+      method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
+    }, { label: `PUT /opportunities/${opp.id} (ig guide)` });
+    if (r.ok) ok++; else console.warn(`[ig-guide] opp PUT ${opp.id} → ${r.status}`);
+  }
+  return ok;
+}
+
+async function igGuideClaimForMax(convo, anchor) {
+  const contactId = convo.contactId;
+  const oppsOk = await igGuideAssignInGhl(contactId, IG_GUIDE_MAX_GHL_USER_ID);
+  const card = await igGuideLeadCard(contactId);
+  if (card) {
+    try { await slack.client.reactions.add({ channel: card.slack_channel_id, timestamp: card.slack_message_ts, name: LEAD_CLAIMED_EMOJI }); }
+    catch (e) { if (!String(e.data?.error || e.message).includes('already_reacted')) console.warn('[ig-guide] card ✅ failed:', e.message); }
+    await slack.client.chat.postMessage({ channel: card.slack_channel_id, thread_ts: card.slack_message_ts,
+      text: `🤖 Tomada por *${igGuide.MAX_CLAIM_NAME}*: viene de un reel, Max redacta y Ron aprueba cada respuesta. Si Max la devuelve, aviso aquí.` });
+  }
+  let email = null;
+  try { email = (await ghlGetContact(contactId))?.email || null; } catch (_) { /* the claim still counts by contact id */ }
+  const anchorTs = card ? card.slack_message_ts : anchor.ts;
+  const { error } = await supabase.from('setter_claims').insert({
+    ghl_contact_id: contactId,
+    contact_name: convo.fullName || convo.contactName || null,
+    prospect_email: email,
+    slack_message_ts: anchorTs,
+    slack_channel_id: card ? card.slack_channel_id : anchor.channel,
+    claimed_by_slack_user_id: process.env.SLACK_BOT_USER_ID || 'max',
+    claimed_by_setter_name: igGuide.MAX_CLAIM_NAME,
+    ghl_user_id: IG_GUIDE_MAX_GHL_USER_ID,
+    opps_reassigned: oppsOk,
+    seconds_to_claim: card ? Math.max(0, Math.round(Date.now() / 1000 - parseFloat(card.slack_message_ts))) : null,
+    claim_source: 'max_ig_guide',
+  });
+  if (error) throw new Error(`setter_claims insert: ${error.message}`);
+}
+
+async function igGuideHandBack({ conversationId, contactId, contactName, reason, suggestion, ronDm }) {
+  const nowIso = new Date().toISOString();
+  // Any draft still waiting is dead: a setter answers from here on.
+  await supabase.from('ig_guide_drafts').update({ status: 'superseded', decided_at: nowIso })
+    .eq('conversation_id', conversationId).eq('status', 'pending');
+  await supabase.from('ig_guide_drafts').update({ handed_back_at: nowIso, handback_reason: `${reason.kind}${reason.detail ? `: ${reason.detail}` : ''}` })
+    .eq('conversation_id', conversationId).is('handed_back_at', null);
+  const setterSlackIds = Object.values(HOT_REPLY_SETTERS).map((x) => x.slackId);
+  const note = igGuide.formatHandbackNote({ reason, setterSlackIds }) + (suggestion ? `\nSugerencia de primer mensaje: _${suggestion}_` : '');
+  const card = await igGuideLeadCard(contactId);
+  if (card) {
+    try { await slack.client.reactions.remove({ channel: card.slack_channel_id, timestamp: card.slack_message_ts, name: LEAD_CLAIMED_EMOJI }); }
+    catch (e) { if (!String(e.data?.error || e.message).includes('no_reaction')) console.warn('[ig-guide] card ✅ remove failed:', e.message); }
+    await slack.client.chat.postMessage({ channel: card.slack_channel_id, thread_ts: card.slack_message_ts, text: note });
+  } else {
+    // No intake card to claim from: a plain post; the setter assigns it in GHL.
+    await slack.client.chat.postMessage({ channel: LEAD_CHANNEL_ID,
+      text: `${note}\n*${contactName || 'Prospecto'}* (Instagram, reel guide): sin tarjeta de intake, asígnelo en GHL.` });
+  }
+  if (ronDm) await igGuideThreadReply(ronDm.channel, ronDm.ts, `🔁 Devuelta a #ng-sales-goats: ${reason.kind === 'timeout' ? 'pasaron 12 h sin aprobación' : reason.detail || 'necesita a una persona'}. Ya no se puede enviar desde aquí.`);
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'igGuideHandBack', status: 'ok', output: { contact_id: contactId, reason: reason.kind } });
 }
 
 async function igGuideThreadReply(channel, ts, text) {
