@@ -212,10 +212,10 @@ Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Pro
 Gerald Arias (U0BAAC0KS82) — Fulfillment Operations.
 Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
-William B (U0B16P6DQ2F) — Appointment Setter. Books discovery calls.
 Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
 Jonathan Madriz — FORMER closer, departed 2026-07-19. He is not on the team: never DM him, never list him in a standup, leaderboard, roster or "who is closing today", and never assign him work. His past results stay attributed to him in reports covering his tenure — name him for history, never as someone current. His open deals are Jose's now.
+William B: FORMER appointment setter, departed 2026-10-07. The active setters are Oscar and Sebastian. He is not on the team: never DM him, never list him in a standup, leaderboard roster, setter nudge or "who is setting today", and never assign him work or leads. His past bookings stay attributed to him in reports covering his tenure: name him for history, never as someone current.
 
 ---
 
@@ -384,7 +384,7 @@ When reading, summarizing, or posting to #ng-sales-goats, you only surface and a
 - Prospect quality and pipeline health (how qualified is the book, what are conversion rates)
 - Objection patterns (what objections are showing up repeatedly, how they are being handled)
 - No-show and follow-up status (who ghosted, who needs re-engagement, FU sequence stage)
-- EOD reports from Oscar, William, Sebastian, and Jose (calls booked, pipeline updates, actions needed)
+- EOD reports from Oscar, Sebastian, and Jose (calls booked, pipeline updates, actions needed)
 - Sales performance signals (close rate trends, setter-to-closer handoff quality)
 - Lead source quality (where are booked calls coming from, which sources convert)
 
@@ -694,11 +694,12 @@ const TEAM_MEMBERS = {
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
   'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe Herrera NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
-  'U0B16P6DQ2F': { name: 'William',  role: 'setter',         displayName: 'William Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
   'U0BAAC0KS82': { name: 'Gerald',   role: 'fulfillment',    displayName: 'Gerald Arias NG' },
   'U07SMMDMSLQ': { name: 'Tania',    role: 'fulfillment',    displayName: 'Tania NG' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
+  // William B (U0B16P6DQ2F) removed 2026-10-07, departed 2026-10-07 (Ron: active
+  // setters are Sebastian and Oscar). Same treatment as Jonathan below.
   // Jonathan Madriz (U0APYAE0999) removed 2026-08-24 — departed 2026-07-19.
   // Off the roster means isRosterMember() is false, so a still-live Slack
   // account cannot ask Max for sales data. His name still resolves through
@@ -862,7 +863,7 @@ Key conversation stages:
 
 When asked about a prospect, pull from GHL conversations and knowledge base. Help them draft follow-up messages, objection responses, and booking confirmations in Spanish (they work LATAM). Help them prep their EOD report. They cannot access Ron's Gmail or calendar.`,
 
-    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closer is Jose Carranza (U0AMTEKDCPN), and Ron closes as well. (Jonathan Madriz departed 2026-07-19 — historical only, never treat him as current.) They take booked calls from Oscar, William, and Sebastian and close them into paying clients.
+    closer: `You are speaking with a High-Ticket Closer at NeuroGrowth. The closer is Jose Carranza (U0AMTEKDCPN), and Ron closes as well. (Jonathan Madriz departed 2026-07-19 — historical only, never treat him as current.) They take booked calls from Oscar and Sebastian and close them into paying clients. (William B, setter, departed 2026-10-07: historical only, never treat him as current.)
 
 His daily responsibilities:
 - Build and manage his own sales pipeline from booked calls
@@ -3434,7 +3435,7 @@ const SALES_TEAM_MAP = {
   'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // Max owns reel guide leads (2026-10-07); its bookings are its own leaderboard row
   'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
-  'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
+  'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',      'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   't28sdyo0eaunhjhl4jyu': 'Josue D',          'T28SDyO0EAUNHJHl4jyu': 'Josue D',
   '5orsahkh2joujb5fczrp': 'Debbanny Romero',  '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero', // historical — no longer active
@@ -3449,7 +3450,7 @@ const SALES_TEAM_MAP = {
   'joseph.neurogrowth@gmail.com':   'Joseph Salazar', // historical — no longer active
   'Salazcamjos@gmail.com':          'Joseph Salazar', // historical — no longer active
   'oscar.neurogrowth@gmail.com':    'Oscar M',
-  'william.neurogrowth@gmail.com':  'William B',
+  'william.neurogrowth@gmail.com':  'William B', // historical: left 2026-10-07
   'sebastian.neurogrowth@gmail.com': 'Sebastian S',
   'josue.duran@neurogrowth.io':     'Josue D',
   'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
@@ -3765,7 +3766,7 @@ async function getSalesIntelligence(query) {
       // (claim may have happened any time, not just today).
       const SETTER_BY_SLACK_ID = {
         'U0B1S1UMH9P': 'Oscar M',
-        'U0B16P6DQ2F': 'William B',
+        'U0B16P6DQ2F': 'William B', // historical: left 2026-10-07 (past claims still name him)
         'U0BFA4SRVQC': 'Sebastian S',
       };
       const allContactIds = [...new Set([...byTs.values()].flatMap(g => [...g.contactIds]))];
@@ -4557,7 +4558,7 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
     const GHL_USERS = {
       'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
       'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
-      'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+      'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
       'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
       '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
@@ -5019,7 +5020,7 @@ async function runMondayGapDetection(correlationId) {
           const GHL_USERS_GAP = {
             'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
             'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
-            'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+            'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
             'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
             '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
           };
@@ -7611,7 +7612,7 @@ const ALL_TOOLS = [
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
           { name: 'create_calendar_event', description: 'Create a new Google Calendar event on Ron\'s primary calendar and send invites to the attendees. Times must be ISO 8601 with timezone offset. Use only when no suitable existing event exists — prefer add_calendar_attendees for existing meetings.',                                                                                                                                                                                                                                    input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Event title.' }, startISO: { type: 'string', description: 'Start time, ISO 8601 with offset, e.g. 2026-04-24T10:00:00-06:00.' }, endISO: { type: 'string', description: 'End time, ISO 8601 with offset.' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses.' }, description: { type: 'string', description: 'Optional event description.' }, location: { type: 'string', description: 'Optional location or video link.' } }, required: ['summary','startISO','endISO'] } },
-          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jose and Ron are the current closers; Jonathan Madriz departed 2026-07-19 and appears only in periods he worked — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, William, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph and Debbanny are historical), today\'s calls (with per-call setter — GHL records who booked each appointment), calls booked today (query "calls booked today" — authoritative BOOKED_CALLS_DATA block over the 9PM-to-9PM CR EOD window, the only correct source for the STRATEGY CALLS BOOKED section), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
+          { name: 'get_sales_intelligence', description: 'Query GHL-native RevOps sales data from Supabase (appointments + outcomes are truth since the 2026-07-23 GHL cutover; EOD self-reports retired; iClosed rows are frozen history). PROVENANCE (state this when asked, never invent people): GHL workflow webhooks POST to the dash.neurogrowth.io portal, which normalizes them into the revops_* tables; setter_claims/lead_posts are written by the ✋ claim flow in #ng-sales-goats — they ARE the channel data in structured form, so never recount from Slack messages. Use for: closer performance (Jose and Ron are the current closers; Jonathan Madriz departed 2026-07-19 and appears only in periods he worked — calls booked, show rate, sold, revenue, close rate from appointments + outcomes), setter performance (Oscar, Sebastian, Josue — calls booked, show rate, qualified attended calls from native setter attribution; Joseph, Debbanny and William (departed 2026-10-07) are historical and appear only in periods they worked), today\'s calls (with per-call setter — GHL records who booked each appointment), calls booked today (query "calls booked today" — authoritative BOOKED_CALLS_DATA block over the 9PM-to-9PM CR EOD window, the only correct source for the STRATEGY CALLS BOOKED section), prospect lookup by name, pipeline summary. Also "leads today" — authoritative count of new leads that arrived today and per-setter ownership (from lead_posts + setter_claims, NOT from Slack post text); always use this for the LEADS TODAY section instead of counting channel messages.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Natural language query e.g. leads today, who booked the Andres Chavez call, how many calls today, close rate this month, Oscar bookings this week' } }, required: ['query'] } },
           { name: 'closer_monthly_scorecard', description: "Monthly per-closer scorecard from the shared closer_month_scorecard view — the SAME numbers as the portal page /admin/closer-scorecard, so never recompute month stats another way when asked for a closer's month. Returns calls assigned, outcomes logged, pending, showed, no-shows (a call cancelled and never rebooked counts as a no-show; a rescheduled call counts once, at its new time), qualified attended, won/lost/follow-up/DQ, show rate, close rate on shows, revenue, plus a REVI recording reality-check (calls that verifiably happened but were never logged, avg call score, no-show-vs-recording flags) and the month's unattributed outcomes. Months are America/Costa_Rica calendar months anchored on the call's scheduled time. When pending is high, always caveat that show/close rates are unreliable — pending does not mean the call didn't happen.", input_schema: { type: 'object', properties: { month: { type: 'string', description: "Month as YYYY-MM, e.g. 2026-07. For 'last month' compute from today's date in CR time." }, closer: { type: 'string', description: 'Optional closer email or name fragment (jose, ron, jonathan). Omit for all closers.' } }, required: ['month'] } },
           { name: 'log_call_outcome', description: "Log a sales-call outcome to the portal (revops_sales_outcomes) on EXPLICIT human instruction ONLY. Use when a closer or Ron states an outcome in their own words ('won 3500', 'that call was a no show', 'log Marco as lost') — typically replying to an outcome reminder/proposal DM. NEVER call this from your own inference, a REVI read, a transcript, or a report — if a human did not state the outcome in this conversation, do not call this tool. won REQUIRES revenue (the real closed amount; ask if not given — never guess). Writes are first-writer-wins: an existing outcome is never overwritten, the tool will tell you if one exists. Also promotes the prospect's pipeline status per the shared dash contract.", input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Prospect email (preferred) or name fragment to find their appointment.' }, date: { type: 'string', description: 'Optional call date YYYY-MM-DD (CR time) to disambiguate when the prospect had multiple calls.' }, outcome: { type: 'string', enum: ['won', 'lost', 'follow_up', 'disqualified', 'no_show'], description: 'The outcome the human stated.' }, revenue: { type: 'number', description: 'Closed revenue in USD — required when outcome is won.' }, note: { type: 'string', description: 'Optional short context, e.g. who instructed it and why.' } }, required: ['prospect', 'outcome'] } },
           { name: 'create_notion_task',   description: 'Create a task in NeuroGrowth Notion. Operational/recurring tasks go to Operations Tracking. Project/strategic tasks go to Project Sprint Tracking.',                                                                                                                               input_schema: { type: 'object', properties: { title: { type: 'string' }, taskType: { type: 'string', description: 'operational (default) or project' }, priority: { type: 'string', description: 'P0 - Critical Customer Impact | P1 - High Business Impact | P2 - Growth & Scalability (default) | P3 - Strategic Initiatives' }, dueDate: { type: 'string', description: 'YYYY-MM-DD format (optional)' }, notes: { type: 'string', description: 'Additional context (optional)' }, customer: { type: 'string', description: 'Customer name (optional)' } }, required: ['title'] } },
@@ -9077,6 +9078,13 @@ const DEPARTED_MEMBERS = {
     aliases: ['gqymykpddltdxvbkfl2c', 'U0APYAE0999'],
     coverage: 'jose.carranza@neurogrowth.io',  // inherits open-deal follow-up (Ron, 2026-08-24); official email since 2026-10-05
   },
+  'william.neurogrowth@gmail.com': {
+    name: 'William B',
+    since: '2026-10-07',                       // Ron: active setters are Sebastian and Oscar
+    role: 'setter',
+    aliases: ['n8mvtuhbbby7qppqnmr7', 'U0B16P6DQ2F'],
+    coverage: null,                            // setter: never a closer_id, so no open deals to inherit
+  },
 };
 // GHL rows carry a person as a roster email, a raw user id, or a Slack id —
 // index every shape so a lookup cannot miss one and quietly DM a leaver.
@@ -9922,9 +9930,9 @@ async function runSalesStandup(_correlationId) {
     );
 
     // ── DM each setter ─────────────────────────────────────────────────────
+    // Active setters only. William departed 2026-10-07 (see DEPARTED_MEMBERS).
     const setters = [
       { slackId: 'U0B1S1UMH9P', name: 'Oscar' },
-      { slackId: 'U0B16P6DQ2F', name: 'William' },
       { slackId: 'U0BFA4SRVQC', name: 'Sebastian' },
     ];
 
@@ -11783,8 +11791,8 @@ async function runOpenDealFollowupSweep(correlationId) {
   for (const d of deals) {
     const owner = d.closer_id || 'unassigned';
     const departed = departedMember(owner);
-    const target = departed ? departed.coverage : owner;
-    (byCloser[target] = byCloser[target] || []).push({ ...d, inheritedFrom: departed ? departed.name : null });
+    const target = departed && departed.coverage ? departed.coverage : owner;
+    (byCloser[target] = byCloser[target] || []).push({ ...d, inheritedFrom: departed && departed.coverage ? departed.name : null });
   }
 
   const skipCounts = {};
@@ -11953,7 +11961,7 @@ async function runOpenDealZombieDigest(correlationId) {
       display: d.full_name || d.email || 'Unknown prospect',
       closer: (() => {
         const dep = departedMember(d.closer_id);
-        return dep ? `${resolveSalesMember(dep.coverage)} (for ${dep.name})` : resolveSalesMember(d.closer_id);
+        return dep && dep.coverage ? `${resolveSalesMember(dep.coverage)} (for ${dep.name})` : resolveSalesMember(d.closer_id);
       })(),
       openedAt: d.opened_at,
       nudgeCount: state ? state.nudgeCount : 0,
@@ -14161,8 +14169,8 @@ if (EMAIL_PROXY_LIVE) {
 }
 
 // ─── GHL LEAD WEBHOOK ─────────────────────────────────────────────────────────
-// ROSTER 2026-07-29 (Ron): active setters are Sebastian, Oscar and William only.
-// Joseph and Debbanny have rolled off.
+// ROSTER 2026-10-07 (Ron): active setters are Sebastian and Oscar only.
+// William departed 2026-10-07; Joseph and Debbanny rolled off earlier.
 //
 // Deliberate split — departed staff stay in the NAME maps but are removed from the
 // ACTION maps. Name resolution is retrospective: leaderboards and weekly reports
@@ -14174,7 +14182,7 @@ const GHL_USER_NAMES = {
   'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // GHL user "Max AI": owns reel guide leads (2026-10-07)
   'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — rolled off 2026-07
   'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
-  'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
+  'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — rolled off 2026-05-03
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
@@ -14185,20 +14193,18 @@ const GHL_USER_NAMES = {
 // ACTION map — routes DMs and nudges. Departed setters MUST NOT appear here.
 const GHL_TO_SLACK = {
   'oscar': 'U0B1S1UMH9P', 'oscar m': 'U0B1S1UMH9P', 'oscar neurogrowth': 'U0B1S1UMH9P',
-  'william': 'U0B16P6DQ2F', 'william b': 'U0B16P6DQ2F', 'william neurogrowth': 'U0B16P6DQ2F',
   'sebastian': 'U0BFA4SRVQC', 'sebastian s': 'U0BFA4SRVQC', 'sebastian serrano': 'U0BFA4SRVQC', 'sebastian neurogrowth': 'U0BFA4SRVQC',
   'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
-  'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P', 'n8mvtuhbbby7qppqnmr7': 'U0B16P6DQ2F',
+  'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P',
   'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN',
   'wdjte1temxfr0lpi5rgv': 'U0BFA4SRVQC',
 };
 
 // ACTION map — lead-claim flow: Slack user → GHL user ID (reaction_added handler).
-// Active staff only: Debbanny rolled off 2026-05-03, Joseph 2026-07.
+// Active staff only: Debbanny rolled off 2026-05-03, Joseph 2026-07, William 2026-10-07.
 const SLACK_TO_GHL_USER = {
   'U0B1S1UMH9P': 'ZcmdIz2EEraPd80W2zop', // Oscar M
-  'U0B16P6DQ2F': 'N8mvtuHbbbY7QppqNMr7', // William B
   'U0BFA4SRVQC': 'Wdjte1temxfR0lpi5RGV', // Sebastian Serrano
   'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
   'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyItjV', // Jose Carranza
@@ -14210,7 +14216,6 @@ const SLACK_TO_GHL_USER = {
 // token doesn't resolve. Active staff only.
 const EMAIL_TO_GHL_USER_ID = {
   'oscar.neurogrowth@gmail.com':  'ZcmdIz2EEraPd80W2zop',
-  'william.neurogrowth@gmail.com': 'N8mvtuHbbbY7QppqNMr7',
   'sebastian.neurogrowth@gmail.com': 'Wdjte1temxfR0lpi5RGV',
   'jonathan.neurogrowth@gmail.com': 'gqYMYkpDDlTdxvBkfl2C',
   // Both of Jose's emails. The old entry had a typo in the id (lowercase l for I),
@@ -15554,13 +15559,13 @@ async function runStalledProspectFollowups(correlationId) {
     return businessDaysBetween(c.lastMessageDate, now) >= 2;
   });
 
-  // Nudge targets = ACTIVE SETTERS ONLY (Ron 2026-07-29: Sebastian, Oscar, William).
+  // Nudge targets = ACTIVE SETTERS ONLY (Ron 2026-10-07: Sebastian and Oscar; William
+  // departed 2026-10-07).
   // Closers are intentionally absent: a conversation assigned to a closer is not a
   // setter's stalled prospect, and Joseph/Debbanny have rolled off — a nudge naming
   // them would either DM a departed teammate or silently reach nobody.
   const ghlUserNames = {
     'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
-    'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
     'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   };
 
