@@ -19455,11 +19455,13 @@ const igGuide = require('./lib/igGuideReplies');
 const IG_GUIDE_TAG = String(process.env.IG_GUIDE_TAG || 'ig-guia-linkedin').trim().toLowerCase();
 const IG_GUIDE_BOOKING_URL = process.env.IG_GUIDE_BOOKING_URL || 'https://api.leadconnectorhq.com/widget/bookings/linkedin-flywheel-appointment';
 const IG_GUIDE_URL = process.env.IG_GUIDE_URL || 'https://neurogrowth.io/recursos/plantillas';
+// The VSL doc ("LinkedIn Flywheel: Su Agenda Llena con Quien Firma"), sent only after the lead says they booked (Ron, 2026-10-07, option C).
+const IG_GUIDE_DOC_URL = process.env.IG_GUIDE_DOC_URL || 'https://docs.google.com/document/d/1Q3aD1nZj9CdI6i2hp0pLY1PU3cCcqjEhdUnbuEhcKyA/edit?usp=sharing';
 const IG_GUIDE_MAX_DRAFTS_PER_RUN = Number(process.env.IG_GUIDE_MAX_DRAFTS_PER_RUN || 8);
 // GHL user "Max AI" (contact@neurogrowthconsulting.com), created by Ron 2026-10-07.
 const IG_GUIDE_MAX_GHL_USER_ID = process.env.IG_GUIDE_MAX_GHL_USER_ID || 'cfLku0XE7BznqtmBSDmX';
 const igGuideDisabled = () => String(process.env.IG_GUIDE_DISABLED || '') === 'true';
-const IG_GUIDE_SYSTEM = igGuide.buildSystemPrompt({ bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL });
+const IG_GUIDE_SYSTEM = igGuide.buildSystemPrompt({ bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL, docUrl: IG_GUIDE_DOC_URL });
 
 async function igGuideDraft(convo, messages, pending, correlationId) {
   const user = igGuide.buildUserPrompt({
@@ -19482,7 +19484,7 @@ async function igGuideDraft(convo, messages, pending, correlationId) {
     const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
     const parsed = igGuide.parseDraft(text);
     if (!parsed.ok) { last = { ...parsed, problems: [parsed.error] }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
-    const verdict = igGuide.validateDraft(parsed.draft, { bookingUrl: IG_GUIDE_BOOKING_URL, intent: parsed.intent, stage: parsed.stage });
+    const verdict = igGuide.validateDraft(parsed.draft, { bookingUrl: IG_GUIDE_BOOKING_URL, docUrl: IG_GUIDE_DOC_URL, intent: parsed.intent, stage: parsed.stage });
     last = { ...parsed, problems: verdict.problems };
     if (verdict.ok) return last;
     feedback = `\n\nSu borrador anterior rompió estas reglas: ${verdict.problems.join('; ')}. Corríjalo.`;
