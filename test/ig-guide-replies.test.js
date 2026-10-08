@@ -83,5 +83,27 @@ check('no thread reply sends the draft', ig.pickSendText({ draft: 'Hola', thread
 check("Ron's latest thread reply wins", ig.pickSendText({ draft: 'Hola', threadReplies: [{ user: RON, text: 'uno', ts: '2' }, { user: RON, text: 'dos', ts: '3' }], ronUserId: RON }), { text: 'dos', edited: true });
 check('slack link markup is unwrapped', ig.unSlack(`<${BOOK}|${BOOK}> &amp; listo`), `${BOOK} & listo`);
 
+// ── ownership (Max owns unclaimed reel guide leads) ──
+check('nobody claimed: Max claims', ig.ownershipDecision({ latestClaimName: null, handedBack: false }), 'claim');
+check('Max already owns: proceed', ig.ownershipDecision({ latestClaimName: ig.MAX_CLAIM_NAME, handedBack: false }), 'proceed');
+check('a setter claimed: Max stays out', ig.ownershipDecision({ latestClaimName: 'Oscar M', handedBack: false }), 'skip_human');
+check('handed back: Max stays out even if still the last claim', ig.ownershipDecision({ latestClaimName: ig.MAX_CLAIM_NAME, handedBack: true }), 'skip_handed_back');
+
+const old = new Date(NOW - 12 * 3600000 - 60000).toISOString();
+const fresh = new Date(NOW - 3600000).toISOString();
+check('only pending drafts past 12 h are due', ig.dueForHandback([
+  { message_id: 'a', status: 'pending', created_at: old },
+  { message_id: 'b', status: 'pending', created_at: fresh },
+  { message_id: 'c', status: 'sent', created_at: old },
+  { message_id: 'd', status: 'pending', created_at: old, handed_back_at: fresh },
+], NOW).map((r) => r.message_id), ['a']);
+check('handback note mentions the setters and the reason',
+  ig.formatHandbackNote({ reason: { kind: 'handoff', detail: 'pidió WhatsApp' }, setterSlackIds: ['U1', 'U2'] }),
+  '🔁 Max devuelve esta tarjeta: el prospecto necesita a una persona (pidió WhatsApp). <@U1> <@U2> el primero que reaccione ✅ la toma y se lleva el crédito.');
+const h = ig.parseDraft('{"intent":"interested","draft":"Le escribe alguien del equipo en breve.","handoff":true,"handoff_reason":"pidió WhatsApp"}');
+check('handoff flag parses', [h.handoff, h.handoff_reason], [true, 'pidió WhatsApp']);
+check('handoff defaults to false', ig.parseDraft('{"intent":"question","draft":"x"}').handoff, false);
+check('system prompt explains when to hand off', sys.includes('CUÁNDO PASAR A UNA PERSONA'), true);
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
