@@ -3432,7 +3432,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
 const SALES_TEAM_MAP = {
   // ── SETTERS — GHL user IDs ───────────────────────────────────────────────
   'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // Max owns reel guide leads (2026-10-07); its bookings are its own leaderboard row
-  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
+  'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar',   'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — no longer active
   'zcmdiz2eerapd80w2zop': 'Oscar M',          'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',        'N8mvtuHbbbY7QppqNMr7': 'William B',
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',      'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
@@ -4555,13 +4555,13 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
     const oneDayMs = 24 * 60 * 60 * 1000;
     // GHL user ID to name map for setter resolution
     const GHL_USERS = {
-      'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+      'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
       'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
       'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
       'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
       '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
       'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-      'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+      'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
     };
     // Fetch the last few messages per conversation in parallel so the model has
     // enough context to judge "positive booking-track" vs noise (single-emoji
@@ -5017,7 +5017,7 @@ async function runMondayGapDetection(correlationId) {
         const staleInbound = convos.filter(c => c.lastMessageDirection === 'inbound' && c.lastMessageDate < seventyTwoHAgo);
         if (staleInbound.length) {
           const GHL_USERS_GAP = {
-            'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
+            'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar',
             'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
             'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
             'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
@@ -14172,13 +14172,13 @@ if (EMAIL_PROXY_LIVE) {
 // where a stale entry does damage.
 const GHL_USER_NAMES = {
   'cflku0xe7bznqtmbsdmx': 'Max · Instagram', 'cfLku0XE7BznqtmBSDmX': 'Max · Instagram', // GHL user "Max AI": owns reel guide leads (2026-10-07)
-  'cuttpcov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — rolled off 2026-07
+  'cuttpgov7ztlvyjkhdx8': 'Joseph Salazar', 'cUTTPGov7ZTLvyjKHdX8': 'Joseph Salazar', // historical — rolled off 2026-07
   'zcmdiz2eerapd80w2zop': 'Oscar M',         'ZcmdIz2EEraPd80W2zop': 'Oscar M',
   'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B',
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — rolled off 2026-05-03
   'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
-  'izlta0jy5orkymsyltjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyltjV': 'Jose Carranza',
+  'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
   'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 
@@ -14190,7 +14190,7 @@ const GHL_TO_SLACK = {
   'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
   'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P', 'n8mvtuhbbby7qppqnmr7': 'U0B16P6DQ2F',
-  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymsyltjv': 'U0AMTEKDCPN',
+  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN',
   'wdjte1temxfr0lpi5rgv': 'U0BFA4SRVQC',
 };
 
@@ -14201,7 +14201,7 @@ const SLACK_TO_GHL_USER = {
   'U0B16P6DQ2F': 'N8mvtuHbbbY7QppqNMr7', // William B
   'U0BFA4SRVQC': 'Wdjte1temxfR0lpi5RGV', // Sebastian Serrano
   'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
-  'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyltjV', // Jose Carranza
+  'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyItjV', // Jose Carranza
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
 };
 
