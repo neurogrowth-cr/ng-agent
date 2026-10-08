@@ -19482,7 +19482,7 @@ async function igGuideDraft(convo, messages, pending, correlationId) {
     const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
     const parsed = igGuide.parseDraft(text);
     if (!parsed.ok) { last = { ...parsed, problems: [parsed.error] }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
-    const verdict = igGuide.validateDraft(parsed.draft, { bookingUrl: IG_GUIDE_BOOKING_URL, intent: parsed.intent });
+    const verdict = igGuide.validateDraft(parsed.draft, { bookingUrl: IG_GUIDE_BOOKING_URL, intent: parsed.intent, stage: parsed.stage });
     last = { ...parsed, problems: verdict.problems };
     if (verdict.ok) return last;
     feedback = `\n\nSu borrador anterior rompió estas reglas: ${verdict.problems.join('; ')}. Corríjalo.`;
