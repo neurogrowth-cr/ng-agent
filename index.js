@@ -18972,13 +18972,13 @@ async function fetchLeadVolumeRows(sinceIso) {
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase
       .from('lead_posts')
-      .select('posted_at, channel, source')
-      .is('personal_excluded_at', null)
+      // Personal rows included: they prove the pipe is alive (lib/leadVolume.js).
+      .select('posted_at, channel, source, personal_excluded_at')
       .gte('posted_at', sinceIso)
       .order('posted_at', { ascending: true })
       .range(from, from + 999);
     if (error) throw new Error(`lead_posts read failed: ${error.message}`);
-    rows.push(...(data || []));
+    rows.push(...(data || []).map(r => ({ ...r, personal: !!r.personal_excluded_at })));
     if (!data || data.length < 1000) return rows;
   }
 }

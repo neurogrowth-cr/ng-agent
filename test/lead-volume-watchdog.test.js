@@ -81,6 +81,21 @@ check('a 30-post sync burst counts as one active hour', find(at(burst, '2026-10-
 check('so a burst alone cannot arm the alarm', find(at(burst, '2026-10-03T20:00Z'), 'messenger').firing, false);
 check('rows with no channel and no watched source are ignored', at([{ posted_at: '2026-10-01T17:00Z', channel: null, source: 'Social media' }], '2026-10-03T20:00Z').every(f => f.reason === 'no_history'), true);
 
+// ── 5b. A post later marked personal still proves the pipe works ─────────
+// 2026-10-07: Instagram carded leads all morning, the last real one at 12:33 PM
+// CR, then a contact carded at 9:55 PM CR was tagged personal. The watchdog
+// ignored that row and fired at 11:05 PM CR on a quiet evening.
+const igWeek = [];
+for (let d = 0; d < 7; d++) for (let k = 0; k < 10; k++) igWeek.push({ posted_at: new Date(utc('2026-09-30T14:00Z') + d * 24 * H + k * H).toISOString(), channel: 'instagram' });
+igWeek.push({ posted_at: '2026-10-07T18:33Z', channel: 'instagram' });
+const personalLate = { posted_at: '2026-10-08T03:55Z', channel: 'instagram', personal: true };
+check('without the personal post, the quiet evening fires', find(at(igWeek, '2026-10-08T05:05Z'), 'instagram').firing, true);
+const withPersonal = find(at([...igWeek, personalLate], '2026-10-08T05:05Z'), 'instagram');
+check('a personal post ends the silence', withPersonal.firing, false);
+check('silence counts from the personal post', lv.fmtCR(withPersonal.lastAt), 'Oct 7, 9:55 PM CR');
+check('personal posts stay out of the rate', withPersonal.postsInWindow, find(at(igWeek, '2026-10-08T05:05Z'), 'instagram').postsInWindow);
+check('personal posts alone are not history', find(at([personalLate], '2026-10-08T05:05Z'), 'instagram').reason, 'no_history');
+
 // ── 6. Text contract (4a) ───────────────────────────────────────────────────
 const fire = find(at(incident, '2026-10-03T19:00Z'), 'instagram');
 const alert = lv.renderLeadVolumeAlert(fire);
@@ -107,6 +122,7 @@ check('declared in STATIC_CRON_SCHEDULES', /runLeadVolumeWatchdog:\s*'5 \* \* \*
 check('registered with the same expression', SRC.includes("cron.schedule('5 * * * *', wrapCronJob('runLeadVolumeWatchdog'"), true);
 check('every lead_posts write carries channel', (SRC.match(/channel: leadChannelKey,/g) || []).length, 3);
 const runner = SRC.slice(SRC.indexOf('async function runLeadVolumeWatchdog'), SRC.indexOf('// ─── end lead volume watchdog'));
+check('runner reads personal rows as liveness', /personal: !!r\.personal_excluded_at/.test(SRC.slice(SRC.indexOf('async function fetchLeadVolumeRows'), SRC.indexOf('async function runLeadVolumeWatchdog'))), true);
 check('runner posts only to #ng-pm-agent', [...runner.matchAll(/channel: ([A-Z_]+)/g)].every(m => m[1] === 'AGENT_CHANNEL'), true);
 check('no self-termination', /disable|cron\.stop|\.stop\(\)|process\.exit/.test(runner), false);
 
