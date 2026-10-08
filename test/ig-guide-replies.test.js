@@ -41,11 +41,11 @@ check('window closed label', ig.fmtRemaining(ig.windowRemainingMs(at(25 * 60), N
 // ── prompt ──
 const sys = ig.buildSystemPrompt({ bookingUrl: BOOK, guideUrl: 'https://neurogrowth.io/recursos/plantillas' });
 check('system prompt carries the booking link', sys.includes(BOOK), true);
-check('system prompt is in usted and forbids tú', sys.includes('siempre de usted'), true);
+check('system prompt keeps usted and the casual voice', [sys.includes('Trata de usted'), sys.includes('close friend')], [true, true]);
 check('thread labels the guide DM as automatic', ig.threadForPrompt(thread).includes('NOSOTROS (automático): Aquí tiene la guía...'), true);
 
 // ── parse ──
-const good = JSON.stringify({ intent: 'interested', stage: 'discover', collected: { offer: 'consultoría', buyer: 'pymes', price: null }, draft: 'Gracias por escribir. ¿Cuánto cobra por cliente, más o menos?', reason_es: 'falta precio' });
+const good = JSON.stringify({ intent: 'interested', stage: 'discover', collected: { offer: 'consultoría', buyer: 'pymes', price: null }, draft: 'y más o menos cuánto cobra por cliente?', reason_es: 'falta precio' });
 const p = ig.parseDraft(`Aquí va:\n${good}`);
 check('parse ok with text around', p.ok, true);
 check('parse fills every field', Object.keys(p.collected).length, ig.FIELDS.length);
@@ -55,18 +55,21 @@ check('broken JSON never throws', ig.parseDraft('no json').ok, false);
 
 // ── validate ──
 const v = (draft, intent = 'interested') => ig.validateDraft(draft, { bookingUrl: BOOK, intent });
-check('clean draft passes', v('Gracias por escribir. ¿Qué vende y a quién?'), { ok: true, problems: [] });
-check('exclamation fails', v('¡Gracias! ¿Qué vende?').problems.includes('exclamation mark'), true);
-check('long dash fails', v('Gracias — ¿qué vende?').problems.includes('long dash'), true);
-check('tú fails', v('¿Qué vendes y a quién?').problems.includes('uses tú'), true);
+check('clean casual draft passes', v('a quién le vende, empresas o personas?'), { ok: true, problems: [] });
+check('opening question mark fails', v('¿A quién le vende?').problems[0].startsWith('opening question mark'), true);
+check('formal filler fails', v('Perfecto, a quién le vende?').problems[0].startsWith('formal filler'), true);
+check('thanks opener fails', v('Gracias por escribir. a quién le vende?').ok, false);
+check('exclamation fails', v('hola! qué vende?').problems.includes('exclamation mark'), true);
+check('long dash fails', v('ok — qué vende?').problems.includes('long dash'), true);
+check('tú fails', v('qué vendes y a quién?').problems.includes('uses tú'), true);
 check('price fails', v('Cuesta $5,000 al mes.').problems.includes('mentions a price'), true);
 check('the disqualification floor is allowed', v('Funciona con servicios de 1,500 dólares en adelante.').ok, true);
 check('banned word fails', v('Le mando más leads.').problems.includes('banned word "leads"'), true);
-check('word containing a banned word is fine', v('Gracias por su clientela.').ok, true);
-check('booking link is allowed', v(`Puede agendar aquí: ${BOOK}`).ok, true);
+check('word containing a banned word is fine', v('y cómo le llega la clientela hoy?').ok, true);
+check('booking link is allowed', v(`agende aquí: ${BOOK}`).ok, true);
 check('any other link fails', v('Mire https://example.com').problems[0].startsWith('unexpected link'), true);
 check('empty draft fails unless not interested', [v('').ok, v('', 'not_interested').ok], [false, true]);
-check('emoji fails', v('Gracias 🙌 ¿qué vende?').problems.includes('emoji'), true);
+check('emoji fails', v('va 🙌 qué vende?').problems.includes('emoji'), true);
 
 // ── Ron's DM ──
 const dm = ig.formatRonDm({ contactName: 'Ana P.', intent: 'interested', stage: 'discover', collected: p.collected,
