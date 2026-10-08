@@ -55,12 +55,15 @@ const leakedSlackIds = Object.values(CLOSER_SLACK).filter(id => departedSlackIds
 check('2b no departed Slack id is a DM target under any key', leakedSlackIds, []);
 
 // ── 3. Coverage must be a real, active, messageable colleague ───────────────
+// A departed SETTER (role 'setter') never appears as a closer_id, so there are
+// no open deals to inherit: coverage must be explicitly null, never a guess.
 for (const [email, rec] of Object.entries(DEPARTED_MEMBERS)) {
+  check(`3e ${rec.name} records a departure date`, /^\d{4}-\d{2}-\d{2}$/.test(rec.since || ''), true);
+  if (rec.role === 'setter') { check(`3f ${rec.name} (setter) has coverage null`, rec.coverage, null); continue; }
   check(`3a ${rec.name} names a coverage closer`, typeof rec.coverage === 'string' && rec.coverage.length > 0, true);
   check(`3b ${rec.name}'s coverage is reachable in CLOSER_SLACK`, Boolean(CLOSER_SLACK[rec.coverage]), true);
   check(`3c ${rec.name}'s coverage is not itself departed`, departedMember(rec.coverage), null);
   check(`3d ${rec.name} does not cover themselves`, rec.coverage === email, false);
-  check(`3e ${rec.name} records a departure date`, /^\d{4}-\d{2}-\d{2}$/.test(rec.since || ''), true);
 }
 
 // ── 4. History is preserved, not rewritten ─────────────────────────────────
@@ -82,6 +85,32 @@ check('6a the roster line no longer calls him a closer',
   /Jonathan Madriz \(U0APYAE0999\) — High-Ticket Closer/.test(promptBlock), false);
 check('6b it states he is former and must not be assigned work',
   /FORMER closer, departed 2026-07-19/.test(promptBlock), true);
+
+// ── 7. William B, setter, departed 2026-10-07 ──────────────────────────────
+// Ron, 2026-10-07: the active setters are Sebastian and Oscar. Same rules as
+// above, plus the setter-specific ACTION maps (claims, nudges, standup DMs).
+check('7a roster email resolves', departedMember('william.neurogrowth@gmail.com')?.name, 'William B');
+check('7b raw GHL id resolves (mixed case)', departedMember('N8mvtuHbbbY7QppqNMr7')?.name, 'William B');
+check('7c Slack id resolves', departedMember('U0B16P6DQ2F')?.name, 'William B');
+check('7d no longer in TEAM_MEMBERS', /U0B16P6DQ2F':\s*\{/.test(rosterBlock), false);
+check('7e prompt no longer calls him a current setter',
+  /William B \(U0B16P6DQ2F\) — Appointment Setter/.test(promptBlock), false);
+check('7f prompt states he is former', /FORMER appointment setter, departed 2026-10-07/.test(promptBlock), true);
+check('7g name maps still name him for history',
+  /'N8mvtuHbbbY7QppqNMr7': 'William B'/.test(SRC) && /'william\.neurogrowth@gmail\.com':\s+'William B'/.test(SRC), true);
+const sliceConst = (name) => {
+  const start = SRC.indexOf(`const ${name} = {`);
+  if (start < 0) return null;
+  return SRC.slice(start, SRC.indexOf('};', start));
+};
+for (const m of ['GHL_TO_SLACK', 'SLACK_TO_GHL_USER', 'EMAIL_TO_GHL_USER_ID', 'ghlUserNames', 'HOT_REPLY_SETTERS']) {
+  const body = sliceConst(m);
+  check(`7h ${m} exists`, Boolean(body), true);
+  check(`7i ${m} has no William id, Slack id or email`,
+    /n8mvtuhbbby7qppqnmr7|U0B16P6DQ2F|william/i.test((body || '').replace(/\/\/.*$/gm, '')), false);
+}
+const setterDm = SRC.slice(SRC.indexOf('// ── DM each setter'), SRC.indexOf('];', SRC.indexOf('// ── DM each setter')));
+check('7j standup setter DM list skips him', /U0B16P6DQ2F/.test(setterDm), false);
 
 console.log(failures ? `\n${failures} failure(s).` : '\nAll departed-member checks passed.');
 process.exit(failures ? 1 : 0);
