@@ -105,5 +105,19 @@ check('handoff flag parses', [h.handoff, h.handoff_reason], [true, 'pidió Whats
 check('handoff defaults to false', ig.parseDraft('{"intent":"question","draft":"x"}').handoff, false);
 check('system prompt explains when to hand off', sys.includes('CUÁNDO PASAR A UNA PERSONA'), true);
 
+// ── regression 2026-10-07: the intake's "Opportunity created" activity is not an answer ──
+const live = [
+  msg('c1', 'inbound', 10, 'LinkedIn', { messageType: 'TYPE_INSTAGRAM_COMMENT' }),
+  msg('o9', 'outbound', 10, 'Gracias por comentar...', { source: 'workflow' }),
+  msg('i7', 'inbound', 8, 'A consultoría'),
+  { id: 'a1', direction: 'outbound', messageType: 'TYPE_ACTIVITY_OPPORTUNITY', source: 'app', dateAdded: at(8), body: 'Opportunity created' },
+];
+check('an activity row after the reply does not count as an answer', ig.latestPendingInbound(live, { now: NOW }),
+  { id: 'i7', at: NOW - 8 * 60000, text: 'A consultoría' });
+check('a real Instagram answer after it still does',
+  ig.latestPendingInbound([...live, msg('o10', 'outbound', 5, 'Hola', { source: 'app' })], { now: NOW }), null);
+check('the comment itself is not part of the burst',
+  ig.latestPendingInbound([msg('c2', 'inbound', 9, 'LinkedIn', { messageType: 'TYPE_INSTAGRAM_COMMENT' }), msg('i8', 'inbound', 8, 'Hola')], { now: NOW }).text, 'Hola');
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
