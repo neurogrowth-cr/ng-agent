@@ -18399,7 +18399,7 @@ async function runReelsWeekly({ now = new Date() } = {}) {
 cron.schedule('0 8 * * 1', wrapCronJob('runReelsWeekly', async () => { await runReelsWeekly(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: reels weekly (0 8 * * 1 CR)');
 
-// ─── REELS BRIEFS (Ron's DM: daily 07:40, monthly day 1 08:00 CR) ───────────
+// ─── REELS BRIEFS (#ng-content: daily 07:40, monthly day 1 08:00 CR) ────────
 // Daily: what goes out today on @linkedin.papi, every reel of the week and the
 // month with reach/likes/comments/saves, and any scheduled post that never
 // published. Monthly: last month ranked by reach against the month before, plus
@@ -18411,6 +18411,9 @@ console.log('Registered static cron: reels weekly (0 8 * * 1 CR)');
 // Recipes: ~/automations/ops/recipes/ig-reels-daily-brief.md, ig-reels-monthly-report.md.
 const reelsBriefs = require('./lib/reelsBriefs');
 const reelsBriefsDisabled = () => String(process.env.REELS_BRIEFS_DISABLED || '') === 'true';
+// Ron, 2026-10-08: briefs go to the content channel (REELS_CHANNEL) so the team
+// sees them; without it they fall back to Ron's DM. Failures always DM Ron.
+const reelsBriefsTarget = () => REELS_CHANNEL || RON_SLACK_ID;
 const IG_REEL_FIELDS = 'id,timestamp,media_product_type,caption,permalink,like_count,comments_count';
 
 // Every Instagram post in GHL (any status) between two instants. The parent of a
@@ -18491,7 +18494,7 @@ async function runReelsDailyBrief({ now = new Date() } = {}) {
   const text = reelsBriefs.formatDaily({ now, schedule, reels });
   const verdict = reelsBriefs.validateDaily(text);
   if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text, unfurl_links: false, unfurl_media: false });
+  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsDailyBrief', status: errors.length ? 'error' : 'ok',
     error_message: errors.length ? errors.join(' | ') : null,
     metadata: { reels: reels ? reels.length : null, scheduled: schedule ? schedule.length : null } });
@@ -18537,7 +18540,7 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
     const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
     if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
   }
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: report + note, unfurl_links: false, unfurl_media: false });
+  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: report + note, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
     error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
 }
