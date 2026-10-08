@@ -112,5 +112,22 @@ for (const m of ['GHL_TO_SLACK', 'SLACK_TO_GHL_USER', 'EMAIL_TO_GHL_USER_ID', 'g
 const setterDm = SRC.slice(SRC.indexOf('// ── DM each setter'), SRC.indexOf('];', SRC.indexOf('// ── DM each setter')));
 check('7j standup setter DM list skips him', /U0B16P6DQ2F/.test(setterDm), false);
 
+// ── 8. Jonathan Madriz, closer, out of every ACTION map ────────────────────
+// Ron, 2026-10-07: section 2 kept him out of CLOSER_SLACK, but he still sat in
+// the setter-side ACTION maps (lead routing, claim flow, claim email fallback),
+// so a lead assigned to him in GHL would still DM his Slack account. Off them now;
+// his open deals reach Jose through DEPARTED_MEMBERS coverage, not these maps.
+check('8a second gmail resolves to him too', departedMember('jonathan.neurogrowth@gmail.com')?.name, 'Jonathan Madriz');
+check('8b and still reroutes to an active closer', departedMember('jonathan.neurogrowth@gmail.com')?.coverage, 'jose.carranza@neurogrowth.io');
+for (const m of ['GHL_TO_SLACK', 'SLACK_TO_GHL_USER', 'EMAIL_TO_GHL_USER_ID', 'ghlUserNames', 'HOT_REPLY_SETTERS', 'CLOSER_SLACK']) {
+  const body = sliceConst(m);
+  check(`8c ${m} exists`, Boolean(body), true);
+  check(`8d ${m} has no Jonathan GHL id, Slack id, email or name key`,
+    /gqymykpddltdxvbkfl2c|U0APYAE0999|jonn?athan/i.test((body || '').replace(/\/\/.*$/gm, '')), false);
+}
+check('8e standup setter DM list skips him', /U0APYAE0999/.test(setterDm), false);
+check('8f name maps still name him for history',
+  (SRC.match(/'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz', \/\/ historical: departed 2026-07-19/g) || []).length, 3);
+
 console.log(failures ? `\n${failures} failure(s).` : '\nAll departed-member checks passed.');
 process.exit(failures ? 1 : 0);

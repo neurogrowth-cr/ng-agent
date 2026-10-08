@@ -3456,7 +3456,7 @@ const SALES_TEAM_MAP = {
   'debbanny.neurogrowth@gmail.com': 'Debbanny Romero', // historical — no longer active
 
   // ── FALLBACK — raw GHL user IDs (unmapped rows surface these) ───────────
-  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz', // historical: departed 2026-07-19
   'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
   'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
@@ -4561,7 +4561,7 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
       'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
       '5orsahkh2joujb5fczrp': 'Debbanny Romero', '5OrSaHkh2joUjB5FCZrP': 'Debbanny Romero',
-      'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+      'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz', // historical: departed 2026-07-19
       'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
     };
     // Fetch the last few messages per conversation in parallel so the model has
@@ -9075,7 +9075,7 @@ const DEPARTED_MEMBERS = {
   'jonathan.madriz.neurogrowth@gmail.com': {
     name: 'Jonathan Madriz',
     since: '2026-07-19',                       // last call taken
-    aliases: ['gqymykpddltdxvbkfl2c', 'U0APYAE0999'],
+    aliases: ['gqymykpddltdxvbkfl2c', 'U0APYAE0999', 'jonathan.neurogrowth@gmail.com'], // second gmail: GHL user.email on claim webhooks
     coverage: 'jose.carranza@neurogrowth.io',  // inherits open-deal follow-up (Ron, 2026-08-24); official email since 2026-10-05
   },
   'william.neurogrowth@gmail.com': {
@@ -14185,39 +14185,39 @@ const GHL_USER_NAMES = {
   'n8mvtuhbbby7qppqnmr7': 'William B',       'N8mvtuHbbbY7QppqNMr7': 'William B', // historical: left 2026-10-07
   'wdjte1temxfr0lpi5rgv': 'Sebastian S',     'Wdjte1temxfR0lpi5RGV': 'Sebastian S',
   '5orsahkh2joujb5fczrp': 'Debbanny',        '5OrSaHkh2joUjB5FCZrP': 'Debbanny', // historical — rolled off 2026-05-03
-  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz',
+  'gqymykpddltdxvbkfl2c': 'Jonathan Madriz', 'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz', // historical: departed 2026-07-19
   'izlta0jy5orkymvyitjv': 'Jose Carranza',   'izLTA0jy5OrKyMvyItjV': 'Jose Carranza',
   'zogw530idnpofqqnfssc': 'Ron Duarte',      'zoGW530iDnPOFqQNfssc': 'Ron Duarte',
 };
 
-// ACTION map — routes DMs and nudges. Departed setters MUST NOT appear here.
+// ACTION map: routes DMs and nudges. Departed staff MUST NOT appear here.
+// Jonathan Madriz (closer) removed 2026-10-07, departed 2026-07-19: his open deals
+// reroute to Jose through DEPARTED_MEMBERS coverage, never through this map.
 const GHL_TO_SLACK = {
   'oscar': 'U0B1S1UMH9P', 'oscar m': 'U0B1S1UMH9P', 'oscar neurogrowth': 'U0B1S1UMH9P',
   'sebastian': 'U0BFA4SRVQC', 'sebastian s': 'U0BFA4SRVQC', 'sebastian serrano': 'U0BFA4SRVQC', 'sebastian neurogrowth': 'U0BFA4SRVQC',
-  'jonnathan': 'U0APYAE0999', 'jonathan': 'U0APYAE0999', 'jonathan madriz': 'U0APYAE0999',
   'jose': 'U0AMTEKDCPN', 'jose carranza': 'U0AMTEKDCPN',
   'zcmdiz2eerapd80w2zop': 'U0B1S1UMH9P',
-  'gqymykpddltdxvbkfl2c': 'U0APYAE0999', 'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN',
+  'izlta0jy5orkymvyitjv': 'U0AMTEKDCPN',
   'wdjte1temxfr0lpi5rgv': 'U0BFA4SRVQC',
 };
 
 // ACTION map — lead-claim flow: Slack user → GHL user ID (reaction_added handler).
-// Active staff only: Debbanny rolled off 2026-05-03, Joseph 2026-07, William 2026-10-07.
+// Active staff only: Debbanny rolled off 2026-05-03, Joseph 2026-07, William 2026-10-07,
+// Jonathan departed 2026-07-19 (removed here 2026-10-07).
 const SLACK_TO_GHL_USER = {
   'U0B1S1UMH9P': 'ZcmdIz2EEraPd80W2zop', // Oscar M
   'U0BFA4SRVQC': 'Wdjte1temxfR0lpi5RGV', // Sebastian Serrano
-  'U0APYAE0999': 'gqYMYkpDDlTdxvBkfl2C', // Jonathan Madriz
   'U0AMTEKDCPN': 'izLTA0jy5OrKyMvyItjV', // Jose Carranza
   'U05HXGX18H3': 'zoGW530iDnPOFqQNfssc', // Ron Duarte (testing)
 };
 
 // ACTION map — fallback: GHL ships payload.user.email reliably even when
 // customData.assignedTo is empty/broken. Used by /webhook/ghl-claim when the GHL
-// token doesn't resolve. Active staff only.
+// token doesn't resolve. Active staff only (Jonathan, departed 2026-07-19, removed 2026-10-07).
 const EMAIL_TO_GHL_USER_ID = {
   'oscar.neurogrowth@gmail.com':  'ZcmdIz2EEraPd80W2zop',
   'sebastian.neurogrowth@gmail.com': 'Wdjte1temxfR0lpi5RGV',
-  'jonathan.neurogrowth@gmail.com': 'gqYMYkpDDlTdxvBkfl2C',
   // Both of Jose's emails. The old entry had a typo in the id (lowercase l for I),
   // so this fallback never resolved him. Verified id via GET /users 2026-10-05.
   'jose.carranza@neurogrowth.io': 'izLTA0jy5OrKyMvyItjV',
