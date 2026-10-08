@@ -8788,6 +8788,13 @@ slack.message(async ({ message, say }) => {
   // asked for.
   const dmThreadTs = (message.thread_ts && message.thread_ts !== message.ts) ? message.thread_ts : null;
   const dmSay = (text) => (dmThreadTs ? say({ text, thread_ts: dmThreadTs }) : say(text));
+  // A reply in the thread of an Instagram guide draft is Ron's edited text for
+  // the lead, not a message to Max: never answer it (the chat model once
+  // invented a contact name replying to one). ✅ sends it; one hint, no LLM.
+  if (dmThreadTs && await igGuideDraftParent(message.channel, message.ts)) {
+    try { await slack.client.reactions.add({ channel: message.channel, timestamp: message.ts, name: 'pencil2' }); } catch (_) { /* already reacted */ }
+    return;
+  }
   const isApproval = await checkApproval(message, say, message.user);
   if (isApproval) return;
   const userId = message.user;
@@ -19656,6 +19663,20 @@ async function igGuideHandBack({ conversationId, contactId, contactName, reason,
   logActivity({ event_type: 'report', event_source: 'cron', action: 'igGuideHandBack', status: 'ok', output: { contact_id: contactId, reason: reason.kind } });
 }
 
+// The ig_guide_draft message a thread reply hangs under, or null. Reads the
+// reply, then its parent with metadata. Any failure means "not a draft thread".
+async function igGuideDraftParent(channel, replyTs) {
+  try {
+    const r = await slack.client.conversations.replies({ channel, ts: replyTs, limit: 1, inclusive: true });
+    const reply = (r.messages || []).find((m) => m.ts === replyTs) || (r.messages || [])[0];
+    const threadTs = reply && reply.thread_ts;
+    if (!threadTs || threadTs === replyTs) return null;
+    const p = await slack.client.conversations.replies({ channel, ts: threadTs, limit: 1, inclusive: true, include_all_metadata: true });
+    const parent = p.messages && p.messages[0];
+    return parent && parent.ts === threadTs && parent.metadata?.event_type === 'ig_guide_draft' && parent.metadata.event_payload ? parent : null;
+  } catch (_) { return null; }
+}
+
 async function igGuideThreadReply(channel, ts, text) {
   try { await slack.client.chat.postMessage({ channel, thread_ts: ts, text }); } catch (e) { console.warn('[ig-guide] thread reply failed:', e.message); }
 }
@@ -20894,6 +20915,13 @@ slack.event('reaction_added', async ({ event }) => {
         const msg = hist.messages && hist.messages[0];
         if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === 'ig_guide_draft' && msg.metadata.event_payload) {
           await handleIgGuideReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+        // ✅ on Ron's own edited text in the draft's thread is the natural tap:
+        // treat it as ✅ on the draft (the handler sends Ron's latest thread reply).
+        const parent = await igGuideDraftParent(event.item.channel, event.item.ts);
+        if (parent) {
+          await handleIgGuideReaction({ ...event, item: { ...event.item, ts: parent.ts } }, baseEmoji, parent, parent.metadata.event_payload);
           return;
         }
       } catch (igErr) {

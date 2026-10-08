@@ -75,7 +75,7 @@ const L = dm.split('\n');
 check('dm header', L[0], '📸 *Instagram · Ana P. respondió a la guía* · interesado · ventana: 5 h 0 min');
 check('dm quotes the lead', L[1], '> Vendo consultoría a pymes.');
 check('dm lists what is known', L[2], '_Vende: consultoría · A quién: pymes_');
-check('dm ends with the controls', L[L.length - 1], '✅ enviar · ❌ descartar · responda en este hilo para editar (se envía su texto)');
+check('dm ends with the controls', L[L.length - 1], '✅ enviar · ❌ descartar · para editar, responda en este hilo y marque ✅ aquí o en su respuesta');
 
 // ── what gets sent ──
 const RON = 'U1';
