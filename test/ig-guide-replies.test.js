@@ -68,7 +68,10 @@ check('price fails', v('Cuesta $5,000 al mes.').problems.includes('mentions a pr
 check('the disqualification floor is allowed', v('Funciona con servicios de 1,500 dólares en adelante.').ok, true);
 check('banned word fails', v('Le mando más leads.').problems.includes('banned word "leads"'), true);
 check('word containing a banned word is fine', v('y cómo le llega la clientela hoy?').ok, true);
-check('booking link is allowed', v(`agende aquí: ${BOOK}`).ok, true);
+check('booking link is allowed once the lead said yes', ig.validateDraft(`listo, aquí puede agendar: ${BOOK}`, { bookingUrl: BOOK, intent: 'interested', stage: 'booking' }).ok, true);
+check('booking link before the yes fails', ig.validateDraft(`agende aquí: ${BOOK}`, { bookingUrl: BOOK, intent: 'interested', stage: 'qualified' }).problems.includes('calendar link before the lead confirmed the call'), true);
+check('prompt asks for the yes before the calendar', [sys.includes('PASO 1'), sys.includes('Nunca mande el enlace antes de ese sí')], [true, true]);
+check('booking is a known stage', ig.parseDraft('{"intent":"interested","stage":"booking","draft":"x"}').stage, 'booking');
 check('any other link fails', v('Mire https://example.com').problems[0].startsWith('unexpected link'), true);
 check('empty draft fails unless not interested', [v('').ok, v('', 'not_interested').ok], [false, true]);
 check('emoji fails', v('va 🙌 qué vende?').problems.includes('emoji'), true);
