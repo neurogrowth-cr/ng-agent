@@ -48,12 +48,16 @@ function build({ leads = [], claims = [], contacts = {}, env = {} } = {}) {
     return c === undefined ? null : c;
   };
   const factory = new Function(
-    'process', 'supabase', 'ghlGetContact', 'console',
+    'process', 'supabase', 'ghlGetContact', 'console', 'SELF_SERVE_SOURCE_RE',
     `${block}; return getUnclaimedLeads;`,
   );
+  // The real self-serve regex from index.js (defined outside the extracted block).
+  const [, reSrc, reFlags] = SRC.match(/const SELF_SERVE_SOURCE_RE\s*=\s*\/(.+)\/(\w*);/);
+  const selfServeRe = new RegExp(reSrc, reFlags);
   const fn = factory(
     { env }, supabaseStub, ghlGetContactStub,
     { log: () => {}, warn: () => {}, error: () => {} },
+    selfServeRe,
   );
   return { fn, lookups };
 }
@@ -205,6 +209,21 @@ const names = (rows) => rows.map(r => r.fullName);
     });
     check('13a STALE_LEAD_TEST_NAME_WORDS overrides the default word set',
       names(await fn(Date.now() - 30 * DAY)), ['QA Check']);
+  }
+
+  // 14. The live 2026-10-08 case: a self-serve VSL booking (Steven Thiel) has no
+  //     setter step and can never be claimed, so it must never nag @setters.
+  {
+    const { fn, lookups } = build({
+      leads: [
+        lead('1791466439.228639', 'TLa7dGsF651xWy0eJQ5T', 'Steven Thiel', { source: 'LinkedIn Flywheel - Self Serving' }),
+        lead('1.7', 'c2', 'Fallback Label', { source: 'Self-serve (VSL)' }),
+        lead('1.8', 'c3', 'Setter Lead', { source: 'Facebook' }),
+      ],
+    });
+    const out = await fn(Date.now() - 30 * DAY);
+    check('14a self-serve leads are skipped, setter lead survives', names(out), ['Setter Lead']);
+    check('14b skipped self-serve leads cost no GHL lookups', lookups, ['c3']);
   }
 
   console.log(failures ? `\n${failures} FAILURE(S)` : '\nAll stale-lead sweep checks passed.');
