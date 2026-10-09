@@ -18397,10 +18397,11 @@ async function runReelsWeekly({ now = new Date() } = {}) {
   }
   const divergence = rows.length && written !== rows.length ? ` ⚠️ reel_stats guardó ${written}/${rows.length} filas.` : '';
 
+  const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now));
   if (reelsWeeklyLive()) {
-    await postToSlack(REELS_CHANNEL, text + divergence);
+    await postToSlack(REELS_CHANNEL, text + divergence + views);
   } else {
-    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${REELS_CHANNEL || 'REELS_CHANNEL unset'}]\n${text}${divergence}` });
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${REELS_CHANNEL || 'REELS_CHANNEL unset'}]\n${text}${divergence}${views}` });
   }
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsWeekly', status: 'ok',
     output: { week: window.isoWeek, reels: posts.length, impressions: account && account.impressions, reach: account && account.reach,
@@ -18505,7 +18506,8 @@ async function runReelsDailyBrief({ now = new Date() } = {}) {
   const text = reelsBriefs.formatDaily({ now, schedule, reels });
   const verdict = reelsBriefs.validateDaily(text);
   if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
-  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text, unfurl_links: false, unfurl_media: false });
+  const viewsLine = await organicViewsDailyLine(now);
+  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: text + viewsLine, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsDailyBrief', status: errors.length ? 'error' : 'ok',
     error_message: errors.length ? errors.join(' | ') : null,
     metadata: { reels: reels ? reels.length : null, scheduled: schedule ? schedule.length : null } });
@@ -18551,7 +18553,9 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
     const { error } = await supabase.from('reel_stats').upsert(rows, { onConflict: 'iso_week,post_id' });
     if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
   }
-  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: report + note, unfurl_links: false, unfurl_media: false });
+  const monthViews = organicViews.monthPeriods(now);
+  const views = await organicViewsBlock(monthViews.cur.label, monthViews);
+  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: report + note + views, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
     error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
 }
@@ -18559,6 +18563,225 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
 cron.schedule('40 7 * * *', wrapCronJob('runReelsDailyBrief', async () => { await runReelsDailyBrief(); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('0 8 1 * *', wrapCronJob('runReelsMonthlyReport', async () => { await runReelsMonthlyReport(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: reels daily brief (40 7 * * *), reels monthly report (0 8 1 * *)');
+
+// ─── ORGANIC VIEWS (Instagram + YouTube + TikTok) ───────────────────────────
+// Ron, 2026-10-09: one place to count organic views per platform and overall,
+// by day, week and month. Platforms only give lifetime views per video, so
+// runOrganicViewsSnapshot stores one row per video per CR night in video_views
+// (migration 021) and the reels posts report the growth (lib/organicViews.js,
+// tested in test/organic-views.test.js). Sources: Meta media insights `views`
+// (META_IG_INSIGHTS_TOKEN), YouTube Data API v3 (YOUTUBE_API_KEY, every upload
+// of YOUTUBE_CHANNEL_ID), and the public page playCount of every TikTok post
+// GHL published (no official API without an app review). A platform that fails
+// is skipped for the night, logged and DMed to Ron; the others still save, and
+// the posts say "sin datos" for it instead of a zero. The views block rides on
+// the weekly (Mon), monthly (day 1) and daily reels posts; it never blocks them.
+// Kill switch: ORGANIC_VIEWS_DISABLED=true.
+const organicViews = require('./lib/organicViews');
+const organicViewsDisabled = () => String(process.env.ORGANIC_VIEWS_DISABLED || '') === 'true';
+const YOUTUBE_CHANNEL_ID = process.env.YOUTUBE_CHANNEL_ID || 'UCNu1VRjsAfUp2uyFwlhaTQQ'; // LinkedIn Papi (@linkedin.papiii)
+const TIKTOK_GHL_ACCOUNT_ID = process.env.TIKTOK_GHL_ACCOUNT_ID || '6ac847e26e36a64dbcf785b2_iUkpsgZqYJ1ftVxGsoXE_000bdsOmUfF9FxnYAnXtEj7bEkLu6a5A1Vb_business';
+const TIKTOK_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36';
+
+// Every Instagram media with lifetime views (all of them, not only reels: a post's views are organic views too).
+async function fetchIgViews() {
+  const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+  if (!token) throw new Error('META_IG_INSIGHTS_TOKEN is not set');
+  let url = `https://graph.facebook.com/v21.0/${REELS_IG_USER_ID}/media?fields=${encodeURIComponent('id,timestamp,caption,insights.metric(views)')}&limit=100&access_token=${token}`;
+  const media = [];
+  for (let i = 0; i < 20 && url; i++) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Meta ${res.status}: ${(json.error && json.error.message) || 'no body'}`);
+    media.push(...(json.data || []));
+    url = json.paging && json.paging.next;
+  }
+  return organicViews.normalizeIg(media);
+}
+
+// Every upload on the channel: uploads playlist → videos.list statistics (~3 quota units a night).
+async function fetchYtViews() {
+  const key = String(process.env.YOUTUBE_API_KEY || '').trim();
+  if (!key) throw new Error('YOUTUBE_API_KEY is not set');
+  const api = async (path) => {
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/${path}&key=${key}`, { signal: AbortSignal.timeout(20000) });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`YouTube ${res.status}: ${(json.error && json.error.message) || 'no body'}`);
+    return json;
+  };
+  const ch = await api(`channels?part=contentDetails&id=${YOUTUBE_CHANNEL_ID}`);
+  const uploads = ch.items && ch.items[0] && ch.items[0].contentDetails.relatedPlaylists.uploads;
+  if (!uploads) throw new Error(`YouTube channel ${YOUTUBE_CHANNEL_ID} not found`);
+  const ids = [];
+  let pageToken = '';
+  for (let i = 0; i < 20; i++) {
+    const pl = await api(`playlistItems?part=contentDetails&maxResults=50&playlistId=${uploads}${pageToken ? `&pageToken=${pageToken}` : ''}`);
+    ids.push(...(pl.items || []).map((it) => it.contentDetails.videoId));
+    if (!pl.nextPageToken) break;
+    pageToken = pl.nextPageToken;
+  }
+  const items = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const v = await api(`videos?part=snippet,statistics&id=${ids.slice(i, i + 50).join(',')}`);
+    items.push(...(v.items || []));
+  }
+  return organicViews.normalizeYt(items);
+}
+
+// TikTok videos GHL published, each page read for its playCount. A page without
+// a count (blocked, removed) is skipped; if every page fails the platform fails.
+async function fetchTtViews() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const body = { type: 'published', accounts: TIKTOK_GHL_ACCOUNT_ID, skip: '0', limit: '100', includeUsers: 'false',
+    fromDate: '2026-10-01T00:00:00.000Z', toDate: new Date(Date.now() + 86400000).toISOString() };
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/${locationId}/posts/list`,
+    { method: 'POST', headers, body: JSON.stringify(body) }, { label: 'social posts/list (tiktok views)' });
+  if (!res.ok) throw new Error(`GHL ${res.status} on social posts/list`);
+  const json = await res.json();
+  const posts = organicViews.tiktokPostsFromGhl((json.results && json.results.posts) || []);
+  const out = [];
+  for (const p of posts) {
+    try {
+      const page = await fetch(p.url, { headers: { 'User-Agent': TIKTOK_UA, 'Accept-Language': 'es' }, signal: AbortSignal.timeout(20000) });
+      const views = organicViews.parseTikTokPlayCount(await page.text());
+      if (views != null) out.push({ platform: 'tiktok', videoId: p.videoId, views, publishedAt: p.publishedAt, title: p.title });
+    } catch (err) {
+      console.warn(`[organic-views] TikTok ${p.videoId} skipped: ${err.message}`);
+    }
+  }
+  if (posts.length && !out.length) throw new Error(`TikTok: 0 of ${posts.length} pages had a playCount (blocked?)`);
+  return out;
+}
+
+async function runOrganicViewsSnapshot({ now = new Date() } = {}) {
+  if (organicViewsDisabled()) return;
+  const date = organicViews.crDate(now);
+  const sources = { instagram: fetchIgViews, youtube: fetchYtViews, tiktok: fetchTtViews };
+  const errors = [];
+  const counts = {};
+  for (const [platform, fetcher] of Object.entries(sources)) {
+    try {
+      const videos = await fetcher();
+      const rows = organicViews.snapshotRows(date, videos, now);
+      if (rows.length) {
+        const { error } = await supabase.from('video_views').upsert(rows, { onConflict: 'snapshot_date,platform,video_id' });
+        if (error) throw new Error(`video_views upsert: ${error.message}`);
+      }
+      counts[platform] = rows.length;
+    } catch (err) {
+      errors.push(`${platform}: ${err.message}`);
+    }
+  }
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runOrganicViewsSnapshot', status: errors.length ? 'error' : 'ok',
+    error_message: errors.length ? errors.join(' | ') : null, metadata: { date, videos: counts } });
+  if (errors.length) {
+    try {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID,
+        text: `⚠️ Foto nocturna de vistas (${date}) incompleta. Sin datos de: ${errors.join(' · ')}. Las demás plataformas sí se guardaron.` });
+    } catch (err) { console.error('[organic-views] failure DM failed:', err.message); }
+  }
+}
+
+// video_views rows needed for a period: a week of slack before `from` finds each video's baseline.
+async function loadVideoViews(from, to) {
+  const out = [];
+  for (let page = 0; page < 50; page++) {
+    const { data, error } = await supabase.from('video_views').select('snapshot_date, platform, video_id, views, published_at')
+      .gte('snapshot_date', organicViews.addDays(from, -7)).lte('snapshot_date', to)
+      .order('id', { ascending: true }).range(page * 1000, page * 1000 + 999);
+    if (error) throw new Error(`video_views read: ${error.message}`);
+    out.push(...data);
+    if (data.length < 1000) break;
+  }
+  return out;
+}
+
+// Embudo for a period: IG comments that say "LinkedIn" → guide conversations
+// (leads who wrote back, ig_guide_drafts) → calls booked by any guide lead.
+// Each step is null (sin datos) on its own failure.
+async function organicFunnel(period) {
+  const startMs = organicViews.crStart(period.from).getTime();
+  const endMs = organicViews.crStart(organicViews.addDays(period.to, 1)).getTime();
+  const startIso = new Date(startMs).toISOString(); const endIso = new Date(endMs).toISOString();
+  const funnel = { comments: null, conversations: null, booked: null };
+  try {
+    const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+    if (!token) throw new Error('no token');
+    let url = `https://graph.facebook.com/v21.0/${REELS_IG_USER_ID}/media?fields=${encodeURIComponent('id,comments.limit(200){text,timestamp}')}&limit=50&access_token=${token}`;
+    const comments = [];
+    for (let i = 0; i < 10 && url; i++) {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`Meta ${res.status}: ${(json.error && json.error.message) || 'no body'}`);
+      for (const m of json.data || []) comments.push(...((m.comments && m.comments.data) || []));
+      url = json.paging && json.paging.next;
+    }
+    funnel.comments = organicViews.countLinkedInComments(comments, startMs, endMs);
+  } catch (err) { console.warn(`[organic-views] funnel comments: ${err.message}`); }
+  let guideContacts = null;
+  try {
+    const { data: drafts, error } = await supabase.from('ig_guide_drafts').select('contact_id, created_at');
+    if (error) throw new Error(error.message);
+    const { data: claims, error: cErr } = await supabase.from('setter_claims').select('ghl_contact_id').eq('claim_source', 'max_ig_guide');
+    if (cErr) throw new Error(cErr.message);
+    funnel.conversations = new Set(drafts.filter((d) => d.created_at >= startIso && d.created_at < endIso).map((d) => d.contact_id)).size;
+    guideContacts = [...new Set([...drafts.map((d) => d.contact_id), ...claims.map((c) => c.ghl_contact_id)].filter(Boolean))];
+  } catch (err) { console.warn(`[organic-views] funnel conversations: ${err.message}`); }
+  if (guideContacts) {
+    try {
+      let booked = 0;
+      if (guideContacts.length) {
+        const { data: prospects, error } = await portalSupabase.from('revops_prospects').select('id').in('ghl_contact_id', guideContacts);
+        if (error) throw new Error(error.message);
+        if (prospects.length) {
+          const { data: appts, error: aErr } = await portalSupabase.from('revops_appointments')
+            .select('id, iclosed_call_id, ghl_appointment_id, source, booked_at, prospect_id')
+            .in('prospect_id', prospects.map((p) => p.id)).gte('booked_at', startIso).lt('booked_at', endIso);
+          if (aErr) throw new Error(aErr.message);
+          booked = filterFlywheelAppts(appts, await getNonFlywheelCallIds()).length;
+        }
+      }
+      funnel.booked = booked;
+    } catch (err) { console.warn(`[organic-views] funnel booked: ${err.message}`); }
+  }
+  return funnel;
+}
+
+/** The views block for a period pair, or '' when it cannot be built (never blocks the post it rides on). */
+async function organicViewsBlock(title, { cur, prev }, { withFunnel = true } = {}) {
+  if (organicViewsDisabled()) return '';
+  try {
+    const rows = await loadVideoViews(prev.from, cur.to);
+    const block = organicViews.formatViewsBlock({
+      title, cur: organicViews.periodViews(rows, cur), prev: organicViews.periodViews(rows, prev),
+      funnel: withFunnel ? await organicFunnel(cur) : null,
+    });
+    const verdict = organicViews.validateBlock(block);
+    if (!verdict.ok) { console.warn(`[organic-views] block dropped: ${verdict.problems.join('; ')}`); return ''; }
+    return `\n\n${block}`;
+  } catch (err) {
+    console.warn(`[organic-views] block skipped: ${err.message}`);
+    logActivity({ event_type: 'alert', event_source: 'cron', action: 'organicViewsBlock', status: 'error', error_message: err.message });
+    return '';
+  }
+}
+
+async function organicViewsDailyLine(now) {
+  if (organicViewsDisabled()) return '';
+  try {
+    const day = organicViews.dayPeriod(now);
+    const line = organicViews.formatDailyLine(organicViews.periodViews(await loadVideoViews(day.from, day.to), day));
+    return line ? `\n${line}` : '';
+  } catch (err) {
+    console.warn(`[organic-views] daily line skipped: ${err.message}`);
+    return '';
+  }
+}
+
+// 23:50 CR: late enough to close the day, early enough to stay on the same CR date.
+cron.schedule('50 23 * * *', wrapCronJob('runOrganicViewsSnapshot', async () => { await runOrganicViewsSnapshot(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: organic views snapshot (50 23 * * * CR)');
 
 // ─── BOOKING → ALERT DIVERGENCE ─────────────────────────────────────────────
 // The scenario watchdog above only sees Make. Make can be perfectly green while
