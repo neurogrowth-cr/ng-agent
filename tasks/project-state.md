@@ -649,3 +649,9 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 ## 2026-10-08: self-serve leads no longer nag @setters (#308)
 - Self-serve VSL bookings got a `lead_posts` row, but the claim handler only acts on Max's `ghl_lead` cards, so a claim could never land and the 2h "unclaimed" nag re-fired hourly for 24h (Steven Thiel, 2026-10-08, even after a setter reacted ✅).
 - `getUnclaimedLeads` now skips rows whose `source` matches `SELF_SERVE_SOURCE_RE` (hourly nag and Ron's daily sweep); skips are logged. Self-serve intake always writes a self-serve source label (`Self-serve (VSL)` when the payload had none). Test 14 in `test/stale-lead-sweep.test.js`.
+
+## 2026-10-09: organic views per platform and total (#310)
+- `runOrganicViewsSnapshot` (23:50 CR nightly) stores each video's LIFETIME views in `video_views` (migration 021, applied 2026-10-09): every Instagram media (Meta `views`), every YouTube upload on channel `UCNu1VRjsAfUp2uyFwlhaTQQ` (Data API v3, needs `YOUTUBE_API_KEY`, not set yet), every TikTok video GHL published (public page `playCount`, no official API).
+- Views gained in a period = growth of those totals (`lib/organicViews.js`). Block rides on the reels weekly (Mon), monthly (day 1) and one line in the daily brief: per platform, total, lifetime, funnel views → "LinkedIn" comments → guide conversations → booked calls. Dead platform = "sin datos" + DM to Ron, never 0. Kill switch `ORGANIC_VIEWS_DISABLED=true`.
+- Week of 2026-10-05 reads "Parcial" (tracking began 2026-10-09). Unproven until the first night: TikTok from Railway's IP, and whether the Meta system-user token can read comments.
+- YouTube Shorts mirror of every reel via GHL since 2026-10-09 (`youtubePostDetails`, recipe in the ng-reels-factory skill step 6b).
