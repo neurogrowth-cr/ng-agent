@@ -12853,7 +12853,16 @@ async function getUnclaimedLeads(sinceMs) {
     // original 11-day Adrian RM blind spot happened.
     console.log(`Stale-lead test filter: ${testLeads.length} test lead(s) suppressed: ${testLeads.map(l => l.fullName).join(', ')}.`);
   }
-  const realLeads = unclaimed.filter(l => !isTestLeadName(l.fullName));
+  // Self-serve leads booked themselves off the VSL: there is no setter step and
+  // the claim flow ignores their FYI card, so a claim can never land. Without
+  // this they nagged @setters every hour until the 24h window ran out (Steven
+  // Thiel, 2026-10-08, still nagging after a setter reacted ✅). The intake
+  // stamps every self-serve row with a matching source (see isSelfServe).
+  const selfServe = unclaimed.filter(l => SELF_SERVE_SOURCE_RE.test(l.source || ''));
+  if (selfServe.length) {
+    console.log(`Stale-lead self-serve filter: ${selfServe.length} self-serve lead(s) skipped (nothing to claim): ${selfServe.map(l => l.fullName).join(', ')}.`);
+  }
+  const realLeads = unclaimed.filter(l => !isTestLeadName(l.fullName) && !SELF_SERVE_SOURCE_RE.test(l.source || ''));
   // Oldest-first before the tag filter, so the lookup cap spends its budget on
   // the leads that have been sitting longest. Test leads are dropped BEFORE
   // the GHL lookups so they cannot eat into the 50-lookup cap.
@@ -14764,7 +14773,9 @@ async function handleGHLWebhook(req, res) {
                   slack_channel_id: LEAD_CHANNEL_ID,
                   phone_last10: phoneLast10,
                   email_lower: emailLower,
-                  source: source || null,
+                  // Always a self-serve label, even when the payload's source was
+                  // missing: the stale-lead nag skips rows by this source.
+                  source: SELF_SERVE_SOURCE_RE.test(source || '') ? source : 'Self-serve (VSL)',
                   channel: leadChannelKey,
                   full_name: fullName || null,
                   name_prefix3: namePrefix3,
