@@ -76,8 +76,15 @@ const block = ov.formatViewsBlock({ title: 'semana 5 oct a 11 oct', cur: p, prev
 check('block: header', block.split('\n')[0], '*👁️ Vistas orgánicas, semana 5 oct a 11 oct*');
 check('block: total with % vs previous', block.split('\n')[1], 'Total: 360 (▲ 20% vs anterior)');
 check('block: per platform, missing = sin datos', block.split('\n')[2], 'Instagram 360 · YouTube 0 · TikTok sin datos');
-check('block: funnel names the missing step', block.split('\n')[4], 'Embudo: 360 vistas → 4 comentarios "LinkedIn" → 1 conversación → sin datos de llamadas agendadas');
+check('block: funnel names the missing step', block.split('\n')[3], 'Embudo: 360 vistas → 4 comentarios "LinkedIn" → 1 conversación → sin datos de llamadas agendadas');
 check('block passes its validator', ov.validateBlock(block).ok, true);
+check('no lifetime line anymore', /por vida/.test(block), false);
+const mtdP = ov.monthToDatePeriod(wk.cur.to);
+check('month to date period', [mtdP.from, mtdP.to, mtdP.label], ['2026-10-01', '2026-10-11', 'octubre']);
+const mtd = { ...ov.periodViews(rows, mtdP), label: mtdP.label };
+const mBlock = ov.formatViewsBlock({ title: 's', cur: p, prev, funnel: null, monthToDate: mtd });
+check('block: acumulado mensual line', mBlock.split('\n')[3], 'Acumulado mensual (octubre): 360 (Instagram 360 · YouTube 0)');
+check('mtd block passes its validator', ov.validateBlock(mBlock).ok, true);
 const pBlock = ov.formatViewsBlock({ title: 'semana', cur: partial, prev: null, funnel: null });
 check('partial block says so', /Parcial: la medición empezó el 9 oct/.test(pBlock), true);
 check('partial previous period gives no % delta',

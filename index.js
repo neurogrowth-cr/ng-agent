@@ -18397,7 +18397,7 @@ async function runReelsWeekly({ now = new Date() } = {}) {
   }
   const divergence = rows.length && written !== rows.length ? ` ⚠️ reel_stats guardó ${written}/${rows.length} filas.` : '';
 
-  const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now));
+  const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now), { withMonthToDate: true });
   if (reelsWeeklyLive()) {
     await postToSlack(REELS_CHANNEL, text + divergence + views);
   } else {
@@ -18575,7 +18575,8 @@ console.log('Registered static crons: reels daily brief (40 7 * * *), reels mont
 // GHL published (no official API without an app review). A platform that fails
 // is skipped for the night, logged and DMed to Ron; the others still save, and
 // the posts say "sin datos" for it instead of a zero. The views block rides on
-// the weekly (Mon), monthly (day 1) and daily reels posts; it never blocks them.
+// the weekly (Mon, with "Acumulado mensual" = month to date), monthly (day 1)
+// and daily reels posts; it never blocks them.
 // Kill switch: ORGANIC_VIEWS_DISABLED=true.
 const organicViews = require('./lib/organicViews');
 const organicViewsDisabled = () => String(process.env.ORGANIC_VIEWS_DISABLED || '') === 'true';
@@ -18749,13 +18750,15 @@ async function organicFunnel(period) {
 }
 
 /** The views block for a period pair, or '' when it cannot be built (never blocks the post it rides on). */
-async function organicViewsBlock(title, { cur, prev }, { withFunnel = true } = {}) {
+async function organicViewsBlock(title, { cur, prev }, { withFunnel = true, withMonthToDate = false } = {}) {
   if (organicViewsDisabled()) return '';
   try {
-    const rows = await loadVideoViews(prev.from, cur.to);
+    const mtdPeriod = withMonthToDate ? organicViews.monthToDatePeriod(cur.to) : null;
+    const rows = await loadVideoViews(mtdPeriod && mtdPeriod.from < prev.from ? mtdPeriod.from : prev.from, cur.to);
     const block = organicViews.formatViewsBlock({
       title, cur: organicViews.periodViews(rows, cur), prev: organicViews.periodViews(rows, prev),
       funnel: withFunnel ? await organicFunnel(cur) : null,
+      monthToDate: mtdPeriod ? { ...organicViews.periodViews(rows, mtdPeriod), label: mtdPeriod.label } : null,
     });
     const verdict = organicViews.validateBlock(block);
     if (!verdict.ok) { console.warn(`[organic-views] block dropped: ${verdict.problems.join('; ')}`); return ''; }
