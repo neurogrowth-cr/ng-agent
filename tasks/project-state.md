@@ -645,3 +645,7 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - The daily brief (07:40 CR) and the monthly report (day 1, 08:00 CR) now post to `REELS_CHANNEL` (C0C7HFQ8THU, #ng-content-machine, private, Max is a member). Unset channel falls back to Ron's DM; failure notices still DM Ron.
 - Reels Weekly (Mon 08:00 CR) needs `REELS_WEEKLY_MODE=live` in Railway to post to the same channel; until then it is a dry run to Ron's DM.
 - Instagram guide drafts stay in Ron's DM (his ✅ is the send gate).
+
+## 2026-10-08: self-serve leads no longer nag @setters (#308)
+- Self-serve VSL bookings got a `lead_posts` row, but the claim handler only acts on Max's `ghl_lead` cards, so a claim could never land and the 2h "unclaimed" nag re-fired hourly for 24h (Steven Thiel, 2026-10-08, even after a setter reacted ✅).
+- `getUnclaimedLeads` now skips rows whose `source` matches `SELF_SERVE_SOURCE_RE` (hourly nag and Ron's daily sweep); skips are logged. Self-serve intake always writes a self-serve source label (`Self-serve (VSL)` when the payload had none). Test 14 in `test/stale-lead-sweep.test.js`.
