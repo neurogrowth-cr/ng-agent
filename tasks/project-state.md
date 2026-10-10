@@ -655,3 +655,8 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - Views gained in a period = growth of those totals (`lib/organicViews.js`). Block rides on the reels weekly (Mon), monthly (day 1) and one line in the daily brief: per platform, total, funnel views → "LinkedIn" comments → guide conversations → booked calls. Weekly also shows "Acumulado mensual" (month to date, Ron's call in #312, replacing lifetime totals). Dead platform = "sin datos" + DM to Ron, never 0. Kill switch `ORGANIC_VIEWS_DISABLED=true`.
 - Week of 2026-10-05 reads "Parcial" (tracking began 2026-10-09). Unproven until the first night: TikTok from Railway's IP, and whether the Meta system-user token can read comments.
 - YouTube Shorts mirror of every reel via GHL since 2026-10-09 (`youtubePostDetails`, recipe in the ng-reels-factory skill step 6b).
+
+## 2026-10-10: reels reports scan as tables (#314)
+- Ron asked for easier-to-scan reports. Daily brief (07:40), Monday weekly and day-1 monthly now use bold section headers carrying the key number plus aligned code-block tables (`lib/slackTable.js`). Reels sort by reach; links sit on a line under each table (links do not render inside code blocks).
+- Daily header is now `*📅 Reels · <día> <fecha>*`; the views section moved between *Hoy se publica* and *📊 Semana*. Monthly opens with a *Resumen* table vs the previous month. Validators also fail on an unclosed table.
+- First runs in the new layout: daily 2026-10-11 07:40, weekly 2026-10-12 08:00, monthly 2026-11-01 08:00.
