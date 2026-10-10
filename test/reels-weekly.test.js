@@ -73,13 +73,20 @@ check('delta missing side', rw.fmtDelta(10, null), '');
 
 const text = rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: { impressions: 40000, reach: 30000, followers: 70 }, metaWired: false });
 const L = text.split('\n');
-check('header line', L[0], '📊 Reels · semana 2026-W41 (5 a 11 oct)');
-check('totals line with deltas', L[1], 'Reels publicados: 2 · Impresiones: 50,325 (▲ +10,325 WoW) · Alcance: 31,132 (▲ +1,132 WoW) · Seguidores nuevos: 64 (▼ −6 WoW)');
-check('ranking header says reach once any reel has it', L[2], 'Ranking por alcance:');
-check('first ranked reel line', L[3], '1. En Facebook está el que regatea. <https://www.instagram.com/reel/AAA/|ver> · 12,400 alcance · 15,000 reproducciones · 72 likes · 4 comentarios · 9 compartidos · 31 guardados');
-check('winner line quotes the hook', L[5], 'Lo que más funcionó: "En Facebook está el que regatea."');
-check('caveat when meta is not wired', L[6].startsWith('Alcance y reproducciones por reel: pendiente'), true);
-check('no caveat when meta is wired', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).split('\n').length, 6);
+check('header line', L[0], '*📊 Reels · semana 2026-W41 (5 a 11 oct)*');
+check('count line', L[1], 'Reels publicados: 2');
+check('account table with deltas', L.slice(2, 7), ['```', '                   Semana  vs anterior', 'Impresiones        50,325      +10,325', 'Alcance            31,132       +1,132', 'Seguidores nuevos      64           -6']);
+check('ranking header says reach once any reel has it', L[9], '*Ranking por alcance*');
+check('ranking table, best reach first, unknown = s/d', L.slice(11, 14), [
+  '#  Reel                            Alcance  Vistas  Likes  Com  Comp  Guard',
+  '1  En Facebook está el que regat…   12,400  15,000     72    4     9     31',
+  '2  Dos garantías por contrato, n…      s/d     s/d     40    1     2    s/d',
+]);
+check('links go under the table', L[15], 'Ver: <https://www.instagram.com/reel/AAA/|1> · <https://www.instagram.com/reel/AAA/|2>');
+check('caveat when meta is not wired', L[16].startsWith('_Alcance y vistas por reel: pendiente'), true);
+check('no caveat when meta is wired', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).includes('pendiente'), false);
+check('no delta column without last week', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).includes('vs anterior'), false);
+check('delta cell', [rw.deltaCell(10, 7), rw.deltaCell(5, 11), rw.deltaCell(3, 3), rw.deltaCell(3, null)], ['+3', '-6', '=', '']);
 check('validate accepts the post', rw.validatePost(text, { posts: merged, account: acct }), { ok: true, problems: [] });
 
 const quiet = rw.formatPost({ window: W, posts: [], account: acct, prevAccount: null, metaWired: true });
@@ -90,6 +97,7 @@ check('validate accepts the quiet week', rw.validatePost(quiet, { posts: [], acc
 check('validate rejects a bad header', rw.validatePost('hola\nReels publicados: 2').ok, false);
 check('validate rejects a banned token', rw.validatePost(`${L[0]}\nReels publicados: undefined`).problems.includes('contains "undefined"'), true);
 check('validate rejects a leftover placeholder', rw.validatePost(`${L[0]}\nReels publicados: 2 · {reach}`).ok, false);
+check('validate rejects an unclosed table', rw.validatePost(`${L[0]}\nReels publicados: 2\n\`\`\``).problems, ['unclosed table']);
 check('validate fails closed on zero impressions with reels published (4b)',
   rw.validatePost(text, { posts: merged, account: { ...acct, impressions: 0 } }).problems[0],
   'reels published but account impressions are 0 (stats feed suspect)');
