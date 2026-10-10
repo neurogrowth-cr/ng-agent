@@ -72,27 +72,31 @@ check('video gone before the period is ignored', ov.periodViews([r('2026-10-01',
 
 // ── formatting ───────────────────────────────────────────────────────────────
 const prev = { total: 300, byPlatform: {}, lifetime: {}, partialSince: null };
-const block = ov.formatViewsBlock({ title: 'semana 5 oct a 11 oct', cur: p, prev, funnel: { comments: 4, conversations: 1, booked: null } });
-check('block: header', block.split('\n')[0], '*👁️ Vistas orgánicas, semana 5 oct a 11 oct*');
-check('block: total with % vs previous', block.split('\n')[1], 'Total: 360 (▲ 20% vs anterior)');
-check('block: per platform, missing = sin datos', block.split('\n')[2], 'Instagram 360 · YouTube 0 · TikTok sin datos');
-check('block: funnel names the missing step', block.split('\n')[3], 'Embudo: 360 vistas → 4 comentarios "LinkedIn" → 1 conversación → sin datos de llamadas agendadas');
+const block = ov.formatViewsBlock({ title: 'semana 5 oct a 11 oct', cur: p, prev, funnel: { comments: 4, conversations: 1, booked: null }, column: 'Semana' });
+const B = block.split('\n');
+check('block: header carries the total and % vs previous', B[0], '*👁️ Vistas orgánicas, semana 5 oct a 11 oct* · total 360 (▲ 20% vs anterior)');
+check('block: platform table, missing = s/d, total row', B.slice(1, 7), ['```', '           Semana', 'Instagram     360', 'YouTube         0', 'TikTok        s/d', 'Total         360']);
+check('block: table closes', B[7], '```');
+check('block: funnel names the missing step', B[8], 'Embudo: 360 vistas → 4 comentarios "LinkedIn" → 1 conversación → sin datos de llamadas agendadas');
 check('block passes its validator', ov.validateBlock(block).ok, true);
 check('no lifetime line anymore', /por vida/.test(block), false);
 const mtdP = ov.monthToDatePeriod(wk.cur.to);
 check('month to date period', [mtdP.from, mtdP.to, mtdP.label], ['2026-10-01', '2026-10-11', 'octubre']);
 const mtd = { ...ov.periodViews(rows, mtdP), label: mtdP.label };
-const mBlock = ov.formatViewsBlock({ title: 's', cur: p, prev, funnel: null, monthToDate: mtd });
-check('block: acumulado mensual line', mBlock.split('\n')[3], 'Acumulado mensual (octubre): 360 (Instagram 360 · YouTube 0)');
+const mBlock = ov.formatViewsBlock({ title: 's', cur: p, prev, funnel: null, monthToDate: mtd, column: 'Semana' });
+check('block: acumulado mensual is a second column', mBlock.split('\n').slice(2, 4), ['           Semana  Acum. octubre', 'Instagram     360            360']);
 check('mtd block passes its validator', ov.validateBlock(mBlock).ok, true);
 const pBlock = ov.formatViewsBlock({ title: 'semana', cur: partial, prev: null, funnel: null });
 check('partial block says so', /Parcial: la medición empezó el 9 oct/.test(pBlock), true);
 check('partial previous period gives no % delta',
-  ov.formatViewsBlock({ title: 's', cur: p, prev: { ...prev, partialSince: '2026-09-30' }, funnel: null }).split('\n')[1], 'Total: 360');
+  ov.formatViewsBlock({ title: 's', cur: p, prev: { ...prev, partialSince: '2026-09-30' }, funnel: null }).split('\n')[0], '*👁️ Vistas orgánicas, s* · total 360');
 check('no data block is explicit', /Sin datos de vistas/.test(ov.formatViewsBlock({ title: 's', cur: ov.periodViews([], wk.cur), prev: null })), true);
 check('validator catches undefined', ov.validateBlock('*👁️ Vistas orgánicas, x*\nTotal: undefined').ok, false);
-check('daily line', ov.formatDailyLine(p), '👁️ Vistas de ayer: 360 (Instagram 360 · YouTube 0)');
-check('daily line absent without data', ov.formatDailyLine(ov.periodViews([], wk.cur)), null);
+check('validator catches an unclosed table', ov.validateBlock('*👁️ Vistas orgánicas, x*\n```\nInstagram 1').ok, false);
+const dBlock = ov.formatDailyBlock(partial);
+check('daily block', dBlock.split('\n'), ['*👁️ Vistas de ayer: 50* _(parcial)_', '```', 'TikTok  50', '```']);
+check('daily block passes the validator', ov.validateBlock(dBlock).ok, true);
+check('daily block absent without data', ov.formatDailyBlock(ov.periodViews([], wk.cur)), null);
 
 // ── funnel helpers ───────────────────────────────────────────────────────────
 const s = Date.parse('2026-10-05T06:00:00Z'); const e = Date.parse('2026-10-12T06:00:00Z');

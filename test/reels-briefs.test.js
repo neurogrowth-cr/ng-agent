@@ -70,33 +70,42 @@ check('failed status is always missed', rb.missedPosts(rb.normalizeSchedule([ghl
 // ── daily ────────────────────────────────────────────────────────────────────
 const daily = rb.formatDaily({ now: WED, schedule, reels });
 const D = daily.split('\n');
-check('daily header', D[0], '*Reels de hoy, miércoles 7 de octubre*');
-check('today lists the 6 pm post with its first line', D.includes('• 6:00 pm · La acción cura todo.'), true);
-check('week row with reach, singular/plural and link',
-  D.includes('• Mar · El mejor de la semana · alcance 1,200 · 30 likes · 3 comentarios · 2 guardados · <https://www.instagram.com/reel/w2/|ver>'), true);
-check('a reel without insights says sin datos', D.some((l) => l.startsWith('• Mié · Sin insights todavía · ⚠️ sin datos · 1 like ·')), true);
-check('fresh reels are marked', D.some((l) => l.includes('Uno de la semana.') && l.endsWith('(menos de 24 h)')), true);
-check('reel older than 24 h is not marked fresh', D.some((l) => l.includes('El mejor de la semana') && l.endsWith('(menos de 24 h)')), false);
-check('week totals flag incomplete reach', D.includes('Total semana: 3 reels · alcance 1,500 (incompleto) · 35 likes · 3 comentarios'), true);
-check('best of the week', D.includes('Mejor de la semana: El mejor de la semana (alcance 1,200)'), true);
-check('month to date includes earlier October reels, not September',
-  D.some((l) => l.startsWith('Mes en curso: 4 reels · alcance 6,500 (incompleto) · 85 likes · 4 comentarios · mejor: El mejor del mes (alcance 5,000)')), true);
-check('no last-week line on a wednesday', D.some((l) => l.startsWith('Semana pasada')), false);
-check('upcoming counts only after today', D.includes('Próximos esta semana: 1'), true);
+check('daily header', D[0], '*📅 Reels · miércoles 7 oct*');
+check('verdict rides on the Hoy header and warns when something missed', D[2].startsWith('*Hoy se publica* · ⚠️ ') && D[2].includes('un reel agendado no salió'), true);
+check('today table: time right-aligned, caption, status', D.slice(3, 7), ['```', '6:00 am  Este debió salir a las 6 am  no salió', '6:00 pm  La acción cura todo.', '```']);
 check('missed post is flagged', D.some((l) => l.startsWith('⚠️ No se publicó: Mié 7 oct 6:00 am · Este debió salir')), true);
-check('verdict is a warning when something missed', D.some((l) => l.startsWith('⚠️ ') && l.includes('un reel agendado no salió')), true);
-check('reels with comments are listed', daily.includes('Reels con comentarios esta semana: <https://www.instagram.com/reel/w2/|El mejor de la semana>'), true);
+check('upcoming counts only after today', D.includes('Próximos esta semana: 1'), true);
+check('week header carries the totals and flags incomplete reach', D.includes('*📊 Semana* · 3 reels · alcance 1,500 (incompleto) · 35 likes · 3 coment.'), true);
+const wk = D.indexOf('*📊 Semana* · 3 reels · alcance 1,500 (incompleto) · 35 likes · 3 coment.');
+check('week table sorted by reach, fresh marked *, missing reach s/d', D.slice(wk + 1, wk + 6), [
+  '```',
+  'Día  Reel                   Alcance  Likes  Com  Guard',
+  'Mar  El mejor de la semana    1,200     30    3      2',
+  'Mar  Uno de la semana.*         300      4    0      2',
+  'Mié  Sin insights todavía*      s/d      1    0    s/d',
+]);
+check('footnote and commented reels with links', D.includes('_* menos de 24 h_ · Con comentarios: <https://www.instagram.com/reel/w2/|El mejor de la semana>'), true);
+check('month to date includes earlier October reels, not September', D.includes('*🗓️ Mes en curso* · 4 reels · alcance 6,500 (incompleto) · 85 likes · 4 coment.'), true);
+check('best of the month links the reel', D.includes('Mejor: <https://www.instagram.com/reel/m1/|El mejor del mes> (alcance 5,000)'), true);
+check('no last-week line on a wednesday', D.some((l) => l.startsWith('Semana pasada')), false);
+check('no views section when none is given', daily.includes('Vistas'), false);
 check('daily passes its own contract', rb.validateDaily(daily), { ok: true, problems: [] });
+
+const withViews = rb.formatDaily({ now: WED, schedule, reels, viewsBlock: '*👁️ Vistas de ayer: 50*\n```\nTikTok  50\n```' });
+const V = withViews.split('\n');
+check('views section sits between Hoy and Semana', V.indexOf('*👁️ Vistas de ayer: 50*') > V.indexOf('Próximos esta semana: 1') && V.indexOf('*👁️ Vistas de ayer: 50*') < V.findIndex((l) => l.startsWith('*📊 Semana*')), true);
+check('daily with views passes its contract', rb.validateDaily(withViews).ok, true);
 
 const cleanSched = rb.normalizeSchedule(SCHED.filter((p) => p._id !== 'missed'));
 const cleanReels = reels.filter((r) => r.id !== 'w3');
-check('all good = green verdict', rb.formatDaily({ now: WED, schedule: cleanSched, reels: cleanReels }).includes('\n✅ Todo publicado a tiempo.'), true);
+check('all good = green verdict', rb.formatDaily({ now: WED, schedule: cleanSched, reels: cleanReels }).includes('*Hoy se publica* · ✅ Todo publicado a tiempo.'), true);
 
 const ghlDown = rb.formatDaily({ now: WED, schedule: null, reels });
-check('GHL down: says so, still sends metrics', [ghlDown.includes('⚠️ No pude leer el calendario de GHL.'), ghlDown.includes('Total semana:')], [true, true]);
+check('GHL down: says so, still sends metrics', [ghlDown.includes('⚠️ No pude leer el calendario de GHL.'), ghlDown.includes('*📊 Semana* · 3 reels')], [true, true]);
 const metaDown = rb.formatDaily({ now: WED, schedule, reels: null });
 check('Meta down: no numbers invented', [metaDown.includes('⚠️ No pude leer las métricas de Meta.'), /alcance \d/.test(metaDown)], [true, false]);
 check('Meta down still passes the contract (it is a valid warning brief)', rb.validateDaily(metaDown).ok, true);
+check('validate catches an unclosed table', rb.validateDaily(`${daily}\n\`\`\``).problems, ['unclosed table']);
 
 const MON = new Date('2026-10-12T13:40:00Z');
 const monday = rb.formatDaily({ now: MON, schedule: [], reels });
@@ -117,14 +126,24 @@ const OCT = [
 ];
 const monthly = rb.formatMonthly({ now: NOV1, reels: rb.normalizeMedia(OCT) });
 const M = monthly.split('\n');
-check('monthly header', M[0], '*Reels de octubre 2026*');
-check('monthly total', M.includes('Total: 5 reels · alcance 7,550 · 175 likes · 20 comentarios · 10 guardados · 5 compartidos'), true);
-check('compared with september', M.includes('Contra septiembre: alcance +89% · likes +338% · reels publicados 2 a 5'), true);
-check('average reach per reel', M.includes('Alcance promedio por reel: 1,510 (septiembre: 2,000)'), true);
-check('top 3 by reach in order', M.filter((l) => /^\d\. /.test(l)).map((l) => l.split(' · ')[0]), ['1. Alto', '2. Medio con mucha interacción', '3. Bajo']);
-check('best engagement ignores reach under 100', M[M.indexOf('*Mejor en interacción* (likes, comentarios, guardados y compartidos sobre alcance)') + 1].startsWith('Medio con mucha interacción · 5.7%'), true);
-check('bottom 3, lowest first', M.slice(M.indexOf('*Los 3 más bajos*') + 1, M.indexOf('*Los 3 más bajos*') + 4).map((l) => l.split(' · ')[0]),
-  ['• Muy bajo, alcance menor a 100', '• Cerró el mes', '• Bajo']);
+check('monthly header', M[0], '*🗓️ Reels de octubre 2026*');
+check('summary compares with september', M[2], '*Resumen* · contra septiembre');
+check('summary table', M.slice(3, 12), [
+  '```',
+  '              octubre  septiembre  Cambio',
+  'Reels               5           2   +150%',
+  'Alcance         7,550       4,000    +89%',
+  'Alcance/reel    1,510       2,000    -24%',
+  'Likes             175          40   +338%',
+  'Comentarios        20           2   +900%',
+  'Guardados          10           4   +150%',
+  'Compartidos         5           2   +150%',
+]);
+check('top 3 by reach in order', M.filter((l) => /^[1-3] {2}\S/.test(l)).map((l) => l.slice(3, 31).trim()), ['Alto', 'Medio con mucha interacción', 'Bajo']);
+check('top 3 links under the table', M.includes('Ver: <https://www.instagram.com/reel/a/|1> · <https://www.instagram.com/reel/b/|2> · <https://www.instagram.com/reel/c/|3>'), true);
+check('best engagement ignores reach under 100', M.includes('*Mejor en interacción* · <https://www.instagram.com/reel/b/|Medio con mucha interacción> · 5.7%'), true);
+const lo = M.indexOf('*Los 3 más bajos*');
+check('bottom 3, lowest first', M.slice(lo + 3, lo + 6).map((l) => l.replace(/\s+[\d,]+$/, '')), ['Muy bajo, alcance menor a 100', 'Cerró el mes', 'Bajo']);
 check('caveat line closes the report', M[M.length - 1], '_Métricas acumuladas a hoy; un reel de fin de mes tuvo menos días para sumar._');
 check('monthly passes its contract', rb.validateMonthly(monthly, { reportedCount: 5 }), { ok: true, problems: [] });
 check('a reel at 1 am CR on the 1st belongs to the new month', monthly.includes('Ya es noviembre'), false);
@@ -135,7 +154,7 @@ check('snapshot row keeps nulls as nulls', rb.monthRows(NOV1, rb.normalizeMedia(
 
 check('meta down: monthly says so and has no numbers', rb.formatMonthly({ now: NOV1, reels: null }).includes('⚠️ No pude leer las métricas de Meta'), true);
 check('empty month says so', rb.formatMonthly({ now: NOV1, reels: [] }).includes('No se publicaron reels en octubre 2026.'), true);
-check('validate catches a short top list', rb.validateMonthly('*Reels de octubre 2026*\nTotal: 5\n*Top 3 por alcance*\n1. a · alcance 5', { reportedCount: 5 }).ok, false);
+check('validate catches a short top list', rb.validateMonthly('*🗓️ Reels de octubre 2026*\n*Resumen*\n*Top 3 por alcance*\n```\n1  a  5\n```', { reportedCount: 5 }).problems, ['top list has 1 rows']);
 check('validate catches an em dash', rb.validateDaily(`${daily}\nx \u2014 y`).problems, ['contains an em dash']);
 check('validate catches undefined', rb.validateDaily(`${daily}\nundefined`).ok, false);
 

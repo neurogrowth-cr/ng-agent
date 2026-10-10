@@ -18397,7 +18397,7 @@ async function runReelsWeekly({ now = new Date() } = {}) {
   }
   const divergence = rows.length && written !== rows.length ? ` ⚠️ reel_stats guardó ${written}/${rows.length} filas.` : '';
 
-  const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now), { withMonthToDate: true });
+  const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now), { withMonthToDate: true, column: 'Semana' });
   if (reelsWeeklyLive()) {
     await postToSlack(REELS_CHANNEL, text + divergence + views);
   } else {
@@ -18503,11 +18503,10 @@ async function runReelsDailyBrief({ now = new Date() } = {}) {
   try {
     reels = reelsBriefs.normalizeMedia(await fetchIgReels(Math.min(w.prevWeekStart.getTime(), w.monthStart.getTime())));
   } catch (err) { errors.push(`meta: ${err.message}`); }
-  const text = reelsBriefs.formatDaily({ now, schedule, reels });
+  const text = reelsBriefs.formatDaily({ now, schedule, reels, viewsBlock: await organicViewsDailyBlock(now) });
   const verdict = reelsBriefs.validateDaily(text);
   if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
-  const viewsLine = await organicViewsDailyLine(now);
-  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: text + viewsLine, unfurl_links: false, unfurl_media: false });
+  await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsDailyBrief', status: errors.length ? 'error' : 'ok',
     error_message: errors.length ? errors.join(' | ') : null,
     metadata: { reels: reels ? reels.length : null, scheduled: schedule ? schedule.length : null } });
@@ -18554,7 +18553,7 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
     if (error) note = `\n⚠️ reel_stats no guardó la foto del mes: ${error.message}`;
   }
   const monthViews = organicViews.monthPeriods(now);
-  const views = await organicViewsBlock(monthViews.cur.label, monthViews);
+  const views = await organicViewsBlock(monthViews.cur.label, monthViews, { column: 'Mes' });
   await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text: report + note + views, unfurl_links: false, unfurl_media: false });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsMonthlyReport', status: metaError || note ? 'error' : 'ok',
     error_message: metaError || (note ? note.trim() : null), metadata: { period: mw.period, reels: reportedCount } });
@@ -18750,7 +18749,7 @@ async function organicFunnel(period) {
 }
 
 /** The views block for a period pair, or '' when it cannot be built (never blocks the post it rides on). */
-async function organicViewsBlock(title, { cur, prev }, { withFunnel = true, withMonthToDate = false } = {}) {
+async function organicViewsBlock(title, { cur, prev }, { withFunnel = true, withMonthToDate = false, column = 'Periodo' } = {}) {
   if (organicViewsDisabled()) return '';
   try {
     const mtdPeriod = withMonthToDate ? organicViews.monthToDatePeriod(cur.to) : null;
@@ -18759,6 +18758,7 @@ async function organicViewsBlock(title, { cur, prev }, { withFunnel = true, with
       title, cur: organicViews.periodViews(rows, cur), prev: organicViews.periodViews(rows, prev),
       funnel: withFunnel ? await organicFunnel(cur) : null,
       monthToDate: mtdPeriod ? { ...organicViews.periodViews(rows, mtdPeriod), label: mtdPeriod.label } : null,
+      column,
     });
     const verdict = organicViews.validateBlock(block);
     if (!verdict.ok) { console.warn(`[organic-views] block dropped: ${verdict.problems.join('; ')}`); return ''; }
@@ -18770,15 +18770,16 @@ async function organicViewsBlock(title, { cur, prev }, { withFunnel = true, with
   }
 }
 
-async function organicViewsDailyLine(now) {
-  if (organicViewsDisabled()) return '';
+// The daily brief's views section, or null (the brief then goes out without it).
+async function organicViewsDailyBlock(now) {
+  if (organicViewsDisabled()) return null;
   try {
     const day = organicViews.dayPeriod(now);
-    const line = organicViews.formatDailyLine(organicViews.periodViews(await loadVideoViews(day.from, day.to), day));
-    return line ? `\n${line}` : '';
+    const block = organicViews.formatDailyBlock(organicViews.periodViews(await loadVideoViews(day.from, day.to), day));
+    return block && organicViews.validateBlock(block).ok ? block : null;
   } catch (err) {
-    console.warn(`[organic-views] daily line skipped: ${err.message}`);
-    return '';
+    console.warn(`[organic-views] daily block skipped: ${err.message}`);
+    return null;
   }
 }
 
