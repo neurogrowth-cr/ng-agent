@@ -29,6 +29,51 @@ let MAX_BOT_ID = process.env.SLACK_BOT_ID || null;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ─── MODEL INPUT SANITIZER ───────────────────────────────────────────────────
+// An emoji is two UTF-16 code units (a surrogate pair). Any character-count cut
+// (`.slice(0, n)`, `.substring(0, n)`) can land between the two and leave a lone
+// surrogate behind, and the Claude API then rejects the whole request as invalid
+// JSON ("no low surrogate in string"). On 2026-09-25 the Friday Delivery Wrap-Up
+// lost all 3 attempts to one split emoji 51k chars into the body: no report posted.
+//
+// Two layers. clipText() replaces the raw cuts on text headed into model context
+// (tool results, live context, knowledge, Slack message text). And ONE sanitizer
+// on the client right below, so every call site, every tool_result and every
+// injected block goes out clean no matter where the cut happened: the same
+// one-place pattern as the cron watchdog, instead of trusting ~250 slice sites.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+function stripLoneSurrogates(str) {
+  return typeof str === 'string' ? str.replace(LONE_SURROGATE_RE, '') : str;
+}
+// Surrogate-safe `String(str).slice(0, max)`; null and undefined read as ''.
+function clipText(str, max) {
+  return stripLoneSurrogates(String(str ?? '').slice(0, max));
+}
+// Deep copy of a request field with every string cleaned; non-strings untouched.
+function sanitizeModelInput(value) {
+  if (typeof value === 'string') return stripLoneSurrogates(value);
+  if (Array.isArray(value)) return value.map(sanitizeModelInput);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = sanitizeModelInput(value[k]);
+    return out;
+  }
+  return value;
+}
+// ─── end model input sanitizer ───────────────────────────────────────────────
+{
+  // `system` and `messages` are the only request fields that carry runtime text;
+  // tools are static definitions. Bound so the SDK keeps its own `this`.
+  const rawCreate = anthropic.messages.create.bind(anthropic.messages);
+  anthropic.messages.create = (params, ...rest) => {
+    if (!params || typeof params !== 'object') return rawCreate(params, ...rest);
+    const clean = { ...params };
+    if ('system' in clean) clean.system = sanitizeModelInput(clean.system);
+    if ('messages' in clean) clean.messages = sanitizeModelInput(clean.messages);
+    return rawCreate(clean, ...rest);
+  };
+}
+
 // ICM model tiers — the only place model ids may appear (env-overridable, no redeploy to switch)
 const MODEL_AGENT = process.env.NG_AGENT_MODEL || 'claude-sonnet-4-6';
 const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-4-5-20251001';
@@ -931,7 +976,7 @@ async function saveMessage(userId, role, content) {
     }
     const { error } = await supabase
       .from('conversations')
-      .insert({ user_id: userId, role, content: safeContent.substring(0, 8000) });
+      .insert({ user_id: userId, role, content: clipText(safeContent, 8000) });
     if (error) throw error;
     await pruneConversationHistory(userId);
   } catch (err) {
@@ -1023,7 +1068,7 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
         {
           category,
           key,
-          value: value.substring(0, 2000),
+          value: clipText(value, 2000),
           source,
           user_id: userId || RON_SLACK_ID,
           visibility: safeVisibility,
@@ -1047,7 +1092,7 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
 // function never inspects the report text to decide what it is.
 async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId, reportId) {
   try {
-    const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${originalReport.substring(0, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
+    const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${clipText(originalReport, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
@@ -1317,7 +1362,7 @@ async function detectAndSaveCorrection(userText, priorAssistantText, userId) {
   try {
     if (!userText || !priorAssistantText) return null;
     if (!CORRECTION_HINT_RE.test(userText)) return null;
-    const prompt = `Max (an ops agent) previously said:\n${priorAssistantText.slice(0, 1200)}\n\nThe user replied:\n${userText.slice(0, 800)}\n\nIs the user CORRECTING a factual claim or behavior of Max's (not just disagreeing, negotiating, or changing topic)? If yes respond JSON: {"topic":"<2-4 word kebab-case topic>","lesson":"<2-3 sentences: what Max got wrong and what to do instead>"}. If no: {"topic":null}. JSON only, no markdown fences.`;
+    const prompt = `Max (an ops agent) previously said:\n${clipText(priorAssistantText, 1200)}\n\nThe user replied:\n${clipText(userText, 800)}\n\nIs the user CORRECTING a factual claim or behavior of Max's (not just disagreeing, negotiating, or changing topic)? If yes respond JSON: {"topic":"<2-4 word kebab-case topic>","lesson":"<2-3 sentences: what Max got wrong and what to do instead>"}. If no: {"topic":null}. JSON only, no markdown fences.`;
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
@@ -1365,7 +1410,7 @@ async function getGlobalLessons() {
 // Uses Haiku (cheap) — runs on every thread mention.
 async function extractClientContext(threadMessages, mentionText, channelName, userId) {
   try {
-    const threadText = threadMessages.map(m => m.text || '').join('\n').substring(0, 2000);
+    const threadText = clipText(threadMessages.map(m => m.text || '').join('\n'), 2000);
     const prompt = `A team member tagged Max in a Slack thread in #${channelName}.\n\nThread:\n${threadText}\n\nTag: ${mentionText}\n\nDoes this thread contain a specific update about a named client? If yes, respond with JSON: {"client": "<client name>", "context": "<1-2 sentence summary of the update, blocker, status change, or action item>"}. If no specific client is mentioned, respond with: {"client": null}. No preamble, JSON only.`;
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
@@ -2226,11 +2271,11 @@ async function getRecentEmails() {
     const payload = msg.data.payload;
     if (payload.parts) {
       const textPart = payload.parts.find(p => p.mimeType === 'text/plain');
-      if (textPart?.body?.data) body = Buffer.from(textPart.body.data, 'base64').toString('utf8').substring(0, 1000);
+      if (textPart?.body?.data) body = clipText(Buffer.from(textPart.body.data, 'base64').toString('utf8'), 1000);
     } else if (payload.body?.data) {
-      body = Buffer.from(payload.body.data, 'base64').toString('utf8').substring(0, 1000);
+      body = clipText(Buffer.from(payload.body.data, 'base64').toString('utf8'), 1000);
     }
-    if (!body) body = msg.data.snippet?.substring(0, 500) || '';
+    if (!body) body = clipText(msg.data.snippet, 500);
     return `From: ${from}\nDate: ${date}\nSubject: ${subject}\nBody:\n${body}`;
   }));
   return details.join('\n\n---\n\n');
@@ -2674,7 +2719,7 @@ async function readGoogleSheet(spreadsheetId, range = null) {
     output += headers.map(() => '---').join(' | ') + '\n';
     output += dataRows.slice(0, 50).map(row => headers.map((_, i) => row[i] || '').join(' | ')).join('\n');
     if (dataRows.length > 50) output += `\n\n... and ${dataRows.length - 50} more rows.`;
-    return output.substring(0, 6000);
+    return clipText(output, 6000);
   } catch (err) {
     return `Google Sheets read error: ${err.message}`;
   }
@@ -2757,7 +2802,7 @@ async function getOpsTracker(tab, client = null, includeDone = false) {
       hiddenDone = before - dataRows.length;
     }
 
-    const cell = v => { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > 350 ? s.substring(0, 350) + '…' : s; };
+    const cell = v => { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > 350 ? clipText(s, 350) + '…' : s; };
     let output = `OPS MASTER TRACKER — ${OPS_TRACKER_TABS[tab].label} (tab "${title}", ${dataRows.length} of ${totalRows} rows${client ? ` matching "${client}"` : ''}${hiddenDone ? `; ${hiddenDone} Done items hidden — pass include_done for history` : ''}):\n\n`;
     output += headers.slice(0, width).join(' | ') + '\n';
     let shown = 0;
@@ -2801,7 +2846,7 @@ async function readGoogleDoc(documentId) {
       }
     }
     if (!text.trim()) return 'Document is empty or has no readable text content.';
-    return `Document: ${doc.title}\n\n${text.substring(0, 6000)}${text.length > 6000 ? '\n\n... [trimmed]' : ''}`;
+    return `Document: ${doc.title}\n\n${clipText(text, 6000)}${text.length > 6000 ? '\n\n... [trimmed]' : ''}`;
   } catch (err) {
     return `Google Docs read error: ${err.message}`;
   }
@@ -3153,8 +3198,8 @@ async function getClientStatus(clientName = null) {
         total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
         blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
         pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
-        ob?.services_products && clientName ? `Service: ${ob.services_products.substring(0,120)}` : '',
-        ob?.ideal_customer    && clientName ? `ICP: ${ob.ideal_customer.substring(0,100)}` : '',
+        ob?.services_products && clientName ? `Service: ${clipText(ob.services_products, 120)}` : '',
+        ob?.ideal_customer    && clientName ? `ICP: ${clipText(ob.ideal_customer, 100)}` : '',
       ].filter(Boolean);
       return lines.join('\n');
     }));
@@ -4587,14 +4632,14 @@ async function getGHLConversations(limit = 20, unreadOnly = false) {
       // a booking-track exchange from a single-emoji ack or an opt-out.
       const tail = (tails[i] || []).slice(-TAIL_N);
       if (!tail.length) {
-        return `${header}\nLast: "${(c.lastMessageBody || '').substring(0, 120)}" (${lastDate})`;
+        return `${header}\nLast: "${clipText(c.lastMessageBody, 120)}" (${lastDate})`;
       }
       const tailLines = tail.map(m => {
         const dir  = m.direction === 'inbound' ? 'in ' : 'out';
         const when = (m.dateAdded || m.createdAt)
           ? new Date(m.dateAdded || m.createdAt).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : '?';
-        const body = String(m.body || m.message || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+        const body = clipText(String(m.body || m.message || '').replace(/\s+/g, ' ').trim(), 150);
         return `  [${dir} ${when}] "${body}"`;
       });
       return `${header}\nLast ${tail.length} messages (oldest first):\n${tailLines.join('\n')}`;
@@ -4617,7 +4662,7 @@ async function readSlackChannel(channelName, messageCount = 20) {
     if (!history.messages.length) return 'No recent messages found.';
     return history.messages.reverse().map(m => {
       const time = new Date(parseFloat(m.ts) * 1000).toLocaleString('en-US', { timeZone: 'America/Costa_Rica', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-      return `[${time}] ${(m.text || '').substring(0, 300)}`;
+      return `[${time}] ${clipText(m.text, 300)}`;
     }).join('\n');
   } catch (err) { return `Error reading channel: ${err.message}`; }
 }
@@ -5143,7 +5188,7 @@ async function runPatternReflection(correlationId, tonightEntries) {
   ]);
   if (!nightly.length) { console.log('Pattern reflection: no window data, skipping.'); return; }
 
-  const fmt = (rows) => rows.map(r => `${r.updated_at.slice(0, 10)} [${r.category || 'alert'}] ${r.key}: ${String(r.value).slice(0, 220)}`).join('\n');
+  const fmt = (rows) => rows.map(r => `${r.updated_at.slice(0, 10)} [${r.category || 'alert'}] ${r.key}: ${clipText(r.value, 220)}`).join('\n');
   const trackerBlock = Object.entries(tracker).map(([slug, t]) =>
     `${slug}: status=${t.status} seen=${t.occurrences}x${t.lastActioned ? ` last_actioned=${new Date(t.lastActioned).toISOString().slice(0, 10)}` : ''}`).join('\n') || '(none yet)';
 
@@ -5165,13 +5210,13 @@ Rules: reuse the existing slug when a pattern you already track is still present
 ${trackerBlock}
 
 === TONIGHT'S ENTRIES ===
-${(tonightEntries || []).map(e => `${new Date().toISOString().slice(0, 10)} [${e.category}] ${e.key}: ${String(e.value).slice(0, 220)}`).join('\n') || '(none)'}
+${(tonightEntries || []).map(e => `${new Date().toISOString().slice(0, 10)} [${e.category}] ${e.key}: ${clipText(e.value, 220)}`).join('\n') || '(none)'}
 
 === LAST 21 DAYS ===
-${fmt(nightly).slice(0, 16000)}
+${clipText(fmt(nightly), 16000)}
 
 === ALERTS (14d) ===
-${fmt(alerts).slice(0, 4000)}`;
+${clipText(fmt(alerts), 4000)}`;
 
   const tRef = Date.now();
   const res = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 700, messages: [{ role: 'user', content: reflectionPrompt }] });
@@ -5292,7 +5337,7 @@ ${Object.entries(tracker).map(([s, t]) => `${s}: ${t.status}, seen ${t.occurrenc
 ${actionsBlock}
 
 === THE WEEK'S KNOWLEDGE (7d) ===
-${nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${String(r.value).slice(0, 200)}`).join('\n').slice(0, 14000)}`;
+${clipText(nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.key}: ${clipText(r.value, 200)}`).join('\n'), 14000)}`;
 
   let patternsText = '', proposalLines = [];
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -5522,11 +5567,10 @@ async function runNightlyLearning(correlationId) {
         // every source (Slack, Gmail, Calendar, Portal, REVI) must reach the
         // summarizer, or low-priority-sorted categories would silently drop.
         const order = { alert: 0, decision: 1, client: 2, team: 3, intel: 4, process: 5 };
-        const entryList = savedEntries
+        const entryList = clipText(savedEntries
           .sort((a, b) => (order[a.category] ?? 9) - (order[b.category] ?? 9))
-          .map(e => `[${e.category}] ${e.key}: ${String(e.value).slice(0, 300)}`)
-          .join('\n')
-          .slice(0, 24000);
+          .map(e => `[${e.category}] ${e.key}: ${clipText(e.value, 300)}`)
+          .join('\n'), 24000);
         const tSum = Date.now();
         const sumRes = await anthropic.messages.create({
           model: MODEL_AGENT,
@@ -6403,7 +6447,7 @@ async function reviGetCoachingSummary(closerName = null, days = 14, forCloserEye
       avg_score: scores.length ? +(scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1) : null,
       outcomes: (calls || []).reduce((m, x) => { const k = x.deal_outcome || 'pending'; m[k] = (m[k] || 0) + 1; return m; }, {}),
       latest_coaching_date: latest ? latest.run_date : null,
-      latest_coaching_focus: focusText ? String(focusText).slice(0, 600) : null,
+      latest_coaching_focus: focusText ? clipText(focusText, 600) : null,
     });
   }
   return out;
@@ -6444,7 +6488,7 @@ async function reviGetOpenInitiatives() {
   return {
     open_initiatives: (inits || []).map(i => ({
       ...i,
-      description: String(i.description || '').slice(0, 300),
+      description: clipText(i.description, 300),
       days_since_movement: i.last_movement_at ? Math.floor((Date.now() - new Date(i.last_movement_at).getTime()) / dayMs) : null,
     })),
     recent_meetings: (meetings || []).map(m => ({
@@ -6452,7 +6496,7 @@ async function reviGetOpenInitiatives() {
       title: m.title,
       date: m.meeting_date,
       counts: m.counts,
-      digest: String(m.digest_text || '').slice(0, 1200),
+      digest: clipText(m.digest_text, 1200),
     })),
   };
 }
@@ -6481,8 +6525,8 @@ async function reviBuildDailyDigest(hours = 26) {
         c.overall_score != null ? `score ${c.overall_score}/100` : null,
         c.deal_outcome && c.deal_outcome !== 'pending' ? `outcome: ${c.deal_outcome}` : null,
         sig.buying_signal_strength ? `buying signal ${sig.buying_signal_strength}` : null,
-        sig.objection_type ? `objection: ${String(sig.objection_type).slice(0, 180)}` : null,
-        sig.stated_timeline ? `timeline: ${String(sig.stated_timeline).slice(0, 180)}` : null,
+        sig.objection_type ? `objection: ${clipText(sig.objection_type, 180)}` : null,
+        sig.stated_timeline ? `timeline: ${clipText(sig.stated_timeline, 180)}` : null,
       ].filter(Boolean);
       lines.push(`• ${bits.join(' · ')}`);
     }
@@ -6498,7 +6542,7 @@ async function reviBuildDailyDigest(hours = 26) {
     for (const m of moves) {
       const title = m.initiative ? m.initiative.title : 'unknown initiative';
       const owner = m.initiative && m.initiative.owner_name ? ` (${m.initiative.owner_name})` : '';
-      lines.push(`• [${m.movement}] ${title}${owner}${m.next_step ? ` — next: ${String(m.next_step).slice(0, 120)}` : ''}`);
+      lines.push(`• [${m.movement}] ${title}${owner}${m.next_step ? ` — next: ${clipText(m.next_step, 120)}` : ''}`);
     }
   }
 
@@ -6565,10 +6609,10 @@ function reviSummarizeReportJson(rj, maxLen = 600) {
       if (items.length) parts.push(`Action items (${items.length}): ${items.slice(0, 4).join(' | ')}`);
     }
     const text = parts.length ? parts.join('\n') : JSON.stringify(obj);
-    return text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
+    return text.length > maxLen ? clipText(text, maxLen) + '…' : text;
   } catch {
     const text = String(rj);
-    return text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
+    return text.length > maxLen ? clipText(text, maxLen) + '…' : text;
   }
 }
 
@@ -7682,7 +7726,7 @@ function capText(str, max = Number(process.env.ICM_TOOL_RESULT_CAP || 8000)) {
   if (s.length <= max) return s;
   const head = Math.floor(max * 0.75);
   const tail = max - head;
-  return s.slice(0, head) + `\n[... ${s.length - max} chars elided — re-query with a narrower filter if you need the middle ...]\n` + s.slice(-tail);
+  return clipText(s, head) + `\n[... ${s.length - max} chars elided — re-query with a narrower filter if you need the middle ...]\n` + stripLoneSurrogates(s.slice(-tail));
 }
 
 // ─── CLAUDE API WITH RETRY ────────────────────────────────────────────────────
@@ -7706,7 +7750,7 @@ async function callClaude(messages, retries = 3, userId = null, correlationId = 
   try {
     const lessons = await getGlobalLessons();
     if (lessons.length) {
-      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${(l.value || '').slice(0, 300)}`).join('\n')}`;
+      lessonBlock = `\n\nLESSONS FROM PAST CORRECTIONS (team members corrected Max on these — do not repeat them):\n${lessons.map(l => `- ${clipText(l.value, 300)}`).join('\n')}`;
     }
   } catch { /* lessons are best-effort — never block a reply */ }
   let lastErr;
@@ -7770,7 +7814,7 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'get_recent_emails')      result = await getRecentEmails();
         else if (toolUse.name === 'send_email')             { const r = await sendEmail(toolUse.input.to, toolUse.input.subject, toolUse.input.body); result = r.message || `Email sent to ${toolUse.input.to}`; }
         else if (toolUse.name === 'get_calendar_events')    result = await getCalendarEvents(toolUse.input.daysFromNow || 0, toolUse.input.daysRange || 1);
-        else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? r.substring(0, 4000) + '...[trimmed]' : r; }
+        else if (toolUse.name === 'search_drive')           { const r = await searchDrive(toolUse.input.query); result = r.length > 4000 ? clipText(r, 4000) + '...[trimmed]' : r; }
         else if (toolUse.name === 'read_google_sheet')      result = await readGoogleSheet(extractGoogleFileId(toolUse.input.spreadsheetId), toolUse.input.range || null);
         else if (toolUse.name === 'get_ops_tracker')        result = await getOpsTracker(toolUse.input.tab, toolUse.input.client || null, toolUse.input.include_done || false);
         else if (toolUse.name === 'read_google_doc')        result = await readGoogleDoc(extractGoogleFileId(toolUse.input.documentId));
@@ -8641,7 +8685,7 @@ function formatThreadTranscript(messages, opts = {}) {
     const sender = senderOf(m);
     const limit  = i === 0 ? rootLimit : replyLimit;
     const text   = (m.text || '').replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${label(id)}`);
-    return `[${time}] ${sender}: ${text.length > limit ? `${text.slice(0, limit)}…` : text}`;
+    return `[${time}] ${sender}: ${text.length > limit ? `${clipText(text, limit)}…` : text}`;
   }).join('\n');
 }
 
@@ -9359,7 +9403,7 @@ async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa,
     `Nombre: ${prospect.name}${prospect.company ? ` — ${prospect.company}` : ''}`,
     leadScore != null ? `Lead score: ${leadScore}/100` : null,
     setterNotes ? `Notas del setter: ${truncateOneLine(setterNotes, 900)}` : null,
-    intakeQa && intakeQa.length ? `Respuestas al agendar: ${intakeQa.map(q => `${q.question} → ${q.answer}`).join(' | ').slice(0, 500)}` : null,
+    intakeQa && intakeQa.length ? `Respuestas al agendar: ${clipText(intakeQa.map(q => `${q.question} → ${q.answer}`).join(' | '), 500)}` : null,
     ...(priorCalls || []).slice(0, 2).map(pc => {
       const sig = pc.prospect_signals || {};
       return `Llamada previa (${pc.call_date ? String(pc.call_date).slice(0, 10) : '?'}): score ${pc.overall_score ?? '?'}, outcome ${pc.deal_outcome || 'pending'}${sig.objection_type ? `, objeción: ${truncateOneLine(sig.objection_type, 150)}` : ''}${sig.decision_maker_status ? `, decisor: ${truncateOneLine(sig.decision_maker_status, 120)}` : ''}`;
@@ -9369,7 +9413,7 @@ async function buildReviGamePlan({ closerFirst, prospect, setterNotes, intakeQa,
     f.week_read ? `Lectura de la semana: ${truncateOneLine(f.week_read, 400)}` : null,
     ...(Array.isArray(f.top_actions) ? f.top_actions : []).slice(0, 3).map((a, i) =>
       `Acción ${i + 1}: ${truncateOneLine(a.action || '', 200)}${a.how ? ` | Script: ${truncateOneLine(a.how, 300)}` : ''}`),
-    adoption.length ? `Adopción medida: ${adoption.map(a => `${a.label} ${Math.round((a.now_rate || 0) * 100)}% (${a.verdict})`).join('; ').slice(0, 400)}` : null,
+    adoption.length ? `Adopción medida: ${clipText(adoption.map(a => `${a.label} ${Math.round((a.now_rate || 0) * 100)}% (${a.verdict})`).join('; '), 400)}` : null,
     f.metric_to_watch ? `Métrica de la semana: ${truncateOneLine(f.metric_to_watch, 150)}` : null,
   ].filter(Boolean).join('\n');
 
@@ -10361,7 +10405,7 @@ function truncateOneLine(s, max) {
     .replace(/\s*[\r\n]+\s*/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
-  return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+  return flat.length > max ? `${clipText(flat, max - 1).trimEnd()}…` : flat;
 }
 
 // ─── REVI PROSPECT NOTE (GHL) ────────────────────────────────────────────────
@@ -13429,7 +13473,7 @@ const VOC_EXTRACT_PROMPT = [
 ].join('\n');
 
 async function vocExtractOne(meeting) {
-  const transcriptText = vocMeetingTranscriptText(meeting).slice(0, 90000);
+  const transcriptText = clipText(vocMeetingTranscriptText(meeting), 90000);
   const tLlm = Date.now();
   const res = await anthropic.messages.create({
     model: MODEL_AGENT,
@@ -15189,7 +15233,7 @@ async function ghlMcpCall(name, args, { label = '' } = {}) {
 
 function ghlMcpTruncate(value, limit = GHL_MCP_MAX_RESULT_CHARS) {
   const s = typeof value === 'string' ? value : JSON.stringify(value);
-  return s.length > limit ? `${s.slice(0, limit)}…[truncated, ${s.length} chars total]` : s;
+  return s.length > limit ? `${clipText(s, limit)}…[truncated, ${s.length} chars total]` : s;
 }
 
 // operationId -> {kind, domain, ...}. The gate reads kind and domain from HERE, never
@@ -16536,12 +16580,12 @@ const NG_OFFER_BRIEF = `NeuroGrowth runs B2B LinkedIn organic-growth campaigns f
 async function generateCampaignDraft(contact, messages, setterFirstName) {
   const tail = messages.slice(-8).map(m => {
     const dir = m.direction === 'inbound' ? 'Prospect' : 'Setter';
-    const body = String(m.body || m.message || '').replace(/\s+/g, ' ').slice(0, 200);
+    const body = clipText(String(m.body || m.message || '').replace(/\s+/g, ' '), 200);
     return `${dir}: ${body}`;
   }).join('\n');
 
   const lastInbound = [...messages].reverse().find(m => m.direction === 'inbound');
-  const lastInboundBody = lastInbound ? String(lastInbound.body || lastInbound.message || '').slice(0, 240) : '(none)';
+  const lastInboundBody = lastInbound ? clipText(lastInbound.body || lastInbound.message, 240) : '(none)';
   const ageDays = lastInbound?.dateAdded ? Math.floor((Date.now() - new Date(lastInbound.dateAdded).getTime()) / (24 * 60 * 60 * 1000)) : '?';
 
   const prompt = `You are writing a single-sentence WhatsApp re-engagement message for a NeuroGrowth prospect who went silent ${ageDays} days ago. Match the conversation's language (Spanish or English).
@@ -16942,7 +16986,7 @@ async function handleAgentConsult(req, res) {
       }
       if (payload.purpose === 'question' && typeof payload.question === 'string' && payload.question.trim()) {
         console.log(`Agent consult [${correlationId}]: question`);
-        const answer = await callClaude([{ role: 'user', content: payload.question.slice(0, 4000) }], 3, null, correlationId, {
+        const answer = await callClaude([{ role: 'user', content: clipText(payload.question, 4000) }], 3, null, correlationId, {
           systemAppend: CONSULT_SYSTEM_APPEND,
           dropTools: CONSULT_DROP_TOOLS,
         });

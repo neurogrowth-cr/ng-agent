@@ -21,7 +21,9 @@ if (SRC.indexOf(START) === -1 || SRC.indexOf(END) === -1) {
   console.error('FAIL  router block sentinels missing from index.js — did the comment markers change?');
   process.exit(1);
 }
-const block = SRC.slice(SRC.indexOf(START), SRC.indexOf(END));
+// clipText (the surrogate-safe cut) lives in the sanitizer block at the top of index.js.
+const sanitizerBlock = SRC.slice(SRC.indexOf('// ─── MODEL INPUT SANITIZER'), SRC.indexOf('// ─── end model input sanitizer'));
+const block = sanitizerBlock + SRC.slice(SRC.indexOf(START), SRC.indexOf(END));
 
 let failures = 0;
 function check(name, actual, expected) {
