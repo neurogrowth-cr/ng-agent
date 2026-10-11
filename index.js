@@ -18266,16 +18266,21 @@ console.log('Registered static cron: weekly report status post (0 11 * * 1 CR)')
 // per reel plus an `account` row into reel_stats (migration 018), and reads
 // last week's account row for the WoW deltas. Fails closed: an unreachable
 // feed, a malformed post or zero impressions with reels published posts
-// nothing to the channel and DMs Ron. REELS_WEEKLY_MODE=live posts to
-// REELS_CHANNEL; anything else is a dry run to Ron's DM. Kill switch:
+// nothing to the channel and DMs Ron. Live by default to REELS_CHANNEL, which
+// itself defaults to #ng-content-machine so no Railway variable is needed (Ron,
+// 2026-10-11: everything reels goes to the channel); REELS_WEEKLY_MODE=dry sends
+// the same text to Ron's DM marked as a dry run. Kill switch:
 // REELS_WEEKLY_DISABLED=true. Recipe: ~/automations/ops/recipes/reels-weekly.md.
 const reelsWeekly = require('./lib/reelsWeekly');
-const REELS_CHANNEL = process.env.REELS_CHANNEL || '';
+// #ng-content-machine (private; Max is a member). A channel id is not a secret.
+const REELS_CHANNEL = process.env.REELS_CHANNEL || 'C0C7HFQ8THU';
 const REELS_GHL_ACCOUNT_ID = process.env.REELS_GHL_ACCOUNT_ID || '6ac68206f0cd230dc3504b51_iUkpsgZqYJ1ftVxGsoXE_17841401814013602';
 const REELS_GHL_PROFILE_ID = process.env.REELS_GHL_PROFILE_ID || '6ac6820c0ff30c39b2b6ad1f';
 const REELS_IG_USER_ID = process.env.REELS_IG_USER_ID || '17841401814013602';
 const reelsWeeklyDisabled = () => String(process.env.REELS_WEEKLY_DISABLED || '') === 'true';
-const reelsWeeklyLive = () => String(process.env.REELS_WEEKLY_MODE || '') === 'live' && !!REELS_CHANNEL;
+// Unset or `live` posts to the channel; any other value (say `dry`) is a dry run.
+// Routing is tested in test/reels-channel.test.js.
+const reelsWeeklyLive = () => String(process.env.REELS_WEEKLY_MODE || 'live') === 'live' && !!REELS_CHANNEL;
 const reelsMetaWired = () => !!String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
 
 async function fetchReelsGhlPosts(window) {
@@ -18398,11 +18403,13 @@ async function runReelsWeekly({ now = new Date() } = {}) {
   const divergence = rows.length && written !== rows.length ? ` ⚠️ reel_stats guardó ${written}/${rows.length} filas.` : '';
 
   const views = await organicViewsBlock(`semana ${window.label}`, organicViews.weekPeriods(now), { withMonthToDate: true, column: 'Semana' });
-  if (reelsWeeklyLive()) {
-    await postToSlack(REELS_CHANNEL, text + divergence + views);
-  } else {
-    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${REELS_CHANNEL || 'REELS_CHANNEL unset'}]\n${text}${divergence}${views}` });
-  }
+  // Same transport as the briefs: the reel links never unfurl in the channel.
+  const live = reelsWeeklyLive();
+  await slack.client.chat.postMessage({
+    channel: live ? REELS_CHANNEL : RON_SLACK_ID,
+    text: live ? text + divergence + views : `[DRY RUN → ${REELS_CHANNEL || 'REELS_CHANNEL unset'}]\n${text}${divergence}${views}`,
+    unfurl_links: false, unfurl_media: false,
+  });
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runReelsWeekly', status: 'ok',
     output: { week: window.isoWeek, reels: posts.length, impressions: account && account.impressions, reach: account && account.reach,
       meta: metaWired, rowsWritten: written, live: reelsWeeklyLive() } });
@@ -18424,7 +18431,8 @@ console.log('Registered static cron: reels weekly (0 8 * * 1 CR)');
 const reelsBriefs = require('./lib/reelsBriefs');
 const reelsBriefsDisabled = () => String(process.env.REELS_BRIEFS_DISABLED || '') === 'true';
 // Ron, 2026-10-08: briefs go to the content channel (REELS_CHANNEL) so the team
-// sees them; without it they fall back to Ron's DM. Failures always DM Ron.
+// sees them. REELS_CHANNEL now defaults to #ng-content-machine, so the DM
+// fallback only matters if that default is ever removed. Failures always DM Ron.
 const reelsBriefsTarget = () => REELS_CHANNEL || RON_SLACK_ID;
 const IG_REEL_FIELDS = 'id,timestamp,media_product_type,caption,permalink,like_count,comments_count';
 
