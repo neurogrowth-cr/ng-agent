@@ -20909,6 +20909,7 @@ async function handleOutcomeCardThreadReply(message, say) {
     const att = result.attendance;
     const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}*.` : '';
     await say({ text: `Logged *${label}*${parsed.revenue ? ` ($${parsed.revenue})` : ''} for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}`, thread_ts: message.thread_ts });
+    await offerCallFieldsForm({ channel: message.channel, ts: message.thread_ts, payload, outcome: parsed.outcome });
   } else if (result.reason === 'exists') {
     // The one legitimate second write: a follow_up row promoted to the
     // terminal outcome the closer just stated. Anything else stays refused.
@@ -20932,6 +20933,185 @@ async function handleOutcomeCardThreadReply(message, say) {
   return true;
 }
 
+// ─── CALL FIELDS FORM (post-call nurture phase 2) ────────────────────────────
+// After a follow_up lands from an outcome card, Max posts a "Call details"
+// button in the card's thread. It opens a Slack form (industry, main objection,
+// ticket, clients missing a month, next-step date) whose answers become GHL
+// tags + custom fields (the post-call email workflow branches on them), the
+// portal objection_category / next_action_date (via ng_set_outcome_call_fields),
+// and a copy in Max's call_fields table. Pure parts: lib/callFields.js.
+//
+// CALL_FIELDS_FORM=on arms the button. Needs Interactivity enabled in the Slack
+// app config (Socket Mode delivers it; no request URL). Off by default, so the
+// cards behave exactly as before until both are in place.
+const callFields = require('./lib/callFields');
+
+async function offerCallFieldsForm({ channel, ts, payload, outcome }) {
+  if (!callFields.shouldOfferCallFields(outcome, process.env.CALL_FIELDS_FORM)) return;
+  try {
+    const meta = {
+      appointment_id: payload.appointment_id,
+      prospect_name: String(payload.prospect_name || '').slice(0, 80),
+      closer_email: payload.closer_email || null,
+      channel,
+      ts,
+    };
+    const msg = callFields.buildCallFieldsButtonMessage({ prospectName: meta.prospect_name || 'this prospect', meta });
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: msg.text, blocks: msg.blocks });
+  } catch (e) {
+    console.warn(`[call-fields] could not offer the form for ${payload.appointment_id}: ${e.message}`);
+  }
+}
+
+function callFieldsAllowed(userId, meta) {
+  if (userId === RON_SLACK_ID) return true;
+  const email = meta.closer_email || '';
+  const closerId = CLOSER_SLACK[email] || CLOSER_SLACK[email.toLowerCase()];
+  return Boolean(closerId) && userId === closerId;
+}
+
+async function loadCallFieldsPrefill(appointmentId) {
+  const { data, error } = await supabase.from('call_fields')
+    .select('industry, objection, ticket, clients_missing, next_step_date')
+    .eq('appointment_id', appointmentId).maybeSingle();
+  if (error || !data) return null;
+  return {
+    industry: data.industry,
+    objection: data.objection,
+    ticket: data.ticket,
+    clientsMissing: data.clients_missing,
+    nextStepDate: data.next_step_date,
+  };
+}
+
+let _ghlCustomFieldsCache = { at: 0, fields: null };
+async function ghlLocationCustomFields() {
+  if (_ghlCustomFieldsCache.fields && Date.now() - _ghlCustomFieldsCache.at < 60 * 60 * 1000) return _ghlCustomFieldsCache.fields;
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/locations/${process.env.GHL_LOCATION_ID}/customFields`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  }, { label: 'GET /locations/customFields' });
+  if (!res.ok) throw new Error(`custom fields GET → ${res.status}`);
+  const fields = (await res.json()).customFields || [];
+  _ghlCustomFieldsCache = { at: Date.now(), fields };
+  return fields;
+}
+
+async function writeCallFieldsToGhl(appointmentId, fields) {
+  const { data: appt } = await portalSupabase.from('revops_appointments')
+    .select('prospect:prospect_id(email, ghl_contact_id)').eq('id', appointmentId).maybeSingle();
+  const prospect = appt?.prospect || {};
+  const contactId = prospect.ghl_contact_id || await ghlFindContactByEmail(prospect.email);
+  if (!contactId) return { ok: false, message: 'no GHL contact found for this prospect' };
+
+  const auth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const contact = await ghlGetContact(contactId);
+  const stale = callFields.staleCallFieldTags(contact?.tags, fields);
+  if (stale.length) {
+    const del = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: 'DELETE', headers: auth, body: JSON.stringify({ tags: stale }),
+    }, { label: `DELETE /contacts/${contactId}/tags` });
+    if (!del.ok) return { ok: false, contactId, message: `removing old tags → ${del.status}` };
+  }
+  const add = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ tags: callFields.callFieldTags(fields) }),
+  }, { label: `POST /contacts/${contactId}/tags` });
+  if (!add.ok) return { ok: false, contactId, message: `adding tags → ${add.status}` };
+
+  // Tags are what the workflow branches on, so from here the write counts as
+  // landed; a field failure is reported on its own line.
+  try {
+    const { resolved, missing } = callFields.resolveGhlFieldIds(callFields.ghlCallFieldValues(fields), await ghlLocationCustomFields());
+    if (resolved.length) {
+      const put = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+        method: 'PUT', headers: auth, body: JSON.stringify({ customFields: resolved }),
+      }, { label: `PUT /contacts/${contactId} (call fields)` });
+      if (!put.ok) return { ok: true, contactId, missing, fieldsError: `custom fields PUT → ${put.status}` };
+    }
+    return { ok: true, contactId, missing };
+  } catch (e) {
+    return { ok: true, contactId, missing: [], fieldsError: e.message };
+  }
+}
+
+async function writeCallFieldsToPortal(appointmentId, fields) {
+  if (!portalWriterPg) return { ok: false, message: 'PORTAL_WRITER_DATABASE_URL is not set' };
+  const { rows } = await portalWriterPg.query(
+    'SELECT ng_set_outcome_call_fields($1::uuid, $2::text, $3::date) AS id',
+    [appointmentId, callFields.PORTAL_OBJECTION[fields.objection], fields.nextStepDate],
+  );
+  return rows[0]?.id ? { ok: true } : { ok: false, message: 'no follow_up or lost outcome row for this call' };
+}
+
+// Each sink is independent: one failing never blocks the others, and the
+// thread reply names exactly what landed.
+async function saveCallFields({ meta, fields, userId }) {
+  const out = {};
+  try {
+    const { error } = await supabase.from('call_fields').upsert({
+      appointment_id: meta.appointment_id,
+      industry: fields.industry,
+      objection: fields.objection,
+      ticket: fields.ticket,
+      clients_missing: fields.clientsMissing,
+      next_step_date: fields.nextStepDate,
+      submitted_by: userId,
+      submitted_at: new Date().toISOString(),
+    }, { onConflict: 'appointment_id' });
+    out.max = error ? { ok: false, message: error.message } : { ok: true };
+  } catch (e) { out.max = { ok: false, message: e.message }; }
+  try { out.portal = await writeCallFieldsToPortal(meta.appointment_id, fields); } catch (e) { out.portal = { ok: false, message: e.message }; }
+  try { out.ghl = await writeCallFieldsToGhl(meta.appointment_id, fields); } catch (e) { out.ghl = { ok: false, message: e.message }; }
+  return out;
+}
+
+function callFieldsResultText(meta, fields, out) {
+  const lines = [`📋 Saved for ${meta.prospect_name || 'this prospect'}: ${callFields.callFieldsSummary(fields)}.`];
+  if (out.ghl?.ok) {
+    const fieldNote = out.ghl.fieldsError
+      ? `, but the custom fields failed (${out.ghl.fieldsError}), so email 0 shows no numbers`
+      : out.ghl.missing?.length ? `, but these fields don't exist yet: ${out.ghl.missing.join(', ')}` : ', fields filled';
+    lines.push(`GHL: tags ${callFields.callFieldTags(fields).map((t) => `\`${t}\``).join(' ')} set${fieldNote}.`);
+  } else {
+    lines.push(`⚠️ GHL not updated (${out.ghl?.message || 'unknown error'}). Add the tags by hand: ${callFields.callFieldTags(fields).join(', ')}.`);
+  }
+  if (!out.portal?.ok) lines.push(`⚠️ Portal objection not saved (${out.portal?.message || 'unknown error'}).`);
+  if (!out.max?.ok) lines.push(`⚠️ Max's copy not saved (${out.max?.message || 'unknown error'}).`);
+  return lines.join('\n');
+}
+
+slack.action(callFields.OPEN_ACTION_ID, async ({ ack, body, action, client }) => {
+  await ack();
+  const meta = callFields.parseMeta(action?.value);
+  if (!meta) return;
+  if (!callFieldsAllowed(body.user.id, meta)) {
+    await client.chat.postEphemeral({ channel: body.channel?.id || meta.channel, user: body.user.id, text: 'Only the closer on this call (or Ron) can add its details.' }).catch(() => {});
+    return;
+  }
+  // trigger_id dies after 3 seconds: the prefill read gets 1.2 of them.
+  const prefill = await Promise.race([
+    loadCallFieldsPrefill(meta.appointment_id).catch(() => null),
+    new Promise((resolve) => setTimeout(() => resolve(null), 1200)),
+  ]);
+  try {
+    await client.views.open({ trigger_id: body.trigger_id, view: callFields.buildCallFieldsModal({ meta, prospectName: meta.prospect_name, prefill }) });
+  } catch (e) {
+    console.warn(`[call-fields] views.open failed for ${meta.appointment_id}: ${e.message}`);
+  }
+});
+
+slack.view(callFields.SUBMIT_CALLBACK_ID, async ({ ack, body, view }) => {
+  const parsed = callFields.parseCallFieldsSubmission(view.state?.values);
+  if (!parsed.ok) { await ack({ response_action: 'errors', errors: parsed.errors }); return; }
+  await ack();
+  const meta = callFields.parseMeta(view.private_metadata);
+  if (!meta || !callFieldsAllowed(body.user.id, meta)) return;
+  const out = await saveCallFields({ meta, fields: parsed.fields, userId: body.user.id });
+  console.log(`[call-fields] ${meta.appointment_id} by ${body.user.id}: max=${out.max?.ok} portal=${out.portal?.ok} ghl=${out.ghl?.ok}`);
+  await slack.client.chat.postMessage({ channel: meta.channel, thread_ts: meta.ts, text: callFieldsResultText(meta, parsed.fields, out) }).catch((e) => {
+    console.warn(`[call-fields] result reply failed for ${meta.appointment_id}: ${e.message}`);
+  });
+});
+
 // Shared tail of every reaction-driven outcome log: mark the card actioned,
 // stamp it, and report what happened in its thread — including the honest
 // ⚠️ when the portal row landed but the GHL move did not. `outcome` is what
@@ -20953,6 +21133,7 @@ async function reportOutcomeCardResult({ channel, ts, payload, result, outcome }
     const att = result.attendance;
     const attNote = att?.ok && !att.already ? ` Attendance set to *${att.status}* — that's Paso 1 done too.` : '';
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Logged *${label}* for ${payload.prospect_name}.${statusNote}${moveNote}${attNote}` });
+    await offerCallFieldsForm({ channel, ts, payload, outcome });
   } else if (result.reason === 'exists') {
     // A tapped terminal answer on a card whose row already says follow_up is
     // the open-deal papercut — promote it instead of stonewalling the closer.
