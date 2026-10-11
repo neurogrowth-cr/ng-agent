@@ -22,7 +22,9 @@ const fs   = require('fs');
 const path = require('path');
 
 const SRC = fs.readFileSync(process.argv[2] || path.join(__dirname, '..', 'index.js'), 'utf8');
-const block = SRC.slice(
+// clipText (the surrogate-safe cut) lives in the sanitizer block at the top of index.js.
+const sanitizerBlock = SRC.slice(SRC.indexOf('// ─── MODEL INPUT SANITIZER'), SRC.indexOf('// ─── end model input sanitizer'));
+const block = sanitizerBlock + SRC.slice(
   SRC.indexOf('const THREAD_ROOT_LIMIT'),
   SRC.indexOf('// ─── end pure thread helpers'),
 );
