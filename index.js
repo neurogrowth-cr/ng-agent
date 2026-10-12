@@ -21073,6 +21073,7 @@ async function handleOutcomeCardThreadReply(message, say) {
 // app config (Socket Mode delivers it; no request URL). Off by default, so the
 // cards behave exactly as before until both are in place.
 const callFields = require('./lib/callFields');
+const prospectWords = require('./lib/prospectWords');
 
 // Follow_up just landed from a card. CALL_FIELDS_AUTOFILL=on: REVI's read of
 // the call fills the fields with no tap, and the thread says what it saved
@@ -21097,7 +21098,8 @@ async function offerCallFieldsForm({ channel, ts, payload, outcome }) {
       if (auto.ok) {
         const msg = callFields.buildReviReadMessage({
           prospectName, fields: auto.fields, evidence: auto.evidence,
-          savedNote: callFieldsSinkNote(auto.fields, auto.out), showFix: formOn, meta,
+          savedNote: [callFieldsSinkNote(auto.fields, auto.out), prospectWordsNote(auto.words)].filter(Boolean).join('\n'),
+          showFix: formOn, meta,
         });
         await slack.client.chat.postMessage({ channel, thread_ts: ts, text: msg.text, blocks: msg.blocks });
         return;
@@ -21112,9 +21114,89 @@ async function offerCallFieldsForm({ channel, ts, payload, outcome }) {
   }
 }
 
+// One Fathom transcript, raw segments (speaker object kept: the prospect is
+// told apart from the closer by `matched_calendar_invitee_email`). Ported from
+// REVI's engine/lib/fathom.js getTranscript: honours retry-after on 429 once,
+// returns [] when the key is unset or the call fails, so the caller degrades
+// to "no prospect words" instead of losing the whole auto-fill.
+const FATHOM_API_BASE = process.env.FATHOM_API_BASE || 'https://api.fathom.ai/external/v1';
+async function fathomGetTranscriptSegments(recordingId) {
+  if (!process.env.FATHOM_API_KEY || !recordingId) return [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await fetch(`${FATHOM_API_BASE}/recordings/${encodeURIComponent(recordingId)}/transcript`, {
+        headers: { 'X-Api-Key': process.env.FATHOM_API_KEY, Accept: 'application/json' },
+      });
+      if (res.status === 429 && attempt === 0) {
+        const waitS = Math.min(parseInt(res.headers.get('retry-after') || '15', 10) || 15, 60);
+        await new Promise((r) => setTimeout(r, (waitS + 1) * 1000));
+        continue;
+      }
+      if (!res.ok) { console.warn(`Fathom transcript ${recordingId} → ${res.status}`); return []; }
+      const data = await res.json();
+      return data.transcript || data.segments || data.items || [];
+    } catch (err) {
+      console.warn(`Fathom transcript ${recordingId} failed:`, err.message);
+      return [];
+    }
+  }
+  return [];
+}
+
+// The three merge fields REVI's structured read cannot give (verbatim prospect
+// sentences, target buyer title and country): read from the call's Fathom
+// transcript, prospect lines only, validated so every quote is verbatim, then
+// written to the GHL contact by field name. Best-effort companion of the
+// auto-fill: its failure never blocks the five fields above it. Audit copy in
+// agent_knowledge `prospect-words:{appointment_id}`.
+async function fillProspectWordsFromRevi({ appointmentId, prospectName, email, recordingId, icpHint, contactId }) {
+  if (!recordingId) return { ok: false, reason: 'no Fathom recording id on the REVI row' };
+  const segments = await fathomGetTranscriptSegments(recordingId);
+  if (!segments.length) return { ok: false, reason: process.env.FATHOM_API_KEY ? 'transcript unavailable' : 'FATHOM_API_KEY not set' };
+  const lines = prospectWords.prospectLinesFromTranscript(segments, { prospectEmail: email, closerEmails: Object.keys(CLOSER_SLACK) });
+  if (lines.length < 200) return { ok: false, reason: 'too few prospect lines in the transcript' };
+
+  const prompt = prospectWords.buildProspectWordsPrompt({ prospectName, prospectLines: lines, icpHint });
+  const tLlm = Date.now();
+  const response = await anthropic.messages.create({
+    model: MODEL_LIGHT,
+    thinking: THINKING_OFF,
+    max_tokens: 500,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  logLlmFromAnthropicResponse(response, Date.now() - tLlm, null, 'prospect_words');
+  const parsed = prospectWords.parseProspectWords(response.content?.[0]?.text, lines);
+  if (!parsed.ok) return { ok: false, reason: parsed.reason };
+
+  let cid = contactId || null;
+  if (!cid) {
+    const { data: appt } = await portalSupabase.from('revops_appointments')
+      .select('prospect:prospect_id(email, ghl_contact_id)').eq('id', appointmentId).maybeSingle();
+    cid = appt?.prospect?.ghl_contact_id || await ghlFindContactByEmail(appt?.prospect?.email || email);
+  }
+  let ghl = { ok: false, missing: [], message: 'no GHL contact found for this prospect' };
+  if (cid) {
+    try { ghl = await writeGhlContactFieldsByName(cid, prospectWords.ghlProspectWordValues(parsed.fields)); }
+    catch (e) { ghl = { ok: false, missing: [], message: e.message }; }
+  }
+  await upsertKnowledge('process', `prospect-words:${appointmentId}`,
+    JSON.stringify({ at: new Date().toISOString(), recording_id: recordingId, fields: parsed.fields, evidence: parsed.evidence, ghl: ghl.ok, missing: ghl.missing }),
+    'prospect-words').catch(() => {});
+  return { ok: true, fields: parsed.fields, evidence: parsed.evidence, dropped: parsed.dropped, ghl };
+}
+
+function prospectWordsNote(words) {
+  if (!words) return '';
+  if (!words.ok) return `_No prospect words: ${words.reason}._`;
+  const where = words.ghl?.ok
+    ? (words.ghl.missing?.length ? ` (GHL fields missing: ${words.ghl.missing.join(', ')})` : ' → GHL')
+    : ` (⚠️ GHL not updated: ${words.ghl?.message || 'unknown'})`;
+  return `🗣️ ${prospectWords.prospectWordsSummary(words.fields)}${where}`;
+}
+
 // REVI auto-fill for one appointment. Never overwrites a closer's own answer
 // (call_fields.submitted_by is a Slack id for humans, 'revi' for this path).
-// Returns { ok, fields, evidence, out } or { ok:false, reason }.
+// Returns { ok, fields, evidence, out, words } or { ok:false, reason }.
 const CALL_FIELDS_REVI_LOOKBACK_MS = 2 * 86400000;
 async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
   const { data: existing } = await supabase.from('call_fields').select('submitted_by').eq('appointment_id', appointmentId).maybeSingle();
@@ -21127,7 +21209,7 @@ async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
 
   const lo = new Date(Date.parse(appt.scheduled_start) - CALL_FIELDS_REVI_LOOKBACK_MS).toISOString();
   const { data: scores, error } = await reviSupabase.from('closer_call_scores')
-    .select('call_date, coaching_json, prospect_signals')
+    .select('fathom_recording_id, call_date, coaching_json, prospect_signals')
     .ilike('prospect_email', email)
     .gte('call_date', lo);
   if (error) return { ok: false, reason: `REVI read failed: ${error.message}` };
@@ -21150,7 +21232,16 @@ async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
   if (!parsed.ok) return { ok: false, reason: `extraction: ${parsed.reason}` };
 
   const out = await saveCallFields({ meta: { appointment_id: appointmentId }, fields: parsed.fields, userId: 'revi' });
-  return { ok: true, fields: parsed.fields, evidence: parsed.evidence, out };
+  let words = null;
+  try {
+    const cj = pick.coaching_json || {};
+    words = await fillProspectWordsFromRevi({
+      appointmentId, prospectName, email, recordingId: pick.fathom_recording_id,
+      icpHint: (cj.context && cj.context.icp_fit) || cj.icp_fit || null,
+      contactId: out.ghl?.contactId || null,
+    });
+  } catch (e) { words = { ok: false, reason: e.message }; }
+  return { ok: true, fields: parsed.fields, evidence: parsed.evidence, out, words };
 }
 
 function callFieldsAllowed(userId, meta) {
@@ -21186,6 +21277,22 @@ async function ghlLocationCustomFields() {
   return fields;
 }
 
+// Writes contact custom fields by their GHL NAME (resolved to ids through the
+// cached location list). Never creates a field: names that do not exist come
+// back in `missing` for the thread message. Shared by the call fields and the
+// prospect words.
+async function writeGhlContactFieldsByName(contactId, valuesByName) {
+  const auth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  const { resolved, missing } = callFields.resolveGhlFieldIds(valuesByName, await ghlLocationCustomFields());
+  if (resolved.length) {
+    const put = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      method: 'PUT', headers: auth, body: JSON.stringify({ customFields: resolved }),
+    }, { label: `PUT /contacts/${contactId} (custom fields)` });
+    if (!put.ok) return { ok: false, missing, message: `custom fields PUT → ${put.status}` };
+  }
+  return { ok: true, missing, written: resolved.length };
+}
+
 async function writeCallFieldsToGhl(appointmentId, fields) {
   const { data: appt } = await portalSupabase.from('revops_appointments')
     .select('prospect:prospect_id(email, ghl_contact_id)').eq('id', appointmentId).maybeSingle();
@@ -21210,14 +21317,9 @@ async function writeCallFieldsToGhl(appointmentId, fields) {
   // Tags are what the workflow branches on, so from here the write counts as
   // landed; a field failure is reported on its own line.
   try {
-    const { resolved, missing } = callFields.resolveGhlFieldIds(callFields.ghlCallFieldValues(fields), await ghlLocationCustomFields());
-    if (resolved.length) {
-      const put = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
-        method: 'PUT', headers: auth, body: JSON.stringify({ customFields: resolved }),
-      }, { label: `PUT /contacts/${contactId} (call fields)` });
-      if (!put.ok) return { ok: true, contactId, missing, fieldsError: `custom fields PUT → ${put.status}` };
-    }
-    return { ok: true, contactId, missing };
+    const w = await writeGhlContactFieldsByName(contactId, callFields.ghlCallFieldValues(fields));
+    if (!w.ok) return { ok: true, contactId, missing: w.missing, fieldsError: w.message };
+    return { ok: true, contactId, missing: w.missing };
   } catch (e) {
     return { ok: true, contactId, missing: [], fieldsError: e.message };
   }
