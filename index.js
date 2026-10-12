@@ -1617,6 +1617,12 @@ function stripApprovalSentinel(text) {
 //
 // Whitelist by design (the TASK_HEADERS lesson at :1421): "starts with X" has
 // one shape, "does not contain any of these framing phrases" has infinite gaps.
+// Narration guard (lib/reportNarration.js): cut to the first declared header
+// and fail validation on process phrases, so the re-prompt runs. Added when
+// the Sonnet 5 shadow narrated around the data while passing every header
+// check (2026-10-07 to 10-09).
+const reportNarration = require('./lib/reportNarration');
+
 const TASK_LEAD_ANCHOR = {
   'Daily Closer Outcome Reminder': '<!subteam^',
   'Daily Sales Call Roster':       '<!subteam^',
@@ -1836,9 +1842,12 @@ function registerDynamicCron(task) {
       // Team-visible reports must never surface company financials, whatever
       // source they arrived from (Slack digests, knowledge base, live context).
       const confidentialityRule = deliversToRonOnly ? '' : `\n\nCONFIDENTIALITY: This report posts to a team-visible channel. Never include company financial details — bank balances, payment failures or successes, billing/subscription status, invoices, card or account information. If such a signal appears anywhere in your context, omit it entirely; Ron is notified privately through a separate channel.`;
+      // Posted verbatim to a channel: the model's process notes must never
+      // appear. Prose is probabilistic, so lib/reportNarration.js also checks.
+      const outputRule = '\n\nOUTPUT RULE: Return only the finished report. No preamble, no notes about what you checked, what was elided or truncated, what you excluded or why, and no sentence about your own process. Start with the first section header.';
       const enrichedPrompt = liveContext
-        ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
-        : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}`;
+        ? `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}${outputRule}\n\n---\nLIVE CONTEXT (use this to inform the report):\n${liveContext}`
+        : `${task.prompt}${lessonContext}${clientCtxBlock}${taskDataBlock}${confidentialityRule}${outputRule}`;
 
       // Retry logic — up to 3 attempts with backoff for 529/503 overload errors
       let reply = null;
@@ -1919,7 +1928,7 @@ function registerDynamicCron(task) {
         'Daily Closer Outcome Reminder': [], // short nightly nudge — no fixed headers
       };
 
-      function validateFinalReport(text, taskName) {
+      function validateReportStructure(text, taskName) {
         const t = text || '';
         const upper = t.toUpperCase();
         const len = t.trim().length;
@@ -1965,6 +1974,18 @@ function registerDynamicCron(task) {
         return { ok: true, reason: null, found, missing, len };
       }
 
+      // Structure first (its reason names the missing headers), then narration:
+      // a report that reads like the model thinking out loud fails even when
+      // every header is present.
+      function validateFinalReport(text, taskName) {
+        const structure = validateReportStructure(text, taskName);
+        if (!structure.ok) return structure;
+        const phrase = reportNarration.findNarration(text);
+        if (phrase) return { ...structure, ok: false, reason: `narration: "${phrase}"` };
+        return structure;
+      }
+
+      reply = reportNarration.cutToFirstHeader(reply, TASK_HEADERS[task.name]);
       const firstCheck = validateFinalReport(reply, task.name);
 
       if (!firstCheck.ok) {
@@ -1973,11 +1994,12 @@ function registerDynamicCron(task) {
           const finalReply = trimToLeadAnchor(stripApprovalSentinel(await callClaude([
             { role: 'user', content: task.prompt },
             { role: 'assistant', content: reply },
-            { role: 'user', content: 'Your previous response was rejected because it did not contain the required section headers. Do NOT narrate your process, explain what you are doing, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.' }
+            { role: 'user', content: `Your previous response was rejected (${firstCheck.reason}). Do NOT narrate your process, explain what you are doing, say what was elided or truncated, or show your reasoning. Output ONLY the final compiled report with every section header and all data filled in, exactly as specified in the original instructions. Start directly with the first section header. Nothing before it.` }
           ], 3, null, correlation_id, process.env.ICM_CRON_ALL_TOOLS === '1' ? {} : { onlyTools: REPORT_TOOLS })), task.name);
-          const secondCheck = validateFinalReport(finalReply, task.name);
-          if (finalReply && secondCheck.ok) {
-            reply = finalReply;
+          const finalCut = reportNarration.cutToFirstHeader(finalReply, TASK_HEADERS[task.name]);
+          const secondCheck = validateFinalReport(finalCut, task.name);
+          if (finalCut && secondCheck.ok) {
+            reply = finalCut;
             console.log(`Cron "${task.name}": re-prompt passed validation (${reply.trim().length} chars)`);
           } else {
             const failingReply = (finalReply || reply || '');
@@ -2017,12 +2039,14 @@ function registerDynamicCron(task) {
         (async () => {
           const shadowTools = REPORT_TOOLS.filter(t => t !== 'draft_channel_post');
           const shadowRaw = await callClaude([{ role: 'user', content: enrichedPrompt }], 2, null, correlation_id, { onlyTools: shadowTools, model: shadowModel, callSite: 'shadow_report' });
-          const shadowReply = trimToLeadAnchor(stripApprovalSentinel(shadowRaw || ''), task.name);
+          const shadowTrimmed = trimToLeadAnchor(stripApprovalSentinel(shadowRaw || ''), task.name);
+          const shadowReply = reportNarration.cutToFirstHeader(shadowTrimmed, TASK_HEADERS[task.name]);
+          const shadowCutNote = shadowReply.length < shadowTrimmed.length ? ' · narration before the first header was cut' : '';
           const check = validateFinalReport(shadowReply, task.name);
           const body = shadowReply.length > 3500 ? shadowReply.slice(0, 3500) + '\n[... trimmed ...]' : shadowReply;
           await slack.client.chat.postMessage({
             channel: RON_SLACK_ID,
-            text: `\`SHADOW ${shadowModel}\` "${task.name}" (real ${MODEL_AGENT} version posted to ${targetChannel})\nFormat check: ${check.ok ? 'passed' : `FAILED (${check.reason})`}${firstCheck.ok ? '' : ' · real version needed a re-prompt'}\n\n${body}`,
+            text: `\`SHADOW ${shadowModel}\` "${task.name}" (real ${MODEL_AGENT} version posted to ${targetChannel})\nFormat check: ${check.ok ? 'passed' : `FAILED (${check.reason})`}${shadowCutNote}${firstCheck.ok ? '' : ' · real version needed a re-prompt'}\n\n${body}`,
           });
         })().catch(e => console.error(`Shadow report failed (${task.name}):`, e.message));
       }
