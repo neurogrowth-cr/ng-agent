@@ -21228,7 +21228,8 @@ async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
     messages: [{ role: 'user', content: prompt }],
   });
   logLlmFromAnthropicResponse(response, Date.now() - tLlm, null, 'call_fields_autofill');
-  const parsed = callFields.parseReviExtraction(response.content?.[0]?.text, pick.call_date);
+  const todayISO = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const parsed = callFields.parseReviExtraction(response.content?.[0]?.text, pick.call_date, { todayISO });
   if (!parsed.ok) return { ok: false, reason: `extraction: ${parsed.reason}` };
 
   const out = await saveCallFields({ meta: { appointment_id: appointmentId }, fields: parsed.fields, userId: 'revi' });

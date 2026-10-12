@@ -192,4 +192,15 @@ t('index.js: autofill runs before the form, never overwrites a closer answer, us
   assert.ok(src.includes('runCallFieldsBackfillOnceIfRequested().catch('), 'backfill is armed at boot');
 });
 
+t('a next step already in the past at write time is dropped (backfill of old calls)', () => {
+  const past = cf.parseReviExtraction('{"industry":"tech","objection":"socio","next_step_date":"2026-07-18"}', '2026-07-15', { todayISO: '2026-10-11' });
+  assert.strictEqual(past.fields.nextStepDate, null);
+  const future = cf.parseReviExtraction('{"industry":"tech","objection":"socio","next_step_date":"2026-10-20"}', '2026-10-09', { todayISO: '2026-10-11' });
+  assert.strictEqual(future.fields.nextStepDate, '2026-10-20');
+  const today = cf.parseReviExtraction('{"industry":"tech","objection":"socio","next_step_date":"2026-10-11"}', '2026-10-09', { todayISO: '2026-10-11' });
+  assert.strictEqual(today.fields.nextStepDate, '2026-10-11');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.ok(src.includes("parseReviExtraction(response.content?.[0]?.text, pick.call_date, { todayISO })"), 'live path passes the CR day');
+});
+
 console.log(`\n${n} passed`);
