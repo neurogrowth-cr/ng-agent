@@ -21539,16 +21539,36 @@ async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
   if (existing && existing.submitted_by !== 'revi') return { ok: false, reason: 'already filled by the closer' };
 
   const { data: appt } = await portalSupabase.from('revops_appointments')
-    .select('scheduled_start, prospect:prospect_id(email)').eq('id', appointmentId).maybeSingle();
-  const email = appt?.prospect?.email;
-  if (!email || !appt?.scheduled_start) return { ok: false, reason: 'no prospect email or call time' };
+    .select('scheduled_start, booked_at, created_at, ghl_appointment_id, prospect:prospect_id(email)').eq('id', appointmentId).maybeSingle();
+  const email = appt?.prospect?.email || null;
+  const ghlApptId = appt?.ghl_appointment_id || null;
+  if (!appt?.scheduled_start) return { ok: false, reason: 'no call time on the appointment' };
+  if (!email && !ghlApptId) return { ok: false, reason: 'no prospect email or GHL appointment id' };
 
-  const lo = new Date(Date.parse(appt.scheduled_start) - CALL_FIELDS_REVI_LOOKBACK_MS).toISOString();
-  const { data: scores, error } = await reviSupabase.from('closer_call_scores')
-    .select('fathom_recording_id, call_date, coaching_json, prospect_signals')
-    .ilike('prospect_email', email)
-    .gte('call_date', lo);
-  if (error) return { ok: false, reason: `REVI read failed: ${error.message}` };
+  // Window anchored to the earliest date the row ever had, not the current
+  // (possibly rescheduled) scheduled_start. See callFields.reviLookbackFrom.
+  const lo = callFields.reviLookbackFrom(appt, CALL_FIELDS_REVI_LOOKBACK_MS);
+  let scores = [];
+  if (email) {
+    const { data, error } = await reviSupabase.from('closer_call_scores')
+      .select('fathom_recording_id, call_date, coaching_json, prospect_signals').ilike('prospect_email', email).gte('call_date', lo);
+    if (error) return { ok: false, reason: `REVI read failed: ${error.message}` };
+    scores = data || [];
+  }
+  // Fallback by GHL appointment id: when the contact has no email REVI files
+  // the score under the closer's own address, but its call_ledger row still
+  // carries the GHL appointment the recording was matched to.
+  if (!scores.length && ghlApptId) {
+    const { data: ledger, error: lErr } = await reviSupabase.from('call_ledger')
+      .select('fathom_recording_id').eq('ghl_appointment_id', ghlApptId).not('fathom_recording_id', 'is', null);
+    if (lErr) return { ok: false, reason: `REVI ledger read failed: ${lErr.message}` };
+    const ids = (ledger || []).map((r) => String(r.fathom_recording_id));
+    if (ids.length) {
+      const { data, error } = await reviSupabase.from('closer_call_scores').select('fathom_recording_id, call_date, coaching_json, prospect_signals').in('fathom_recording_id', ids);
+      if (error) return { ok: false, reason: `REVI read failed: ${error.message}` };
+      scores = data || [];
+    }
+  }
   // Newest scored call: a later follow-up call knows more than the first one.
   const pick = pickClosingCall(scores, Date.now());
   if (!pick) return { ok: false, reason: 'REVI has no scored call for this prospect' };

@@ -192,6 +192,30 @@ t('index.js: autofill runs before the form, never overwrites a closer answer, us
   assert.ok(src.includes('runCallFieldsBackfillOnceIfRequested().catch('), 'backfill is armed at boot');
 });
 
+t('index.js: the REVI window is anchored to the earliest appointment date and falls back to the GHL appointment id', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  const auto = src.slice(src.indexOf('async function autofillCallFieldsFromRevi'), src.indexOf('function callFieldsAllowed'));
+  assert.ok(auto.includes('callFields.reviLookbackFrom(appt, CALL_FIELDS_REVI_LOOKBACK_MS)'), 'window uses the helper, not scheduled_start alone');
+  assert.ok(auto.includes('scheduled_start, booked_at, created_at, ghl_appointment_id'), 'the appointment read carries the dates the helper needs');
+  assert.ok(auto.includes(".from('call_ledger')") && auto.includes(".eq('ghl_appointment_id', ghlApptId)"), 'ledger fallback by GHL appointment id');
+  assert.ok(auto.indexOf(".ilike('prospect_email', email)") < auto.indexOf(".from('call_ledger')"), 'email first, ledger second');
+  assert.ok(!auto.includes("'no prospect email or call time'"), 'a contact without email is no longer a hard skip');
+});
+
+t('reviLookbackFrom: a rescheduled appointment still reaches the real call', () => {
+  const two = 2 * 86400000;
+  // Federico Vargas (2026-10-11 backfill): booked Sep 8, call Sep 10, rescheduled 6 times to Sep 22.
+  const lo = cf.reviLookbackFrom({ scheduled_start: '2026-09-22T18:30:00.000Z', booked_at: '2026-09-08T02:41:59.000Z', created_at: '2026-09-08T02:42:03.753Z' }, two);
+  assert.strictEqual(lo, '2026-09-06T02:41:59.000Z');
+  assert.ok(lo < '2026-09-10T21:00:20+00'.replace(' ', 'T'), 'the Sep 10 recording is inside the window');
+  // Never rescheduled: same answer as before (scheduled_start minus two days).
+  assert.strictEqual(cf.reviLookbackFrom({ scheduled_start: '2026-10-09T21:00:00.000Z', booked_at: '2026-10-09T22:00:00.000Z' }, two), '2026-10-07T21:00:00.000Z');
+  // Missing or junk secondary dates are ignored; no scheduled_start means no window.
+  assert.strictEqual(cf.reviLookbackFrom({ scheduled_start: '2026-10-09T21:00:00.000Z', booked_at: null, created_at: 'nope' }, two), '2026-10-07T21:00:00.000Z');
+  assert.strictEqual(cf.reviLookbackFrom({ booked_at: '2026-10-09T21:00:00.000Z' }, two), null);
+  assert.strictEqual(cf.reviLookbackFrom(null, two), null);
+});
+
 t('a next step already in the past at write time is dropped (backfill of old calls)', () => {
   const past = cf.parseReviExtraction('{"industry":"tech","objection":"socio","next_step_date":"2026-07-18"}', '2026-07-15', { todayISO: '2026-10-11' });
   assert.strictEqual(past.fields.nextStepDate, null);
