@@ -41,28 +41,30 @@ const NOW = Date.parse('2026-08-24T16:00:00Z'); // a Monday, 10:00 CR
 const daysAgoISO = (d) => new Date(NOW - d * 86400000).toISOString();
 
 // ── 1. Nudge cadence (evaluateOpenDealNudge) ─────────────────────────────────
-check('1a constants: 3d / 4d / 7d / 21d / 3 nudges',
+// Cadence 5 / 30 since 2026-10-11 (Persuasion Playbook Play 6): first card at
+// day 5 after the call, second at day 30 (5 + 25), nothing in the dead zone.
+check('1a constants: 5d / 25d / 7d / 21d / 3 nudges',
   [OPEN_DEAL_FIRST_NUDGE_DAYS, OPEN_DEAL_RENUDGE_DAYS, OPEN_DEAL_SNOOZE_DAYS, OPEN_DEAL_ZOMBIE_AGE_DAYS, OPEN_DEAL_ZOMBIE_NUDGES],
-  [3, 4, 7, 21, 3]);
-check('1b 2d old, no card yet → too_fresh',
-  evaluateOpenDealNudge({ ageDays: 2, state: null, ghlStageTerminal: false }, NOW), { skip: 'too_fresh' });
-check('1c 3d old, no card yet → first_nudge',
-  evaluateOpenDealNudge({ ageDays: 3, state: null, ghlStageTerminal: false }, NOW), { act: 'first_nudge' });
+  [5, 25, 7, 21, 3]);
+check('1b 4d old, no card yet → too_fresh (day 7 nudges are the dead zone)',
+  evaluateOpenDealNudge({ ageDays: 4, state: null, ghlStageTerminal: false }, NOW), { skip: 'too_fresh' });
+check('1c 5d old, no card yet → first_nudge',
+  evaluateOpenDealNudge({ ageDays: 5, state: null, ghlStageTerminal: false }, NOW), { act: 'first_nudge' });
 check('1d 61d old, never carded → digest_only (cold-start guard)',
   evaluateOpenDealNudge({ ageDays: 61, state: null, ghlStageTerminal: false }, NOW), { skip: 'digest_only' });
 check('1e GHL card already terminal → ghl_drift, beats everything',
   evaluateOpenDealNudge({ ageDays: 10, state: null, ghlStageTerminal: true }, NOW), { skip: 'ghl_drift' });
 const carded = (over = {}) => ({ firstNudgedISO: daysAgoISO(5), nudgeCount: 1, lastNudgedISO: daysAgoISO(5), snoozeUntilISO: null, snoozeCount: 0, cardChannel: 'D1', cardTs: '1.1', driftISO: null, ...over });
-check('1f nudged 2d ago → renudge_gap (4d cadence)',
-  evaluateOpenDealNudge({ ageDays: 6, state: carded({ lastNudgedISO: daysAgoISO(2) }), ghlStageTerminal: false }, NOW), { skip: 'renudge_gap' });
-check('1g nudged 4d ago → renudge',
-  evaluateOpenDealNudge({ ageDays: 8, state: carded({ lastNudgedISO: daysAgoISO(4) }), ghlStageTerminal: false }, NOW), { act: 'renudge' });
+check('1f carded on day 5, 14d later → renudge_gap (silence until day 30)',
+  evaluateOpenDealNudge({ ageDays: 19, state: carded({ lastNudgedISO: daysAgoISO(14) }), ghlStageTerminal: false }, NOW), { skip: 'renudge_gap' });
+check('1g carded on day 5, 25d later → renudge (the day-30 return)',
+  evaluateOpenDealNudge({ ageDays: 30, state: carded({ lastNudgedISO: daysAgoISO(25) }), ghlStageTerminal: false }, NOW), { act: 'renudge' });
 check('1h snoozed until tomorrow → snoozed, even though bump is due',
-  evaluateOpenDealNudge({ ageDays: 8, state: carded({ snoozeUntilISO: daysAgoISO(-1) }), ghlStageTerminal: false }, NOW), { skip: 'snoozed' });
+  evaluateOpenDealNudge({ ageDays: 31, state: carded({ lastNudgedISO: daysAgoISO(26), snoozeUntilISO: daysAgoISO(-1) }), ghlStageTerminal: false }, NOW), { skip: 'snoozed' });
 check('1i snooze expired yesterday → renudge resumes',
-  evaluateOpenDealNudge({ ageDays: 12, state: carded({ snoozeUntilISO: daysAgoISO(1) }), ghlStageTerminal: false }, NOW), { act: 'renudge' });
+  evaluateOpenDealNudge({ ageDays: 31, state: carded({ lastNudgedISO: daysAgoISO(26), snoozeUntilISO: daysAgoISO(1) }), ghlStageTerminal: false }, NOW), { act: 'renudge' });
 check('1j carded deal older than 60d keeps its bumps (digest_only is first-card only)',
-  evaluateOpenDealNudge({ ageDays: 65, state: carded(), ghlStageTerminal: false }, NOW), { act: 'renudge' });
+  evaluateOpenDealNudge({ ageDays: 65, state: carded({ lastNudgedISO: daysAgoISO(30) }), ghlStageTerminal: false }, NOW), { act: 'renudge' });
 
 // ── 2. State round-trip ──────────────────────────────────────────────────────
 const st = { firstNudgedISO: '2026-08-20T16:00:00.000Z', nudgeCount: 2, lastNudgedISO: '2026-08-24T16:00:00.000Z', snoozeUntilISO: '', snoozeCount: 1, cardChannel: 'D0AAA', cardTs: '1724.5', driftISO: '' };
@@ -124,6 +126,9 @@ check('6b card surfaces nudge and snooze counts', card.includes('nudged 2×') &&
 check('6c card offers snooze + close verbs, won is typed-only',
   card.includes('💤 *Still working it*') && card.includes('👎 *Lost*') && card.includes('🙅 *No Fit*') && card.includes('`won <amount>`') && !card.includes('tap won'), true);
 check('6d card never renders undefined/null/NaN', /undefined|NaN|\bnull\b/.test(card), false);
+const cardWithDraft = buildOpenDealCardText({ prospectName: 'Ana Lopez', ageDays: 5, nudgeCount: 0, snoozeCount: 0, callDateStr: 'Aug 12', acts, wonLabel: 'Closed', draftBlock: '💬 *WhatsApp draft*\n> Ana, ¿sigue en pie?' });
+check('6e draft block lands after the verbs, verbatim', cardWithDraft.endsWith('💬 *WhatsApp draft*\n> Ana, ¿sigue en pie?') && cardWithDraft.includes('`won <amount>`'), true);
+check('6f no draft block → card unchanged', buildOpenDealCardText({ prospectName: 'Ana Lopez', ageDays: 5, nudgeCount: 2, snoozeCount: 1, callDateStr: 'Aug 12', acts, wonLabel: 'Closed', draftBlock: null }), card);
 
 // ── 7. Digest structural contract ────────────────────────────────────────────
 const digest = formatOpenDealZombieDigest({ zombies: b.zombies, drift: b.drift });
