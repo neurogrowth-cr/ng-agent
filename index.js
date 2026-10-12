@@ -2,6 +2,7 @@ require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
 const hotReplies = require('./lib/hotReplies');
+const openDealDrafts = require('./lib/openDealDrafts');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -11335,14 +11336,20 @@ const GHL_CUTOVER_ISO = '2026-07-23T00:00:00.000Z';
 // stages by design, the outcome reminders only chase UNLOGGED calls, and the
 // stalled-prospect cron is setter-only. Open deals rotted on closer memory.
 // This sweep makes the system own the follow-up cadence instead: card the
-// owning closer once a deal has sat 3 days, bump every 4 days, let a 💤 tap
-// snooze it a week, and surface zombies to Ron every Monday. Max NEVER writes
-// a terminal outcome on his own — every promotion below traces to a human tap
-// or typed reply.
+// owning closer at day 5 after the call, again at day 30, let a 💤 tap snooze
+// it a week, and surface zombies to Ron every Monday. Each card carries a
+// WhatsApp draft written from REVI's read of the call (lib/openDealDrafts.js);
+// ✅ sends it through GHL. Max NEVER writes a terminal outcome on his own —
+// every promotion below traces to a human tap or typed reply.
+// Cadence moved from 3d/4d/7d to 5/30 on 2026-10-11 (Ron, Persuasion Playbook
+// Play 6): wins land inside 5 days or after day 30, almost never between, and
+// the post-call email sequence is deliberately silent on days 9 to 30. A nudge
+// on day 7 contradicted it. Age is measured from the CALL, not from when the
+// outcome was logged (fetchOpenDeals aliases scheduled_start as opened_at).
 // Recipe spec: ~/automations/ops/recipes/open-deal-followup.md
 // ─── open-deal followup pure block ───────────────────────────────────────────
-const OPEN_DEAL_FIRST_NUDGE_DAYS = 3;   // deal must sit this long before the first card
-const OPEN_DEAL_RENUDGE_DAYS     = 4;   // thread-bump cadence once a card exists
+const OPEN_DEAL_FIRST_NUDGE_DAYS = 5;   // day-5 card: close or pause (playbook Play 6)
+const OPEN_DEAL_RENUDGE_DAYS     = 25;  // day-30 card: the planned return (5 + 25)
 const OPEN_DEAL_SNOOZE_DAYS      = 7;   // one "still working it" buys this long
 const OPEN_DEAL_ZOMBIE_AGE_DAYS  = 21;  // age alone puts a deal in Ron's digest
 const OPEN_DEAL_ZOMBIE_NUDGES    = 3;   // ...as do this many ignored nudges
@@ -11492,7 +11499,7 @@ function sortOpenDealsOldestFirst(deals) {
 // Renders one open-deal card. Pure — callers pass the pipeline's own action
 // vocabulary — so the exact copy a closer sees is asserted in tests. `won` is
 // never a tap: money is always typed, same convention as the outcome cards.
-function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount, callDateStr, acts, wonLabel, inheritedFrom }) {
+function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount, callDateStr, acts, wonLabel, inheritedFrom, draftBlock }) {
   const meta = [];
   if (nudgeCount > 0) meta.push(`nudged ${nudgeCount}×`);
   if (snoozeCount > 0) meta.push(`snoozed ${snoozeCount}×`);
@@ -11504,6 +11511,7 @@ function buildOpenDealCardText({ prospectName, ageDays, nudgeCount, snoozeCount,
     '',
     `→ 💤 *Still working it* (snoozes me ${OPEN_DEAL_SNOOZE_DAYS} days — or type \`snooze\`) · ${tapList}`,
     `→ Closed it? Reply \`won <amount>\` and I'll log *${wonLabel}* — money is always typed, never tapped.`,
+    ...(draftBlock ? ['', draftBlock] : []),
   ].join('\n');
 }
 
@@ -11544,8 +11552,10 @@ function formatOpenDealZombieDigest({ zombies, drift, historical }) {
 // ─── end open-deal followup pure block ───────────────────────────────────────
 
 // Every open deal, straight from the source of truth: an outcome row still
-// sitting at follow_up. `opened_at` is when that outcome was logged — the
-// moment the deal entered Open Deal. Returns null (not []) when the read-only
+// sitting at follow_up. `opened_at` is the CALL time (scheduled_start): the
+// day-5 / day-30 cadence counts from the conversation the prospect remembers,
+// not from when the closer got around to logging it (`logged_at`, kept for
+// reference). Returns null (not []) when the read-only
 // portal DB is not configured, so callers can tell "no access" from "none".
 // Only deals a closer can actually act on — the same two gates
 // fetchDueSalesCalls applies, and for the same reason its comment gives:
@@ -11564,7 +11574,7 @@ function formatOpenDealZombieDigest({ zombies, drift, historical }) {
 async function fetchOpenDeals() {
   if (!portalPg) return null;
   const { rows } = await portalPg.query(
-    `SELECT o.appointment_id, o.created_at AS opened_at,
+    `SELECT o.appointment_id, a.scheduled_start AS opened_at, o.created_at AS logged_at,
             a.closer_id, a.scheduled_start,
             p.id AS prospect_id, p.full_name, p.email,
             p.ghl_opportunity_id, p.ghl_contact_id
@@ -11740,6 +11750,94 @@ async function reportOpenDealCardResult({ channel, ts, payload, result, outcome,
   }
 }
 
+// Drafts the WhatsApp message for one card from REVI's read of the call.
+// Validate-and-retry once (the validator is the contract the prompt states);
+// a draft that still fails returns null and the card goes out without one —
+// a card with no draft beats a bad draft reaching a prospect. Only closer-safe
+// REVI fields travel into the prompt (see lib/openDealDrafts.reviContextForDraft).
+async function generateOpenDealDraft({ touch, prospectName, closerEmail, callDateStr, ageDays, recording, correlationId }) {
+  const revi = openDealDrafts.reviContextForDraft(recording, recording ? recording.coaching : null);
+  const archetype = openDealDrafts.pickOpenDealArchetype({ touch, signals: recording ? recording.signals : {}, dealStatus: recording ? recording.dealStatus : null });
+  const language = revi.language || 'es';
+  const prospectFirstName = String(prospectName || '').trim().split(/\s+/)[0] || '';
+  const closerFirstName = (resolveSalesMember(closerEmail) || '').split(/\s+/)[0] || 'Jose';
+  let feedback = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const prompt = openDealDrafts.buildOpenDealDraftPrompt({ touch, archetype, prospectFirstName, closerFirstName, language, callDateStr, ageDays, revi, feedback });
+    const t = Date.now();
+    let text = '';
+    try {
+      const res = await anthropic.messages.create({
+        model: MODEL_AGENT,
+        thinking: THINKING_OFF,
+        max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }],
+      });
+      logLlmFromAnthropicResponse(res, Date.now() - t, correlationId, 'open_deal_draft');
+      text = (res.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    } catch (err) {
+      console.error(`open-deal draft (${touch}) for ${prospectName} failed:`, err.message);
+      return null;
+    }
+    const v = openDealDrafts.validateOpenDealDraft(text, { language, archetype });
+    if (v.ok) return { text, archetype, touch, source: (revi.recovery || revi.generalRead) ? 'revi' : 'generic' };
+    feedback = v.problems.join('; ');
+    console.log(`open-deal draft (${touch}) for ${prospectName} rejected on attempt ${attempt + 1}: ${feedback}`);
+  }
+  return null;
+}
+
+// The GHL note that keeps the contact's history complete: call, REVI read,
+// then every follow-up Max helped send. Best-effort; a failed note never
+// un-sends the message.
+async function postOpenDealWhatsappNote({ contactId, touch, closerName, text }) {
+  if (!contactId) return false;
+  try {
+    const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: `WhatsApp de seguimiento (${openDealDrafts.TOUCH_LABEL[touch] || touch}) enviado por ${closerName} vía Max:\n\n${text}` }),
+    }, { label: `open-deal note ${contactId}` });
+    return res.ok;
+  } catch (err) {
+    console.error(`open-deal note for ${contactId} failed:`, err.message);
+    return false;
+  }
+}
+
+// ✅ on a card with a draft, or a typed `revise: <text>` in its thread: send
+// the message to the prospect through GHL's WhatsApp, stamp the card 📨 (NOT ✅
+// — the deal is still open and later 👎/🙅 taps must keep working), note it
+// on the GHL contact, and tell Ron. Idempotent on the 📨 stamp.
+async function sendOpenDealWhatsapp({ payload, channel, ts, userId, text, isRevised, dmMsg }) {
+  const already = (dmMsg?.reactions || []).find(r => r.name === 'incoming_envelope' && r.users?.includes(process.env.SLACK_BOT_USER_ID));
+  if (already && !isRevised) {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: 'Already sent from this card. Reply `revise: <text>` to send a different message.' });
+    return;
+  }
+  const contactId = payload.ghl_contact_id || null;
+  if (!contactId) {
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: '⚠️ No GHL contact on file for this prospect, so I cannot send it. Copy the draft and send it from your phone.' });
+    return;
+  }
+  const correlationId = newCorrelationId();
+  const result = await sendCampaignMessage({ contactId, contactName: payload.prospect_name, draftText: text, approverSlackId: userId, correlationId, isRevised: !!isRevised });
+  const closerName = resolveSalesMember(payload.closer_email) || 'the closer';
+  if (result.ok) {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'incoming_envelope' }).catch(() => {});
+    const noted = await postOpenDealWhatsappNote({ contactId, touch: payload.touch || 'd5', closerName, text });
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `📨 Sent by WhatsApp to ${payload.prospect_name}${isRevised ? ' (your version)' : ''}.${noted ? ' Noted on the GHL contact.' : ' (Could not add the GHL note.)'} The deal stays on my list until it is won, lost, or snoozed.` });
+    if (userId !== RON_SLACK_ID) {
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `📨 ${closerName} sent the ${openDealDrafts.TOUCH_LABEL[payload.touch] || 'follow-up'} WhatsApp to *${payload.prospect_name}*${isRevised ? ' (revised)' : ''}:\n> ${String(text).split('\n').join('\n> ')}` }).catch(() => {});
+    }
+    logActivity({ event_type: 'open_deal_whatsapp_sent', event_source: 'slack', action: isRevised ? 'revise' : 'approve', actor_user_id: userId, correlation_id: correlationId,
+      output: { appointment_id: payload.appointment_id, contact_id: contactId, touch: payload.touch || null, archetype: payload.draft_archetype || null, text: String(text).slice(0, 500) } });
+  } else {
+    await slack.client.reactions.add({ channel, timestamp: ts, name: 'warning' }).catch(() => {});
+    await slack.client.chat.postMessage({ channel, thread_ts: ts, text: `Couldn't send it through GHL (${result.error}). Send it from your phone, or tap ✅ again in a minute.` });
+  }
+}
+
 // A reaction on an open-deal card. Ownership and idempotency mirror
 // handleOutcomeProposalReaction; the verbs are this card's own: 💤 snoozes,
 // 👎/🙅 promote to lost/no-fit, everything else gets an explanation. There is
@@ -11778,7 +11876,11 @@ async function handleOpenDealFollowupReaction(event, baseEmoji, dmMsg, payload) 
     await reportOpenDealCardResult({ channel, ts, payload, result, outcome: tapped });
     return;
   }
-  // ✅ / ❌ / 📞 / 👻 — none of them answer this card.
+  if (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) && payload.draft_text) {
+    await sendOpenDealWhatsapp({ payload, channel, ts, userId: event.user, text: payload.draft_text, isRevised: false, dmMsg });
+    return;
+  }
+  // ✅ (no draft) / ❌ / 📞 / 👻 — none of them answer this card.
   await slack.client.chat.postMessage({
     channel, thread_ts: ts,
     text: `This card has no proposal to confirm and doesn't dismiss — an open deal stays on my list until it's won, lost, or snoozed. 💤 snoozes ${OPEN_DEAL_SNOOZE_DAYS} days · 👎/🙅 close it out · reply \`won <amount>\` for a win.`,
@@ -11793,6 +11895,11 @@ async function handleOpenDealCardThreadReply(message, say, payload) {
   const expectedSlackId = CLOSER_SLACK[payload.closer_email] || CLOSER_SLACK[(payload.closer_email || '').toLowerCase()];
   if (message.user !== RON_SLACK_ID && message.user !== expectedSlackId) {
     return `[CONTEXT: reply in the open-deal follow-up thread for prospect ${payload.prospect_name}, but the sender is not the owning closer — do not log or promote an outcome from this.]`;
+  }
+  const revise = String(message.text || '').match(/^(?:revise|enviar|send)\s*:\s*([\s\S]{5,})$/i);
+  if (revise) {
+    await sendOpenDealWhatsapp({ payload, channel: message.channel, ts: message.thread_ts, userId: message.user, text: revise[1].trim(), isRevised: true, dmMsg: null });
+    return true;
   }
   const parsed = parseOpenDealReply(message.text);
   if (!parsed) {
@@ -11849,8 +11956,17 @@ async function runOpenDealFollowupSweep(correlationId) {
   const skipCounts = {};
   const bumpSkip = (k) => { skipCounts[k] = (skipCounts[k] || 0) + 1; };
   const dryLines = [];
+  const liveLines = [];
   const unmappedClosers = {};
-  let cardsSent = 0, bumpsSent = 0, driftFound = 0;
+  let cardsSent = 0, bumpsSent = 0, driftFound = 0, draftsMade = 0;
+
+  // One REVI read for the whole book (36h match window per call). Lazy: only
+  // fetched when a card is actually due, so a quiet run costs nothing.
+  let recordings = null;
+  const recordingFor = async (deal) => {
+    if (recordings === null) recordings = await fetchReviRecordings(deals.map(d => Date.parse(d.scheduled_start || '')), 'open-deal drafts');
+    return matchRecordingToCall(recordings, deal.email, Date.parse(deal.scheduled_start || ''));
+  };
 
   for (const [closerEmail, closerDeals] of Object.entries(byCloser)) {
     const slackId = CLOSER_SLACK[closerEmail] || CLOSER_SLACK[(closerEmail || '').toLowerCase()];
@@ -11898,38 +12014,32 @@ async function runOpenDealFollowupSweep(correlationId) {
       if (decision.skip) { bumpSkip(decision.skip); continue; }
 
       const pName = deal.full_name || deal.email || 'Unknown prospect';
+      const touch = decision.act === 'first_nudge' ? 'd5' : 'd30';
+      const callDateStr = deal.scheduled_start ? formatICTime(deal.scheduled_start, { month: 'short', day: 'numeric' }) : '';
+      const recording = await recordingFor(deal);
+      const draft = await generateOpenDealDraft({ touch, prospectName: pName, closerEmail, callDateStr, ageDays, recording, correlationId });
+      if (draft) draftsMade += 1;
+      let contactId = deal.ghl_contact_id || null;
+      if (!contactId && deal.email && draft) contactId = await ghlFindContactByEmail(deal.email);
+
       if (!isLive) {
-        dryLines.push(`• ${pName} — ${decision.act === 'first_nudge' ? 'would card' : 'would bump'} (open ${ageDays}d, closer ${resolveSalesMember(closerEmail)})`);
+        dryLines.push(`• ${pName} — would send ${touch} card (call ${ageDays}d ago, closer ${resolveSalesMember(closerEmail)}, ${draft ? `${draft.archetype}/${draft.source}` : 'NO DRAFT'}${contactId ? '' : ', no GHL contact'})${draft ? `\n> ${draft.text.split('\n').join('\n> ')}` : ''}`);
         if (decision.act === 'first_nudge') newCards += 1;
         continue;
       }
 
-      if (decision.act === 'renudge' && state && state.cardChannel && state.cardTs) {
-        try {
-          await slack.client.chat.postMessage({
-            channel: state.cardChannel, thread_ts: state.cardTs,
-            text: `🕰️ Day ${ageDays} in Open Deal — still working it? 💤 on the card (or type \`snooze\`) buys ${OPEN_DEAL_SNOOZE_DAYS} days · 👎/🙅 close it out · \`won <amount>\` logs the win.`,
-          });
-          state.nudgeCount += 1;
-          state.lastNudgedISO = new Date(now).toISOString();
-          await upsertKnowledge('process', key, encodeOpenDealNudgeState(state), 'open-deal-nudge');
-          bumpsSent += 1;
-          continue;
-        } catch (err) {
-          // Thread gone (message purged)? Fall through and send a fresh card.
-          console.error(`Open-deal bump for ${pName} failed (${err.message}) — sending a fresh card`);
-        }
-      }
-
-      if (newCards >= OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN) { bumpSkip('closer_cap'); continue; }
+      // Both touches are fresh cards, never thread bumps: reactions are routed
+      // by the reacted message's own metadata, and a thread reply is invisible
+      // to conversations.history, so a ✅ on a bump could never find its draft.
+      if (decision.act === 'first_nudge' && newCards >= OPEN_DEAL_CARDS_PER_CLOSER_PER_RUN) { bumpSkip('closer_cap'); continue; }
       const acts = outcomeActionsFor(pipelineId).filter(a => a.outcome === 'lost' || a.outcome === 'disqualified');
       const stages = GHL_OUTCOME_STAGES[pipelineId] || GHL_OUTCOME_STAGES[GHL_PIPELINE.APPT_SETTING];
       const prev = state || {};
+      const draftBlock = draft ? openDealDrafts.renderOpenDealDraftBlock({ touch, archetype: draft.archetype, text: draft.text, hasContact: !!contactId, source: draft.source }) : null;
       const text = buildOpenDealCardText({
         prospectName: pName, ageDays, inheritedFrom: deal.inheritedFrom,
         nudgeCount: prev.nudgeCount || 0, snoozeCount: prev.snoozeCount || 0,
-        callDateStr: deal.scheduled_start ? formatICTime(deal.scheduled_start, { month: 'short', day: 'numeric' }) : '',
-        acts, wonLabel: stages.won.label,
+        callDateStr, acts, wonLabel: stages.won.label, draftBlock,
       });
       try {
         const posted = await slack.client.chat.postMessage({
@@ -11942,6 +12052,10 @@ async function runOpenDealFollowupSweep(correlationId) {
               closer_email: closerEmail,
               pipeline_id: pipelineId,
               opened_at: deal.opened_at,
+              touch,
+              ghl_contact_id: contactId || '',
+              draft_text: draft ? draft.text : '',
+              draft_archetype: draft ? draft.archetype : '',
             },
           },
         });
@@ -11955,13 +12069,14 @@ async function runOpenDealFollowupSweep(correlationId) {
           cardTs: posted.ts || '',
           driftISO: '',
         }), 'open-deal-nudge');
-        // Pre-seed 💤 + the pipeline's own close verbs so answering is one tap.
-        // posted.channel is the D-channel id (reactions.add rejects user ids).
-        for (const name of [OPEN_DEAL_SNOOZE_EMOJI, ...acts.map(a => a.emojiName)]) {
+        // Pre-seed ✅ (send the draft), 💤, and the pipeline's own close verbs
+        // so answering is one tap. posted.channel is the D-channel id
+        // (reactions.add rejects user ids).
+        for (const name of [...(draft && contactId ? ['white_check_mark'] : []), OPEN_DEAL_SNOOZE_EMOJI, ...acts.map(a => a.emojiName)]) {
           await slack.client.reactions.add({ channel: posted.channel || slackId, timestamp: posted.ts, name }).catch(() => {});
         }
-        cardsSent += 1;
-        newCards += 1;
+        if (decision.act === 'first_nudge') { cardsSent += 1; newCards += 1; } else { bumpsSent += 1; }
+        liveLines.push(`• ${pName} — ${touch} card to ${resolveSalesMember(closerEmail)} (${draft ? `${draft.archetype}/${draft.source}` : 'no draft'})${draft ? `\n> ${draft.text.split('\n').join('\n> ')}` : ''}`);
       } catch (err) {
         console.error(`Open-deal card DM for ${pName} failed:`, err.message);
         bumpSkip('dm_failed');
@@ -11974,22 +12089,31 @@ async function runOpenDealFollowupSweep(correlationId) {
   logActivity({
     event_type: 'open_deal_sweep', event_source: 'cron', action: 'runOpenDealFollowupSweep',
     correlation_id: correlationId,
-    metadata: { mode, open_deals: deals.length, cards: cardsSent, bumps: bumpsSent, drift: driftFound, skips: skipCounts },
+    metadata: { mode, open_deals: deals.length, cards: cardsSent, bumps: bumpsSent, drafts: draftsMade, drift: driftFound, skips: skipCounts },
   });
+
+  // Ron sees every card that went out, draft included (his "copy me on all of
+  // it" rule, 2026-10-11), as one summary per run rather than one DM per card.
+  if (isLive && liveLines.length) {
+    const summary = ['OPEN-DEAL FOLLOW-UP SWEEP — LIVE', '', `Open deals: ${deals.length} | Cards sent: ${cardsSent} (day 5) + ${bumpsSent} (day 30)`, '',
+      ...liveLines.slice(0, 12), liveLines.length > 12 ? `• …and ${liveLines.length - 12} more.` : ''].filter(Boolean);
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary.join('\n') })
+      .catch(err => console.error('Open-deal live summary failed:', err.message));
+  }
 
   if (!isLive && dryLines.length) {
     const summary = [
       'OPEN-DEAL FOLLOW-UP SWEEP — DRY RUN', '',
       `Open deals: ${deals.length} | Would send: ${dryLines.length}`, '',
-      ...dryLines.slice(0, 25),
-      dryLines.length > 25 ? `• …and ${dryLines.length - 25} more.` : '',
+      ...dryLines.slice(0, 12),
+      dryLines.length > 12 ? `• …and ${dryLines.length - 12} more.` : '',
       '', 'Set OPEN_DEAL_SWEEP_MODE=live on Railway to arm the closer DMs.',
     ].filter(Boolean);
     await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: summary.join('\n') })
       .catch(err => console.error('Open-deal dry-run summary failed:', err.message));
   }
   const skipBreakdown = Object.entries(skipCounts).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
-  console.log(`runOpenDealFollowupSweep done — ${deals.length} open, ${isLive ? `sent ${cardsSent} card(s) + ${bumpsSent} bump(s)` : `would send ${dryLines.length}`}, drift ${driftFound}, skips: ${skipBreakdown} (mode=${mode})`);
+  console.log(`runOpenDealFollowupSweep done — ${deals.length} open, ${isLive ? `sent ${cardsSent} day-5 + ${bumpsSent} day-30 card(s)` : `would send ${dryLines.length}`}, drafts ${draftsMade}, drift ${driftFound}, skips: ${skipBreakdown} (mode=${mode})`);
 }
 
 // Ron's Monday zombie digest. Always on (it never DMs closers), even while the
@@ -12094,6 +12218,9 @@ async function fetchReviRecordings(startTimesMs, label) {
           dealRecovery: deal.recovery || null,
           icpFit: coaching.icp_fit || null,
           cashCollected: coaching.cash_collected_usd == null ? null : Number(coaching.cash_collected_usd),
+          // Raw coaching object for the open-deal drafts (closer-safe fields are
+          // picked by lib/openDealDrafts.reviContextForDraft; never teardown).
+          coaching,
           matched: false,
         };
       });
