@@ -3,6 +3,7 @@ const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
 const hotReplies = require('./lib/hotReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
+const triageFicha = require('./lib/triageFicha');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -1772,7 +1773,7 @@ function registerDynamicCron(task) {
           // call from the WhatsApp phone app, which never marks a GHL conversation
           // read, so "unread in GHL" flagged people for leads they had already
           // answered. Do not bring it back without a signal that sees WhatsApp.
-          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls; leads claimed + claimed→booked cross-check come from setter_claims, the ✋ flow in #ng-sales-goats; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}${reviBlock}`;
+          taskDataBlock = `\n\n---\nPRECOMPUTED DATA (use these numbers as the primary truth source; the HEADLINE, held calls with a complete triage ficha, is read from the FICHA DE TRIAGE note on each held call's GHL contact; GHL-native setter attribution + outcomes are truth for calls booked/show rate/qualified-attended-calls; leads claimed + claimed→booked cross-check come from setter_claims, the ✋ flow in #ng-sales-goats; EOD self-reports were retired at the GHL cutover 2026-07-23):\n\n${setterBlock}${reviBlock}`;
         } catch (statsErr) {
           console.error('Setter leaderboard stats failed:', statsErr.message);
           // A public ranking must never be rebuilt from ad-hoc tool calls: the
@@ -4444,6 +4445,12 @@ function _newSetterSlot() {
     calls_booked: 0, attended: 0, no_shows: 0, pending: 0, aqc: 0,
     cancelled: 0, // sub-count of no_shows: cancelled and never rebooked
     distinct_leads: 0, // distinct prospects behind those calls (rebookings collapse)
+    // HEADLINE (Ron, 2026-10-11, script audit decision 4): held calls whose GHL
+    // contact carries a complete FICHA DE TRIAGE note (all 6 claros answered).
+    // Detection in lib/triageFicha.js; credited by addFichaStats below.
+    held_with_ficha: 0,
+    ficha_incomplete: 0, // held, a ficha was pasted, at least one claro is blank
+    ficha_unchecked: 0,  // held, but no GHL contact id or the notes read failed
   };
 }
 
@@ -4527,11 +4534,18 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
     // "pending" calls on the 2026-09-19 board). `cancelled` is kept as a
     // sub-count of no_shows so the board can say how many were cancellations.
     const cancelled = unheld === 'cancelled_noshow';
-    ownedCalls.push({ owner, email: prospectEmail || null, cancelled });
-    if (cancelled) { slot.no_shows += 1; slot.cancelled += 1; continue; }
+    // `held` and `ghlContactId` feed the ficha check (addFichaStats): the GHL
+    // contact is where the setter pastes the triage ficha.
+    const ghlContactId = a.prospect?.ghl_contact_id || null;
+    if (cancelled) {
+      slot.no_shows += 1; slot.cancelled += 1;
+      ownedCalls.push({ owner, email: prospectEmail || null, cancelled, held: false, ghlContactId });
+      continue;
+    }
     // Same reschedule-leftover guard as getCloserWeeklyStats: no outcome can
     // describe a call that hasn't happened yet.
     const c = classifyOutcome(new Date(a.scheduled_start).getTime() > nowMs ? null : outcomesById[a.id]);
+    ownedCalls.push({ owner, email: prospectEmail || null, cancelled, held: c.showed, ghlContactId });
     if (c.showed)            slot.attended += 1;
     if (c.noShow)            slot.no_shows += 1;
     if (c.pending)           slot.pending  += 1;
@@ -4554,11 +4568,52 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
   return { stats: result, ownedCalls };
 }
 
+// GET /contacts/{id}/notes that THROWS on failure, unlike fetchGHLNotesForContact
+// (call-prep enrichment, where an empty list is fine). For the headline metric a
+// failed read must land in ficha_unchecked, never read as "no ficha".
+async function fetchContactNotesForFicha(contactId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+  }, { label: `GET /contacts/${contactId}/notes (ficha)` });
+  if (!res.ok) throw new Error(`notes GET → ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.notes) ? data.notes : [];
+}
+
+// HEADLINE metric (Ron, 2026-10-11): held calls with a complete triage ficha,
+// credited to the call's OWNER (the claim owner, same attribution as every other
+// number here), never to whoever typed the note. One notes read per distinct GHL
+// contact among the held calls, so a rebooked prospect is read once. Non-fatal
+// per contact: a failed read lands in ficha_unchecked and is said out loud on
+// the board, so a GHL blip can never look like a setter who skipped the ficha.
+async function addFichaStats(stats, ownedCalls) {
+  const held = (ownedCalls || []).filter(c => c.held && stats[c.owner]);
+  const statusByContact = {};
+  for (const c of held) {
+    const id = c.ghlContactId;
+    if (!id || statusByContact[id]) continue;
+    try {
+      statusByContact[id] = triageFicha.fichaStatus(await fetchContactNotesForFicha(id)).status;
+    } catch (err) {
+      console.warn(`Setter stats: ficha check could not read notes for contact ${id}: ${err.message}`);
+      statusByContact[id] = 'unchecked';
+    }
+  }
+  for (const c of held) {
+    const slot = stats[c.owner];
+    const status = c.ghlContactId ? statusByContact[c.ghlContactId] : 'unchecked';
+    if (status === 'complete')        slot.held_with_ficha  += 1;
+    else if (status === 'incomplete') slot.ficha_incomplete += 1;
+    else if (status === 'unchecked')  slot.ficha_unchecked  += 1;
+  }
+  return stats;
+}
+
 async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
   // Flywheel appointments in range + their outcomes
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
-    .select('id, prospect_id, scheduled_start, iclosed_call_id, ghl_appointment_id, setter_id, source, qualification_snapshot, prospect:prospect_id ( email )')
+    .select('id, prospect_id, scheduled_start, iclosed_call_id, ghl_appointment_id, setter_id, source, qualification_snapshot, prospect:prospect_id ( email, ghl_contact_id )')
     .gte('scheduled_start', weekStartIso)
     .lte('scheduled_start', weekEndIso);
   if (apptErr) throw apptErr;
@@ -4578,7 +4633,9 @@ async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
 
   const lookbackIso = new Date(new Date(weekStartIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString();
   const claims = await fetchSetterClaimsSince(lookbackIso);
-  return tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now(), latestStartByProspect);
+  const tally = tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now(), latestStartByProspect);
+  await addFichaStats(tally.stats, tally.ownedCalls);
+  return tally;
 }
 
 async function getSetterWeeklyStats(weekStartIso, weekEndIso) {
@@ -4592,15 +4649,18 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   if (!names.length) {
     return `No setter activity (GHL bookings or lead claims) found for ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}.`;
   }
-  // Ranked by the setter-CONTROLLED outcome first: calls from leads they own.
-  // Converted calls (AQC) and claims break ties — quality still matters, but a
-  // setter is never out-ranked on a number gated by closer follow-through.
+  // Ranked by the HEADLINE (Ron, 2026-10-11, script audit decision 4): held
+  // calls with a complete triage ficha. Reward bookings and you breed bookings
+  // (Persuasion Playbook team rule 3); the ficha is the setter's own work on a
+  // call that happened. Calls, converted calls (AQC) and claims break ties, so
+  // a setter is still never out-ranked on a number gated by closer logging.
   const ranked = names.map(name => {
     const s = stats[name];
     const decided = (s.attended || 0) + (s.no_shows || 0);
     const showRate = decided > 0 ? Math.round((s.attended / decided) * 100) : null;
     return { name, s, showRate, decided };
   }).sort((a, b) =>
+    (b.s.held_with_ficha || 0) - (a.s.held_with_ficha || 0) ||
     (b.s.calls_booked || 0) - (a.s.calls_booked || 0) ||
     (b.s.aqc || 0) - (a.s.aqc || 0) ||
     (b.s.leads_claimed || 0) - (a.s.leads_claimed || 0));
@@ -4608,11 +4668,22 @@ function formatSetterWeeklyStatsBlock(stats, weekStartIso, weekEndIso) {
   // Window-agnostic header — the leaderboard cron passes month-to-date, the sales
   // standup passes a 7-day window; the dates say which.
   const lines = [`SETTER STATS — ${weekStartIso.slice(0,10)} → ${weekEndIso.slice(0,10)}`];
-  lines.push(`(Ordered by what the setter CONTROLS: leads claimed → calls from those leads, then the shared/downstream numbers. ATTRIBUTION: a call belongs to the setter who CLAIMED the prospect (the ✋ flow in #ng-sales-goats). It does not matter whether the setter or the prospect clicked book — the setter owns the lead either way. GHL's recorded booker is only a fallback for calls on leads nobody claimed. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Ranked by calls.)`);
+  lines.push(`(HEADLINE first: held calls with a COMPLETE TRIAGE FICHA, the call happened and the setter's FICHA DE TRIAGE note on the GHL contact has all 6 claros answered (NEGOCIO, NÚMEROS, DOLOR, DECISOR, INVERSIÓN, COMPROMISOS; a claro counts as answered when at least one of its lines is filled or ticked). Then what the setter CONTROLS: leads claimed → calls from those leads, then the shared/downstream numbers, as diagnostics. ATTRIBUTION: a call belongs to the setter who CLAIMED the prospect (the ✋ flow in #ng-sales-goats). It does not matter whether the setter or the prospect clicked book — the setter owns the lead either way. GHL's recorded booker is only a fallback for calls on leads nobody claimed. "Converted calls (AQC)" is a POST-CALL metric — the call happened and the prospect was not disqualified on it; it is NOT booking-form qualification, and it sits at 0 until a closer logs the outcome, so it must never be read as a setter quality signal. Ranked by held calls with a complete ficha.)`);
   ranked.forEach(({ name, s, showRate, decided }, idx) => {
     const showRateStr = showRate === null ? 'pending' : `${showRate}%`;
     lines.push(``);
     lines.push(`#${idx + 1} ${name.toUpperCase()}`);
+    // 0. HEADLINE: held calls with a complete triage ficha, count and share of
+    // held calls. Incomplete and unchecked are said out loud so a missing note
+    // and a failed GHL read never look the same.
+    const heldN = s.attended || 0;
+    const fichaN = s.held_with_ficha || 0;
+    const fichaExtras = [
+      s.ficha_incomplete ? `ficha started but a claro blank: ${s.ficha_incomplete}` : '',
+      s.ficha_unchecked ? `not checked: ${s.ficha_unchecked} (GHL contact notes unreadable)` : '',
+    ].filter(Boolean);
+    const fichaStr = heldN > 0 ? `${fichaN} of ${heldN} held (${Math.round((fichaN / heldN) * 100)}%)` : '0 (no held calls yet)';
+    lines.push(`  HEADLINE: Held calls with complete ficha: ${fichaStr}${fichaExtras.length ? ` | ${fichaExtras.join(' | ')}` : ''}`);
     // 1. OWNED — leads they claimed and the calls those leads produced. Distinct
     // lead count is shown only when it differs from the call count (a prospect
     // who rebooked is 2 calls, 1 lead) so the numbers never look contradictory.
