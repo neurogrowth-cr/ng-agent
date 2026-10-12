@@ -127,4 +127,69 @@ t('every objection maps onto the dash picklist the portal RPC enforces', () => {
   assert.ok(src.includes('callFields.PORTAL_OBJECTION[fields.objection]'), 'portal write maps the objection');
 });
 
+// ─── REVI auto-fill ──────────────────────────────────────────────────────────
+
+t('extraction prompt carries only closer-safe REVI fields and the call weekday', () => {
+  const coaching = { company: 'Acme', context: 'ctx', general_read: 'read', deal: { status: 'alive' }, opportunities: ['x'], icp_fit: 'alto',
+    closer: 'SECRET-closer-critique', moments: ['SECRET-moment'], closing_note: 'SECRET-note', cash_collected_usd: 999 };
+  const p = cf.buildReviExtractionPrompt({ prospectName: 'Ana', callDateISO: '2026-10-09T15:00:00Z', coaching, signals: { objection_type: 'Liquidez', stated_timeline: 'viernes' } });
+  assert.ok(p.includes('"company":"Acme"'));
+  assert.ok(p.includes('"objection_type":"Liquidez"'));
+  assert.ok(p.includes('2026-10-09 (Friday)'));
+  assert.ok(!p.includes('SECRET'), 'coaching critique, moments, closing note never reach the prompt');
+  assert.ok(!p.includes('999'), 'our cash never reaches the prompt');
+});
+
+t('valid extraction parses, numbers cleaned, relative date kept inside the window', () => {
+  const r = cf.parseReviExtraction('```json\n{"industry":"Asesor","objection":"liquidez","ticket":"$3,000","clients_missing":2.4,"next_step_date":"2026-10-13","evidence":"dijo que no tiene la plata"}\n```', '2026-10-09T15:00:00Z');
+  assert.deepStrictEqual(r, { ok: true, fields: { industry: 'asesor', objection: 'liquidez', ticket: 3000, clientsMissing: 2, nextStepDate: '2026-10-13' }, evidence: 'dijo que no tiene la plata' });
+});
+
+t('bad industry or objection fails the read; bad numbers and dates become null', () => {
+  assert.strictEqual(cf.parseReviExtraction('{"industry":"bakery","objection":"liquidez"}', '2026-10-09').ok, false);
+  assert.strictEqual(cf.parseReviExtraction('{"industry":"tech","objection":"price"}', '2026-10-09').ok, false);
+  assert.strictEqual(cf.parseReviExtraction('not json', '2026-10-09').ok, false);
+  const r = cf.parseReviExtraction('{"industry":"tech","objection":"socio","ticket":-5,"clients_missing":"muchos","next_step_date":"2026-10-01"}', '2026-10-09');
+  assert.deepStrictEqual(r.fields, { industry: 'tech', objection: 'socio', ticket: null, clientsMissing: null, nextStepDate: null });
+  const far = cf.parseReviExtraction('{"industry":"tech","objection":"timing","next_step_date":"2027-06-01"}', '2026-10-09');
+  assert.strictEqual(far.fields.nextStepDate, null, 'a date past the window is dropped');
+  assert.strictEqual(r.evidence, null);
+});
+
+t('REVI read message: Fix button only when the form is on', () => {
+  const meta = { appointment_id: 'a1', prospect_name: 'Ana', closer_email: 'c@x.io', channel: 'D1', ts: '1.2' };
+  const fields = { industry: 'coach', objection: 'prueba', ticket: 2000, clientsMissing: 1, nextStepDate: null };
+  const on = cf.buildReviReadMessage({ prospectName: 'Ana', fields, evidence: 'ev', savedNote: 'GHL: ok', showFix: true, meta });
+  assert.ok(on.text.includes('REVI read for Ana'));
+  assert.ok(on.text.includes('GHL: ok'));
+  assert.strictEqual(on.blocks[1].elements[0].action_id, cf.OPEN_ACTION_ID);
+  assert.deepStrictEqual(cf.parseMeta(on.blocks[1].elements[0].value), meta);
+  const off = cf.buildReviReadMessage({ prospectName: 'Ana', fields, evidence: null, savedNote: '', showFix: false, meta });
+  assert.strictEqual(off.blocks.length, 1);
+  assert.ok(off.text.includes('not switched on'));
+});
+
+t('autofill flag', () => {
+  assert.strictEqual(cf.autofillEnabled('on'), true);
+  assert.strictEqual(cf.autofillEnabled(' On '), true);
+  assert.strictEqual(cf.autofillEnabled(undefined), false);
+  assert.strictEqual(cf.autofillEnabled('live'), false);
+});
+
+t('index.js: autofill runs before the form, never overwrites a closer answer, uses the light model, backfill is run-once', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  const block = src.slice(src.indexOf('// ─── CALL FIELDS FORM'), src.indexOf('// Shared tail of every reaction-driven outcome log'));
+  const offer = block.slice(block.indexOf('async function offerCallFieldsForm'), block.indexOf('async function autofillCallFieldsFromRevi'));
+  assert.ok(offer.indexOf('autofillCallFieldsFromRevi(') < offer.indexOf('buildCallFieldsButtonMessage('), 'REVI first, empty form second');
+  assert.ok(offer.includes("if (outcome !== 'follow_up') return;"));
+  const auto = block.slice(block.indexOf('async function autofillCallFieldsFromRevi'), block.indexOf('function callFieldsAllowed'));
+  assert.ok(auto.includes("existing.submitted_by !== 'revi'"), 'closer answers are never overwritten');
+  assert.ok(auto.includes('model: MODEL_LIGHT'));
+  assert.ok(auto.includes('thinking: THINKING_OFF'));
+  assert.ok(auto.includes("userId: 'revi'"));
+  assert.ok(block.includes("process.env.CALL_FIELDS_BACKFILL_RUN_ONCE"));
+  assert.ok(block.includes("`call-fields-backfill:${token}`"));
+  assert.ok(src.includes('runCallFieldsBackfillOnceIfRequested().catch('), 'backfill is armed at boot');
+});
+
 console.log(`\n${n} passed`);
