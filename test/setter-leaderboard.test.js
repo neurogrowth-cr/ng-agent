@@ -25,10 +25,22 @@ const block = [
   slice('function _newSetterSlot', '// ─── SETTER ATTRIBUTION RECONCILER'),
 ].join('\n');
 const ROSTER = { 'seb@x.com': 'Sebastian S', 'oscar@x.com': 'Oscar M' };
-const { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows } = new Function(
-  'resolveSalesMember', 'isUnresolvedSalesId',
-  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows };`,
-)(id => ROSTER[id] || id, () => false);
+// ghlFetch is stubbed per contact id so addFichaStats (the HEADLINE credit) runs
+// against real lib/triageFicha parsing with no network.
+const triageFicha = require('../lib/triageFicha');
+let ghlNotesByContact = {};
+let ghlCalls = 0;
+const ghlFetchStub = async (url) => {
+  ghlCalls++;
+  const id = url.match(/contacts\/([^/]+)\/notes/)[1];
+  const notes = ghlNotesByContact[id];
+  if (notes === 'fail') return { ok: false, status: 500, json: async () => ({}) };
+  return { ok: true, status: 200, json: async () => ({ notes }) };
+};
+const { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows, addFichaStats, _newSetterSlot } = new Function(
+  'resolveSalesMember', 'isUnresolvedSalesId', 'ghlFetch', 'triageFicha',
+  `${block}; return { tallySetterStats, formatSetterWeeklyStatsBlock, classifyUnheldAppt, latestStartFromRows, addFichaStats, _newSetterSlot };`,
+)(id => ROSTER[id] || id, () => false, ghlFetchStub, triageFicha);
 
 const cases = [];
 const check = (name, ok, detail) => cases.push({ name, ok, detail });
@@ -73,6 +85,7 @@ const appt = (o = {}) => ({
   check('a logged outcome outranks the cancel and delete flags', s.attended === 4 && s.aqc === 3, s);
   check('buckets add up to calls booked', s.attended + s.no_shows + s.pending === s.calls_booked, s);
   check('ownedCalls flags only the cancelled no-show', ownedCalls.filter(c => c.cancelled).length === 1 && ownedCalls.length === 7);
+  check('ownedCalls marks held calls (the 4 attended) for the ficha check', ownedCalls.filter(c => c.held).length === 4 && ownedCalls.every(c => 'ghlContactId' in c), ownedCalls);
 
   const text = formatSetterWeeklyStatsBlock(stats, START, END);
   check('block folds cancellations into no-shows and says how many',
@@ -148,7 +161,75 @@ const appt = (o = {}) => ({
   check('the real call counts once and is pending', stats['Sebastian S']?.calls_booked === 1 && stats['Sebastian S'].pending === 1, stats);
 }
 
-const failed = cases.filter(c => !c.ok);
-for (const c of cases) console.log(`${c.ok ? '✓' : '✗'} ${c.name}${c.ok ? '' : ' ' + JSON.stringify(c.detail || {})}`);
-console.log(`${cases.length - failed.length}/${cases.length} passed`);
-if (failed.length) process.exit(1);
+// 6. HEADLINE (Ron, 2026-10-11, script audit decision 4): held calls with a
+//    complete triage ficha lead the board; bookings, show rate and AQC follow.
+{
+  const stats = {
+    'Oscar M':     { ..._newSetterSlot(), leads_claimed: 9, calls_booked: 6, attended: 4, no_shows: 1, pending: 1, aqc: 3, held_with_ficha: 1, ficha_incomplete: 2 },
+    'Sebastian S': { ..._newSetterSlot(), leads_claimed: 4, calls_booked: 3, attended: 3, aqc: 2, held_with_ficha: 3 },
+    'Josue D':     { ..._newSetterSlot(), leads_claimed: 2, calls_booked: 2, pending: 2 },
+  };
+  const text = formatSetterWeeklyStatsBlock(stats, START, END);
+  const order = text.split('\n').filter(l => /^#\d /.test(l)).map(l => l.replace(/^#\d /, ''));
+  check('ranked by held calls with a complete ficha, not by calls', order.join(',') === 'SEBASTIAN S,OSCAR M,JOSUE D', order);
+  const lines = text.split('\n');
+  const after = name => lines[lines.findIndex(l => l.endsWith(name)) + 1];
+  check('HEADLINE is the first line under every setter',
+    /^  HEADLINE: Held calls with complete ficha: 3 of 3 held \(100%\)$/.test(after('SEBASTIAN S')) &&
+    /^  HEADLINE: Held calls with complete ficha: 1 of 4 held \(25%\) \| ficha started but a claro blank: 2$/.test(after('OSCAR M')) &&
+    /^  HEADLINE: Held calls with complete ficha: 0 \(no held calls yet\)$/.test(after('JOSUE D')), [after('SEBASTIAN S'), after('OSCAR M'), after('JOSUE D')]);
+  check('bookings, show rate and AQC still follow as diagnostics',
+    /OWNED: Leads claimed: 9 \| Calls from their leads: 6/.test(text) && /Show rate: 80% \(4 attended of 5 decided\)/.test(text) && /Converted calls \(AQC, closer-logged\): 3/.test(text), text);
+  check('intro names the ficha rule and the six claros', /COMPLETE TRIAGE FICHA/.test(lines[1]) && /COMPROMISOS/.test(lines[1]) && /Ranked by held calls with a complete ficha/.test(lines[1]));
+  check('lines I own carry no em or en dash', !lines.slice(2).join('\n').match(/[—–]/), text);
+}
+
+// 7. addFichaStats credits the OWNER, reads each contact once, and never turns a
+//    failed GHL read into "no ficha".
+(async () => {
+  const fs2 = require('fs');
+  const TEMPLATE = fs2.readFileSync(path.join(__dirname, 'triage-ficha.test.js'), 'utf8');
+  // Reuse the blank v1.2 template from the ficha test and fill one answer per claro.
+  const blank = TEMPLATE.slice(TEMPLATE.indexOf('`FICHA DE TRIAGE v1.2') + 1, TEMPLATE.indexOf('decide solo.`') + 'decide solo.'.length);
+  const complete = blank
+    .replace('Vende: ______ a: ______', 'Vende: software a: bancos')
+    .replace('Cobra por cliente: $______', 'Cobra por cliente: $2,500')
+    .replace('Por qué ahora: ______', 'Por qué ahora: cerró un canal')
+    .replace('[ ] Solo  [ ] Con: ______', '[x] Solo  [ ] Con: ______')
+    .replace('Respuesta: ______', 'Respuesta: ok')
+    .replace('[ ] Material visto', '[x] Material visto');
+  const incomplete = complete.replace('[x] Material visto', '[ ] Material visto');
+  ghlNotesByContact = {
+    cA: [{ bodyText: 'nota suelta' }, { bodyText: complete }],
+    cB: [{ bodyText: incomplete }],
+    cC: 'fail',
+    cD: [{ bodyText: 'sin ficha' }],
+  };
+  ghlCalls = 0;
+  const stats = { 'Sebastian S': _newSetterSlot(), 'Oscar M': _newSetterSlot() };
+  stats['Sebastian S'].attended = 4; stats['Oscar M'].attended = 2;
+  const owned = [
+    { owner: 'Sebastian S', held: true,  ghlContactId: 'cA' },
+    { owner: 'Sebastian S', held: true,  ghlContactId: 'cA' },   // rebooked prospect: one read, credited twice
+    { owner: 'Sebastian S', held: true,  ghlContactId: 'cB' },
+    { owner: 'Sebastian S', held: true,  ghlContactId: null },   // iClosed-era prospect, no GHL contact id
+    { owner: 'Sebastian S', held: false, ghlContactId: 'cD' },   // not held: never read
+    { owner: 'Oscar M',     held: true,  ghlContactId: 'cC' },
+    { owner: 'Oscar M',     held: true,  ghlContactId: 'cD' },
+    { owner: 'Ghost',       held: true,  ghlContactId: 'cA' },   // no slot: ignored
+  ];
+  await addFichaStats(stats, owned);
+  const s = stats['Sebastian S'], o = stats['Oscar M'];
+  check('complete ficha credited to the owner once per held call', s.held_with_ficha === 2, s);
+  check('ficha with a blank claro counts as incomplete', s.ficha_incomplete === 1, s);
+  check('no GHL contact id is unchecked, not "no ficha"', s.ficha_unchecked === 1, s);
+  check('a failed notes read is unchecked, a note without a ficha is nothing', o.ficha_unchecked === 1 && o.held_with_ficha === 0 && o.ficha_incomplete === 0, o);
+  check('one GHL read per distinct held contact (cA, cB, cC, cD)', ghlCalls === 4, ghlCalls);
+  const text = formatSetterWeeklyStatsBlock(stats, START, END);
+  check('unchecked is said out loud on the board', /2 of 4 held \(50%\) \| ficha started but a claro blank: 1 \| not checked: 1 \(GHL contact notes unreadable\)/.test(text), text);
+
+  const failed = cases.filter(c => !c.ok);
+  for (const c of cases) console.log(`${c.ok ? '✓' : '✗'} ${c.name}${c.ok ? '' : ' ' + JSON.stringify(c.detail || {})}`);
+  console.log(`${cases.length - failed.length}/${cases.length} passed`);
+  if (failed.length) process.exit(1);
+})().catch(e => { console.error(e); process.exit(1); });
