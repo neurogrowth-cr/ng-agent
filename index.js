@@ -20963,6 +20963,7 @@ async function resolveBotIdentity() {
   attachSocketWatchdog();
   await loadAndRegisterDynamicCrons();
   runOutcomeCardsOnceIfRequested().catch(err => console.error('Outcome cards run-once failed:', err.message));
+  runCallFieldsBackfillOnceIfRequested().catch(err => console.error('Call fields backfill failed:', err.message));
   // Static infrastructure crons (not stored in DB)
   cron.schedule('0 7 15 * *', wrapCronJob('runPhase3Reconciliation', async (c) => { await runPhase3Reconciliation(c); }), { timezone: 'America/Costa_Rica' });
   console.log('Registered static cron: Phase 3 reconciliation (0 7 15 * *)');
@@ -21073,21 +21074,83 @@ async function handleOutcomeCardThreadReply(message, say) {
 // cards behave exactly as before until both are in place.
 const callFields = require('./lib/callFields');
 
+// Follow_up just landed from a card. CALL_FIELDS_AUTOFILL=on: REVI's read of
+// the call fills the fields with no tap, and the thread says what it saved
+// (plus a Fix button when the form is on). No REVI read, or the extraction
+// fails: the empty form button, when CALL_FIELDS_FORM=on.
 async function offerCallFieldsForm({ channel, ts, payload, outcome }) {
-  if (!callFields.shouldOfferCallFields(outcome, process.env.CALL_FIELDS_FORM)) return;
+  if (outcome !== 'follow_up') return;
+  const formOn = callFields.shouldOfferCallFields(outcome, process.env.CALL_FIELDS_FORM);
+  const autoOn = callFields.autofillEnabled(process.env.CALL_FIELDS_AUTOFILL);
+  if (!formOn && !autoOn) return;
+  const meta = {
+    appointment_id: payload.appointment_id,
+    prospect_name: String(payload.prospect_name || '').slice(0, 80),
+    closer_email: payload.closer_email || null,
+    channel,
+    ts,
+  };
+  const prospectName = meta.prospect_name || 'this prospect';
   try {
-    const meta = {
-      appointment_id: payload.appointment_id,
-      prospect_name: String(payload.prospect_name || '').slice(0, 80),
-      closer_email: payload.closer_email || null,
-      channel,
-      ts,
-    };
-    const msg = callFields.buildCallFieldsButtonMessage({ prospectName: meta.prospect_name || 'this prospect', meta });
+    if (autoOn) {
+      const auto = await autofillCallFieldsFromRevi({ appointmentId: meta.appointment_id, prospectName });
+      if (auto.ok) {
+        const msg = callFields.buildReviReadMessage({
+          prospectName, fields: auto.fields, evidence: auto.evidence,
+          savedNote: callFieldsSinkNote(auto.fields, auto.out), showFix: formOn, meta,
+        });
+        await slack.client.chat.postMessage({ channel, thread_ts: ts, text: msg.text, blocks: msg.blocks });
+        return;
+      }
+      console.log(`[call-fields] no auto-fill for ${meta.appointment_id}: ${auto.reason}`);
+    }
+    if (!formOn) return;
+    const msg = callFields.buildCallFieldsButtonMessage({ prospectName, meta });
     await slack.client.chat.postMessage({ channel, thread_ts: ts, text: msg.text, blocks: msg.blocks });
   } catch (e) {
     console.warn(`[call-fields] could not offer the form for ${payload.appointment_id}: ${e.message}`);
   }
+}
+
+// REVI auto-fill for one appointment. Never overwrites a closer's own answer
+// (call_fields.submitted_by is a Slack id for humans, 'revi' for this path).
+// Returns { ok, fields, evidence, out } or { ok:false, reason }.
+const CALL_FIELDS_REVI_LOOKBACK_MS = 2 * 86400000;
+async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
+  const { data: existing } = await supabase.from('call_fields').select('submitted_by').eq('appointment_id', appointmentId).maybeSingle();
+  if (existing && existing.submitted_by !== 'revi') return { ok: false, reason: 'already filled by the closer' };
+
+  const { data: appt } = await portalSupabase.from('revops_appointments')
+    .select('scheduled_start, prospect:prospect_id(email)').eq('id', appointmentId).maybeSingle();
+  const email = appt?.prospect?.email;
+  if (!email || !appt?.scheduled_start) return { ok: false, reason: 'no prospect email or call time' };
+
+  const lo = new Date(Date.parse(appt.scheduled_start) - CALL_FIELDS_REVI_LOOKBACK_MS).toISOString();
+  const { data: scores, error } = await reviSupabase.from('closer_call_scores')
+    .select('call_date, coaching_json, prospect_signals')
+    .ilike('prospect_email', email)
+    .gte('call_date', lo);
+  if (error) return { ok: false, reason: `REVI read failed: ${error.message}` };
+  // Newest scored call: a later follow-up call knows more than the first one.
+  const pick = pickClosingCall(scores, Date.now());
+  if (!pick) return { ok: false, reason: 'REVI has no scored call for this prospect' };
+
+  const prompt = callFields.buildReviExtractionPrompt({
+    prospectName, callDateISO: pick.call_date, coaching: pick.coaching_json, signals: parseReviSignals(pick.prospect_signals),
+  });
+  const tLlm = Date.now();
+  const response = await anthropic.messages.create({
+    model: MODEL_LIGHT,
+    thinking: THINKING_OFF,
+    max_tokens: 400,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  logLlmFromAnthropicResponse(response, Date.now() - tLlm, null, 'call_fields_autofill');
+  const parsed = callFields.parseReviExtraction(response.content?.[0]?.text, pick.call_date);
+  if (!parsed.ok) return { ok: false, reason: `extraction: ${parsed.reason}` };
+
+  const out = await saveCallFields({ meta: { appointment_id: appointmentId }, fields: parsed.fields, userId: 'revi' });
+  return { ok: true, fields: parsed.fields, evidence: parsed.evidence, out };
 }
 
 function callFieldsAllowed(userId, meta) {
@@ -21191,8 +21254,9 @@ async function saveCallFields({ meta, fields, userId }) {
   return out;
 }
 
-function callFieldsResultText(meta, fields, out) {
-  const lines = [`📋 Saved for ${meta.prospect_name || 'this prospect'}: ${callFields.callFieldsSummary(fields)}.`];
+// What landed where, one line per sink that needs a word.
+function callFieldsSinkNote(fields, out) {
+  const lines = [];
   if (out.ghl?.ok) {
     const fieldNote = out.ghl.fieldsError
       ? `, but the custom fields failed (${out.ghl.fieldsError}), so email 0 shows no numbers`
@@ -21204,6 +21268,61 @@ function callFieldsResultText(meta, fields, out) {
   if (!out.portal?.ok) lines.push(`⚠️ Portal objection not saved (${out.portal?.message || 'unknown error'}).`);
   if (!out.max?.ok) lines.push(`⚠️ Max's copy not saved (${out.max?.message || 'unknown error'}).`);
   return lines.join('\n');
+}
+
+function callFieldsResultText(meta, fields, out) {
+  return `📋 Saved for ${meta.prospect_name || 'this prospect'}: ${callFields.callFieldsSummary(fields)}.\n${callFieldsSinkNote(fields, out)}`;
+}
+
+// One-shot backfill of open deals already in the pipeline, so they enter the
+// email workflow branched too. CALL_FIELDS_BACKFILL_RUN_ONCE="<new token>"
+// arms it once per token (same pattern as OUTCOME_CARDS_RUN_ONCE);
+// CALL_FIELDS_BACKFILL_DAYS limits it to calls in the last N days (default 90).
+// Skips deals a closer already filled. Ron gets one summary DM.
+async function runCallFieldsBackfillOnceIfRequested() {
+  const token = String(process.env.CALL_FIELDS_BACKFILL_RUN_ONCE || '').trim();
+  if (!token) return;
+  const key = `call-fields-backfill:${token}`;
+  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
+  if (prior && prior.length) { console.log(`Call fields backfill: token "${token}" already used, skipping.`); return; }
+  await upsertKnowledge('process', key, `claimed|${new Date().toISOString()}`, 'call-fields-backfill');
+
+  const days = Number(process.env.CALL_FIELDS_BACKFILL_DAYS) || 90;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const { data: rows, error } = await portalSupabase.from('revops_sales_outcomes')
+    .select('appointment_id, appt:appointment_id(scheduled_start, prospect:prospect_id(full_name))')
+    .eq('outcome', 'follow_up');
+  if (error) { console.error('Call fields backfill: open-deal read failed:', error.message); return; }
+  const open = (rows || []).filter((r) => r.appt?.scheduled_start && r.appt.scheduled_start >= since && Date.parse(r.appt.scheduled_start) <= Date.now());
+
+  const tally = { filled: 0, skipped: 0, failed: 0, ghlFailed: 0, objections: {} };
+  const reasons = {};
+  for (const r of open) {
+    try {
+      const res = await autofillCallFieldsFromRevi({ appointmentId: r.appointment_id, prospectName: r.appt.prospect?.full_name || 'prospect' });
+      if (res.ok) {
+        tally.filled++;
+        tally.objections[res.fields.objection] = (tally.objections[res.fields.objection] || 0) + 1;
+        if (!res.out.ghl?.ok) tally.ghlFailed++;
+      } else {
+        tally.skipped++;
+        const k = res.reason.split(':')[0];
+        reasons[k] = (reasons[k] || 0) + 1;
+      }
+    } catch (e) {
+      tally.failed++;
+      console.warn(`Call fields backfill: ${r.appointment_id} failed: ${e.message}`);
+    }
+  }
+  await upsertKnowledge('process', key, `done|${new Date().toISOString()}|${tally.filled}/${open.length}`, 'call-fields-backfill');
+  const objLine = Object.entries(tally.objections).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(' · ') || '-';
+  const skipLine = Object.entries(reasons).map(([k, n]) => `${k} (${n})`).join(', ') || '-';
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: [
+    `📋 Call fields backfill (open deals, calls in the last ${days} days): filled ${tally.filled} of ${open.length} from REVI.`,
+    `Objections: ${objLine}`,
+    `Skipped: ${skipLine}${tally.failed ? ` · errors ${tally.failed}` : ''}${tally.ghlFailed ? ` · GHL write failed on ${tally.ghlFailed}` : ''}`,
+  ].join('\n') }).catch(() => {});
+  console.log(`Call fields backfill: done, ${tally.filled}/${open.length} filled.`);
 }
 
 slack.action(callFields.OPEN_ACTION_ID, async ({ ack, body, action, client }) => {
