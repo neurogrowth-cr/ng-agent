@@ -29,6 +29,11 @@ t('prospect lines: no invitee email on file → everyone who is not a closer', (
   assert.strictEqual(pw.prospectLinesFromTranscript(segs, { prospectEmail: '', closerEmails: CLOSERS }), 'hola');
 });
 
+t('prospect lines: closer with no invitee email is dropped by display name', () => {
+  const segs = [{ speaker: { display_name: 'Jose Carranza' }, text: 'yo soy el closer' }, { speaker: { display_name: 'Ana Lopez' }, text: 'yo soy la prospecta' }];
+  assert.strictEqual(pw.prospectLinesFromTranscript(segs, { prospectEmail: '', closerEmails: CLOSERS, closerNames: ['Jose Carranza'] }), 'yo soy la prospecta');
+});
+
 t('prompt: verbatim rule, own-country guard, lines included, data-not-instructions', () => {
   const p = pw.buildProspectWordsPrompt({ prospectName: 'Ana', prospectLines: 'Hoy vivo de referidos.', icpHint: 'asesora en CR' });
   assert.ok(p.includes('VERBATIM'));
@@ -96,6 +101,7 @@ t('index.js: words run inside the REVI autofill, verbatim-validated, light model
   const fathom = src.slice(src.indexOf('async function fathomGetTranscriptSegments'), src.indexOf('async function fillProspectWordsFromRevi'));
   assert.ok(fathom.includes('FATHOM_API_KEY'));
   assert.ok(fathom.includes('/recordings/'));
+  assert.ok(fathom.includes('fathomTranscriptFromListing('), '401 on the recording endpoint falls back to the meetings listing');
   assert.ok(fathom.includes('fathom_recording_id') || src.includes("select('fathom_recording_id, call_date, coaching_json, prospect_signals')"), 'recording id is selected');
 });
 

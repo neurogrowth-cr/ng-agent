@@ -21120,7 +21120,30 @@ async function offerCallFieldsForm({ channel, ts, payload, outcome }) {
 // returns [] when the key is unset or the call fails, so the caller degrades
 // to "no prospect words" instead of losing the whole auto-fill.
 const FATHOM_API_BASE = process.env.FATHOM_API_BASE || 'https://api.fathom.ai/external/v1';
-async function fathomGetTranscriptSegments(recordingId) {
+// The meetings listing (teams[]=Sales, include_transcript) is the one Fathom
+// call Max's key is known to be allowed (the VoC extraction has used it since
+// September). GET /recordings/{id}/transcript answered 401 for the same key on
+// the first backfill (2026-10-11), so that endpoint is tried first and the
+// listing is the fallback: one page set per process, reused for every call
+// of the run (a backfill asks for dozens of transcripts in a row).
+let _fathomMeetingsCache = { sinceISO: null, at: 0, items: [] };
+async function fathomTranscriptFromListing(recordingId, callDateISO) {
+  const callMs = Date.parse(callDateISO || '');
+  if (!Number.isFinite(callMs)) return [];
+  const since = new Date(callMs - 3 * 86400000).toISOString();
+  const fresh = _fathomMeetingsCache.sinceISO && _fathomMeetingsCache.sinceISO <= since && Date.now() - _fathomMeetingsCache.at < 30 * 60 * 1000;
+  if (!fresh) {
+    try {
+      _fathomMeetingsCache = { sinceISO: since, at: Date.now(), items: await vocFetchFathomMeetings(since) };
+    } catch (err) {
+      console.warn(`Fathom listing for transcript ${recordingId} failed:`, err.message);
+      return [];
+    }
+  }
+  const m = _fathomMeetingsCache.items.find((it) => vocMeetingRecordingId(it) === String(recordingId));
+  return m && Array.isArray(m.transcript) ? m.transcript : [];
+}
+async function fathomGetTranscriptSegments(recordingId, callDateISO) {
   if (!process.env.FATHOM_API_KEY || !recordingId) return [];
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -21132,15 +21155,18 @@ async function fathomGetTranscriptSegments(recordingId) {
         await new Promise((r) => setTimeout(r, (waitS + 1) * 1000));
         continue;
       }
-      if (!res.ok) { console.warn(`Fathom transcript ${recordingId} → ${res.status}`); return []; }
+      if (!res.ok) {
+        console.warn(`Fathom transcript ${recordingId} → ${res.status}, trying the meetings listing`);
+        return fathomTranscriptFromListing(recordingId, callDateISO);
+      }
       const data = await res.json();
       return data.transcript || data.segments || data.items || [];
     } catch (err) {
-      console.warn(`Fathom transcript ${recordingId} failed:`, err.message);
-      return [];
+      console.warn(`Fathom transcript ${recordingId} failed (${err.message}), trying the meetings listing`);
+      return fathomTranscriptFromListing(recordingId, callDateISO);
     }
   }
-  return [];
+  return fathomTranscriptFromListing(recordingId, callDateISO);
 }
 
 // The three merge fields REVI's structured read cannot give (verbatim prospect
@@ -21149,11 +21175,14 @@ async function fathomGetTranscriptSegments(recordingId) {
 // written to the GHL contact by field name. Best-effort companion of the
 // auto-fill: its failure never blocks the five fields above it. Audit copy in
 // agent_knowledge `prospect-words:{appointment_id}`.
-async function fillProspectWordsFromRevi({ appointmentId, prospectName, email, recordingId, icpHint, contactId }) {
+async function fillProspectWordsFromRevi({ appointmentId, prospectName, email, recordingId, callDateISO, icpHint, contactId }) {
   if (!recordingId) return { ok: false, reason: 'no Fathom recording id on the REVI row' };
-  const segments = await fathomGetTranscriptSegments(recordingId);
+  const segments = await fathomGetTranscriptSegments(recordingId, callDateISO);
   if (!segments.length) return { ok: false, reason: process.env.FATHOM_API_KEY ? 'transcript unavailable' : 'FATHOM_API_KEY not set' };
-  const lines = prospectWords.prospectLinesFromTranscript(segments, { prospectEmail: email, closerEmails: Object.keys(CLOSER_SLACK) });
+  const lines = prospectWords.prospectLinesFromTranscript(segments, {
+    prospectEmail: email, closerEmails: Object.keys(CLOSER_SLACK),
+    closerNames: Object.keys(CLOSER_SLACK).map((e) => resolveSalesMember(e)).filter(Boolean),
+  });
   if (lines.length < 200) return { ok: false, reason: 'too few prospect lines in the transcript' };
 
   const prompt = prospectWords.buildProspectWordsPrompt({ prospectName, prospectLines: lines, icpHint });
@@ -21237,7 +21266,7 @@ async function autofillCallFieldsFromRevi({ appointmentId, prospectName }) {
   try {
     const cj = pick.coaching_json || {};
     words = await fillProspectWordsFromRevi({
-      appointmentId, prospectName, email, recordingId: pick.fathom_recording_id,
+      appointmentId, prospectName, email, recordingId: pick.fathom_recording_id, callDateISO: pick.call_date,
       icpHint: (cj.context && cj.context.icp_fit) || cj.icp_fit || null,
       contactId: out.ghl?.contactId || null,
     });
