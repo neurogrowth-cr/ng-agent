@@ -20,8 +20,8 @@ const block = SRC.slice(
   SRC.indexOf('// ─── END GAP REPORT GROOMING'),
 );
 const helpers = new Function(`${block};
-  return { computeGapDelta, gapOrdinal, gapCtxSentence, gapListJoin, formatGapClientLine, formatGapReport,
-           GAP_CHRONIC_DAYS, GAP_NEW_MAX_LINES, GAP_CTX_MAX_CHARS };`)();
+  return { computeGapDelta, gapOrdinal, gapCtxSentence, gapListJoin, formatGapClientLine, formatGapReport, splitPhase0,
+           GAP_CHRONIC_DAYS, GAP_NEW_MAX_LINES, GAP_CTX_MAX_CHARS, GAP_PHASE0_DECISION_DAYS };`)();
 const { computeGapDelta, gapOrdinal, gapCtxSentence, gapListJoin, formatGapClientLine, formatGapReport,
         GAP_CHRONIC_DAYS, GAP_NEW_MAX_LINES } = helpers;
 
@@ -94,9 +94,9 @@ const NO_SALES = { noShowCount: 0, staleLeadCount: 0 };
       && !r.includes('Known Hold One') && !r.includes('Known Hold Two'), null);
   check('newly blocked client is named under New this week',
     r.indexOf('Newly Blocked') > r.indexOf('*New this week*'), null);
-  check('crossing client gets the one-time escalate-or-close ask',
-    r.indexOf('Just Crossed') > r.indexOf(`*Crossed ${GAP_CHRONIC_DAYS} days — needs an escalate-or-close call*`)
-      && r.includes("Reply in-thread with the call — these won't move on follow-ups alone."), null);
+  check('crossing client gets the one-time keep-or-close ask',
+    r.indexOf('Just Crossed') > r.indexOf('*Needs a keep-or-close call*')
+      && r.includes("Reply in the thread with the call. These won't move on follow-ups alone."), null);
   check('stale + no-note clients stay under On our side',
     r.indexOf('Stale Sam') > r.indexOf('*On our side*') && r.indexOf('Ghost Co') > r.indexOf('*On our side*'), null);
   check('wins are named', r.includes('*Moved forward*') && r.includes('Winner A and Winner B are no longer flagged.'), null);
@@ -126,7 +126,7 @@ const NO_SALES = { noShowCount: 0, staleLeadCount: 0 };
   const delta = computeGapDelta(null, clients);
   const { message: r, hasSignal } = formatGapReport({ todayLabel: 'X', firstRun: true, clients, delta, phase0: [], sales: NO_SALES });
   check('first run suppresses transitions despite delta calling all new/crossed',
-    !r.includes('*New this week*') && !r.includes('escalate-or-close') && !r.includes('Moved forward'), r);
+    !r.includes('*New this week*') && !r.includes('keep-or-close') && !r.includes('Moved forward'), r);
   check('first run announces the baseline', r.includes('2 clients are currently flagged — baseline set; from next Monday only changes get named.'), null);
   check('first run with only holds is silent (no post)', hasSignal === false, null);
   const staleClients = [...clients, { name: 'Stale Sam', severity: 'stale', status: 'phase_1', daysSince: 10, staleCount: 1, assignees: 'josue', ctx: '', noNote: false, streak: 1 }];
@@ -155,6 +155,36 @@ const NO_SALES = { noShowCount: 0, staleLeadCount: 0 };
   check('phase 0 single signup is one sentence', r.includes('One signup stuck in Phase 0: Andres Sandoval (DIY), Day 13, awaiting activation call.'), null);
   check('sales collapsed to counts pointing at thread', r.includes('Sales side: 2 no-shows without a reschedule and 3 inbound leads waiting 72h+ on a setter — details in the thread.'), null);
   check('phase0/sales alone still constitute signal', hasSignal === true, null);
+}
+
+// ── Keep-or-close: tagged, asked once (Ron, 2026-10-12) ─────────────────────
+// The only report thread in five weeks that produced a decision (Sep 2) was
+// Ron reacting to a long-stuck Phase 0 signup. The ask now tags Ron and tech
+// ops, fires once at the crossing, and old asks collapse to a count.
+{
+  const { splitPhase0, GAP_PHASE0_DECISION_DAYS: P0 } = helpers;
+  const p = (name, days) => ({ name, company: 'Co', stepLabel: 'awaiting T&C', days });
+  const s1 = splitPhase0({ 'Crossing': 26, 'Old Ask': 45 }, [p('Fresh', 9), p('Crossing', 33), p('Old Ask', 52), p('Born Old', 70)]);
+  check('phase0 under the line stays listed', s1.recent.map(x => x.name).join() === 'Fresh', JSON.stringify(s1));
+  check('phase0 crossing the line is asked once', s1.crossed.map(x => x.name).join() === 'Crossing,Born Old', JSON.stringify(s1.crossed));
+  check('phase0 already asked collapses to raised', s1.raised.map(x => x.name).join() === 'Old Ask', JSON.stringify(s1.raised));
+  check('phase0 state carries every signup', Object.keys(s1.nextPhase0).length === 4 && s1.nextPhase0.Crossing === 33);
+  check(`decision line is ${P0} days`, P0 === 30);
+
+  const deciders = ['URON', 'UJOSUE'];
+  const { message: r, hasSignal } = formatGapReport({ todayLabel: 'X', firstRun: false, clients: [], delta: computeGapDelta({}, []), phase0: s1, sales: NO_SALES, deciders });
+  check('a phase0 crossing posts', hasSignal === true);
+  check('decision section tags Ron and tech ops', /\*Needs a keep-or-close call\* <@URON> <@UJOSUE>/.test(r), r);
+  check('phase0 crossing sits in the decision section', r.indexOf('Crossing') > r.indexOf('keep-or-close') && /Born Old\* \(Co\), Day 70 in Phase 0/.test(r), r);
+  check('already-raised signups are a count, not names', /1 older Phase 0 signup was already raised/.test(r) && !r.includes('Old Ask'), r);
+
+  const quiet = formatGapReport({ todayLabel: 'X', firstRun: false, clients: [], delta: computeGapDelta({}, []),
+    phase0: splitPhase0({ 'Old Ask': 45 }, [p('Old Ask', 52)]), sales: NO_SALES, deciders });
+  check('only already-raised signups: no post, no tags', quiet.hasSignal === false && !quiet.message.includes('<@'), quiet.message);
+  const noCrossing = formatGapReport({ todayLabel: 'X', firstRun: false, clients: [], delta: computeGapDelta({}, []),
+    phase0: splitPhase0({}, [p('Fresh', 9)]), sales: NO_SALES, deciders });
+  check('nobody is tagged without a decision to make', !noCrossing.message.includes('<@'), noCrossing.message);
+  check('new decision copy has no dashes', !/[\u2013\u2014]/.test(r.split('*Needs a keep-or-close call*')[1].split('*Phase 0 and sales*')[0]), r);
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────

@@ -4826,6 +4826,26 @@ const GAP_CHRONIC_DAYS = 60;
 const GAP_NEW_MAX_LINES = 10;
 const GAP_CTX_MAX_CHARS = 140;
 const GAP_PHASE_LABELS = { phase_1: 'Phase 1', phase_2: 'Phase 2' };
+// A Phase 0 signup this old needs a keep-or-close call, not another reminder
+// (Sep 2: Ron's one reply to a report in five weeks closed five dead accounts).
+const GAP_PHASE0_DECISION_DAYS = 30;
+
+// Phase 0 week-over-week: signups under the decision line stay listed; a signup
+// crossing it is asked about once; one already asked collapses to a count.
+// A signup already past the line the first time it is seen counts as crossing,
+// same as computeGapDelta, so the decision is asked exactly once.
+function splitPhase0(prevPhase0, phase0) {
+  const prev = prevPhase0 || {};
+  const recent = [], crossed = [], raised = [];
+  const nextPhase0 = {};
+  for (const p of phase0 || []) {
+    nextPhase0[p.name] = p.days;
+    if (p.days < GAP_PHASE0_DECISION_DAYS) recent.push(p);
+    else if (prev[p.name] === undefined || prev[p.name] < GAP_PHASE0_DECISION_DAYS) crossed.push(p);
+    else raised.push(p);
+  }
+  return { recent, crossed, raised, nextPhase0 };
+}
 
 // Week-over-week diff against the persisted state row {name: {s: streak, d: days}}.
 // Returns the transition sets plus the next state to persist. A client already
@@ -4892,7 +4912,9 @@ function formatGapClientLine(c) {
 // The whole Monday post: transitions in, Slack mrkdwn out. Returns hasSignal so
 // the caller can skip posting on a nothing-changed week — the standing-holds
 // count alone is not worth a post.
-function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }) {
+function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales, deciders = [] }) {
+  // phase0 is splitPhase0() output; a plain array (older callers) is all "recent".
+  const p0 = Array.isArray(phase0) ? { recent: phase0, crossed: [], raised: [] } : (phase0 || { recent: [], crossed: [], raised: [] });
   const newSet     = new Set(firstRun ? [] : delta.newNames);
   const crossedSet = new Set(firstRun ? [] : delta.crossedNames);
   const resolved   = firstRun ? [] : delta.resolvedNames;
@@ -4929,11 +4951,18 @@ function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }
     sections.push(`*New this week*\n\n${shown.join('\n')}`);
   }
 
-  if (crossedClients.length) {
+  // One decision section, tagged, fired once per client at the crossing:
+  // clients past GAP_CHRONIC_DAYS and Phase 0 signups past GAP_PHASE0_DECISION_DAYS.
+  if (crossedClients.length || p0.crossed.length) {
+    const tags = deciders.length ? ` ${deciders.map(id => `<@${id}>`).join(' ')}` : '';
+    const lines = [
+      ...crossedClients.map(formatGapClientLine),
+      ...p0.crossed.map(p => `• *${p.name}*${p.company ? ` (${p.company})` : ''}, Day ${p.days} in Phase 0, ${p.stepLabel}.`),
+    ];
     sections.push([
-      `*Crossed ${GAP_CHRONIC_DAYS} days — needs an escalate-or-close call*`,
-      crossedClients.map(formatGapClientLine).join('\n'),
-      "Reply in-thread with the call — these won't move on follow-ups alone.",
+      `*Needs a keep-or-close call*${tags}`,
+      lines.join('\n'),
+      "Reply in the thread with the call. These won't move on follow-ups alone.",
     ].join('\n\n'));
   }
 
@@ -4944,11 +4973,14 @@ function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }
   }
 
   const tail = [];
-  if (phase0.length === 1) {
-    const p = phase0[0];
+  if (p0.recent.length === 1) {
+    const p = p0.recent[0];
     tail.push(`One signup stuck in Phase 0: ${p.name}${p.company ? ` (${p.company})` : ''}, Day ${p.days}, ${p.stepLabel}.`);
-  } else if (phase0.length > 1) {
-    tail.push(`${phase0.length} signups stuck in Phase 0:\n${phase0.map(p => `• *${p.name}*${p.company ? ` (${p.company})` : ''} — Day ${p.days}, ${p.stepLabel}.`).join('\n')}`);
+  } else if (p0.recent.length > 1) {
+    tail.push(`${p0.recent.length} signups stuck in Phase 0:\n${p0.recent.map(p => `• *${p.name}*${p.company ? ` (${p.company})` : ''}, Day ${p.days}, ${p.stepLabel}.`).join('\n')}`);
+  }
+  if (p0.raised.length) {
+    tail.push(`${p0.raised.length} older Phase 0 signup${p0.raised.length === 1 ? ' was' : 's were'} already raised for a keep-or-close call.`);
   }
   if (sales && (sales.noShowCount || sales.staleLeadCount)) {
     const bits2 = [];
@@ -4959,7 +4991,7 @@ function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }
   if (tail.length) sections.push(`*Phase 0 and sales*\n\n${tail.join('\n')}`);
 
   const hasSignal = !!(newClients.length || crossedClients.length || ourSide.length || resolved.length
-    || phase0.length || (sales && (sales.noShowCount || sales.staleLeadCount)));
+    || p0.recent.length || p0.crossed.length || (sales && (sales.noShowCount || sales.staleLeadCount)));
   return { message: sections.join('\n\n'), hasSignal };
 }
 // ─── END GAP REPORT GROOMING ─────────────────────────────────────────────────
@@ -5170,11 +5202,13 @@ async function runMondayGapDetection(correlationId) {
       '3_awaiting_form': 'awaiting onboarding form', '4_awaiting_activation_call': 'awaiting activation call',
       '5_ready_for_handoff': 'ready for Phase 1 handoff — not moved',
     };
+    // days_in_phase0 arrives as a decimal string ("114.80...") and names carry
+    // trailing spaces: whole days and trimmed names, or the post prints both raw.
     const phase0List = (phase0Gaps || []).map(r => ({
-      name: [r.first_name, r.last_name].filter(Boolean).join(' ') || r.email,
-      company: r.company || '',
+      name: [r.first_name, r.last_name].map(x => String(x || '').trim()).filter(Boolean).join(' ') || r.email,
+      company: String(r.company || '').trim(),
       stepLabel: stepLabels[r.phase0_step] || r.phase0_step,
-      days: r.days_in_phase0,
+      days: Math.floor(Number(r.days_in_phase0) || 0),
     }));
 
     // ── Sales gap detection ────────────────────────────────────────────────────
@@ -5278,27 +5312,35 @@ async function runMondayGapDetection(correlationId) {
     // new/crossed/resolved phrasing is suppressed rather than calling the whole
     // roster "new".
     let prevClients = null;
+    let prevPhase0 = null;
     try {
       const { data: stateRow } = await supabase
         .from('agent_knowledge').select('value')
         .eq('category', 'intel').eq('key', 'gap-report-state').limit(1);
-      if (stateRow?.[0]?.value) prevClients = JSON.parse(stateRow[0].value).clients || null;
+      if (stateRow?.[0]?.value) {
+        const st = JSON.parse(stateRow[0].value);
+        prevClients = st.clients || null;
+        prevPhase0 = st.phase0 || null;
+      }
     } catch (stateErr) { console.error('Gap state read error:', stateErr.message); }
     const firstRun = !prevClients;
     const delta = computeGapDelta(prevClients, clientGaps);
     clientGaps.forEach(c => { c.streak = delta.nextClients[c.name].s; });
 
     const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
+    const phase0Split = splitPhase0(prevPhase0, phase0List);
     const { message: report, hasSignal } = formatGapReport({
       todayLabel: today,
       firstRun,
       clients: clientGaps,
       delta,
-      phase0: phase0List,
+      phase0: phase0Split,
       sales: { noShowCount, staleLeadCount },
+      // Keep-or-close is Ron's call with tech ops (Josue).
+      deciders: [RON_SLACK_ID, ...slackIdsByRole('tech_ops')],
     });
 
-    const stateJson = JSON.stringify({ date: new Date().toISOString().slice(0, 10), clients: delta.nextClients });
+    const stateJson = JSON.stringify({ date: new Date().toISOString().slice(0, 10), clients: delta.nextClients, phase0: phase0Split.nextPhase0 });
     if (!hasSignal) {
       // Nothing changed and nothing is on us — no post. Ron's rule: known
       // customer-side holds are not news. State still advances so next week's
@@ -5321,7 +5363,7 @@ async function runMondayGapDetection(correlationId) {
       // not swallow this week's transitions; they should resurface next Monday.
       await upsertKnowledge('intel', 'gap-report-state', stateJson, 'gap-detection');
     }
-    console.log(`Gap detection: ${delta.newNames.length} new, ${delta.crossedNames.length} crossed, ${delta.resolvedNames.length} resolved, ${phase0List.length} phase-0, ${noShowCount + staleLeadCount} sales item(s) posted to ${OPS_CHANNEL}.`);
+    console.log(`Gap detection: ${delta.newNames.length} new, ${delta.crossedNames.length} crossed, ${delta.resolvedNames.length} resolved, ${phase0Split.recent.length} phase-0, ${phase0Split.crossed.length} phase-0 decisions, ${noShowCount + staleLeadCount} sales item(s) posted to ${OPS_CHANNEL}.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
 }
 
@@ -6183,12 +6225,33 @@ const ANOMALY_THRESHOLD_SIGMA = 1.5;
 const ANOMALY_MIN_SAMPLE      = 7;
 const ANOMALY_WINDOW_DAYS     = 28;
 
+// ─── ANOMALY POPULATION FLOOR (pure helpers) ─────────────────────────────────
+// A median or average over a handful of clients is not a trend. On 2026-09-30
+// the EOD Pulse told the team "a systemic throughput problem" from Phase 1 and
+// Phase 2 medians taken over 2 to 4 clients: one client stuck 120+ days moved
+// the number by itself. Scrapers that summarise a set of clients return
+// {value, n}; the reading is stored with n, and the detector stays quiet below
+// ANOMALY_MIN_POPULATION. Plain-number scrapers (counts, money) are unaffected.
+// test/anomaly-population-floor.test.js extracts this block.
+const ANOMALY_MIN_POPULATION = 5;
+function normalizeScrape(raw) {
+  if (raw && typeof raw === 'object' && 'value' in raw) {
+    return { value: raw.value, meta: Number.isFinite(raw.n) ? { n: raw.n } : null };
+  }
+  return { value: raw, meta: null };
+}
+function populationTooThin(meta) {
+  const n = meta && meta.n;
+  return Number.isFinite(n) && n < ANOMALY_MIN_POPULATION;
+}
+// ─── END ANOMALY POPULATION FLOOR ────────────────────────────────────────────
+
 // Domain → roles that should be DM'd when an anomaly fires.
 // Ron sees everything; the rest of the team only their lanes. Recipients deduped.
 const ANOMALY_ROUTING = {
   marketing:      ['ceo'],
   sales:          ['ceo'],
-  fulfillment:    ['ceo', 'tech_ops', 'fulfillment', 'client_success', 'tech_lead'],
+  fulfillment:    ['ceo', 'tech_ops', 'fulfillment', 'campaigns', 'client_success', 'tech_lead'], // campaigns: Gerald since #332
   client_success: ['ceo', 'client_success', 'tech_lead'],
 };
 
@@ -6255,6 +6318,10 @@ async function detectAnomaly(metric, threshold = ANOMALY_THRESHOLD_SIGMA) {
     .limit(1);
   const latest = latestRows?.[0];
   if (!latest) return null;
+  if (populationTooThin(latest.meta)) {
+    console.log(`Anomaly: ${metric} skipped, latest reading covers only ${latest.meta.n} client(s) (< ${ANOMALY_MIN_POPULATION})`);
+    return null;
+  }
 
   const { data: baseline } = await supabase
     .from('metric_baselines')
@@ -6522,7 +6589,7 @@ async function _scrapePhase0ToPhase1Conv7d() {
   if (tErr) throw new Error(tErr.message);
   const denom = total?.length || 0;
   if (denom === 0) return null;
-  return +((promoted?.length || 0) / denom).toFixed(4);
+  return { value: +((promoted?.length || 0) / denom).toFixed(4), n: denom };
 }
 
 async function _scrapePhaseCycleP50(targetStatus) {
@@ -6559,7 +6626,7 @@ async function _scrapePhaseCycleP50(targetStatus) {
   }
   if (!days.length) return null;
   days.sort((a, b) => a - b);
-  return days[Math.floor(days.length / 2)];
+  return { value: days[Math.floor(days.length / 2)], n: days.length };
 }
 
 async function _scrapeDay7AtRiskCount() {
@@ -7617,7 +7684,7 @@ async function _scrapeDaysToLaunchAvg() {
     if (d >= 0 && d < 120) days.push(d);
   }
   if (!days.length) return null;
-  return +(days.reduce((s, d) => s + d, 0) / days.length).toFixed(1);
+  return { value: +(days.reduce((s, d) => s + d, 0) / days.length).toFixed(1), n: days.length };
 }
 
 // Stuck post-activation: activation call held ≥7 days ago, still active, and
@@ -7768,13 +7835,13 @@ async function runAnomalyDetection({ dryRun = false, threshold = ANOMALY_THRESHO
   // 1. Scrape every metric. One failing scraper does not stop the others.
   for (const m of METRIC_REGISTRY) {
     try {
-      const value = await m.scrape();
+      const { value, meta } = normalizeScrape(await m.scrape());
       if (value === null || value === undefined) {
         results.skipped.push({ metric: m.name, reason: 'no value' });
         continue;
       }
-      if (!dryRun) await recordObservation(m.name, m.domain, value, 'anomaly-cron');
-      results.scraped.push({ metric: m.name, domain: m.domain, value });
+      if (!dryRun) await recordObservation(m.name, m.domain, value, 'anomaly-cron', meta);
+      results.scraped.push({ metric: m.name, domain: m.domain, value, ...(meta ? { n: meta.n } : {}) });
     } catch (err) {
       console.error(`Anomaly scrape error for ${m.name}:`, err.message);
       results.errors.push({ metric: m.name, error: err.message });
