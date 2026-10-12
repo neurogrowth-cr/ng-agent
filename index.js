@@ -1056,6 +1056,35 @@ function containsSensitiveData(text) {
   return SENSITIVE_PATTERNS.some(pattern => pattern.test(text));
 }
 
+// Boot-time run-once claim shared by the OUTCOME_CARDS_RUN_ONCE and
+// CALL_FIELDS_BACKFILL_RUN_ONCE jobs. The claim is written as `started|<iso>`
+// BEFORE the work and flipped to `done|<iso>` after it; only `done` counts as
+// used. A `started` claim younger than RUN_ONCE_STALE_MS means another boot is
+// (or was seconds ago) running it, so this boot skips. Older than that with no
+// `done` means the claimant died mid-run (2026-10-11: two Railway deploys
+// booted a second apart, the first claimed the token and was SIGTERM'd by the
+// second, which then skipped; the backfill never ran and the token was burned),
+// so the next boot retries. Returns true when this boot owns the run.
+const RUN_ONCE_STALE_MS = 15 * 60 * 1000;
+function runOnceClaimState(value, now = Date.now()) {
+  const [state, iso] = String(value || '').split('|');
+  if (state === 'done') return 'done';
+  if (state === 'started' || state === 'claimed') {
+    const age = now - Date.parse(iso || '');
+    return Number.isFinite(age) && age < RUN_ONCE_STALE_MS ? 'running' : 'stale';
+  }
+  return value ? 'done' : 'free';
+}
+async function claimRunOnce(label, key, source) {
+  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
+  const state = runOnceClaimState(prior && prior.length ? prior[0].value : '');
+  if (state === 'done') { console.log(`${label}: token already used (${prior[0].value}), skipping.`); return false; }
+  if (state === 'running') { console.log(`${label}: another boot started this token ${prior[0].value.split('|')[1]}, skipping.`); return false; }
+  if (state === 'stale') console.warn(`${label}: claim "${prior[0].value}" never finished, retrying.`);
+  await upsertKnowledge('process', key, `started|${new Date().toISOString()}`, source);
+  return true;
+}
+
 async function upsertKnowledge(category, key, value, source = 'agent', userId = null, visibility = 'shared') {
   try {
     if (containsSensitiveData(value) || containsSensitiveData(key)) {
@@ -13865,21 +13894,17 @@ cron.schedule('0 21 * * *',   wrapCronJob('runUnloggedOutcomeReminders', async (
 //   OUTCOME_CARDS_RUN_ONCE="<any new token>"         arms it
 //   OUTCOME_CARDS_RUN_ONCE_CLOSERS="a@x.io,b@y.com"   optional, scope to closers
 // On boot it sends every due card uncapped, skips Ron's escalation (the nightly
-// run owns that), and records `outcome-cards-run-once:<token>` BEFORE sending,
-// so a restart or crash loop can never deliver the same batch twice. Reusing a
-// token is a no-op; pick a new one to drain again. Deliberately not wrapped in
+// run owns that), and claims `outcome-cards-run-once:<token>` BEFORE sending
+// (see claimRunOnce), so a restart within 15 minutes can never deliver the
+// same batch twice; a claim that never reached `done` is retried after that.
+// Reusing a finished token is a no-op; pick a new one to drain again. Not wrapped in
 // wrapCronJob: it is not a cron, and a cron_run row would read as an undeclared
 // job to runCronLivenessAudit.
 async function runOutcomeCardsOnceIfRequested() {
   const token = String(process.env.OUTCOME_CARDS_RUN_ONCE || '').trim();
   if (!token) return;
   const key = `outcome-cards-run-once:${token}`;
-  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
-  if (prior && prior.length) {
-    console.log(`Outcome cards run-once: token "${token}" already used (${prior[0].value}), skipping.`);
-    return;
-  }
-  await upsertKnowledge('process', key, `claimed|${new Date().toISOString()}`, 'outcome-run-once');
+  if (!await claimRunOnce('Outcome cards run-once', key, 'outcome-run-once')) return;
   const onlyClosers = String(process.env.OUTCOME_CARDS_RUN_ONCE_CLOSERS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
   console.log(`Outcome cards run-once: draining now (token "${token}", closers: ${onlyClosers.join(', ') || 'all'}).`);
@@ -21415,9 +21440,7 @@ async function runCallFieldsBackfillOnceIfRequested() {
   const token = String(process.env.CALL_FIELDS_BACKFILL_RUN_ONCE || '').trim();
   if (!token) return;
   const key = `call-fields-backfill:${token}`;
-  const { data: prior } = await supabase.from('agent_knowledge').select('value').eq('key', key).limit(1);
-  if (prior && prior.length) { console.log(`Call fields backfill: token "${token}" already used, skipping.`); return; }
-  await upsertKnowledge('process', key, `claimed|${new Date().toISOString()}`, 'call-fields-backfill');
+  if (!await claimRunOnce('Call fields backfill', key, 'call-fields-backfill')) return;
 
   const days = Number(process.env.CALL_FIELDS_BACKFILL_DAYS) || 90;
   const since = new Date(Date.now() - days * 86400000).toISOString();
