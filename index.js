@@ -255,12 +255,12 @@ Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, p
 Josue Duran (U08ABBFNGUW) — Technical Operations Manager (full-time fulfillment). Activation calls, campaign ops, client launch sequencing.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
 Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
-Gerald Arias (U0BAAC0KS82) — Fulfillment Operations.
-Felipe (U09TNMVML3F) — Technical Campaign Specialist (part-time). Campaign launches, Prosp management.
+Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner. Campaign config, Prosp management, campaign launches.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
 Jonathan Madriz — FORMER closer, departed 2026-07-19. He is not on the team: never DM him, never list him in a standup, leaderboard, roster or "who is closing today", and never assign him work. His past results stay attributed to him in reports covering his tenure — name him for history, never as someone current. His open deals are Jose's now.
+Felipe Herrera: FORMER campaign specialist, departed 2026-09-16. He is not on the team: never DM him, never tag him, never assign him work. Phase 2 and Prosp work is Gerald's now.
 William B: FORMER appointment setter, departed 2026-10-07. The active setters are Oscar and Sebastian. He is not on the team: never DM him, never list him in a standup, leaderboard roster, setter nudge or "who is setting today", and never assign him work or leads. His past bookings stay attributed to him in reports covering his tenure: name him for history, never as someone current.
 
 ---
@@ -272,7 +272,7 @@ Task Execution: When Ron assigns a task, confirm you understood it, execute with
 Communication Drafting: Draft all routine outgoing messages. Ron reviews client-facing or sales-critical content before it goes out. Write in professional, confident, direct tone for external; efficient and direct for internal.
 
 Standup Accountability (Scheduled Jobs):
-- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Josue, Valeria, Felipe.
+- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Josue, Valeria, Gerald.
 - EOD check (weekdays 5:00 PM Costa Rica): Cross-reference open items against reported completions. Flag anything unresolved.
 - Weekly summary (Fridays 4:00 PM Costa Rica): Digest for Ron covering sales closures, delivery status, blockers, Monday priorities.
 - Sales call prep (evening before any sales call on calendar): Alert Ron to review prospect brief. If no brief exists, alert Ron directly.
@@ -738,12 +738,13 @@ const TEAM_MEMBERS = {
   'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' },
   'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
-  'U09TNMVML3F': { name: 'Felipe',   role: 'campaigns',      displayName: 'Felipe Herrera NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
-  'U0BAAC0KS82': { name: 'Gerald',   role: 'fulfillment',    displayName: 'Gerald Arias NG' },
+  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG' }, // Phase 2 owner since Felipe left 2026-09-16
   'U07SMMDMSLQ': { name: 'Tania',    role: 'fulfillment',    displayName: 'Tania NG' },
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
+  // Felipe Herrera (U09TNMVML3F) removed 2026-10-11, departed 2026-09-16. Gerald
+  // took the campaigns role (Phase 2: campaign config, Prosp). See DEPARTED_MEMBERS.
   // William B (U0B16P6DQ2F) removed 2026-10-07, departed 2026-10-07 (Ron: active
   // setters are Sebastian and Oscar). Same treatment as Jonathan below.
   // Jonathan Madriz (U0APYAE0999) removed 2026-08-24 — departed 2026-07-19.
@@ -869,27 +870,27 @@ He cannot access Ron's email or calendar.`,
 How the delivery system works:
 - Project 1 (Profile Optimization and Client Intelligence): Takes onboarding form + activation call + LinkedIn PDF as inputs. Runs language gate and activation gate quality checks, then runs 14-step market analysis. Produces 3 docs: Doc 1 (Voice + Calendar) goes to client via WhatsApp, Doc 2 (LinkedIn guide) goes to fulfillment team, Doc 3 (Intelligence bundle) hands off to Project 2.
 - Project 2 (Campaign Factory): Takes the intelligence bundle, runs bundle detection and pre-gen summary confirmation, builds 3 sequences (A, B, C — 5 messages each) + voice notes + Sales Navigator D1-D12 + Prosp.ai config. Produces File 1 (internal campaign bible for fulfillment, 7 sections D1-D12) and File 2 (founder-facing campaign overview, plain language).
-- Delivery: Doc 1 and File 2 go to founder. Doc 2 and File 1 go to fulfillment team (Felipe).
+- Delivery: Doc 1 and File 2 go to founder. Doc 2 and File 1 go to fulfillment team (Gerald).
 
 Client onboarding checklist phases fulfillment owns or coordinates:
 - Phase 1: Voice Profile and Content Calendar setup, Video General Overview, Voice Profile Prompt
-- Phase 2: Campaign Validation (with Felipe), content calendar and profile steps
+- Phase 2: Campaign Validation (with Gerald), content calendar and profile steps
 
 Help ${member.name} with delivery doc status, client setup coordination, and fulfillment channel activity. They cannot access Ron's Gmail, calendar, or GHL.`,
 
-    campaigns: `You are speaking with Felipe, the Technical Campaign Specialist at NeuroGrowth. He executes the LinkedIn growth system deliverables that Valeria's docs produce. He works alongside Valeria on fulfillment.
+    campaigns: `You are speaking with ${member.displayName}, who owns Phase 2 (campaigns) at NeuroGrowth. They execute the LinkedIn growth system deliverables that Valeria's docs produce, alongside Valeria on fulfillment.
 
-His 3 core areas:
+Their 3 core areas:
 1. LinkedIn Profile Optimization: Uses Success GPT framework to optimize client profiles (headline, banner, about, featured content) and company pages. Target: profile optimized within 48 hours of onboarding.
 2. Campaign Building and Deployment: Builds Prosp campaigns using Campaign Factory GPT. Configures sequences (connection requests, soft CTA, hard CTA, nurture — 5 messages each), voice notes, Sales Navigator D1-D12, objection handling SOPs. Target: campaign built and launched within 3-5 hours per client. Benchmarks: 15%+ connection acceptance rate, 8%+ reply rate, 2%+ meeting booking rate.
 3. Content Pipeline Management: Uses voice prompt extractor for client voice, ghostwriter agent for content, creates content calendars. Target: 8-12 posts/month + 2-4 long-form pieces per client.
 
-Client onboarding checklist items he owns:
+Client onboarding checklist items they own:
 - Phase 1: LinkedIn Profile Optimization, Activation Post (Live), Loom walkthrough, Sales Navigator Coupon
 - Phase 2: Campaign Config in Prosp AI, Loom walkthrough Phase 2
 Full client setup target: <12 hours start to fully operational.
 
-When Felipe asks about a client, give him their campaign status, profile setup stage, and any performance data from the knowledge base. Help him draft Prosp sequences, objection handlers, content calendars, and campaign SOPs. He cannot access Ron's Gmail, calendar, or GHL.`,
+When ${member.name} asks about a client, give them the campaign status, profile setup stage, and any performance data from the knowledge base. Help them draft Prosp sequences, objection handlers, content calendars, and campaign SOPs. They cannot access Ron's Gmail, calendar, or GHL.`,
 
     setter: `You are speaking with ${member.displayName}, an Appointment Setter at NeuroGrowth. They work the B2C LinkedIn outreach pipeline and book discovery calls with qualified prospects.
 
@@ -936,7 +937,7 @@ PORTAL FOCUS: Lead with portfolio health — phase transitions, launch risk, SLA
 Their role:
 - Oversight of the 14-day launch cycle and the ROLEX/PATEK tier portfolio (works alongside Josue on technical campaign excellence)
 - Owns operational gap detection and escalation: when something is slipping, they're the one who notices and routes it
-- Coordinates between fulfillment (Valeria), campaigns (Felipe), client success, and tech lead (David)
+- Coordinates between fulfillment (Valeria), campaigns (Gerald), client success, and tech lead (David)
 - Surfaces operational issues to Ron with recommended actions, not raw status
 
 When they ask about ops health, pull fulfillment channel activity, recent gap detection alerts, SLA status across active clients, and any cross-team dependencies that are blocking. Help them draft escalation summaries for Ron, ops channel updates, and coordination messages between teams. They can use GHL, Drive, Notion, and calendar; they cannot send email on Ron's behalf.`,
@@ -1799,7 +1800,7 @@ function registerDynamicCron(task) {
             }));
             anomalyBlock = `PRECOMPUTED FULFILLMENT ANOMALIES (last 24h, ≥${ANOMALY_THRESHOLD_SIGMA}σ from baseline):\n${lines.join('\n')}`;
           }
-          taskDataBlock = `\n\n---\nFRESH BLOCKERS ONLY (aged + fully blocked clients are deliberately hidden from the daily — they belong in the Friday Delivery Wrap-Up):\n${dailyAlerts}\n\n---\n${anomalyBlock}`;
+          taskDataBlock = `\n\n---\nFRESH BLOCKERS ONLY (aged and fully blocked clients are deliberately hidden from the daily: they show as a count in the Monday gap report and in full on request via get_portal_alerts):\n${dailyAlerts}\n\n---\n${anomalyBlock}`;
         } catch (fErr) {
           console.error('Fulfillment EOD precompute failed:', fErr.message);
           taskDataBlock = `\n\n---\nNOTE: Failed to pre-compute fulfillment data block (${fErr.message}). Use your usual data tools.`;
@@ -1897,7 +1898,7 @@ function registerDynamicCron(task) {
       const TASK_HEADERS = {
         'Sales EOD Report':           ['LEADS TODAY', 'STRATEGY CALLS BOOKED', 'WORKED VS UNWORKED', "TOMORROW'S PRIORITY"],
         'Fulfillment EOD Pulse':      ['WINS TODAY', 'BLOCKERS', 'ANOMALIES', 'TOMORROW'],
-        'Friday Delivery Wrap-Up':    ['WEEK IN REVIEW', 'CLIENT STATUS BOARD', 'TEAM WINS THIS WEEK', 'MISSES THIS WEEK', 'MONDAY PRIORITIES'],
+        // 'Friday Delivery Wrap-Up' retired 2026-10: replaced by the templated runFridayDeliveryDelta.
         'Ron Weekly Ops Digest':      ['DELIVERY', 'SALES', 'WHAT NEEDS YOUR ATTENTION'],
         'Monthly VoC Digest':         ['MUESTRA DEL MES', 'DOLORES DEL MES', 'VERBATIMS NUEVOS', 'CREENCIAS Y OBJECIONES', 'SUGERENCIAS PARA PAUTA'],
         'Monthly Business Review':    ['WINS THIS MONTH', 'GAPS & MISSES', 'KEEP DOING', 'STOP DOING', 'WATCH LIST', 'ONE PRIORITY FOR NEXT MONTH'],
@@ -3449,7 +3450,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       const blockedDetails = blockedActs.map(a => templateMap[a.template_id] || 'Unknown').join(', ');
 
       if (dash.customer_status === 'blocked') {
-        if (dailyMode) continue; // long-standing blocked clients move to weekly wrap-up
+        if (dailyMode) continue; // long-standing blocked clients: Monday gap report count, full list on request
         alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince}${anchorSuffix})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
       } else if (daysSince >= 14) {
         if (dailyMode && daysSince > 30) {
@@ -3483,7 +3484,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       if (r.phase0_step === '5_ready_for_handoff') {
         phase0Alerts.push(`🟢 PHASE 0 HANDOFF READY — ${name}${co} | ${stepStr} | Day ${days} — move to Phase 1`);
       } else if (days >= 14) {
-        if (dailyMode && days > 30) continue; // aged Phase 0 stalls move to weekly wrap-up
+        if (dailyMode && days > 30) continue; // aged Phase 0 stalls: Monday gap report, full list on request
         phase0Alerts.push(`🔴 PHASE 0 OVERDUE — ${name}${co} | ${stepStr} | Day ${days} (past 14-day threshold)`);
       } else if (days >= 7) {
         phase0Alerts.push(`🟡 PHASE 0 AT RISK — ${name}${co} | ${stepStr} | Day ${days}`);
@@ -4780,7 +4781,7 @@ async function runWeeklyPortalTrends(_correlationId) {
     const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     const trendReport = [`Week ending ${today}:`, `Phase distribution: ${Object.entries(phaseCounts).map(([k,v])=>`${k}:${v}`).join(', ')}`, `Client mix: ${fwCount} Flywheel AI, ${fsCount} Full Service`, topBlocked ? `Top blocked activities: ${topBlocked}` : 'No blocked activities this week.', workload ? `Team workload: ${workload}` : '', avgDaysToLiveLine].filter(Boolean).join(' | ');
     await upsertKnowledge('intel', `weekly-trends-${new Date().toISOString().slice(0,10)}`, trendReport, 'weekly-cron');
-    if (topBlocked) await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Josue and Felipe.`, 'weekly-cron');
+    if (topBlocked) await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Josue and Gerald.`, 'weekly-cron');
     if (workload)   await upsertKnowledge('team', 'current-workload', `As of ${today}: ${workload}`, 'weekly-cron');
     console.log('Weekly trend analysis complete.');
     await postToSlack(AGENT_CHANNEL, `📊 *Weekly trend analysis saved* — check knowledge base for latest intel and process insights.`);
@@ -4938,6 +4939,138 @@ function formatGapReport({ todayLabel, firstRun, clients, delta, phase0, sales }
   return { message: sections.join('\n\n'), hasSignal };
 }
 // ─── END GAP REPORT GROOMING ─────────────────────────────────────────────────
+
+// ─── FRIDAY DELIVERY DELTA (pure helpers) ────────────────────────────────────
+// Replaced the LLM "Friday Delivery Wrap-Up" scheduled task in 2026-10. That
+// post rebuilt the whole client roster every week (1,500 to 2,000 words over
+// 2 to 3 messages) and got zero reactions in five weeks: the same names, the
+// same Monday asks, known state restated. Same rule as the Monday gap report
+// above: name only what changed since last Friday, collapse standing holds to
+// a count, and post nothing on a week with no change. The roster stays
+// available on demand through get_portal_alerts.
+// Pure and self-contained apart from gapListJoin (gap block above):
+// test/friday-delivery-delta.test.js extracts both blocks.
+const FRIDAY_WINDOW_DAYS = 14;
+const FRIDAY_AT_RISK_DAYS = 7;
+const FRIDAY_MAX_PRIORITIES = 3;
+const FRIDAY_LAUNCH_MEMORY_DAYS = 28;
+const FRIDAY_PHASE_LABELS = { phase_1: 'Phase 1', phase_2: 'Phase 2', blocked: 'blocked' };
+// Phase 2 is campaign config and Prosp (Gerald since Felipe left 2026-09-16).
+// Phase 1 and blocked clients sit with tech ops (Josue).
+const FRIDAY_OWNER_ROLE = { phase_1: 'tech_ops', phase_2: 'campaigns', blocked: 'tech_ops' };
+
+function fridayFlagged(status, days) {
+  return status === 'blocked' || (days ?? 0) >= FRIDAY_WINDOW_DAYS;
+}
+
+// prevState: {date, clients: {name: {d, s}}, launched: {name: iso}} or null.
+// clients:  every active phase_1 / phase_2 / blocked client as {name, status, daysSince}.
+// launches: launch steps completed in the last 7 days as {name, launchedAt, daysToLaunch}.
+// stillActive: names of active clients in any other status (live, phase_3),
+//   so a client who left the list by launching counts as moved forward and a
+//   client who churned out of the portal does not.
+function computeFridayDelta(prevState, { clients, launches, stillActive, todayISO }) {
+  const prevClients  = prevState?.clients  || {};
+  const prevLaunched = prevState?.launched || {};
+  const active = new Set(stillActive || []);
+  const nextClients = {};
+  const flaggedNow = new Set();
+  const crossed = [];
+  const atRisk = [];
+  for (const c of clients || []) {
+    nextClients[c.name] = { d: c.daysSince, s: c.status };
+    if (fridayFlagged(c.status, c.daysSince)) flaggedNow.add(c.name);
+    if (c.status === 'blocked') continue; // a block is a hold, never a window crossing
+    const p = prevClients[c.name];
+    if (c.daysSince >= FRIDAY_WINDOW_DAYS) {
+      if (!p || (p.d ?? 0) < FRIDAY_WINDOW_DAYS) crossed.push(c);
+    } else if (c.daysSince >= FRIDAY_AT_RISK_DAYS) {
+      atRisk.push(c);
+    }
+  }
+  const resolved = Object.entries(prevClients)
+    .filter(([name, p]) => fridayFlagged(p.s, p.d) && !flaggedNow.has(name))
+    .filter(([name]) => name in nextClients || active.has(name))
+    .map(([name]) => name);
+
+  const cutoff = Date.parse(todayISO) - FRIDAY_LAUNCH_MEMORY_DAYS * 86400000;
+  const launched = (launches || []).filter(l => !prevLaunched[l.name]);
+  const nextLaunched = {};
+  for (const [name, iso] of Object.entries(prevLaunched)) if (Date.parse(iso) >= cutoff) nextLaunched[name] = iso;
+  for (const l of launches || []) nextLaunched[l.name] = nextLaunched[l.name] || l.launchedAt;
+
+  crossed.sort((a, b) => b.daysSince - a.daysSince);
+  atRisk.sort((a, b) => b.daysSince - a.daysSince);
+  return {
+    launched,
+    crossed,
+    resolved,
+    atRisk,
+    holdsCount: flaggedNow.size - crossed.length,
+    nextState: { date: todayISO, clients: nextClients, launched: nextLaunched },
+  };
+}
+
+// {role: {name, id}} from the team roster: the first member holding each role.
+function fridayOwnersFrom(teamMembers) {
+  const out = {};
+  for (const [id, m] of Object.entries(teamMembers || {})) if (m.role && !out[m.role]) out[m.role] = { name: m.name, id };
+  return out;
+}
+
+function fridayOwnerTag(status, owners) {
+  const o = owners[FRIDAY_OWNER_ROLE[status]] || owners.tech_ops;
+  return o ? ` Owner: <@${o.id}>.` : '';
+}
+
+// The clients who hit Day 14 before next Friday, closest first, each with its
+// owner. A miss already carries its owner on its own line, so no client is
+// named twice in one post.
+function fridayUpcoming(delta, owners) {
+  return delta.atRisk.slice(0, FRIDAY_MAX_PRIORITIES).map(c => {
+    const left = FRIDAY_WINDOW_DAYS - c.daysSince;
+    return `• ${c.name} hits Day 14 in ${left} day${left === 1 ? '' : 's'} (${FRIDAY_PHASE_LABELS[c.status] || c.status}).${fridayOwnerTag(c.status, owners)}`;
+  });
+}
+
+function fridayLaunchLine(l) {
+  return Number.isFinite(l.daysToLaunch)
+    ? `• ${l.name} launched, ${l.daysToLaunch} day${l.daysToLaunch === 1 ? '' : 's'} from the activation call.`
+    : `• ${l.name} launched. No activation call date on file.`;
+}
+
+// The whole Friday post. hasSignal is false on a week where nothing launched,
+// nobody newly missed the window and nothing came off the list: no post then.
+// On the first run there is no baseline, so misses and resolved items are not
+// named (they would all read as new).
+function formatFridayDelta({ todayLabel, firstRun, delta, owners }) {
+  const crossed  = firstRun ? [] : delta.crossed;
+  // One line per client: a launch already says it moved forward, and a client
+  // off the list but heading for Day 14 belongs in the warning, not the wins.
+  const named = new Set([...delta.launched.map(l => l.name), ...delta.atRisk.slice(0, FRIDAY_MAX_PRIORITIES).map(x => x.name)]);
+  const resolved = firstRun ? [] : delta.resolved.filter(n => !named.has(n));
+  const hasSignal = !!(delta.launched.length || crossed.length || resolved.length);
+  const sections = [`*Friday delivery, ${todayLabel}*`];
+  if (firstRun) sections.push('First run, so this sets the baseline. From next Friday only changes get named.');
+  if (delta.launched.length) sections.push(`*Launched this week*\n${delta.launched.map(fridayLaunchLine).join('\n')}`);
+  if (crossed.length) {
+    sections.push(`*Missed the 14-day window*\n${crossed.map(c =>
+      `• ${c.name} crossed Day 14 in ${FRIDAY_PHASE_LABELS[c.status] || c.status} (now Day ${c.daysSince}).${fridayOwnerTag(c.status, owners)}`).join('\n')}`);
+  }
+  if (resolved.length) {
+    sections.push(`*Moved forward*\n${gapListJoin(resolved)} ${resolved.length === 1 ? 'is' : 'are'} no longer flagged.`);
+  }
+  const holds = firstRun ? delta.holdsCount + delta.crossed.length : delta.holdsCount;
+  if (holds > 0) {
+    sections.push(holds === 1
+      ? '1 client flagged in earlier weeks is unchanged. Ask Max for the full list.'
+      : `${holds} clients flagged in earlier weeks are unchanged. Ask Max for the full list.`);
+  }
+  const upcoming = fridayUpcoming(delta, owners);
+  if (upcoming.length) sections.push(`*Hits Day 14 before next Friday*\n${upcoming.join('\n')}`);
+  return { message: sections.join('\n\n'), hasSignal };
+}
+// ─── END FRIDAY DELIVERY DELTA ───────────────────────────────────────────────
 
 // ─── PORTAL: MONDAY GAP DETECTION ────────────────────────────────────────────
 // The param is USED (passed to executeChannelPost below), so it must not carry the
@@ -5166,6 +5299,117 @@ async function runMondayGapDetection(correlationId) {
     }
     console.log(`Gap detection: ${delta.newNames.length} new, ${delta.crossedNames.length} crossed, ${delta.resolvedNames.length} resolved, ${phase0List.length} phase-0, ${noShowCount + staleLeadCount} sales item(s) posted to ${OPS_CHANNEL}.`);
   } catch (err) { console.error('Gap detection error:', err.message); }
+}
+
+// ─── PORTAL: FRIDAY DELIVERY DELTA ───────────────────────────────────────────
+// Friday 4 PM CR to the ops channel. Templated from portal data (no model call),
+// formatted by the FRIDAY DELIVERY DELTA helpers. Day N counts from the real
+// activation call (resolveDayAnchor + loadActivationDates). Launch = latest
+// completed "campaign qa check" / "campaign validation" step, the same rule as
+// _scrapeDaysToLaunchAvg; go_live_at is provisioning, not launch.
+// opts.dryRun returns the message without posting or saving state.
+async function gatherFridayDeliveryData() {
+  const { data: dashboards, error: dErr } = await portalSupabase
+    .from('client_dashboards')
+    .select('id, client_name, email, customer_status, created_at, stabilization_started_at')
+    .eq('is_active', true);
+  if (dErr) throw new Error(`client_dashboards read: ${dErr.message}`);
+  const { data: templates, error: tErr } = await portalSupabase.from('customer_activity_templates').select('id, title');
+  if (tErr) throw new Error(`activity templates read: ${tErr.message}`);
+  const tMap = {};
+  (templates || []).forEach(t => { tMap[t.id] = t.title; });
+  const activationFor = await loadActivationDates();
+
+  const IN_FLIGHT = ['phase_1', 'phase_2', 'blocked'];
+  const nameOf = d => String(d.client_name || d.email || '').replace(/\s+/g, ' ').trim();
+  const clients = [];
+  const stillActive = [];
+  for (const dash of dashboards || []) {
+    if (!IN_FLIGHT.includes(dash.customer_status)) { stillActive.push(nameOf(dash)); continue; }
+    // Dual-path activity read, same as the gap report: rows can be keyed on the
+    // dashboard id or on the older customer_onboarding id.
+    const { data: byDash } = await portalSupabase.from('customer_activities')
+      .select('template_id, status, completed_at').eq('customer_id', dash.id);
+    let acts = byDash || [];
+    const { data: onboarding } = await portalSupabase.from('customer_onboarding').select('id').eq('email', dash.email).limit(1);
+    if (onboarding?.[0] && onboarding[0].id !== dash.id) {
+      const { data: byOb } = await portalSupabase.from('customer_activities')
+        .select('template_id, status, completed_at').eq('customer_id', onboarding[0].id);
+      if (byOb?.length) acts = [...acts, ...byOb];
+    }
+    const anchor = resolveDayAnchor(dash, acts, id => tMap[id] || '', activationFor(dash));
+    clients.push({ name: nameOf(dash), status: dash.customer_status, daysSince: anchor.daysSince ?? 0 });
+  }
+
+  // Launches in the last 7 days, mapped back to a dashboard by id or by the
+  // onboarding id's email.
+  const launchIds = (templates || []).filter(t => /campaign qa check|campaign validation/i.test(t.title || '')).map(t => t.id);
+  const launches = [];
+  if (launchIds.length) {
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    const { data: rows, error: lErr } = await portalSupabase.from('customer_activities')
+      .select('customer_id, completed_at').in('template_id', launchIds).gte('completed_at', since).not('completed_at', 'is', null);
+    if (lErr) throw new Error(`launch steps read: ${lErr.message}`);
+    const dashById = Object.fromEntries((dashboards || []).map(d => [d.id, d]));
+    const dashByEmail = Object.fromEntries((dashboards || []).filter(d => d.email).map(d => [d.email.toLowerCase(), d]));
+    const unknownIds = [...new Set((rows || []).map(r => r.customer_id).filter(id => !dashById[id]))];
+    const obEmail = {};
+    if (unknownIds.length) {
+      const { data: obs } = await portalSupabase.from('customer_onboarding').select('id, email').in('id', unknownIds);
+      (obs || []).forEach(o => { if (o.email) obEmail[o.id] = o.email.toLowerCase(); });
+    }
+    const latest = {};
+    for (const r of rows || []) {
+      const dash = dashById[r.customer_id] || dashByEmail[obEmail[r.customer_id]];
+      if (!dash) continue; // inactive or unknown client: not announced
+      if (!latest[dash.id] || r.completed_at > latest[dash.id].at) latest[dash.id] = { dash, at: r.completed_at };
+    }
+    for (const { dash, at } of Object.values(latest)) {
+      const activation = activationFor(dash);
+      const d = activation ? Math.floor((Date.parse(at) - Date.parse(activation)) / 86400000) : null;
+      launches.push({ name: nameOf(dash), launchedAt: at, daysToLaunch: d !== null && d >= 0 && d < 365 ? d : null });
+    }
+  }
+  return { clients, launches, stillActive };
+}
+
+async function runFridayDeliveryDelta(correlationId, { dryRun = false } = {}) {
+  console.log('Running Friday delivery delta...');
+  try {
+    const { clients, launches, stillActive } = await gatherFridayDeliveryData();
+    let prevState = null;
+    const { data: stateRow, error: sErr } = await supabase
+      .from('agent_knowledge').select('value')
+      .eq('category', 'intel').eq('key', 'friday-delivery-state').limit(1);
+    // A failed read must not pass for a first run: that would rebaseline and
+    // swallow this week's changes. Stop and let the next Friday try again.
+    if (sErr) throw new Error(`state read: ${sErr.message}`);
+    if (stateRow?.[0]?.value) prevState = JSON.parse(stateRow[0].value);
+    const firstRun = !prevState;
+
+    const todayISO   = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const todayLabel = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
+    const delta = computeFridayDelta(prevState, { clients, launches, stillActive, todayISO });
+    const { message, hasSignal } = formatFridayDelta({ todayLabel, firstRun, delta, owners: fridayOwnersFrom(TEAM_MEMBERS) });
+    const stateJson = JSON.stringify(delta.nextState);
+    if (dryRun) return { message, hasSignal, firstRun, delta };
+
+    if (!hasSignal) {
+      // Ron's rule: a week with no change is not news. State still advances.
+      await upsertKnowledge('intel', 'friday-delivery-state', stateJson, 'friday-delivery');
+      console.log(`Friday delivery delta: no change (${delta.holdsCount} standing holds), post skipped, state saved.`);
+      return { message, hasSignal, firstRun, delta };
+    }
+    const posted = await executeChannelPost(OPS_CHANNEL, message, null, correlationId);
+    await registerPostedReport(posted, 'friday-delivery');
+    // Advance state only when the post landed, so a failed post resurfaces next week.
+    if (posted) await upsertKnowledge('intel', 'friday-delivery-state', stateJson, 'friday-delivery');
+    console.log(`Friday delivery delta: ${delta.launched.length} launched, ${delta.crossed.length} crossed, ${delta.resolved.length} resolved, posted=${!!posted}.`);
+    return { message, hasSignal, firstRun, delta };
+  } catch (err) {
+    console.error('Friday delivery delta error:', err.message);
+    throw err;
+  }
 }
 
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
@@ -5814,11 +6058,11 @@ async function runProactiveDMs(_correlationId) {
       console.log(`Proactive DM sent to fulfillment role: ${stalledPhase1.length} client(s) stalled in Phase 1`);
     }
 
-    // ── DM Felipe: clients stalled in phase_2 ──
+    // ── DM campaigns role (Gerald): clients stalled in phase_2 ──
     if (stalledPhase2.length > 0) {
       const names = stalledPhase2.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag Josue if anything is blocked.`;
-      for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
+      for (const id of slackIdsByRole('campaigns')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to campaigns role: ${stalledPhase2.length} client(s) stalled in Phase 2`);
@@ -9166,6 +9410,14 @@ const DEPARTED_MEMBERS = {
     aliases: ['n8mvtuhbbby7qppqnmr7', 'U0B16P6DQ2F'],
     coverage: null,                            // setter: never a closer_id, so no open deals to inherit
   },
+  // Keyed by Slack id: no email of his is on record anywhere Max reads.
+  'U09TNMVML3F': {
+    name: 'Felipe Herrera',
+    since: '2026-09-16',                       // wiki people/team-roles.md; Phase 2 is Gerald's now
+    role: 'campaigns',
+    aliases: ['U09TNMVML3F'],
+    coverage: null,                            // fulfillment, never a closer_id: no open deals to inherit
+  },
 };
 // GHL rows carry a person as a roster email, a raw user id, or a Slack id —
 // index every shape so a lookup cannot miss one and quietly DM a leaver.
@@ -9839,9 +10091,11 @@ async function runFulfillmentStandup(_correlationId) {
     await saveStandupSnapshot('valeria', { phase1Clients: phase1.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP1, blocked: vBlockedNames });
     console.log('Standup DM sent to fulfillment role');
 
-    // ── DM Felipe — campaigns, Phase 2 ───────────────────────────────────────
+    // ── DM campaigns role (Gerald), Phase 2 ──────────────────────────────────
+    // Snapshot key stays 'felipe' so the first brief after the handover diffs
+    // against yesterday instead of listing every client as new.
     const felipeSnap = await getYesterdayStandupSnapshot('felipe');
-    const felipeLines = [`Good morning Felipe! Here's your ${today} campaign brief:\n`];
+    const felipeLines = [];
 
     const phase2Names  = phase2.map(d => d.client_name);
     const stalledP2    = phase2.filter(d => (getDayCount(d) || 0) >= 4).map(d => d.client_name);
@@ -9878,11 +10132,12 @@ async function runFulfillmentStandup(_correlationId) {
 
     felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so Josue can sequence it.`);
 
-    for (const id of (slackIdsByRole('campaigns').length ? slackIdsByRole('campaigns') : ['U09TNMVML3F'])) {
-      await slack.client.chat.postMessage({ channel: id, text: felipeLines.join('\n') });
+    for (const id of slackIdsByRole('campaigns')) {
+      const greeting = `Good morning ${getMemberContext(id).name}! Here's your ${today} campaign brief:\n`;
+      await slack.client.chat.postMessage({ channel: id, text: [greeting, ...felipeLines].join('\n') });
     }
     await saveStandupSnapshot('felipe', { phase2Clients: phase2.map(d => ({ name: d.client_name, day: getDayCount(d) })), stalledGe4: stalledP2, phase3Clients: phase3.map(d => ({ name: d.client_name })) });
-    console.log('Standup DM sent to Felipe');
+    console.log('Standup DM sent to campaigns role');
 
     // ── DM client success — Phase 0 owner, SLA enforcer, Phase 3 client success
     const taniaSnap = await getYesterdayStandupSnapshot('tania');
@@ -13840,6 +14095,8 @@ cron.schedule('0 8 * * 1',   wrapCronJob('runWeeklyReflectionBrief', async (c) =
 
 // Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
 cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
+// Friday delivery delta, 4:00 PM CR: what changed this week, or no post (replaced the LLM 'Friday Delivery Wrap-Up' task 2026-10)
+cron.schedule('0 16 * * 5', wrapCronJob('runFridayDeliveryDelta', async (c) => { await runFridayDeliveryDelta(c); }), { timezone: 'America/Costa_Rica' });
 
 // Weekly sales & marketing recap — Friday 5:00 PM CR (DMs Ron with 7-day sales + marketing summary)
 cron.schedule('0 17 * * 5',  wrapCronJob('runWeeklySalesMarketingRecap', async (c) => { await runWeeklySalesMarketingRecap(c); }), { timezone: 'America/Costa_Rica' });
@@ -13855,7 +14112,7 @@ cron.schedule('0 14 * * 1',  wrapCronJob('runMondayGapDetection', async (c) => {
 // cron.schedule('0 15 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 // cron.schedule('0 20 * * *',  wrapCronJob('runProactiveAlerts', runProactiveAlerts),     { timezone: 'America/Costa_Rica' });
 
-// Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Felipe, client_success based on client status)
+// Proactive team DMs — 8:00 AM CR Mon–Fri (infrastructure — DMs Josue, Valeria, Gerald, client_success based on client status)
 // runProactiveDMs merged into runFulfillmentStandup (9 AM) — stalled flags now inline per role
 // cron.schedule('0 8 * * 1-5', wrapCronJob('runProactiveDMs', async (c) => { await runProactiveDMs(c); }),        { timezone: 'America/Costa_Rica' });
 
@@ -13874,7 +14131,7 @@ cron.schedule('0 6 * * *',   async () => {
 // Heartbeat on REVI's ingestion + delivery; alert-only, silent when healthy.
 cron.schedule('30 6 * * 2-6', wrapCronJob('runReviCrossChecks', async (c) => { await runReviCrossChecks(c); }), { timezone: 'America/Costa_Rica' });
 
-// Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Felipe with daily priorities)
+// Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Gerald with daily priorities)
 cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
 
 // Sales morning standup — 9:00 AM CR Mon–Fri (DMs setters and closers with role-specific briefs)
@@ -20588,6 +20845,7 @@ const STATIC_CRON_SCHEDULES = {
   runVocExtraction:             '0 2 * * 1',
   runVocExtractionMonthly:      '0 6 1 * *',
   runWeeklyPortalTrends:        '30 22 * * 5',
+  runFridayDeliveryDelta:       '0 16 * * 5',
   runWeeklySalesMarketingRecap: '0 17 * * 5',
   runWinningAdsSweep:           '0 20 * * 0',
   runWonHandoffNotes:           '0 9,17 * * *',
@@ -22172,7 +22430,7 @@ slack.event('member_joined_channel', async ({ event }) => {
       tech_ops:       `You are greeting Josue, the Technical Operations Manager. Welcome him and let him know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and his daily briefing every morning at 8:30 AM. Keep it to 3-4 lines max.`,
       tech_lead:      `You are greeting David, the Lead Technology and Automation specialist. Welcome him and let him know you can help with: systems channel activity, Make.com issue tracking, process documentation, and Notion. Keep it to 3-4 lines max.`,
       fulfillment:    `You are greeting ${member.displayName}, a Fulfillment Operations specialist. Welcome them and let them know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
-      campaigns:      `You are greeting Felipe, the Technical Campaign Specialist. Welcome him and let him know you can help with: campaign status per client, Prosp config questions, fulfillment channel updates, and content pipeline tracking. Keep it to 3-4 lines max.`,
+      campaigns:      `You are greeting ${member.displayName}, who owns Phase 2 campaigns. Welcome them and let them know you can help with: campaign status per client, Prosp config questions, fulfillment channel updates, and content pipeline tracking. Keep it to 3-4 lines max.`,
       setter:         `You are greeting ${member.displayName}, an Appointment Setter at NeuroGrowth. Welcome them and let them know you can help with: GHL prospect lookups, drafting follow-up messages in Spanish, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`,
       closer:         `You are greeting Jose, the High-Ticket Closer. Welcome him and let him know you can help with: GHL pipeline status, prospect follow-up drafts, sales channel activity, and EOD report prep. Keep it to 3-4 lines max.`,
     };

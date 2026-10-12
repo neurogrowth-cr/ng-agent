@@ -59,7 +59,8 @@ check('2b no departed Slack id is a DM target under any key', leakedSlackIds, []
 // no open deals to inherit: coverage must be explicitly null, never a guess.
 for (const [email, rec] of Object.entries(DEPARTED_MEMBERS)) {
   check(`3e ${rec.name} records a departure date`, /^\d{4}-\d{2}-\d{2}$/.test(rec.since || ''), true);
-  if (rec.role === 'setter') { check(`3f ${rec.name} (setter) has coverage null`, rec.coverage, null); continue; }
+  // Fulfillment roles (e.g. 'campaigns') never hold deals either.
+  if (rec.role && rec.role !== 'closer') { check(`3f ${rec.name} (${rec.role}) has coverage null`, rec.coverage, null); continue; }
   check(`3a ${rec.name} names a coverage closer`, typeof rec.coverage === 'string' && rec.coverage.length > 0, true);
   check(`3b ${rec.name}'s coverage is reachable in CLOSER_SLACK`, Boolean(CLOSER_SLACK[rec.coverage]), true);
   check(`3c ${rec.name}'s coverage is not itself departed`, departedMember(rec.coverage), null);
@@ -128,6 +129,18 @@ for (const m of ['GHL_TO_SLACK', 'SLACK_TO_GHL_USER', 'EMAIL_TO_GHL_USER_ID', 'g
 check('8e standup setter DM list skips him', /U0APYAE0999/.test(setterDm), false);
 check('8f name maps still name him for history',
   (SRC.match(/'gqYMYkpDDlTdxvBkfl2C': 'Jonathan Madriz', \/\/ historical: departed 2026-07-19/g) || []).length, 3);
+
+// ── 9. Felipe Herrera, campaigns, departed 2026-09-16 ──────────────────────
+// Found 2026-10-11: three weeks after he left, Max still DMed him a 9 AM brief
+// and 8 AM alerts every weekday (both loops fell back to his hardcoded id), and
+// the Friday report tagged @deactivateduser on every Phase 2 line. Gerald owns
+// Phase 2 now.
+check('9a Slack id resolves', departedMember('U09TNMVML3F')?.name, 'Felipe Herrera');
+check('9b no longer in TEAM_MEMBERS', /U09TNMVML3F':\s*\{/.test(rosterBlock), false);
+check('9c Gerald holds the campaigns role', /'U0BAAC0KS82':\s*\{[^}]*role: 'campaigns'/.test(rosterBlock), true);
+check('9d no DM loop falls back to his id', /:\s*\['U09TNMVML3F'\]\)/.test(SRC), false);
+check('9e prompt states he is former', /Felipe Herrera: FORMER campaign specialist, departed 2026-09-16/.test(promptBlock), true);
+check('9f no hardcoded "Good morning Felipe" greeting', /Good morning Felipe/.test(SRC), false);
 
 console.log(failures ? `\n${failures} failure(s).` : '\nAll departed-member checks passed.');
 process.exit(failures ? 1 : 0);
