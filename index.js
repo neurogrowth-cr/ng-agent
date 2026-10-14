@@ -5613,15 +5613,10 @@ async function runFridayDeliveryDelta(correlationId, { dryRun = false } = {}) {
     const todayLabel = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
     const delta = computeFridayDelta(prevState, { clients, launches, stillActive, todayISO });
     const delivery = formatFridayDelta({ todayLabel, firstRun, delta, owners: fridayOwnersFrom(TEAM_MEMBERS) });
-    // Lead-to-close block: the month-to-date funnel moves every week, so it is
-    // news on its own and keeps the post alive on a quiet delivery week. A
-    // failed read drops the block, never the delivery post.
-    let funnelBlock = '';
-    try {
-      funnelBlock = (await gatherLeadToCloseBlock()).block;
-    } catch (fErr) { console.error('Friday delivery delta: lead-to-close block skipped:', fErr.message); }
-    const message = funnelBlock ? `${delivery.message}\n\n${funnelBlock}` : delivery.message;
-    const hasSignal = delivery.hasSignal || !!funnelBlock;
+    // The lead-to-close funnel used to ride along here; Ron moved it to its own
+    // post in #ng-sales-goats (runFridayLeadToClose), so this post is delivery only.
+    const message = delivery.message;
+    const hasSignal = delivery.hasSignal;
     const stateJson = JSON.stringify(delta.nextState);
     if (dryRun) return { message, hasSignal, firstRun, delta };
 
@@ -5641,6 +5636,18 @@ async function runFridayDeliveryDelta(correlationId, { dryRun = false } = {}) {
     console.error('Friday delivery delta error:', err.message);
     throw err;
   }
+}
+
+// Lead-to-close funnel, its own Friday post in #ng-sales-goats (Ron, 2026-10-14).
+// The month-to-date funnel moves every week, so it always posts. Counts and
+// rates only, no revenue: the channel is team-visible.
+async function runFridayLeadToClose(correlationId, { dryRun = false } = {}) {
+  const { block } = await gatherLeadToCloseBlock();
+  if (dryRun || !block) return { message: block };
+  const posted = await executeChannelPost(SALES_CHANNEL, block, null, correlationId);
+  await registerPostedReport(posted, 'friday-lead-to-close');
+  console.log(`Friday lead-to-close: posted=${!!posted}.`);
+  return { message: block };
 }
 
 // ─── NIGHTLY LEARNING ─────────────────────────────────────────────────────────
@@ -14353,6 +14360,7 @@ cron.schedule('0 8 * * 1',   wrapCronJob('runWeeklyReflectionBrief', async (c) =
 cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
 // Friday delivery delta, 4:00 PM CR: what changed this week, or no post (replaced the LLM 'Friday Delivery Wrap-Up' task 2026-10)
 cron.schedule('0 16 * * 5', wrapCronJob('runFridayDeliveryDelta', async (c) => { await runFridayDeliveryDelta(c); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('5 16 * * 5', wrapCronJob('runFridayLeadToClose', async (c) => { await runFridayLeadToClose(c); }), { timezone: 'America/Costa_Rica' });
 
 // Weekly sales & marketing recap — Friday 5:00 PM CR (DMs Ron with 7-day sales + marketing summary)
 cron.schedule('0 17 * * 5',  wrapCronJob('runWeeklySalesMarketingRecap', async (c) => { await runWeeklySalesMarketingRecap(c); }), { timezone: 'America/Costa_Rica' });
@@ -21234,6 +21242,7 @@ const STATIC_CRON_SCHEDULES = {
   runVocExtractionMonthly:      '0 6 1 * *',
   runWeeklyPortalTrends:        '30 22 * * 5',
   runFridayDeliveryDelta:       '0 16 * * 5',
+  runFridayLeadToClose:         '5 16 * * 5',
   runWeeklySalesMarketingRecap: '0 17 * * 5',
   runWinningAdsSweep:           '0 20 * * 0',
   runWonHandoffNotes:           '0 9,17 * * *',

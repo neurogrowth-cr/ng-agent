@@ -1,4 +1,4 @@
-// Rules test for the lead-to-close block in the Friday delivery delta.
+// Rules test for the lead-to-close Friday post in #ng-sales-goats.
 // Run:  node test/lead-to-close.test.js
 //
 // lib/leadToClose.js is pure, so it is required directly. All rows below are

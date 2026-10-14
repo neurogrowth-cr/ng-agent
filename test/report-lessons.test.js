@@ -39,7 +39,8 @@ const orphanWrites = [...new Set(writeIds)].filter(i => !readIds.includes(i));
 // read lessons just to print them on top of the post, which leaked raw lesson
 // text ("[Corrections applied from team feedback] ...") to the team.
 // friday-delivery: the templated Friday delivery delta (2026-10), same shape as gap-detection.
-const TEMPLATED = ["'gap-detection'", "'sales-standup-setter'", "'sales-standup-closer'", "'unlogged-outcome-reminder'", "'friday-delivery'"];
+// friday-lead-to-close: the templated lead-to-close funnel post in #ng-sales-goats (2026-10-14).
+const TEMPLATED = ["'gap-detection'", "'sales-standup-setter'", "'sales-standup-closer'", "'unlogged-outcome-reminder'", "'friday-delivery'", "'friday-lead-to-close'"];
 check('the model-written reports are read', readIds.length >= 2, true);
 // Pin the count and ban channel variables outright.
 check('the dynamic-cron read is scoped to the task, not the channel',
