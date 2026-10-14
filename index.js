@@ -5510,6 +5510,91 @@ async function gatherFridayDeliveryData() {
   return { clients, launches, stillActive };
 }
 
+// ─── LEAD TO CLOSE (Friday delivery delta block) ─────────────────────────────
+// Month to date against last month: leads -> booked -> held -> won by channel
+// and by country. Pure tally and format live in lib/leadToClose.js; the
+// booked/held/no-show rule is the one closer_month_scorecard and the setter
+// board use (classifyUnheldAppt, then classifyOutcome), so the totals match
+// the portal scorecard month for month.
+const leadToClose = require('./lib/leadToClose');
+
+async function gatherLeadToCloseBlock(now = new Date()) {
+  const windows = leadToClose.monthWindows(now);
+  const { mtd, prev } = windows;
+
+  // Leads: paged, two months can pass the 1,000-row default.
+  const leadRows = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase.from('lead_posts')
+      .select('contact_id, source, channel, posted_at')
+      .is('personal_excluded_at', null)
+      .gte('posted_at', prev.startIso).lt('posted_at', mtd.endIso)
+      .order('posted_at', { ascending: true })
+      .range(from, from + 999);
+    if (error) throw new Error(`lead_posts read: ${error.message}`);
+    leadRows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  const leads = leadRows.map(l => ({ month: leadToClose.crMonthKey(l.posted_at), bucket: leadToClose.leadBucket(l) }));
+
+  // Booked calls by scheduled month, strategy calls only.
+  const { data: apptsRaw, error: aErr } = await portalSupabase.from('revops_appointments')
+    .select('id, prospect_id, setter_id, scheduled_start, iclosed_call_id, ghl_appointment_id, qualification_snapshot, prospect:prospect_id(phone, ghl_contact_id, lead_source)')
+    .gte('scheduled_start', prev.startIso).lt('scheduled_start', mtd.endIso)
+    .limit(5000);
+  if (aErr) throw new Error(`revops_appointments read: ${aErr.message}`);
+  const appts = filterFlywheelAppts(apptsRaw, await getNonFlywheelCallIds());
+  const outcomesById = {};
+  const ids = appts.map(a => a.id);
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await portalSupabase.from('revops_sales_outcomes')
+      .select('appointment_id, outcome').in('appointment_id', ids.slice(i, i + 100));
+    if (error) throw new Error(`revops_sales_outcomes read: ${error.message}`);
+    (data || []).forEach(o => { outcomesById[o.appointment_id] = o; });
+  }
+  const latestStartByProspect = await fetchLatestStartByProspect(appts.map(a => a.prospect_id));
+
+  // Channel of a booked call = the channel of the contact's lead card, any date.
+  const contactIds = [...new Set(appts.map(a => a.prospect?.ghl_contact_id).filter(Boolean))];
+  const bucketByContact = {};
+  for (let i = 0; i < contactIds.length; i += 100) {
+    const { data, error } = await supabase.from('lead_posts')
+      .select('contact_id, source, channel, posted_at')
+      .in('contact_id', contactIds.slice(i, i + 100))
+      .is('personal_excluded_at', null)
+      .order('posted_at', { ascending: true });
+    if (error) throw new Error(`lead_posts contact read: ${error.message}`);
+    // Earliest card wins: that is how the contact first came in.
+    (data || []).forEach(l => { if (!bucketByContact[l.contact_id]) bucketByContact[l.contact_id] = leadToClose.leadBucket(l); });
+  }
+
+  const apptRows = [];
+  for (const a of appts) {
+    const o = outcomesById[a.id];
+    const unheld = classifyUnheldAppt(a, o, latestStartByProspect);
+    if (unheld === 'skip') continue;
+    let cls = 'pending';
+    if (unheld === 'cancelled_noshow') cls = 'no_show';
+    else {
+      const c = classifyOutcome(o);
+      cls = c.showed ? 'showed' : c.noShow ? 'no_show' : c.rescheduled ? 'rescheduled' : 'pending';
+    }
+    apptRows.push({
+      month: leadToClose.crMonthKey(a.scheduled_start),
+      bucket: leadToClose.apptBucket({
+        setterId: a.setter_id,
+        leadSource: a.prospect?.lead_source,
+        leadRowBucket: bucketByContact[a.prospect?.ghl_contact_id],
+      }),
+      country: leadToClose.countryFromPhone(a.prospect?.phone),
+      cls,
+      won: (o?.outcome || '').toLowerCase().trim() === 'won',
+    });
+  }
+  const tally = leadToClose.tallyFunnel({ leads, appts: apptRows, months: [prev.key, mtd.key] });
+  return { block: leadToClose.formatLeadToClose(tally, windows), tally };
+}
+
 async function runFridayDeliveryDelta(correlationId, { dryRun = false } = {}) {
   console.log('Running Friday delivery delta...');
   try {
@@ -5527,7 +5612,16 @@ async function runFridayDeliveryDelta(correlationId, { dryRun = false } = {}) {
     const todayISO   = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
     const todayLabel = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/Costa_Rica' });
     const delta = computeFridayDelta(prevState, { clients, launches, stillActive, todayISO });
-    const { message, hasSignal } = formatFridayDelta({ todayLabel, firstRun, delta, owners: fridayOwnersFrom(TEAM_MEMBERS) });
+    const delivery = formatFridayDelta({ todayLabel, firstRun, delta, owners: fridayOwnersFrom(TEAM_MEMBERS) });
+    // Lead-to-close block: the month-to-date funnel moves every week, so it is
+    // news on its own and keeps the post alive on a quiet delivery week. A
+    // failed read drops the block, never the delivery post.
+    let funnelBlock = '';
+    try {
+      funnelBlock = (await gatherLeadToCloseBlock()).block;
+    } catch (fErr) { console.error('Friday delivery delta: lead-to-close block skipped:', fErr.message); }
+    const message = funnelBlock ? `${delivery.message}\n\n${funnelBlock}` : delivery.message;
+    const hasSignal = delivery.hasSignal || !!funnelBlock;
     const stateJson = JSON.stringify(delta.nextState);
     if (dryRun) return { message, hasSignal, firstRun, delta };
 
