@@ -20396,6 +20396,139 @@ cron.schedule('*/15 * * * *', wrapCronJob('runHotReplyCheck', async (c) => { awa
 console.log('Registered static cron: hot reply alerts + social intake gap (*/15 * * * *)');
 // ─── end hot reply alerts ───────────────────────────────────────────────────
 
+// ─── CONTENT BRIDGE: 24H SETTER CARD ────────────────────────────────────────
+// The day before each flywheel strategy call, DM the setter who owns the
+// prospect a card with the ready-to-copy WhatsApp from section (d) of
+// ~/NG-content/content-bridge/ghl-placements.md and the link to video C. Plan:
+// ~/.claude/plans/chapter-1-the-problem-streamed-moonbeam.md (Phase 2, "24h
+// before the call"). Recipe: ~/automations/ops/recipes/bridge-24h-setter-card.md.
+// Pure logic in lib/bridgeReminder.js; this owns the reads and the posts.
+//
+// SHADOW until Ron flips it (target ~2026-10-21): while BRIDGE_24H_LIVE is
+// false every card goes ONLY to Ron's DM, labelled with the setter it would
+// have gone to. To go live: set BRIDGE_24H_LIVE = true and paste the recorded
+// video's link into VIDEO_C_URL (used verbatim, so put any tracking link or
+// UTM in it). Code constants on purpose, no env var.
+const bridgeReminder = require('./lib/bridgeReminder');
+const BRIDGE_24H_LIVE = false;
+const VIDEO_C_URL = '';
+const _bridgeSentGuard = new Set(); // keys posted this process, in case the stamp write fails
+
+// Owner = the setter who CLAIMED the prospect (latest claim, 45 days), else
+// GHL's recorded booker: the same attribution the leaderboard uses
+// (tallySetterStats). Only active setters get cards (the hot reply roster);
+// a widget self-booking with no claim has no owner and is skipped in v1.
+async function fetchBridgeClaimOwners(emails) {
+  const owners = {};
+  const list = [...new Set((emails || []).filter(Boolean))];
+  const since = new Date(Date.now() - 45 * 86400000).toISOString();
+  for (let i = 0; i < list.length; i += 100) {
+    const { data, error } = await supabase.from('setter_claims')
+      .select('prospect_email, claimed_by_setter_name, claimed_at')
+      .in('prospect_email', list.slice(i, i + 100))
+      .gte('claimed_at', since)
+      .order('claimed_at', { ascending: true });
+    if (error) throw new Error(`setter_claims read: ${error.message}`);
+    for (const c of (data || [])) {
+      const k = (c.prospect_email || '').toLowerCase().trim();
+      if (k && c.claimed_by_setter_name) owners[k] = c.claimed_by_setter_name;
+    }
+  }
+  return owners;
+}
+
+async function runBridge24hCards(correlationId, { now = Date.now() } = {}) {
+  const live = BRIDGE_24H_LIVE;
+  const mode = live ? 'live' : 'shadow';
+  const { data: raw, error } = await portalSupabase
+    .from('revops_appointments')
+    .select('id, prospect_id, setter_id, closer_id, scheduled_start, iclosed_call_id, ghl_appointment_id, source, qualification_snapshot, prospect:prospect_id ( full_name, email, ghl_contact_id )')
+    .gt('scheduled_start', new Date(now - 12 * 3600000).toISOString())
+    .lte('scheduled_start', new Date(now + 36 * 3600000).toISOString())
+    .is('attended', null)
+    .limit(1000);
+  if (error) throw new Error(`revops_appointments read: ${error.message}`);
+  const appts = filterFlywheelAppts(raw, await getNonFlywheelCallIds());
+  // Reschedules: GHL reuses the row (scheduled_start moves, the key carries the
+  // date) and a re-booking under a new row supersedes the old one here.
+  const latestStartByProspect = await fetchLatestStartByProspect(appts.map(a => a.prospect_id));
+  const claimOwners = await fetchBridgeClaimOwners(appts.map(a => (a.prospect?.email || '').toLowerCase().trim()));
+
+  const keyOf = (a) => bridgeReminder.bridgeKey(a.id, Date.parse(a.scheduled_start || ''), live);
+  const keys = appts.map(keyOf);
+  const stamped = new Set(_bridgeSentGuard);
+  for (let i = 0; i < keys.length; i += 100) {
+    const { data, error: kErr } = await supabase.from('agent_knowledge').select('key').in('key', keys.slice(i, i + 100));
+    if (kErr) throw new Error(`agent_knowledge read: ${kErr.message}`); // fail closed: never risk a double card
+    for (const r of (data || [])) stamped.add(r.key);
+  }
+
+  const activeSetters = new Set(Object.values(HOT_REPLY_SETTER_SLACK));
+  const skips = {};
+  let sent = 0;
+  for (const a of appts) {
+    const startMs = Date.parse(a.scheduled_start || '');
+    const key = keyOf(a);
+    const email = (a.prospect?.email || '').toLowerCase().trim();
+    const ownerName = claimOwners[email] || (a.setter_id ? resolveSalesMember(a.setter_id) : null);
+    const slackId = ownerName ? resolveSetterSlackId(ownerName) : null;
+    const latest = a.prospect_id ? latestStartByProspect[a.prospect_id] : null;
+    const verdict = bridgeReminder.classifyBridgeCall({
+      startMs,
+      deleted: isAppointmentDeleted(a),
+      cancelled: isAppointmentCancelled(a),
+      superseded: !!(latest && Date.parse(latest) > startMs),
+      stamped: stamped.has(key),
+      hasOwner: !!ownerName,
+      ownerSlackId: slackId && activeSetters.has(slackId) ? slackId : null,
+    }, now);
+    if (verdict !== 'due') { skips[verdict] = (skips[verdict] || 0) + 1; continue; }
+
+    const prospectName = a.prospect?.full_name || a.prospect?.email || 'Prospecto';
+    const whatsappText = bridgeReminder.buildWhatsAppText({ firstName: bridgeReminder.firstNameOf(a.prospect?.full_name), startMs, videoUrl: VIDEO_C_URL });
+    const card = bridgeReminder.buildBridgeCard({
+      prospectName, startMs, whatsappText,
+      closerName: a.closer_id ? resolveSalesMember(a.closer_id) : null,
+      ghlLink: a.prospect?.ghl_contact_id && process.env.GHL_LOCATION_ID ? ghlContactLink(a.prospect.ghl_contact_id) : null,
+      shadowFor: live ? null : ownerName,
+      videoMissing: !VIDEO_C_URL,
+    });
+    const problems = bridgeReminder.validateBridgeCard(card, { videoUrl: VIDEO_C_URL });
+    if (problems.length) {
+      skips.invalid_card = (skips.invalid_card || 0) + 1;
+      console.error(`Bridge 24h: card for appointment ${a.id} failed its contract (${problems.join(', ')}), not posted`);
+      continue;
+    }
+    try {
+      const posted = await slack.client.chat.postMessage({ channel: live ? slackId : RON_SLACK_ID, text: card });
+      _bridgeSentGuard.add(key);
+      stamped.add(key);
+      const saved = await upsertKnowledge('process', key, `sent|${new Date(now).toISOString()}|${posted.channel || ''}|${posted.ts || ''}`, 'bridge-24h');
+      if (!String(saved).startsWith('Knowledge saved')) console.error(`Bridge 24h: stamp write failed for ${key}: ${saved}`);
+      sent += 1;
+    } catch (err) {
+      skips.dm_failed = (skips.dm_failed || 0) + 1;
+      console.error(`Bridge 24h: DM for appointment ${a.id} failed: ${err.message}`);
+    }
+  }
+
+  logActivity({
+    event_type: 'bridge_24h', event_source: 'cron', action: 'runBridge24hCards', correlation_id: correlationId,
+    metadata: { mode, video_c: VIDEO_C_URL ? 'set' : 'pending', upcoming: appts.length, sent, skips },
+  });
+  const skipLine = Object.entries(skips).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+  console.log(`runBridge24hCards done (${mode}): ${appts.length} calls in range, ${sent} card(s) ${live ? 'to setters' : "to Ron's DM"}, skips: ${skipLine}`);
+  // A failed post must reach the cron log and the liveness audit, not vanish.
+  if (skips.dm_failed && !sent) throw new Error(`every due card failed to post (${skips.dm_failed})`);
+  return { sent, skips };
+}
+
+// Hourly, 8 AM to 8 PM CR, every day: a Monday call needs its card on Sunday
+// for "mañana nos vemos" to be true. Declared in STATIC_CRON_SCHEDULES.
+cron.schedule('15 8-20 * * *', wrapCronJob('runBridge24hCards', async (c) => { await runBridge24hCards(c); }), { timezone: 'America/Costa_Rica' });
+console.log(`Registered static cron: content bridge 24h setter card (15 8-20 * * *, ${BRIDGE_24H_LIVE ? 'live' : 'shadow to Ron'})`);
+// ─── end content bridge 24h setter card ─────────────────────────────────────
+
 // ─── INSTAGRAM GUIDE REPLIES (phase A: draft, Ron approves) ─────────────────
 // The VSL reels close with "Comente LinkedIn"; a GHL workflow DMs the guide and
 // tags the contact `ig-guia-linkedin`. When that lead writes back by Instagram,
@@ -21092,6 +21225,7 @@ const STATIC_CRON_SCHEDULES = {
   runStaleLeadDailySweep:       '0 18 * * *',
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runHotReplyCheck:             '*/15 * * * *',
+  runBridge24hCards:            '15 8-20 * * *',
   runIgGuideCheck:              '*/5 * * * *',
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
