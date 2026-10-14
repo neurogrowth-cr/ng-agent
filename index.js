@@ -18819,6 +18819,23 @@ async function runClientAttentionAlerts() {
   if (overflow > 0) await postClientAttention(clientAttention.formatAlertOverflow(overflow, feed.adminUrl));
 }
 
+// Monday WBR reminder (Ron, 2026-10-14): with the Slack alerts retired, Josué
+// reviews Campaign health in the Monday 16:00 CR WBR. One DM at 15:30 with the
+// link and open counts. A broken feed still sends the link, without counts.
+const WBR_REMINDER_TO = 'U08ABBFNGUW'; // Josué
+async function runCampaignHealthWbrReminder() {
+  let feed = null;
+  try {
+    feed = await fetchClientAttentionFeed();
+    const check = clientAttention.checkFeed(feed, new Date());
+    if (!check.ok) { console.warn('[wbr-reminder] feed refused:', check.problem); feed = null; }
+  } catch (err) { console.warn('[wbr-reminder] feed unreachable:', err.message); }
+  await slack.client.chat.postMessage({ channel: WBR_REMINDER_TO, text: clientAttention.formatWbrReminder(feed) });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runCampaignHealthWbrReminder', status: 'ok',
+    output: { feed: !!feed, items: feed ? feed.items.length : null } });
+}
+cron.schedule('30 15 * * 1', wrapCronJob('runCampaignHealthWbrReminder', async () => { await runCampaignHealthWbrReminder(); }), { timezone: 'America/Costa_Rica' });
+
 // Slack side RETIRED 2026-10-14 (Ron: "this is just spam right now, lets just
 // use the dashboard"). The report, urgent alerts, Friday digest and Monday
 // scorecard no longer run; Admin -> Campaign health in the dash is the only
@@ -21204,6 +21221,7 @@ const STATIC_CRON_SCHEDULES = {
   runReelsDailyBrief:           '40 7 * * *',
   runReelsMonthlyReport:        '0 8 1 * *',
   runAppointmentStatusSync:     '0 15 * * *',
+  runCampaignHealthWbrReminder: '30 15 * * 1',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
   // The audit declares itself, so a run where it dies shows up as stale on the
