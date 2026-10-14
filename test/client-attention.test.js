@@ -211,5 +211,17 @@ check('9h  unknown feed reads as open unknown', ignoredCard.includes('open unkno
 check('9i  no alerts in the window', ca.formatScorecard([], {}).includes('No alerts were sent in this window.'), true);
 check('9j  no em dashes in the digest or scorecard', /\u2014/.test(digest + card + ignoredCard), false);
 
+// ── 10. Monday WBR reminder to Josué (Slack alerts retired 2026-10-14).
+const wbr = ca.formatWbrReminder(FEED);
+const wbrGroups = ca.groupByClient(FEED.items);
+const wbrUrgent = wbrGroups.filter((g) => g.level === 'urgent').length;
+check('10a reminder carries the urgent client count', wbr.includes(`🔴 ${wbrUrgent} cliente`), true);
+check('10b reminder links Campaign health', wbr.includes(`<${FEED.adminUrl}|Abrir Campaign health>`), true);
+const wbrNoFeed = ca.formatWbrReminder(null);
+check('10c no feed still sends the link', wbrNoFeed.includes('<https://dash.neurogrowth.io/admin/campaign-health|Abrir Campaign health>'), true);
+check('10d no feed sends no counts', /🔴|🟠/.test(wbrNoFeed), false);
+check('10e empty feed says nothing is open', ca.formatWbrReminder({ ...FEED, items: [] }).includes('Hoy no hay alertas abiertas.'), true);
+check('10f no banned tokens or em dashes', /undefined|null|NaN|\u2014/.test(wbr + wbrNoFeed), false);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall checks passed');
