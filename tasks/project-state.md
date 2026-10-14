@@ -747,3 +747,7 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - SHADOW: `BRIDGE_24H_LIVE = false` sends every card only to Ron's DM, labelled `[SHADOW · iría a <setter>]`. `VIDEO_C_URL = ''` shows `(video C pendiente de grabar)` plus a do-not-send warning.
 - FLIP (~2026-10-21, after Ron records video C): one PR setting `BRIDGE_24H_LIVE = true` and `VIDEO_C_URL` to the recorded link (used verbatim, so include any tracking link or UTM).
 - Code: `lib/bridgeReminder.js` (pure), `test/bridge-reminder.test.js`. Recipe: `~/automations/ops/recipes/bridge-24h-setter-card.md`.
+## 2026-10-14: lead-to-close moved to its own post in #ng-sales-goats (#351)
+- Ron's call: the funnel belongs with sales, not fulfillment. New `runFridayLeadToClose` posts the *Lead to close* block to `SALES_CHANNEL` every Friday at 16:05 CR (own cron, in `STATIC_CRON_SCHEDULES`, report id `friday-lead-to-close`). It always posts.
+- `runFridayDeliveryDelta` is delivery only again: the funnel no longer counts as signal there, so "no change, no post" applies to it again (reverses the #347 behavior change).
+- First funnel post 2026-10-16 16:05 CR. Counts and rates only, no revenue.
