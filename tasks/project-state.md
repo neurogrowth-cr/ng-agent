@@ -751,3 +751,5 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - Ron's call: the funnel belongs with sales, not fulfillment. New `runFridayLeadToClose` posts the *Lead to close* block to `SALES_CHANNEL` every Friday at 16:05 CR (own cron, in `STATIC_CRON_SCHEDULES`, report id `friday-lead-to-close`). It always posts.
 - `runFridayDeliveryDelta` is delivery only again: the funnel no longer counts as signal there, so "no change, no post" applies to it again (reverses the #347 behavior change).
 - First funnel post 2026-10-16 16:05 CR. Counts and rates only, no revenue.
+## 2026-10-14: Monday WBR reminder DM to Josué (#353)
+- Follow-up to #345. Josué owns Campaign health and reviews it in the Monday 16:00 CR WBR. `runCampaignHealthWbrReminder` DMs him (U08ABBFNGUW) Mondays 15:30 CR with the Campaign health link plus urgent / watch / fleet counts from the client attention feed; a refused or unreachable feed still sends the link without counts. Formatter `formatWbrReminder` in `lib/clientAttention.js`, tests in section 10 of `test/client-attention.test.js`. Declared in `STATIC_CRON_SCHEDULES`. First run Mon 2026-10-19.
