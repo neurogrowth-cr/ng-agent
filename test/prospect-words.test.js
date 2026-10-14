@@ -80,7 +80,19 @@ t('parse: unparseable → not ok', () => {
 
 t('ghl values: joined quotes, blanks clear', () => {
   const v = pw.ghlProspectWordValues({ words: ['a b c d', 'e f g h'], targetTitle: null, targetCountry: 'MX' });
-  assert.deepStrictEqual(v, { 'Llamada Palabras': 'a b c d | e f g h', 'Llamada Cargo Objetivo': '', 'Llamada Pais Objetivo': 'MX' });
+  assert.deepStrictEqual(v, { 'Llamada Palabras': 'a b c d | e f g h', 'Llamada Frase': 'a b c d', 'Llamada Cargo Objetivo': '', 'Llamada Pais Objetivo': 'MX' });
+});
+
+t('ghl values: Llamada Frase is the first (strongest) quote alone, blank when there are none', () => {
+  assert.strictEqual(pw.ghlProspectWordValues({ words: ['Hoy vivo de referidos y no alcanza.', 'otra frase cualquiera aqui'] })['Llamada Frase'], 'Hoy vivo de referidos y no alcanza.');
+  assert.strictEqual(pw.ghlProspectWordValues({ words: [] })['Llamada Frase'], '');
+  assert.strictEqual(pw.ghlProspectWordValues({})['Llamada Frase'], '');
+  assert.ok(!pw.ghlProspectWordValues({ words: ['a b c d', 'e f g h'] })['Llamada Frase'].includes('|'));
+});
+
+t('prompt asks for the strongest quote first', () => {
+  const p = pw.buildProspectWordsPrompt({ prospectName: 'Ana', prospectLines: 'x' });
+  assert.ok(p.includes('STRONGEST sentence first'));
 });
 
 t('summary line', () => {
