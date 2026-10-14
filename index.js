@@ -18488,6 +18488,7 @@ console.log('Registered static crons: Kai health watch (*/15 * * * *) + Kai dail
 
 // ─── CLIENT ATTENTION (fulfillment) ─────────────────────────────────────────
 // Mon + Thu report and urgent alerts in #ng-fullfillment-ops (Ron, 2026-09-23).
+// Slack posting RETIRED 2026-10-14; the crons are unscheduled (see below).
 // Recipe: ~/automations/ops/recipes/client-attention.md. The list is computed
 // in the dash (GET /api/ops/client-attention, the same engine as Admin ->
 // Campaign health, so Slack and the page never disagree); logic here lives in
@@ -18716,8 +18717,12 @@ async function runClientAttentionAlerts() {
   if (overflow > 0) await postClientAttention(clientAttention.formatAlertOverflow(overflow, feed.adminUrl));
 }
 
-cron.schedule('30 8 * * 1,4', wrapCronJob('runClientAttentionReport', async () => { await runClientAttentionReport(); }), { timezone: 'America/Costa_Rica' });
-cron.schedule('*/30 7-19 * * 1-6', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
+// Slack side RETIRED 2026-10-14 (Ron: "this is just spam right now, lets just
+// use the dashboard"). The report, urgent alerts, Friday digest and Monday
+// scorecard no longer run; Admin -> Campaign health in the dash is the only
+// surface. The functions stay so re-enabling is one cron.schedule line each
+// (plus its STATIC_CRON_SCHEDULES entry). The ✅/💤 handler still works on
+// alerts already in the channel.
 
 // Friday "still open" digest: every urgent item still in the feed, with how
 // long it has been open (from the alert record). Same channel and dry-run
@@ -18779,9 +18784,6 @@ async function runClientAttentionScorecard() {
     output: { sent: sent.length, actions: actions.length, feed: !!feed } });
 }
 
-cron.schedule('0 10 * * 5', wrapCronJob('runClientAttentionOpenDigest', async () => { await runClientAttentionOpenDigest(); }), { timezone: 'America/Costa_Rica' });
-cron.schedule('0 9 * * 1', wrapCronJob('runClientAttentionScorecard', async () => { await runClientAttentionScorecard(); }), { timezone: 'America/Costa_Rica' });
-console.log('Registered static crons: client attention report (30 8 * * 1,4 CR) + urgent alerts (*/30 7-19 * * 1-6 CR)');
 
 // ─── WEEKLY PERFORMANCE REPORT STATUS ────────────────────────────────────────
 // The dash sends every client a Monday performance email (weekly performance
@@ -20963,12 +20965,9 @@ const STATIC_CRON_SCHEDULES = {
   checkMakeScenarioHealth:      '*/10 * * * *',
   checkAxonHealth:              '*/10 * * * *',
   checkKaiHealth:              '*/15 * * * *',
-  runClientAttentionAlerts:     '*/30 7-19 * * 1-6',
-  runClientAttentionOpenDigest: '0 10 * * 5',
   runReelsWeekly:               '0 8 * * 1',
   runReelsDailyBrief:           '40 7 * * *',
   runReelsMonthlyReport:        '0 8 1 * *',
-  runClientAttentionScorecard:  '0 9 * * 1',
   runAppointmentStatusSync:     '0 15 * * *',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
@@ -20990,7 +20989,6 @@ const STATIC_CRON_SCHEDULES = {
   runApiBudgetCheck:            '0 9 * * *',
   runDailySpendPost:            '5 8 * * *',
   runKaiHealthDigest:           '0 8 * * 1-5',
-  runClientAttentionReport:     '30 8 * * 1,4',
   runWeeklyReportStatusPost:    '0 11 * * 1',
   runProvisioningLagCheck:      '30 8 * * 1',
   runReviCrossChecks:           '30 6 * * 2-6',
