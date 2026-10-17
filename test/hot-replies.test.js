@@ -165,5 +165,32 @@ check('9f a hot verdict sets ever_hot on a new row',
   hr.signalRow({ convo: convo(), analysis: a1, verdict: { verdict: 'hot' }, mode: 'live', now: NOW }).ever_hot, true);
 check('9g row carries no raw message text', Object.values(row).some(v => typeof v === 'string' && /sesiones|terapias/.test(v)), false);
 
+
+// ── Setter end-of-day digest (runSetterHotRepliesDigest, 2026-10-16) ────────
+console.log('setter digest');
+const SD_NOW = cr('2026-10-16T18:00:00'); // a Friday, 6 PM CR
+const sdRows = [
+  { ownerLabel: 'Oscar',     ownerSlackId: 'U_OSC', contactName: 'Lead A', channel: 'TYPE_WHATSAPP',  quote: 'Cuanto cuesta?',          anchorAt: SD_NOW - 3 * H,     link: 'https://x/a' },
+  { ownerLabel: 'Sebastian', ownerSlackId: 'U_SEB', contactName: 'Lead B', channel: 'TYPE_INSTAGRAM', quote: 'Si, hablemos manana',     anchorAt: SD_NOW - 5 * H,     link: 'https://x/b' },
+  { ownerLabel: 'Oscar',     ownerSlackId: 'U_OSC', contactName: 'Lead C', channel: 'TYPE_FACEBOOK',  quote: 'Me interesa el programa', anchorAt: SD_NOW - 90 * MIN,  link: null },
+  { ownerLabel: 'Oscar',     ownerSlackId: 'U_OSC', contactName: 'Lead D', channel: 'TYPE_WHATSAPP',  quote: 'ok',                      anchorAt: SD_NOW - 20 * MIN,  link: 'https://x/d' }, // under 1h: not yet
+  { ownerLabel: 'Unassigned', ownerSlackId: null,   contactName: 'Lead E', channel: 'TYPE_WHATSAPP',  quote: 'hola',                    anchorAt: SD_NOW - 4 * H,     link: 'https://x/e' },
+];
+const sd = hr.formatSetterDigest(sdRows, { now: SD_NOW });
+check('10a one digest per setter, busiest first, unassigned and under-1h rows left out', sd.map(d => [d.slackId, d.count]), [['U_OSC', 2], ['U_SEB', 1]]);
+check('10b header carries the count and the items read oldest first with the GHL link', sd[0].text.split('\n'), [
+  '🔥 *Respuestas calientes sin contestar al cierre del día* (2). Contéstelas antes de salir, o primero mañana:',
+  '',
+  '• *Lead A* (WhatsApp, esperando 3h 0min): "Cuanto cuesta?"',
+  '  <https://x/a|Abrir en GHL>',
+  '• *Lead C* (Messenger, esperando 1h 30min): "Me interesa el programa"',
+]);
+check('10c no rows means no digests (nobody is DMed on a quiet day)', hr.formatSetterDigest([], { now: SD_NOW }), []);
+check('10d a real digest passes the contract', sd.map(d => hr.validateSetterDigest(d.text)), [null, null]);
+check('10e missing header fails', hr.validateSetterDigest('hola'), 'missing header');
+check('10f header without items fails', hr.validateSetterDigest(`🔥 *${hr.SETTER_DIGEST_HEAD}* (1). x:`), 'no items');
+check('10g header count must match the items', hr.validateSetterDigest(sd[0].text.replace('(2).', '(3).')), 'header count 3 does not match 2 item(s)');
+check('10h a placeholder value fails even with the structure intact', hr.validateSetterDigest(sd[1].text.replace('Lead B', 'undefined')), 'placeholder value');
+
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall hot reply checks passed');
