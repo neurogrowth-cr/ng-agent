@@ -20409,10 +20409,54 @@ async function getHotRepliesStillUnanswered(now = Date.now()) {
     if (!v || !v.conversationId) continue;
     const analysis = hotReplies.analyzeThread(await ghlGetConversationMessages(v.conversationId), { isAutomatedBody: strikeIsAutomatedBody });
     if (!analysis || analysis.anchorId !== v.anchorId) continue; // answered since
-    rows.push({ ownerLabel: v.ownerLabel, contactName: v.contactName, channel: analysis.channel, quote: analysis.quote, anchorAt: analysis.anchorAt });
+    // ownerSlackId and link feed the setter digest (runSetterHotRepliesDigest);
+    // Ron's sweep section ignores them. The label was written from the same roster.
+    const ownerSetter = Object.values(HOT_REPLY_SETTERS).find(st => st.label === v.ownerLabel) || null;
+    rows.push({ ownerLabel: v.ownerLabel, ownerSlackId: ownerSetter ? ownerSetter.slackId : null, contactName: v.contactName, channel: analysis.channel, quote: analysis.quote, anchorAt: analysis.anchorAt, link: v.contactId ? ghlContactLink(v.contactId) : null });
   }
   return rows;
 }
+
+// 6 PM CR, Monday to Friday: each setter gets ONE DM listing the hot replies
+// they own that are still unanswered (the same rows as Ron's sweep, re-read live
+// from GHL, never trusted from the keys). Zero LLM calls. Replaces the dynamic
+// "Setter Hot Replies DM" task (scheduled_tasks, created 2026-10-07, deactivated
+// 2026-10-16): that prompt asked the model to send DMs from inside the report
+// runner, which can only post the reply to its channel, so quiet days posted
+// "undefined" and "placeholder" to #ng-pm-agent and busy days posted the list
+// where no setter reads it. Recipe: ~/automations/ops/recipes/setter-hot-replies-digest.md.
+// Mode follows HOT_REPLY_MODE (live since 2026-10-05): dry_run sends every digest
+// to Ron's DM marked, live DMs the setter. SETTER_HOT_DIGEST=off stops only this.
+// A digest that fails its contract (lib/hotReplies.js validateSetterDigest) goes
+// to Ron instead of the setter; a read failure DMs Ron and is never an all-clear.
+async function runSetterHotRepliesDigest(correlationId, { now = Date.now() } = {}) {
+  const mode = hotReplyMode();
+  if (mode === 'off' || process.env.SETTER_HOT_DIGEST === 'off') { console.log('Setter hot replies digest: disabled.'); return { disabled: true }; }
+  let rows;
+  try { rows = await getHotRepliesStillUnanswered(now); }
+  catch (err) {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Setter hot replies digest could not read the hot replies (${err.message}). No setter was DMed; this is not an all-clear.` }).catch(e => console.error('setter digest: failure DM failed:', e.message));
+    throw err;
+  }
+  const digests = hotReplies.formatSetterDigest(rows, { now });
+  const stats = { rows: rows.length, setters: digests.length, sent: 0, invalid: 0, mode };
+  for (const d of digests) {
+    const problem = hotReplies.validateSetterDigest(d.text);
+    if (problem) {
+      stats.invalid++;
+      await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Setter hot replies digest for <@${d.slackId}> failed its contract (${problem}) and was NOT sent:\n${d.text}` });
+      continue;
+    }
+    if (mode === 'live') await slack.client.chat.postMessage({ channel: d.slackId, text: d.text });
+    else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN] setter hot replies digest, would DM <@${d.slackId}>:\n${d.text}` });
+    stats.sent++;
+  }
+  console.log(`Setter hot replies digest (${mode}): ${rows.length} hot replies waiting, ${digests.length} setter(s), ${stats.sent} DM(s) sent${stats.invalid ? `, ${stats.invalid} failed contract` : ''}.`);
+  await logActivity({ event_type: 'report', event_source: 'cron', action: 'runSetterHotRepliesDigest', status: stats.invalid ? 'degraded' : 'ok', output: stats, correlation_id: correlationId });
+  return stats;
+}
+cron.schedule('0 18 * * 1-5', wrapCronJob('runSetterHotRepliesDigest', async (c) => { await runSetterHotRepliesDigest(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: setter hot replies digest (0 18 * * 1-5)');
 
 // Every 15 min around the clock: the intake check must see an evening or Sunday
 // outage (Oct 3's started 6:44 PM). Pokes themselves only go out Mon to Sat,
@@ -21249,6 +21293,7 @@ const STATIC_CRON_SCHEDULES = {
   runSalesCallPrep:             '0 * * * 1-5',
   runSalesStandup:              '0 9 * * 1-5',
   runStaleLeadDailySweep:       '0 18 * * *',
+  runSetterHotRepliesDigest:    '0 18 * * 1-5',
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runHotReplyCheck:             '*/15 * * * *',
   runBridge24hCards:            '15 8-20 * * *',
