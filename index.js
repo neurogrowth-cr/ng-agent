@@ -3967,6 +3967,11 @@ async function getSalesIntelligence(query) {
     // performance sections now derive from appointments + outcomes.
 
     // ── Query appointments for individual call lookups ─────────────────────
+    // The 200-row cap must only count rows we keep. opp:% rows (pre-book
+    // disqualifications) have no scheduled_start and are dropped below, so they
+    // are excluded here too. NULLs sort last so dated calls always win the cap.
+    // Without this, 200+ opp rows filled the window and today's calls vanished
+    // (2026-10-20: roster said "no calls" with 3 booked).
     const { data: appointmentsRaw } = await portalSupabase
       .from('revops_appointments')
       .select(`
@@ -3974,7 +3979,8 @@ async function getSalesIntelligence(query) {
         attended, no_show_reason, reschedule_count, meeting_type, iclosed_call_id, ghl_appointment_id,
         prospect:prospect_id ( full_name, company, email, lead_source, setter_owner_id, closer_owner_id, status )
       `)
-      .order('scheduled_start', { ascending: false })
+      .or('ghl_appointment_id.is.null,ghl_appointment_id.not.like.opp:*') // PostgREST uses * as the LIKE wildcard
+      .order('scheduled_start', { ascending: false, nullsFirst: false })
       .limit(200);
     const excludeIds = await getNonFlywheelCallIds();
     const appointments = filterFlywheelAppts(appointmentsRaw, excludeIds);
