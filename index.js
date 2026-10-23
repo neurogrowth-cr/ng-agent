@@ -15021,6 +15021,29 @@ function clientCallLeadReason({ sourceRaw = '', contactSource = '', calendarIds 
   return null;
 }
 
+// Webinar registrants are not sales leads. GHL's "New Lead Intake and
+// Assignment" workflow enrols every new contact, including registrants from
+// the /registro form (source "Webinar Optin", tag "webinar 27 de octubre"),
+// which created 30 duplicate Appointment Setting opportunities and 30
+// claimable cards on 2026-10-22/23. Registrants live in the "Webinar 27 De
+// Octubre" pipeline and only become sales leads when they book a call, which
+// arrives as its own booking webhook. Matched loosely on "webinar" so future
+// classes ("Webinar <topic>", "webinar <date>") are covered without a deploy.
+const WEBINAR_SOURCE_RE = /webinar/i;
+
+// Returns a human-readable reason this contact is a webinar registrant, or
+// null when it is a genuine sales lead. Source string first (present on the
+// webhook payload even when the contact lookup failed), then the fetched
+// contact's source and tags.
+function webinarLeadReason({ sourceRaw = '', contactSource = '', tags = [] } = {}) {
+  for (const s of [sourceRaw, contactSource]) {
+    if (s && WEBINAR_SOURCE_RE.test(String(s))) return `source "${s}"`;
+  }
+  const tag = (tags || []).filter(Boolean).find(t => WEBINAR_SOURCE_RE.test(String(t)));
+  if (tag) return `tag "${tag}"`;
+  return null;
+}
+
 const LEAD_CLAIM_EMOJIS = new Set(['raised_hand', 'hand', 'white_check_mark', 'heavy_check_mark']);
 const LEAD_CLAIMED_EMOJI = 'white_check_mark';
 
@@ -15330,6 +15353,24 @@ async function handleGHLWebhook(req, res) {
             event_type: 'ghl_webhook', event_source: 'ghl', action: 'client_call_dropped',
             correlation_id: newCorrelationId(),
             output: { contact_id: contactId, full_name: fullName, reason: clientCallReason, source: sourceRaw || null },
+          });
+          return;
+        }
+        // A webinar registrant (free class, source "Webinar Optin" or a
+        // "webinar <date>" tag) is not a lead either. Same drop point: before
+        // the Slack card, the setter DM, the phone writeback and the lead_posts
+        // row. See WEBINAR_SOURCE_RE.
+        const webinarReason = webinarLeadReason({
+          sourceRaw,
+          contactSource: ghlContact?.source || '',
+          tags: ghlContact?.tags || [],
+        });
+        if (webinarReason) {
+          console.log(`GHL lead ${contactId} ("${fullName}") DROPPED: webinar registrant, not a sales lead (${webinarReason}). No Slack post, no setter DM, no lead_posts row.`);
+          logActivity({
+            event_type: 'ghl_webhook', event_source: 'ghl', action: 'webinar_lead_dropped',
+            correlation_id: newCorrelationId(),
+            output: { contact_id: contactId, full_name: fullName, reason: webinarReason, source: sourceRaw || null },
           });
           return;
         }
