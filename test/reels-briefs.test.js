@@ -139,11 +139,17 @@ check('summary table', M.slice(3, 12), [
   'Guardados          10           4   +150%',
   'Compartidos         5           2   +150%',
 ]);
-check('top 3 by reach in order', M.filter((l) => /^[1-3] {2}\S/.test(l)).map((l) => l.slice(3, 31).trim()), ['Alto', 'Medio con mucha interacción', 'Bajo']);
+check('monthly with no history: batch median (5 reels), header names the multiple', M.includes('*Top 3 por múltiplo, luego env/1k*'), true);
+check('top 3 by multiple in order', M.filter((l) => /^[1-3] {2}\S/.test(l)).map((l) => l.slice(3, 31).trim()), ['Alto', 'Medio con mucha interacción', 'Bajo']);
 check('top 3 links under the table', M.includes('Ver: <https://www.instagram.com/reel/a/|1> · <https://www.instagram.com/reel/b/|2> · <https://www.instagram.com/reel/c/|3>'), true);
 check('best engagement ignores reach under 100', M.includes('*Mejor en interacción* · <https://www.instagram.com/reel/b/|Medio con mucha interacción> · 5.7%'), true);
 const lo = M.indexOf('*Los 3 más bajos*');
-check('bottom 3, lowest first', M.slice(lo + 3, lo + 6).map((l) => l.replace(/\s+[\d,]+$/, '')), ['Muy bajo, alcance menor a 100', 'Cerró el mes', 'Bajo']);
+check('bottom 3, lowest multiple first, xMed and reach as columns', M.slice(lo + 2, lo + 6), [
+  'Reel                           xMed  Alcance',
+  'Muy bajo, alcance menor a 100  0.1x       50',
+  'Cerró el mes                   0.5x      500',
+  'Bajo                           1.0x    1,000',
+]);
 check('caveat line closes the report', M[M.length - 1], '_Métricas acumuladas a hoy; un reel de fin de mes tuvo menos días para sumar._');
 check('monthly passes its contract', rb.validateMonthly(monthly, { reportedCount: 5 }), { ok: true, problems: [] });
 check('a reel at 1 am CR on the 1st belongs to the new month', monthly.includes('Ya es noviembre'), false);
@@ -154,7 +160,7 @@ check('snapshot row keeps nulls as nulls', rb.monthRows(NOV1, rb.normalizeMedia(
 
 check('meta down: monthly says so and has no numbers', rb.formatMonthly({ now: NOV1, reels: null }).includes('⚠️ No pude leer las métricas de Meta'), true);
 check('empty month says so', rb.formatMonthly({ now: NOV1, reels: [] }).includes('No se publicaron reels en octubre 2026.'), true);
-check('validate catches a short top list', rb.validateMonthly('*🗓️ Reels de octubre 2026*\n*Resumen*\n*Top 3 por alcance*\n```\n1  a  5\n```', { reportedCount: 5 }).problems, ['top list has 1 rows']);
+check('validate catches a short top list', rb.validateMonthly('*🗓️ Reels de octubre 2026*\n*Resumen*\n*Top 3 por alcance*\n```\n#  Reel  Fecha  Alcance\n1  a  1 oct  5\n```', { reportedCount: 5 }).problems, ['top list has 1 rows']);
 check('validate catches an em dash', rb.validateDaily(`${daily}\nx \u2014 y`).problems, ['contains an em dash']);
 check('validate catches undefined', rb.validateDaily(`${daily}\nundefined`).ok, false);
 
@@ -175,6 +181,61 @@ const WR = withRead.split('\n');
 check('lectura sits right before the caveat line', WR.slice(-4), ['*Lectura*', 'Los de mayor alcance son frases en español con una idea.', '', '_Métricas acumuladas a hoy; un reel de fin de mes tuvo menos días para sumar._']);
 check('report with lectura still passes the contract', rb.validateMonthly(withRead, { reportedCount: 5 }).ok, true);
 check('no lectura leaves the report untouched', rb.withLectura(monthly, null), monthly);
+
+
+// ── outlier multiple in the briefs (lib/reelsOutlier.js, reach-based) ───────
+// The /media expansion carries no views, so xMed here is reach over the median
+// reach of the trailing weeks in reel_stats. Synthetic history rows below.
+const HIST = [];
+for (let i = 0; i < 9; i++) HIST.push({ iso_week: '2026-W39', post_id: `h${i}`, kind: 'reel', reach: 400 + i * 50, views: null, shares: 1 }); // median 600
+const dailyHist = rb.formatDaily({ now: WED, schedule, reels, history: HIST });
+const DH = dailyHist.split('\n');
+const wkh = DH.findIndex((l) => l.startsWith('*📊 Semana*'));
+check('daily: xMed column added after Reel, order still by reach, missing reach = s/d', DH.slice(wkh + 1, wkh + 6), [
+  '```',
+  'Día  Reel                   xMed  Alcance  Likes  Com  Guard',
+  'Mar  El mejor de la semana  2.0x    1,200     30    3      2',
+  'Mar  Uno de la semana.*     0.5x      300      4    0      2',
+  'Mié  Sin insights todavía*   s/d      s/d      1    0    s/d',
+]);
+check('daily: footnote names the history median, no Env/1k (the daily has no sends column)', DH[wkh + 8], '_xMed = alcance del reel / mediana de alcance de las 8 semanas anteriores (n=9)._');
+check('daily with history passes its contract', rb.validateDaily(dailyHist).ok, true);
+check('daily without history: no xMed column (2 reels with reach, floor is 5) and the footnote says so',
+  [D.some((l) => l.includes('xMed  Alcance')), D.includes('_xMed: s/d, la mediana necesita al menos 5 reels con alcance (hay 2)._')], [false, true]);
+check('daily: the week table is unchanged otherwise', D.slice(wk + 1, wk + 6)[1], 'Día  Reel                   Alcance  Likes  Com  Guard');
+
+const MHIST = [];
+for (let i = 0; i < 10; i++) MHIST.push({ iso_week: `2026-W4${i % 4}`, post_id: `h${i}`, kind: 'reel', reach: 500 + i * 100, shares: 1 }); // median 950
+MHIST.push({ iso_week: '2026-W41', post_id: 'account', kind: 'account', reach: 20000, followers: 10 },
+  { iso_week: '2026-W42', post_id: 'account', kind: 'account', reach: 20000, followers: 5 },
+  { iso_week: '2026-W39', post_id: 'account', kind: 'account', reach: 20000, followers: 999 }); // September week: not counted
+const octReelsH = rb.normalizeMedia(OCT.map((m) => (m.id === 'b' ? { ...m, insights: { data: [{ name: 'reach', values: [{ value: 2000 }] }, { name: 'saved', values: [{ value: 2 }] }, { name: 'shares', values: [{ value: 30 }] }] } } : m)));
+const monthlyH = rb.formatMonthly({ now: NOV1, reels: octReelsH, history: MHIST });
+const MH = monthlyH.split('\n');
+const th = MH.indexOf('*Top 3 por múltiplo, luego env/1k*');
+check('monthly: top 3 header names the multiple', th > 0, true);
+check('monthly: top 3 by multiple then env/1k, reach kept', MH.slice(th + 1, th + 6), [
+  '```',
+  '#  Reel                         Fecha   xMed  Env/1k  Alcance  Likes  Com',
+  '1  Alto                         3 oct   4.2x     0.3    4,000     40    4',
+  '2  Medio con mucha interacción  10 oct  2.1x    15.0    2,000    100   10',
+  '3  Bajo                         12 oct  1.1x     1.0    1,000     10    0',
+]);
+check('monthly: footnote names the history median', MH[th + 8], '_xMed = alcance del reel / mediana de alcance de las 8 semanas anteriores (n=10). Env/1k = compartidos por cada 1,000 alcanzados._');
+check('monthly: verdict sums the new followers of the weeks starting in the month (15 over 7,550 reached)', MH[th + 9],
+  '*Veredicto:* problema de perfil, no de gancho. El mejor reel hizo 4.2x la mediana y la cuenta sumó pocos seguidores (2.0 por 1,000 alcanzados).');
+check('monthly with history passes its contract', rb.validateMonthly(monthlyH, { reportedCount: 5 }), { ok: true, problems: [] });
+check('monthly: unreadable history falls back to the batch median and says so', rb.formatMonthly({ now: NOV1, reels: octReelsH, history: null }).includes('mediana de este mes (reel_stats ilegible)'), true);
+const FLAT = OCT.filter((m) => m.id !== 'a' && m.id !== 'b').concat(media('a', '2026-10-03T15:00:00+0000', 1000, 40, 4, 'Alto'), media('b', '2026-10-10T15:00:00+0000', 1500, 100, 10, 'Medio'));
+check('monthly: flat reach and nothing past 2x = hook problem', rb.formatMonthly({ now: NOV1, reels: rb.normalizeMedia(FLAT), history: MHIST }).split('\n').find((l) => l.startsWith('*Veredicto:*')),
+  '*Veredicto:* problema de gancho. Alcance plano (+1% vs septiembre) y ningún reel pasó de 2x la mediana (mejor: 1.6x).');
+const FOUR = OCT.filter((m) => m.id !== 'e');
+check('monthly: fewer than 5 reels with reach = verdict s/d', rb.formatMonthly({ now: NOV1, reels: rb.normalizeMedia(FOUR), history: MHIST }).includes('_Veredicto: s/d (hacen falta 5 reels con alcance; hay 4)._'), true);
+check('monthly: lectura still lands before the caveat with the verdict present', rb.withLectura(monthlyH, 'Los de mayor múltiplo son frases cortas en español.').split('\n').slice(-4)[0], '*Lectura*');
+check('validate rejects a top header that no longer names the sort key',
+  rb.validateMonthly(monthlyH.replace('*Top 3 por múltiplo, luego env/1k*', '*Top 3 por alcance*'), { reportedCount: 5 }).problems, ['top header says "alcance" but the table sorts by "xMed"']);
+check('validate rejects an unknown top sort key', rb.validateMonthly(monthlyH.replace('múltiplo, luego env/1k', 'magia'), { reportedCount: 5 }).problems, ['top header does not name a known sort key: "magia"']);
+check('validate still requires the top header', rb.validateMonthly(monthlyH.replace('*Top 3 por múltiplo, luego env/1k*', 'Top 3'), { reportedCount: 5 }).problems, ['missing "*Top 3 por <clave>*"']);
 
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
