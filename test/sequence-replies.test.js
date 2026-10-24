@@ -188,17 +188,67 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
   check('6h later runs go back to the watermark minus 1h', sr.sinceFor({ now: NOW, watermark: NOW - 10 * MIN }), { since: NOW - 70 * MIN, firstRun: false });
   check('6i a week-old watermark is capped at 3 days', sr.sinceFor({ now: NOW, watermark: NOW - 7 * 24 * H }).since, NOW - 72 * H);
 
-  // ── 7. Reminder ladder: one reminder, 2h of window time, never again ──────
-  const due = (o) => sr.reminderDue({ now: NOW, ...o });
-  check('7a 2h after the post, inside the window: due', due({ postedAt: NOW - 2 * H - MIN }), true);
-  check('7b 1h after the post: not yet', due({ postedAt: NOW - H }), false);
-  check('7c handled with ✅: never', due({ postedAt: NOW - 3 * H, handledAt: NOW - H }), false);
-  check('7d already reminded: no further nagging', due({ postedAt: NOW - 5 * H, remindedAt: NOW - 3 * H }), false);
-  check('7e posted at 23:00, due 10:00 next day (clock starts at 08:00)',
-    [sr.reminderDue({ now: cr('2026-10-23T09:30:00'), postedAt: cr('2026-10-22T23:00:00') }),
-     sr.reminderDue({ now: cr('2026-10-23T10:01:00'), postedAt: cr('2026-10-22T23:00:00') })], [false, true]);
-  check('7f no reminder at 21:00 CR', sr.reminderDue({ now: cr('2026-10-23T21:00:00'), postedAt: cr('2026-10-23T17:00:00') }), false);
-  check('7g an alert older than 2 days is never reminded', due({ postedAt: NOW - 3 * 24 * H }), false);
+  // ── 7. Digest of alerts still waiting (twice a day, replaces the 2h reminder) ─
+  const posted = { s: 'posted', ch: 'C1', ts: '1.1', at: NOW - 5 * H };
+  check('7a candidates: posted and waiting yes; ✅, skipped, 8 days old or no card no', [
+    sr.digestCandidate(posted, NOW),
+    sr.digestCandidate({ ...posted, handledAt: NOW - H }, NOW),
+    sr.digestCandidate({ s: 'skipped', reason: 'client', at: NOW }, NOW),
+    sr.digestCandidate({ ...posted, at: NOW - 8 * 24 * H }, NOW),
+    sr.digestCandidate({ ...posted, ts: undefined }, NOW),
+  ], [true, false, false, false, false]);
+
+  const sent = sr.formatAlert({
+    contactName: 'Ana Ruiz', intents: ['pausa'], subject: 'Ana, ARRANCO o PAUSA', group: 'reactivación · no-show',
+    quote: 'PAUSA por ahora <gracias>\nAna', link: 'https://app.gohighlevel.com/v2/location/L/contacts/detail/K1', mentions: ['U1'],
+  });
+  const want = { quote: 'PAUSA por ahora <gracias> Ana', group: 'reactivación · no-show' };
+  check('7b quote and group read back from the card as posted', sr.cardParts(sent), want);
+  check('7c same when Slack returns the quote marker escaped', sr.cardParts(sent.replace(/^> /gm, '&gt; ')), want);
+  check('7d Slack link markup and entities become plain text',
+    sr.cardParts('x\n&gt; ver <https://x.example/a|x.example/a> &amp; <mailto:a@b.co|a@b.co>').quote, 'ver x.example/a & a@b.co');
+  check('7e a card Slack could not return gives nothing', sr.cardParts(''), { quote: '', group: null });
+
+  const items = [
+    { name: 'Ana Ruiz', intents: ['sigue igual'], group: 'reactivación · deal abierto', quote: 'Sigue igual', mentions: ['U_SETTER', 'U_JOSE'],
+      replyAt: NOW - 26 * H, postedAt: NOW - 20 * H, link: 'https://neurogrowth.slack.com/archives/C1/p1' },
+    { name: 'Luis <Pérez>', intents: ['quiere agendar'], group: null, quote: 'El lunes a las 5:00 pm me sirve', mentions: ['U_RON'],
+      replyAt: NOW - 3 * H, postedAt: NOW - 3 * H, link: null },
+    { name: 'Eva', intents: ['respuesta'], group: 'post-llamada', quote: '', mentions: [], replyAt: NOW - 50 * H, postedAt: NOW - 50 * H, link: null },
+  ];
+  check('7f buying signals first, then the oldest reply', sr.orderPending(items).map(i => i.name), ['Luis <Pérez>', 'Eva', 'Ana Ruiz']);
+  const digest = sr.formatDigest({ items, now: NOW });
+  check('7g digest shape', digest.split('\n'), [
+    '📬 *Pendientes: respuestas a las secuencias de correo* (3)',
+    'Respondan desde GHL y marquen ✅ en el aviso cuando quede atendido. Lo que siga sin ✅ vuelve a salir aquí.',
+    '',
+    '*1. Luis &lt;Pérez&gt;* · quiere agendar · hace 3h <@U_RON>',
+    '> El lunes a las 5:00 pm me sirve',
+    '',
+    '*2. Eva* (post-llamada) · respuesta · hace 2d 2h',
+    '',
+    '*3. Ana Ruiz* (reactivación · deal abierto) · sigue igual · hace 1d 2h <@U_SETTER> <@U_JOSE>',
+    '> Sigue igual',
+    '<https://neurogrowth.slack.com/archives/C1/p1|Ver aviso>',
+  ]);
+  check('7h a valid digest passes its contract', sr.validateDigest(digest), null);
+  check('7i "undefined" outside a quote fails', sr.validateDigest(digest.replace('Eva', 'undefined')), 'placeholder value');
+  check('7j past the cap the rest are counted, the header keeps the total',
+    sr.formatDigest({ items, now: NOW, max: 1 }).split('\n').filter(l => /^\*\d|^_Y|^📬/.test(l)),
+    ['📬 *Pendientes: respuestas a las secuencias de correo* (3)', '*1. Luis &lt;Pérez&gt;* · quiere agendar · hace 3h <@U_RON>', '_Y 2 más en el canal._']);
+  check('7k long quotes are clipped', sr.formatDigest({ items: [{ ...items[0], quote: 'palabra '.repeat(60) }], now: NOW }).split('\n')[4].length <= 2 + 160, true);
+  const twice = [
+    { cid: 'K1', name: 'Juan', intents: ['respuesta'], group: 'post-llamada', quote: 'una consulta', mentions: ['U_OSCAR', 'U_JOSE'], replyAt: NOW - 70 * H, postedAt: NOW - 10 * H, link: 'https://s.example/a' },
+    { cid: 'K1', name: 'Juan', intents: ['no interesado'], group: 'post-llamada', quote: 'de momento sería un no', mentions: ['U_OSCAR', 'U_JOSE'], replyAt: NOW - 48 * H, postedAt: NOW - 10 * H, link: 'https://s.example/b' },
+  ];
+  check('7m two replies from one contact are one entry: newest quote and link, oldest age',
+    sr.formatDigest({ items: twice, now: NOW }).split('\n').slice(3), [
+      '*1. Juan* (post-llamada) · no interesado · 2 respuestas · hace 2d 22h <@U_OSCAR> <@U_JOSE>',
+      '> de momento sería un no',
+      '<https://s.example/b|Ver aviso>',
+    ]);
+  check('7l one slot per CR date and hour', [sr.digestSlot(cr('2026-10-24T09:00:30')), sr.digestSlot(cr('2026-10-24T15:00:02'))],
+    ['2026-10-24T09', '2026-10-24T15']);
 
   // ── 8. Answered in GHL ────────────────────────────────────────────────────
   const replyAt = NOW - 3 * H;
@@ -239,9 +289,6 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
   check('9e2 a backfilled reply says how old it is',
     sr.formatAlert({ contactName: 'Ana', intents: ['respuesta'], subject: 's', quote: 'hola', link: 'https://x.example/a', mentions: ['U1'], replyAt: NOW - 26 * H, now: NOW }).split('\n')[0],
     '<@U1> 📧 *Respuesta por correo* · *Ana* (hace 1d 2h)');
-  check('9f reminder mentions the same people',
-    sr.formatReminder({ mentions: ['U_SETTER', 'U_JOSE'], contactName: 'Ana Ruiz', postedAt: NOW - 2 * H, now: NOW }),
-    '<@U_SETTER> <@U_JOSE> ⏰ La respuesta de *Ana Ruiz* sigue sin atender (hace 2h). Reaccione ✅ en el mensaje de arriba cuando esté atendida.');
 
   // ── 10. Wiring in index.js (text checks, the monolith is never required) ──
   const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
@@ -250,6 +297,10 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
   check('10c kill switch read from SEQ_REPLY_ALERTS_DISABLED', /process\.env\.SEQ_REPLY_ALERTS_DISABLED === 'true'/.test(SRC), true);
   check('10d ✅ route reads the alert metadata', /metadata\?\.event_type === SEQ_REPLY_EVENT/.test(SRC), true);
   check('10e posts to #ng-sales-goats by id', /channel: LEAD_CHANNEL_ID, text: card/.test(SRC), true);
+  check('10g digest declared at 09:00 and 15:00 Mon to Sat', /runSequenceReplyDigest:\s*'0 9,15 \* \* 1-6'/.test(SRC), true);
+  check('10h digest registered with the same schedule', SRC.includes("cron.schedule('0 9,15 * * 1-6', wrapCronJob('runSequenceReplyDigest'"), true);
+  check('10i the 2h thread reminder is gone', /seqRunReminders|formatReminder|reminderDue/.test(SRC), false);
+  check('10j digest posts to #ng-sales-goats, one per slot', /seqInsert\(slotKey/.test(SRC) && /channel: LEAD_CHANNEL_ID, text, unfurl_links: false/.test(SRC), true);
   check('10f no em dash in the new code', /\u2014/.test(fs.readFileSync(path.join(__dirname, '..', 'lib', 'sequenceReplies.js'), 'utf8').replace(/'\\u2014'/g, '')), false);
 
   if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }

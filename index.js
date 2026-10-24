@@ -20550,9 +20550,11 @@ console.log('Registered static cron: hot reply alerts + social intake gap (*/15 
 // Every 10 min this posts each new reply in #ng-sales-goats with intent tags,
 // the email it answered, the contact's group and the cleaned text, mentioning
 // the setter (contact owner) and the closer (closer field), or Ron when neither
-// maps. ✅ on the alert = handled; one thread reminder after 2h of poke-window
-// time (Mon to Sat, 8 AM to 8 PM CR) if nobody reacted, then nothing. Approved
-// by Ron 2026-10-23. Pure logic in lib/sequenceReplies.js; this owns the I/O.
+// maps. ✅ on the alert = handled. At 09:00 and 15:00 Mon to Sat one digest
+// lists every alert still without a ✅ and not answered in GHL, with the same
+// mentions; nothing waiting, no post. Approved by Ron 2026-10-23, digest in
+// place of the 2h thread reminder 2026-10-24. Pure logic in
+// lib/sequenceReplies.js; this owns the I/O.
 //
 // State lives in agent_knowledge (category process, source seq-reply), one row
 // per GHL email message id, `seq-reply:<emailId>`, inserted with ON CONFLICT DO
@@ -20764,38 +20766,47 @@ async function seqScanReplies(now, since, stats) {
   }
 }
 
-// The first human ✅ on an alert, read from Slack. Catches a reaction the
-// handler never saw (Socket Mode drops every inbound event when it dies).
-async function seqHumanCheck(channel, ts) {
+// The alert card as Slack holds it: its text and the first human ✅ on it.
+// The ✅ catches a reaction the handler never saw (Socket Mode drops every
+// inbound event when it dies). null when the card is gone.
+async function seqReadCard(channel, ts) {
   const hist = await slack.client.conversations.history({ channel, latest: ts, limit: 1, inclusive: true });
   const msg = hist.messages && hist.messages[0];
   if (!msg || msg.ts !== ts) return null;
   const botId = process.env.SLACK_BOT_USER_ID;
+  let reactor = null;
   for (const r of msg.reactions || []) {
     if (!CAMPAIGN_APPROVE_EMOJIS.has(String(r.name || '').split('::')[0])) continue;
-    const u = (r.users || []).find(x => x !== botId);
-    if (u) return u;
+    reactor = (r.users || []).find(x => x !== botId) || null;
+    if (reactor) break;
   }
-  return null;
+  return { text: msg.text || '', reactor };
 }
 
-// One reminder per alert still not handled 2h (window time) after the post.
-// Skipped, and the alert closed, when a ✅ is found on the message or the reply
-// was answered in GHL meanwhile.
-async function seqRunReminders(now, stats) {
+// Alerts still waiting: posted, no ✅ on the card, not answered in GHL since,
+// younger than a week. A ✅ or a GHL answer found here closes the alert for
+// good. A card Slack fails to return is still listed, without its quote: a
+// failed read never hides a reply.
+async function seqPendingAlerts(now, stats) {
   const { data, error } = await supabase.from('agent_knowledge').select('key, value')
     .eq('category', 'process').like('key', `${SEQ_REPLY_KEY}:%`)
-    .gte('updated_at', new Date(now - sequenceReplies.CONFIG.reminderMaxAgeMs - 60 * 60 * 1000).toISOString())
+    .gte('updated_at', new Date(now - sequenceReplies.CONFIG.digestMaxAgeMs - 60 * 60 * 1000).toISOString())
     .limit(1000);
   if (error) throw new Error(`alert history read failed: ${error.message}`);
+  const items = [];
   for (const row of data || []) {
     let rec = null;
     try { rec = JSON.parse(row.value); } catch (_) { continue; }
-    if (!rec || rec.s !== 'posted' || !rec.ts || !rec.ch) continue;
-    if (!sequenceReplies.reminderDue({ now, postedAt: rec.at, handledAt: rec.handledAt, remindedAt: rec.remindedAt })) continue;
-    const reactor = await seqHumanCheck(rec.ch, rec.ts).catch(() => null);
-    if (reactor) {
-      await seqSwap(row.key, row.value, { ...rec, handledBy: reactor, handledAt: now, via: 'scan' }, now).catch(() => {});
+    if (!sequenceReplies.digestCandidate(rec, now)) continue;
+    let card;
+    try { card = await seqReadCard(rec.ch, rec.ts); } catch (err) {
+      card = undefined;
+      stats.cardErrors++;
+      console.warn(`seq-reply digest: card read failed for ${row.key}: ${err.message}`);
+    }
+    if (card === null) { stats.cardsGone++; continue; }
+    if (card && card.reactor) {
+      await seqSwap(row.key, row.value, { ...rec, handledBy: card.reactor, handledAt: now, via: 'scan' }, now).catch(() => {});
       stats.handledByScan++;
       continue;
     }
@@ -20805,20 +20816,48 @@ async function seqRunReminders(now, stats) {
       stats.answeredInGhl++;
       continue;
     }
-    const next = { ...rec, remindedAt: now };
-    if (!(await seqSwap(row.key, row.value, next, now))) continue; // a ✅ or another process got there first
-    try {
-      await slack.client.chat.postMessage({
-        channel: rec.ch, thread_ts: rec.ts,
-        text: sequenceReplies.formatReminder({ mentions: rec.mentions, contactName: rec.name, postedAt: rec.at, now }),
-      });
-      stats.reminders++;
-    } catch (err) {
-      await seqSwap(row.key, JSON.stringify(next), rec, now).catch(() => {});
-      stats.postFailures++;
-      console.error(`seq-reply: reminder failed for ${row.key}:`, err.message);
+    const parts = sequenceReplies.cardParts(card ? card.text : '');
+    const link = await slack.client.chat.getPermalink({ channel: rec.ch, message_ts: rec.ts }).then(r => r.permalink, () => null);
+    items.push({ cid: rec.cid, name: rec.name, intents: rec.intents, group: parts.group, quote: parts.quote, mentions: rec.mentions, replyAt: rec.replyAt, postedAt: rec.at, link });
+  }
+  return items;
+}
+
+// 09:00 and 15:00 Mon to Sat: one post in #ng-sales-goats with every alert
+// still waiting. Nothing waiting, no post. A slot row keeps two overlapping
+// deploys from posting twice.
+async function runSequenceReplyDigest(correlationId, { now = Date.now() } = {}) {
+  if (seqReplyDisabled()) { console.log('Sequence reply digest disabled (SEQ_REPLY_ALERTS_DISABLED=true).'); return { ok: true, disabled: true }; }
+  const stats = { pending: 0, handledByScan: 0, answeredInGhl: 0, cardErrors: 0, cardsGone: 0, posted: false, slotTaken: false };
+  const items = await seqPendingAlerts(now, stats);
+  stats.pending = items.length;
+  if (items.length) {
+    const slotKey = `${SEQ_REPLY_RUN_KEY}:digest:${sequenceReplies.digestSlot(now)}`;
+    if (!(await seqInsert(slotKey, { s: 'digest', at: now, n: items.length }, now))) stats.slotTaken = true;
+    else {
+      const text = sequenceReplies.formatDigest({ items, now });
+      const problem = sequenceReplies.validateDigest(text);
+      if (problem) {
+        await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Sequence reply digest failed its contract (${problem}) and was NOT posted in #ng-sales-goats:\n${text}` })
+          .catch(e => console.error('seq-reply digest: invalid DM failed:', e.message));
+      } else {
+        try {
+          await slack.client.chat.postMessage({ channel: LEAD_CHANNEL_ID, text, unfurl_links: false, unfurl_media: false });
+          stats.posted = true;
+        } catch (err) {
+          // Free the slot so a manual rerun can post it.
+          await supabase.from('agent_knowledge').delete().eq('category', 'process').eq('key', slotKey).then(() => {}, () => {});
+          throw err;
+        }
+      }
     }
   }
+  console.log(`Sequence reply digest: ${stats.pending} pending${stats.posted ? ', posted' : ''}${stats.slotTaken ? ', slot already posted' : ''}, ${stats.handledByScan} ✅ found, ${stats.answeredInGhl} answered in GHL${stats.cardErrors ? `, ${stats.cardErrors} card read errors` : ''}${stats.cardsGone ? `, ${stats.cardsGone} cards gone` : ''}`);
+  await logActivity({
+    event_type: 'audit', event_source: 'cron', action: 'sequence_reply_digest',
+    status: stats.cardErrors ? 'degraded' : 'ok', output: stats, correlation_id: correlationId,
+  });
+  return { ok: true, stats };
 }
 
 // ✅ on an alert (reaction_added Route -0.5): record who handled it, once.
@@ -20853,7 +20892,7 @@ async function runSequenceReplyAlerts(correlationId, { now = Date.now() } = {}) 
   try {
     const stats = {
       since: null, firstRun: false, convos: 0, unchanged: 0, threadReads: 0, emailReads: 0, posted: 0, invalid: 0,
-      reminders: 0, handledByScan: 0, answeredInGhl: 0, postFailures: 0, convoErrors: 0, reportErrors: 0, skips: {}, alerts: [],
+      postFailures: 0, convoErrors: 0, reportErrors: 0, skips: {}, alerts: [],
     };
     const errors = [];
     const wmKey = `${SEQ_REPLY_RUN_KEY}:watermark`;
@@ -20866,7 +20905,6 @@ async function runSequenceReplyAlerts(correlationId, { now = Date.now() } = {}) 
       stats.firstRun = firstRun;
       try { await seqScanReplies(now, since, stats); } catch (err) { errors.push(`scan: ${err.message}`); }
     }
-    try { await seqRunReminders(now, stats); } catch (err) { errors.push(`reminders: ${err.message}`); }
 
     // The watermark only moves after a clean run, so a failed conversation is
     // re-read next time (decided replies are keyed and never re-alert).
@@ -20884,7 +20922,7 @@ async function runSequenceReplyAlerts(correlationId, { now = Date.now() } = {}) 
         .catch(e => console.error('seq-reply broken post failed:', e.message));
     }
 
-    console.log(`Sequence reply alerts${stats.firstRun ? ' (first run, 3-day backfill)' : ''}: since ${stats.since || '-'}, ${stats.convos} email chats, ${stats.unchanged} unchanged, ${stats.threadReads} read, ${stats.emailReads} emails fetched, ${stats.posted} posted, ${stats.reminders} reminders, skips ${JSON.stringify(stats.skips)}${stats.invalid ? `, ${stats.invalid} failed contract` : ''}${stats.convoErrors ? `, ${stats.convoErrors} chat errors` : ''}${stats.postFailures ? `, ${stats.postFailures} post failures` : ''}${errors.length ? ` · ERRORS: ${errors.join(' | ')}` : ''}`);
+    console.log(`Sequence reply alerts${stats.firstRun ? ' (first run, 3-day backfill)' : ''}: since ${stats.since || '-'}, ${stats.convos} email chats, ${stats.unchanged} unchanged, ${stats.threadReads} read, ${stats.emailReads} emails fetched, ${stats.posted} posted, skips ${JSON.stringify(stats.skips)}${stats.invalid ? `, ${stats.invalid} failed contract` : ''}${stats.convoErrors ? `, ${stats.convoErrors} chat errors` : ''}${stats.postFailures ? `, ${stats.postFailures} post failures` : ''}${errors.length ? ` · ERRORS: ${errors.join(' | ')}` : ''}`);
     await logActivity({
       event_type: 'audit', event_source: 'cron', action: 'sequence_reply_alerts',
       status: errors.length || stats.convoErrors || stats.postFailures ? 'degraded' : 'ok',
@@ -20897,10 +20935,12 @@ async function runSequenceReplyAlerts(correlationId, { now = Date.now() } = {}) 
   }
 }
 
-// Every 10 min around the clock: an alert posts whenever a reply lands; only
-// the reminder waits for the window. Declared in STATIC_CRON_SCHEDULES.
+// Every 10 min around the clock: an alert posts whenever a reply lands. The
+// digest runs at 09:00 and 15:00 Mon to Sat. Both in STATIC_CRON_SCHEDULES.
 cron.schedule('*/10 * * * *', wrapCronJob('runSequenceReplyAlerts', async (c) => { await runSequenceReplyAlerts(c); }, { timeoutMs: 8 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: sequence email reply alerts (*/10 * * * *)');
+cron.schedule('0 9,15 * * 1-6', wrapCronJob('runSequenceReplyDigest', async (c) => { await runSequenceReplyDigest(c); }, { timeoutMs: 8 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: sequence email reply digest (0 9,15 * * 1-6)');
 // ─── end sequence email reply alerts ────────────────────────────────────────
 
 // ─── CONTENT BRIDGE: 24H SETTER CARD ────────────────────────────────────────
@@ -22402,6 +22442,7 @@ const STATIC_CRON_SCHEDULES = {
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runHotReplyCheck:             '*/15 * * * *',
   runSequenceReplyAlerts:       '*/10 * * * *',
+  runSequenceReplyDigest:       '0 9,15 * * 1-6',
   runBridge24hCards:            '15 8-20 * * *',
   runIgGuideCheck:              '*/5 * * * *',
   runGuardianCheck:             '*/15 8-20 * * *',
