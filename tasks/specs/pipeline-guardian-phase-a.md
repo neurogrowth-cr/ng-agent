@@ -2,7 +2,7 @@
 
 **Owner:** Ron   **Status:** draft (spec only, nothing built)
 **Written:** 2026-10-24   **Last verified:** n/a
-**Decision:** strategy repo `docs/plan-of-record.md`, UPDATE 2026-10-24 "the pipeline guardian replaces the second setter seat". This spec does not change the decision; where it needs a number the decision does not have, it says `[confirm]`.
+**Decision:** strategy repo `docs/plan-of-record.md`, UPDATE 2026-10-24 "the pipeline guardian replaces the second setter seat". Ron's rulings of 2026-10-24 on the open items are folded in below; the numbers still marked as measured are read in the shadow week.
 **Watched by:** `guardian_watchdog` (section 4b) and the hot-reply broken-check pattern (3 failed runs in a row post to #ng-pm-agent). Until that check exists the recipe may run in `shadow` only.
 
 ## 1. Job
@@ -30,7 +30,7 @@ Read every inbound message and every silence on the Appointment Setting pipeline
 | 3 | Thread analysis: who spoke last, unanswered lead messages (anchor), time since our last message, Meta window state per channel | `analyzeThread` in `lib/hotReplies.js` plus new `windowState(convo, now)` | `ghlGetConversationMessages` | `_hotThreadCache` |
 | 4 | Classify: intent and trajectory with Haiku, Kai's intent classes (`interested, wants_info, objection_timing, objection_budget, objection_relevance, objection_existing, referral, question, positive_not_ready, unsubscribe, angry, legal_risk, competitor_mention, sensitive, already_client, unclear`) plus the hot/normal/noise verdict already in use | `hotClassify` reused; prompt extended with the intent list from `ng-automation/lib/intent-classifier.js` (copied, not imported) | thread tail (6 messages) | `agent_knowledge` key `guardian:verdict:<newestId>` (verdict only, never the quote) |
 | 5 | Decide: reply, strike, signal, or stop (table in 3.1) | `decideAction()` pure | steps 3 and 4 | one `guardian_actions` row (migration 022) status `drafted` or `signal` |
-| 6 | Draft: the reply or strike in usted from the Persuasion Playbook and the Triage Call Script v1.0 (chat triage), with the bridge video or guide link when the step calls for it | `buildDraftPrompt()` pure; `MODEL_AGENT` with `THINKING_OFF`; same guard chain as `igGuideReplies` (no em dash, no English, no price outside the catalog, no promise) | step 5, contact facts, FAQ file `~/NG-content/guardian/faq.md` [confirm location] | `guardian_actions.draft` |
+| 6 | Draft: the reply or strike in usted from the Persuasion Playbook and the Triage Call Script v1.0 (chat triage), with the bridge video or guide link when the step calls for it | `buildDraftPrompt()` pure; `MODEL_AGENT` with `THINKING_OFF`; same guard chain as `igGuideReplies` (no em dash, no English, no price outside the catalog, no promise) | step 5, contact facts, FAQ text from the env `GUARDIAN_FAQ` (source file `~/NG-content/guardian/faq.md`, written before shadow) | `guardian_actions.draft` |
 | 7 | Hand to Sebastián: one Slack DM per action with the card in 3.2; ✅ sends the draft, ❌ archives, a thread reply sends his text instead | reaction handler pattern from `runIgGuideCheck` (atomic claim on the row, double tap never sends twice) | `guardian_actions` | Slack DM ts on the row; `agent_activity` `guardian_card` |
 | 8 | Send on approval through GHL `POST /conversations/messages` on the lead's channel, only if the Meta window is still open at send time; otherwise the card flips to "ventana cerrada" and the strike moves to email or waits | the direct send helper used by the open-deal ✅ (`index.js`, "Direct send helper used by the reaction handler") | row, window state | `guardian_actions.status = sent`, `sent_at`, `message_id` |
 | 9 | Own the card: on the first sent message, assign contact and opportunity to GHL user "Max AI" (`IG_GUIDE_MAX_GHL_USER_ID`, `cfLku0XE7BznqtmBSDmX`) unless a human setter already owns it; on a signal handoff, assign to Sebastián (`Wdjte1temxfR0lpi5RGV`) | `igGuideAssignInGhl` generalised | GHL | GHL contact and opportunity `assignedTo`; `agent_activity` `guardian_assigned` |
@@ -51,7 +51,7 @@ Read every inbound message and every silence on the Appointment Setting pipeline
 | `unclear` | draft one clarifying question | Sebastián ✅ |
 | Instagram or Messenger lead inside the window with no phone and no email on the contact | the reply always ends by asking for WhatsApp or email (the move-off-channel rule) | Sebastián ✅ |
 
-Channel per step: Instagram and Messenger only while `now < lastInbound + 24h` (an ad-started chat may carry a 7-day window; the guardian treats 24h as the limit until Meta's documentation is confirmed); WhatsApp inside 24h free text, outside 24h only an approved template [confirm what coexistence allows; until then WhatsApp strikes outside the window are not drafted]; email any time when the contact has one. A strike whose only open channel is Instagram and whose window has closed is skipped with reason `window_closed` and counted.
+Channel per step: Instagram and Messenger only while `now < lastInbound + 24h` (an ad-started chat may carry a 7-day window; the guardian treats 24h as the limit until Meta's documentation is confirmed); WhatsApp inside 24h free text, outside 24h only an approved utility template (section 3.3; until the coexistence test in the shadow week passes, WhatsApp strikes outside the window are not drafted and go to email when the contact has one); email any time when the contact has one. A strike whose only open channel is Instagram and whose window has closed is skipped with reason `window_closed` and counted.
 
 ### 3.2 Card contract (step 7), Slack DM to Sebastián
 
@@ -68,6 +68,20 @@ Vence: <HH:MM CR> (ventana de Meta cierra <HH:MM> | sin ventana)
 
 Signal cards replace `Borrador:` with `Sugerencia:` and add `Ficha:` with the fields already known (empresa, a quién vende, dolor, urgencia) and `Agendar:` with the booking link for the setter calendar.
 
+### 3.3 WhatsApp utility templates (submitted from GHL before day one, usted, one variable each)
+
+| Step | Template (Spanish) |
+|---|---|
+| Strike 2, follow-up | Hola {{1}}, le escribí hace un par de días sobre cómo llenar su agenda con prospectos desde LinkedIn. ¿Sigue teniendo sentido conversarlo esta semana? |
+| Strike 3, resource | {{1}}, le dejo un video corto de 10 minutos con el sistema por dentro, por si prefiere verlo antes de hablar: {{2}}. ¿Le parece si lo revisamos juntos? |
+| Strike 5, thread close | {{1}}, no quiero insistir. Si en algún momento quiere retomar lo de LinkedIn, me escribe por aquí y lo vemos. Un gusto. |
+
+None names a price or an offer (Meta classifies those as marketing and rejects more of them). Strikes 1 and 4 go inside the window as free text, or by email. The coexistence test: one template sent to a test contact in the shadow week; if it fails, WhatsApp strikes outside the window stay off and the email path carries them.
+
+### 3.4 Phase B gate (per message type, not built in phase A)
+
+A type (strike, acknowledgement, FAQ answer) moves to autonomous send once, over two weeks and at least 30 drafts of that type, Sebastián approved 90% as written or with a minor edit and there was no guardrail incident. Other types keep their ✅. Measured from `guardian_actions` (status and `edited`).
+
 ## 4. CRITERIA
 
 ### 4a. Structural contract (machine-checkable)
@@ -83,7 +97,7 @@ Checked by: `lib/pipelineGuardian.js validateCard()` and `validateDraft()`, test
 |---|---|---|---|---|---|
 | Runs completed | 52 per day (every 15 min, 13 hours) | 48 to 51 | below 48 | 1 day | n ≥ 7 days |
 | Drafts per run | ≤ `GUARDIAN_MAX_DRAFTS_PER_RUN` (8) | n/a | cap hit 3 runs in a row | 1 day | n ≥ 7 |
-| Cards sent to Sebastián per day | 5 to 40 [confirm after shadow week] | 41 to 60 | 0 on a weekday with inbound messages, or above 60 | 1 day | n ≥ 7 |
+| Cards sent to Sebastián per day | 5 to 40 (measured in the shadow week) | 41 to 60 | 0 on a weekday with inbound messages, or above 60 | 1 day | n ≥ 7 |
 | Approval rate (✅ ÷ (✅ + ❌)) | ≥ 70% | 50 to 69% | below 50% | 7 days | n ≥ 7 |
 | Median time lead message to card | ≤ 15 min | 16 to 30 | above 30 | 1 day | n ≥ 7 |
 | Cards expired unanswered (window closed before ✅) | ≤ 10% | 11 to 25% | above 25% | 7 days | n ≥ 7 |
@@ -99,7 +113,7 @@ Every Friday, 20 random sent drafts from the week are scored by Sonnet against `
 
 ### 4d. Human gate
 
-Phase A: **every message to a lead needs Sebastián's ✅** (Ron's for the first week [confirm]). Default if nobody answers before the Meta window closes: **do nothing**, mark `expired`, move the strike to email if an email exists.
+Phase A: **every message to a lead needs Sebastián's ✅** from day one; Ron reads a sample of 10 drafts a day for the first five days, then the weekly sample of 20 (4c). Default if nobody answers before the Meta window closes: **do nothing**, mark `expired`, move the strike to email if an email exists.
 Never auto, in any phase: a price other than the catalog string, a discount, a promise of results, a reply to a contact tagged `personal` or `guardian-off`, a reply to a client email, a message outside Meta's window, a second message while ours is the newest in the thread (live thread check, as Kai), anything to a lead whose card is Call Booked or later.
 
 ## 5. On failure (fail closed)
@@ -114,7 +128,7 @@ Never auto, in any phase: a price other than the catalog string, a discount, a p
 
 - [ ] `test/pipeline-guardian.test.js`: decision table (every row of 3.1), window rules per channel (23h59 kept, 24h01 skipped, ad window ignored), stop rules, cadence days from a real-shaped thread, `validateCard` and `validateDraft` red on a placeholder, a `tú`, an em dash, a foreign URL, a price.
 - [ ] Golden draft test (skips cleanly without an API key): a fixture thread per intent, asserts the 4a contract on the model output. Fixtures use made-up names and numbers; the repo is public.
-- [ ] 3 days in `shadow` to Ron's DM (target around 2026-11-03 [confirm]), then `draft` to Sebastián.
+- [ ] `shadow` to Ron's DM from 2026-11-03, `draft` to Sebastián from 2026-11-06 (Oscar's last day is 2026-10-31; his open cards up to Strike 3 are the first batch).
 - [ ] The 4b check made to fail on purpose once (a planted approved row with no `sent_at`), and the failure path fired.
 - [ ] One deliberately expired card: confirmed nothing was sent after the window.
 
@@ -127,10 +141,14 @@ Never auto, in any phase: a price other than the catalog string, a discount, a p
 
 Migration `022_guardian_actions.sql` (apply before merge, as 016 and 017 were): `guardian_actions(id uuid, contact_id text, conversation_id text, opportunity_id text, channel text, step text, intent text, verdict text, draft text, status text check in (drafted, signal, approved, sent, rejected, expired, send_failed, skipped), window_closes_at timestamptz, slack_channel_id text, slack_message_ts text, approved_by text, sent_at timestamptz, message_id text, correlation_id text, created_at timestamptz default now(), updated_at timestamptz)`, unique on `(conversation_id, step, created_at::date)` so one strike per step per day, RLS on, insert and select for the service role, update only through an RPC `guardian_claim_send(id, actor)` that flips `approved → sent` first-writer-wins (the `ig_guide_drafts` pattern). Rows carry no message body other than the draft; the lead's quote stays out of the table (the Slack card shows it).
 
-## 9. Cost (estimate, [confirm after the shadow week])
+## 9. Cost (estimate, measured in the shadow week)
 
 Population today is about 86 leads a week (`leads_total_7d` on 2026-10-23) plus the open backlog. Per lead and month: about 6 classifications on Haiku and 4 to 6 drafts on the agent model, roughly $0.10 to $0.20. At 350 to 400 leads a month: $40 to $80 a month in model cost, logged as `call_site = guardian_*` so the ICM cost report shows it on its own line.
 
-## 10. Out of scope for phase A
+## 10. Sebastián's compensation (Ron, 2026-10-24)
+
+The bonus stays on held calls with a complete FICHA DE TRIAGE, whoever booked them: a call the guardian books and Sebastián holds with a complete ficha counts for him like one of his own. One condition is added: handoffs answered within 15 minutes between 08:00 and 20:00 CR (measured from `guardian_actions.created_at` to the ✅, ❌ or thread reply on signal cards). The amount per call stays as today.
+
+## 11. Out of scope for phase A
 
 Autonomous sends (phase B), slot proposals and booking (phase C), the Instagram guide flow (stays Ron-approved under `runIgGuideCheck`), VSL self-serve cards, Call Booked and later stages (open-deal follow-up owns them), any change to Kai in ng-automation.
