@@ -45,6 +45,17 @@ check('1f an active client is skipped', screen(convo({ email: 'Client@Example.co
 check('1g email channel is out of scope', screen(convo({ lastMessageType: 'TYPE_EMAIL' })), 'other_channel');
 check('1h older than the 48h lookback is skipped', screen(convo({ lastMessageDate: NOW - 49 * H })), 'too_old');
 check('1i Instagram is in scope', screen(convo({ lastMessageType: 'TYPE_INSTAGRAM' })), null);
+// Webinar registrants (2026-10-22/23 leak, ng-agent #365): the webinar pipeline
+// opportunity is not a sales card, so the chat is skipped until a sales one exists.
+check('1j webinar registrant with only the webinar-pipeline card is skipped',
+  screen(convo({ tags: ['webinar 27 de octubre', 'intake-done'], opportunities: [{ id: 'W1', status: 'open', pipelineId: 'na0mJ5F6gUtN6Qw48DNd', pipelineStageId: 'fa04c156' }] })), 'webinar');
+check('1k webinar registrant with no card at all is skipped',
+  screen(convo({ tags: ['Webinar 27 De Octubre'], opportunities: [] })), 'webinar');
+check('1l webinar registrant who now holds an open Appointment Setting card is kept',
+  screen(convo({ tags: ['webinar 27 de octubre'], opportunities: [{ id: 'A1', status: 'open', pipelineId: 'KH1IQuaN8aNB1lfRpvP4', pipelineStageId: 'x' }] })), null);
+check('1m webinar registrant whose sales card is lost is still skipped as webinar',
+  screen(convo({ tags: ['webinar 27 de octubre'], opportunities: [{ id: 'A1', status: 'lost', pipelineId: 'KH1IQuaN8aNB1lfRpvP4' }] })), 'webinar');
+check('1n a tag merely containing webinar mid-word does not match', screen(convo({ tags: ['post-webinar-cliente'] })), null);
 
 // ── 2. Thread analysis (the Alejandro shape, 2026-10-04) ───────────────────
 const t0 = cr('2026-10-04T12:21:00');
