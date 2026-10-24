@@ -210,6 +210,19 @@ check('a real setter reply that merely quotes part of the template still counts'
     fbBody('outbound', '2026-09-22T20:00:03.000Z', 'Gracias por escribir, cuénteme de su negocio'),
   ], SEP), { move: S.S1, reason: 'chase — lead never replied' });
 
+// Pipeline guardian (phase A, step 10): an approved strike goes out through the
+// API as the GHL user "Max AI" with a non-'app' source. It is a real touch.
+{
+  const MAX_AI = 'cfLku0XE7BznqtmBSDmX';
+  const api = (ts, userId) => ({ messageType: 'TYPE_WHATSAPP', direction: 'outbound', source: 'api', userId, dateAdded: ts });
+  const NOW2 = Date.parse('2026-11-10T15:00:00Z');
+  const o = { id: 'opp', status: 'open', pipelineId: PIPE, pipelineStageId: S.NL, lastStageChangeAt: '2026-11-09T10:00:00Z' };
+  check('guardian send as Max AI counts as the first human touch',
+    evaluateStrikeMove(o, [api('2026-11-10T12:00:00Z', MAX_AI)], NOW2), { move: S.IC, reason: 'first human touch' });
+  check('an API send by anyone else is still automated',
+    evaluateStrikeMove(o, [api('2026-11-10T12:00:00Z', 'someoneElse')], NOW2).skip, 'automated_send');
+}
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);
