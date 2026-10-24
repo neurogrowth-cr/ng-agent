@@ -2,6 +2,7 @@ require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
 const hotReplies = require('./lib/hotReplies');
+const sequenceReplies = require('./lib/sequenceReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
 const triageFicha = require('./lib/triageFicha');
 const { App } = require('@slack/bolt');
@@ -20512,6 +20513,366 @@ cron.schedule('*/15 * * * *', wrapCronJob('runHotReplyCheck', async (c) => { awa
 console.log('Registered static cron: hot reply alerts + social intake gap (*/15 * * * *)');
 // ─── end hot reply alerts ───────────────────────────────────────────────────
 
+// ─── SEQUENCE EMAIL REPLY ALERTS ────────────────────────────────────────────
+// Prospects answer the post-call ("Post-llamada · Deal abierto"), reactivation
+// ("Reactivación Oct 2026") and pre-call emails by email. The replies land in
+// the GHL conversation and many never reach Ron's Gmail, so nobody saw them.
+// Every 10 min this posts each new reply in #ng-sales-goats with intent tags,
+// the email it answered, the contact's group and the cleaned text, mentioning
+// the setter (contact owner) and the closer (closer field), or Ron when neither
+// maps. ✅ on the alert = handled; one thread reminder after 2h of poke-window
+// time (Mon to Sat, 8 AM to 8 PM CR) if nobody reacted, then nothing. Approved
+// by Ron 2026-10-23. Pure logic in lib/sequenceReplies.js; this owns the I/O.
+//
+// State lives in agent_knowledge (category process, source seq-reply), one row
+// per GHL email message id, `seq-reply:<emailId>`, inserted with ON CONFLICT DO
+// NOTHING before the post, so a restart or a double deploy never re-alerts.
+// The run watermark and the failure counter sit under `seq-reply-run:*`; with
+// no watermark (first run) it backfills 3 days, never older.
+// On by default; SEQ_REPLY_ALERTS_DISABLED=true stops it.
+const SEQ_REPLY_KEY = 'seq-reply';
+const SEQ_REPLY_RUN_KEY = 'seq-reply-run';
+const SEQ_REPLY_EVENT = 'sequence_reply_alert';
+const SEQ_CLOSER_EMAIL_FIELD = 'd43h5jq9Vl5QMFshKMjK'; // closer email (old contacts hold Jose's gmail)
+const SEQ_CLOSER_NAME_FIELD = 'ntpsrmtlw23vM9uJbiTw';  // closer name
+// GHL user id (lowercase) → Slack: the active setters plus the closers' raw GHL
+// ids already in CLOSER_SLACK (Jose, Ron), so a contact a closer owns still
+// mentions that closer. Departed members are in none of these maps.
+const SEQ_OWNER_SLACK = {
+  ...Object.fromEntries(Object.entries(CLOSER_SLACK).filter(([k]) => !k.includes('@')).map(([k, v]) => [k.toLowerCase(), v])),
+  ...HOT_REPLY_SETTER_SLACK,
+};
+const SEQ_CLOSER_EMAIL_SLACK = Object.fromEntries(Object.entries(CLOSER_SLACK).filter(([k]) => k.includes('@')).map(([k, v]) => [k.toLowerCase(), v]));
+const SEQ_CLOSER_NAME_SLACK = {
+  ...Object.fromEntries(Object.entries(GHL_TO_SLACK).filter(([k]) => /^[a-z ]+$/.test(k))),
+  'ron duarte': RON_SLACK_ID, 'ronny duarte': RON_SLACK_ID,
+};
+const _seqEmailMeta = new Map(); // email id → { direction, at }; only non-inbound entries are reused
+const _seqConvoDone = new Map(); // conversation id → lastMessageDate fully handled
+const _seqDone = new Set();      // email ids decided in this process, in case a knowledge write fails
+let _seqRunning = false;
+
+function seqReplyDisabled() { return process.env.SEQ_REPLY_ALERTS_DISABLED === 'true'; }
+const seqKey = (emailId) => `${SEQ_REPLY_KEY}:${emailId}`;
+const seqBump = (obj, k) => { obj[k] = (obj[k] || 0) + 1; };
+
+// One email of a thread: body (HTML), from, subject, direction, dateAdded.
+async function ghlGetEmailMessage(emailId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/conversations/messages/email/${emailId}`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-04-15' },
+  }, { label: 'GET /conversations/messages/email' });
+  if (!res.ok) throw new Error(`GHL email ${emailId} fetch ${res.status}`);
+  const data = await res.json();
+  return data.emailMessage || null;
+}
+
+const seqRow = (key, value, now) => ({
+  category: 'process', key, value: JSON.stringify(value), source: SEQ_REPLY_KEY,
+  user_id: RON_SLACK_ID, visibility: 'shared', updated_at: new Date(now).toISOString(),
+});
+// INSERT ... ON CONFLICT DO NOTHING: true only for the run that wrote the row.
+async function seqInsert(key, value, now = Date.now()) {
+  const { data, error } = await supabase.from('agent_knowledge')
+    .upsert(seqRow(key, value, now), { onConflict: 'category,key', ignoreDuplicates: true }).select('key');
+  if (error) throw new Error(`agent_knowledge claim failed: ${error.message}`);
+  return !!(data && data.length);
+}
+// Compare-and-swap on the stored text: true only if `oldValue` was still there.
+async function seqSwap(key, oldValue, value, now = Date.now()) {
+  const { data, error } = await supabase.from('agent_knowledge')
+    .update({ value: JSON.stringify(value), updated_at: new Date(now).toISOString() })
+    .eq('category', 'process').eq('key', key).eq('value', oldValue).select('key');
+  if (error) throw new Error(`agent_knowledge update failed: ${error.message}`);
+  return !!(data && data.length);
+}
+// Writes `value` if the row is free or a dead claim. Returns the stored text, or
+// null when another run owns it.
+async function seqTake(key, prior, value, now) {
+  const state = sequenceReplies.claimState(prior, now);
+  let ok = false;
+  if (state === 'free') ok = await seqInsert(key, value, now);
+  else if (state === 'stale') ok = await seqSwap(key, prior, value, now);
+  return ok ? JSON.stringify(value) : null;
+}
+
+// Decide one reply: skip it (recorded, never re-read) or post it. Returns false
+// when the post failed, so the conversation is retried next run.
+async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior, clientEmails, now, stats }) {
+  const key = seqKey(reply.id);
+  const text = sequenceReplies.cleanReply(email.body);
+  const from = sequenceReplies.emailAddress(email.from);
+  const reason = sequenceReplies.skipReason({ from: email.from, subject: email.subject, text })
+    || sequenceReplies.tagSkip(tags, PERSONAL_CONTACT_TAG)
+    || (from && clientEmails.has(from) ? 'client' : null)
+    || (sequenceReplies.answeredInGhl({ messages: msgs, replyAt: reply.at, isAutomatedBody: strikeIsAutomatedBody }) ? 'answered' : null);
+  if (reason) {
+    await seqTake(key, prior, { s: 'skipped', reason, at: now, cid: convo.contactId }, now);
+    _seqDone.add(reply.id);
+    seqBump(stats.skips, reason);
+    return true;
+  }
+
+  const claim = await seqTake(key, prior, { s: 'claimed', at: now }, now);
+  if (!claim) { seqBump(stats.skips, 'claimed_elsewhere'); return true; }
+
+  const who = sequenceReplies.resolveMentions({
+    assignedTo: (contact && contact.assignedTo) || convo.assignedTo,
+    closerEmail: sequenceReplies.customFieldValue(contact, SEQ_CLOSER_EMAIL_FIELD),
+    closerName: sequenceReplies.customFieldValue(contact, SEQ_CLOSER_NAME_FIELD),
+    ownerSlackByGhlId: SEQ_OWNER_SLACK, closerSlackByEmail: SEQ_CLOSER_EMAIL_SLACK, closerSlackByName: SEQ_CLOSER_NAME_SLACK,
+    fallbackSlackId: RON_SLACK_ID,
+  });
+  const contactName = convo.contactName || convo.fullName
+    || [contact && contact.firstName, contact && contact.lastName].filter(Boolean).join(' ') || 'Sin nombre';
+  const intents = sequenceReplies.tagIntents(text);
+  const group = sequenceReplies.groupLabel({ tags, opportunities: convo.opportunities });
+  const card = sequenceReplies.formatAlert({
+    contactName, intents, group,
+    subject: sequenceReplies.answeredSubject(email.subject) || sequenceReplies.answeredSubject(reply.threadSubject),
+    quote: text, link: ghlContactLink(convo.contactId), mentions: who.mentions, fallback: who.fallback,
+    replyAt: reply.at, now,
+  });
+  const problem = sequenceReplies.validateAlert(card);
+  if (problem) {
+    stats.invalid++;
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ Sequence reply alert failed its contract (${problem}) and was NOT posted in #ng-sales-goats:\n${card}` })
+      .catch(e => console.error('seq-reply: invalid-card DM failed:', e.message));
+    await seqSwap(key, claim, { s: 'skipped', reason: 'invalid', at: now, cid: convo.contactId }, now).catch(() => {});
+    _seqDone.add(reply.id);
+    return true;
+  }
+
+  let posted;
+  try {
+    posted = await slack.client.chat.postMessage({
+      channel: LEAD_CHANNEL_ID, text: card, unfurl_links: false, unfurl_media: false,
+      metadata: { event_type: SEQ_REPLY_EVENT, event_payload: { email_id: reply.id, contact_id: convo.contactId, conversation_id: convo.id } },
+    });
+  } catch (err) {
+    // Release the claim: the next run retries instead of going quiet.
+    await supabase.from('agent_knowledge').delete().eq('category', 'process').eq('key', key).eq('value', claim)
+      .then(() => {}, (e) => console.warn(`seq-reply: could not release claim ${key}: ${e.message}`));
+    console.error(`seq-reply: post failed for contact ${convo.contactId}:`, err.message);
+    stats.postFailures++;
+    return false;
+  }
+  _seqDone.add(reply.id);
+  const record = {
+    s: 'posted', at: now, ch: posted.channel, ts: posted.ts, cid: convo.contactId, conv: convo.id, th: reply.threadId,
+    replyAt: reply.at, name: contactName, mentions: who.mentions, intents,
+  };
+  const saved = await seqSwap(key, claim, record, now).catch(e => { console.warn(`seq-reply: record write failed for ${key}: ${e.message}`); return false; });
+  if (!saved) stats.reportErrors++;
+  stats.posted++;
+  stats.alerts.push({ contact_id: convo.contactId, intents, group, mentions: who.mentions.length, fallback: who.fallback });
+  return true;
+}
+
+// One conversation whose last message is an inbound email. Returns true when
+// every new reply in it was decided (posted or skipped).
+async function seqScanConversation(c, { now, since, clientEmails, stats }) {
+  const msgs = await ghlGetConversationMessages(c.id);
+  stats.threadReads++;
+  const threads = msgs.filter(m => m.messageType === 'TYPE_EMAIL' && m.direction === 'inbound'
+    && hotReplies.msgTime(m) >= since && Array.isArray(m.meta?.email?.messageIds) && m.meta.email.messageIds.length);
+  if (!threads.length) { seqBump(stats.skips, 'no_inbound_email'); return true; }
+  // Throws on a read error: a failed read must never look like "not alerted yet".
+  const known = await hotReadKnowledge(threads.flatMap(t => t.meta.email.messageIds.map(seqKey)));
+  const isKnown = (id) => _seqDone.has(id) || ['done', 'running'].includes(sequenceReplies.claimState(known.get(seqKey(id)), now));
+  const emails = new Map();
+  const fetchMeta = async (id) => {
+    const cached = _seqEmailMeta.get(id);
+    if (cached && cached.direction !== 'inbound') return cached;
+    const e = await ghlGetEmailMessage(id);
+    stats.emailReads++;
+    if (!e) return null;
+    const meta = { direction: String(e.direction || '').toLowerCase(), at: Date.parse(e.dateAdded || e.dateUpdated) || 0 };
+    if (_seqEmailMeta.size > 5000) _seqEmailMeta.clear();
+    _seqEmailMeta.set(id, meta);
+    emails.set(id, e);
+    return meta;
+  };
+  const replies = [];
+  for (const t of threads) {
+    const found = await sequenceReplies.collectNewReplies({ messageIds: t.meta.email.messageIds, fetchMeta, since, isKnown });
+    for (const r of found) replies.push({ ...r, threadId: t.id, threadSubject: t.meta.email.subject || '' });
+  }
+  if (!replies.length) return true;
+  replies.sort((a, b) => a.at - b.at);
+
+  // Owner, closer field and the full tag list. A contact GHL cannot return
+  // (merged away) still alerts, with the conversation's owner and tags.
+  const contact = await ghlGetContact(c.contactId).catch(() => null);
+  const tags = [...new Set([...(c.tags || []), ...((contact && contact.tags) || [])])];
+  let clean = true;
+  for (const r of replies) {
+    const email = emails.get(r.id) || await ghlGetEmailMessage(r.id);
+    if (!email) { clean = false; continue; }
+    const ok = await seqHandleReply({ convo: c, contact, tags, reply: r, email, msgs, prior: known.get(seqKey(r.id)), clientEmails, now, stats });
+    if (!ok) clean = false;
+  }
+  return clean;
+}
+
+async function seqScanReplies(now, since, stats) {
+  const clientEmails = await loadActiveClientEmails();
+  // Clients get the same pre-call and onboarding emails. Without the roster a
+  // client's reply could reach the sales channel, so the run holds and fails.
+  if (!clientEmails) throw new Error('client list unavailable (portal client_dashboards)');
+  const convos = await hotSearchConversations(since, '&lastMessageDirection=inbound&lastMessageType=TYPE_EMAIL');
+  stats.convos = convos.length;
+  for (const c of convos) {
+    if (_seqConvoDone.get(c.id) === c.lastMessageDate) { stats.unchanged++; continue; }
+    const s = sequenceReplies.screenConversation(c, { clientEmails, personalTag: PERSONAL_CONTACT_TAG });
+    if (!s.keep) { seqBump(stats.skips, s.reason); _seqConvoDone.set(c.id, c.lastMessageDate); continue; }
+    try {
+      if (await seqScanConversation(c, { now, since, clientEmails, stats })) _seqConvoDone.set(c.id, c.lastMessageDate);
+    } catch (err) {
+      stats.convoErrors++;
+      console.warn(`seq-reply: conversation ${c.id} failed: ${err.message}`);
+    }
+  }
+}
+
+// The first human ✅ on an alert, read from Slack. Catches a reaction the
+// handler never saw (Socket Mode drops every inbound event when it dies).
+async function seqHumanCheck(channel, ts) {
+  const hist = await slack.client.conversations.history({ channel, latest: ts, limit: 1, inclusive: true });
+  const msg = hist.messages && hist.messages[0];
+  if (!msg || msg.ts !== ts) return null;
+  const botId = process.env.SLACK_BOT_USER_ID;
+  for (const r of msg.reactions || []) {
+    if (!CAMPAIGN_APPROVE_EMOJIS.has(String(r.name || '').split('::')[0])) continue;
+    const u = (r.users || []).find(x => x !== botId);
+    if (u) return u;
+  }
+  return null;
+}
+
+// One reminder per alert still not handled 2h (window time) after the post.
+// Skipped, and the alert closed, when a ✅ is found on the message or the reply
+// was answered in GHL meanwhile.
+async function seqRunReminders(now, stats) {
+  const { data, error } = await supabase.from('agent_knowledge').select('key, value')
+    .eq('category', 'process').like('key', `${SEQ_REPLY_KEY}:%`)
+    .gte('updated_at', new Date(now - sequenceReplies.CONFIG.reminderMaxAgeMs - 60 * 60 * 1000).toISOString())
+    .limit(1000);
+  if (error) throw new Error(`alert history read failed: ${error.message}`);
+  for (const row of data || []) {
+    let rec = null;
+    try { rec = JSON.parse(row.value); } catch (_) { continue; }
+    if (!rec || rec.s !== 'posted' || !rec.ts || !rec.ch) continue;
+    if (!sequenceReplies.reminderDue({ now, postedAt: rec.at, handledAt: rec.handledAt, remindedAt: rec.remindedAt })) continue;
+    const reactor = await seqHumanCheck(rec.ch, rec.ts).catch(() => null);
+    if (reactor) {
+      await seqSwap(row.key, row.value, { ...rec, handledBy: reactor, handledAt: now, via: 'scan' }, now).catch(() => {});
+      stats.handledByScan++;
+      continue;
+    }
+    const msgs = rec.conv ? await ghlGetConversationMessages(rec.conv).catch(() => null) : null;
+    if (msgs && sequenceReplies.answeredInGhl({ messages: msgs, replyAt: rec.replyAt, threadId: rec.th, isAutomatedBody: strikeIsAutomatedBody })) {
+      await seqSwap(row.key, row.value, { ...rec, handledBy: 'ghl', handledAt: now }, now).catch(() => {});
+      stats.answeredInGhl++;
+      continue;
+    }
+    const next = { ...rec, remindedAt: now };
+    if (!(await seqSwap(row.key, row.value, next, now))) continue; // a ✅ or another process got there first
+    try {
+      await slack.client.chat.postMessage({
+        channel: rec.ch, thread_ts: rec.ts,
+        text: sequenceReplies.formatReminder({ mentions: rec.mentions, contactName: rec.name, postedAt: rec.at, now }),
+      });
+      stats.reminders++;
+    } catch (err) {
+      await seqSwap(row.key, JSON.stringify(next), rec, now).catch(() => {});
+      stats.postFailures++;
+      console.error(`seq-reply: reminder failed for ${row.key}:`, err.message);
+    }
+  }
+}
+
+// ✅ on an alert (reaction_added Route -0.5): record who handled it, once.
+async function handleSequenceReplyReaction(event, payload) {
+  if (!payload || !payload.email_id) return;
+  const key = seqKey(payload.email_id);
+  const { data, error } = await supabase.from('agent_knowledge').select('value').eq('category', 'process').eq('key', key).maybeSingle();
+  if (error) { console.warn(`seq-reply: handled read failed for ${key}: ${error.message}`); return; }
+  let rec = null;
+  try { rec = data ? JSON.parse(data.value) : null; } catch (_) { rec = null; }
+  if (rec && rec.handledAt) return; // already recorded; a second ✅ changes nothing
+  const now = Date.now();
+  // A ✅ that lands before the post's record is written still closes the alert:
+  // the row is marked posted here, so a restart never reads it as a dead claim.
+  const next = { ...(rec || {}), s: 'posted', ch: event.item.channel, ts: event.item.ts,
+    cid: (rec && rec.cid) || payload.contact_id, conv: (rec && rec.conv) || payload.conversation_id,
+    handledBy: event.user, handledAt: now };
+  const ok = data ? await seqSwap(key, data.value, next, now) : await seqInsert(key, next, now);
+  if (!ok) return;
+  await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts, text: `✅ Atendido por <@${event.user}>.` })
+    .catch(e => console.error('seq-reply: handled note failed:', e.message));
+  logActivity({
+    event_type: 'sequence_reply_handled', event_source: 'slack', action: 'seqReply:handled', status: 'ok', actor_user_id: event.user,
+    output: { email_id: payload.email_id, contact_id: payload.contact_id, minutes_to_handle: rec && rec.at ? Math.round((now - rec.at) / 60000) : null },
+  });
+}
+
+async function runSequenceReplyAlerts(correlationId, { now = Date.now() } = {}) {
+  if (seqReplyDisabled()) { console.log('Sequence reply alerts disabled (SEQ_REPLY_ALERTS_DISABLED=true).'); return { ok: true, disabled: true }; }
+  if (_seqRunning) { console.log('Sequence reply alerts: previous run still going, skipping this one.'); return { ok: true, skipped: true }; }
+  _seqRunning = true;
+  try {
+    const stats = {
+      since: null, firstRun: false, convos: 0, unchanged: 0, threadReads: 0, emailReads: 0, posted: 0, invalid: 0,
+      reminders: 0, handledByScan: 0, answeredInGhl: 0, postFailures: 0, convoErrors: 0, reportErrors: 0, skips: {}, alerts: [],
+    };
+    const errors = [];
+    const wmKey = `${SEQ_REPLY_RUN_KEY}:watermark`;
+    const failKey = `${SEQ_REPLY_RUN_KEY}:failures`;
+    let state = null;
+    try { state = await hotReadKnowledge([wmKey, failKey]); } catch (err) { errors.push(`state read: ${err.message}`); }
+    if (state) {
+      const { since, firstRun } = sequenceReplies.sinceFor({ now, watermark: Number(state.get(wmKey)) });
+      stats.since = new Date(since).toISOString();
+      stats.firstRun = firstRun;
+      try { await seqScanReplies(now, since, stats); } catch (err) { errors.push(`scan: ${err.message}`); }
+    }
+    try { await seqRunReminders(now, stats); } catch (err) { errors.push(`reminders: ${err.message}`); }
+
+    // The watermark only moves after a clean run, so a failed conversation is
+    // re-read next time (decided replies are keyed and never re-alert).
+    if (state && !errors.length && !stats.convoErrors && !stats.postFailures) {
+      const res = await upsertKnowledge('process', wmKey, String(now), SEQ_REPLY_KEY);
+      if (!String(res).startsWith('Knowledge saved')) console.warn(`seq-reply: watermark not saved: ${res}`);
+    }
+    // Fail closed: a broken read is never an all-clear. One post after three bad
+    // runs in a row (30 min), counter reset by the next good run.
+    const prev = state ? (Number(state.get(failKey)) || 0) : 0;
+    const fail = hotReplies.nextFailureState(prev, errors.length > 0);
+    if (fail.count !== prev) await upsertKnowledge('process', failKey, String(fail.count), SEQ_REPLY_KEY);
+    if (fail.postBroken) {
+      await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text: `⚠️ *CHECK BROKEN*: sequence email reply alerts failed ${fail.count} runs in a row. Prospect email replies are NOT reaching #ng-sales-goats; this is not an all-clear.\n${errors.join('\n')}\n<@${RON_SLACK_ID}>` })
+        .catch(e => console.error('seq-reply broken post failed:', e.message));
+    }
+
+    console.log(`Sequence reply alerts${stats.firstRun ? ' (first run, 3-day backfill)' : ''}: since ${stats.since || '-'}, ${stats.convos} email chats, ${stats.unchanged} unchanged, ${stats.threadReads} read, ${stats.emailReads} emails fetched, ${stats.posted} posted, ${stats.reminders} reminders, skips ${JSON.stringify(stats.skips)}${stats.invalid ? `, ${stats.invalid} failed contract` : ''}${stats.convoErrors ? `, ${stats.convoErrors} chat errors` : ''}${stats.postFailures ? `, ${stats.postFailures} post failures` : ''}${errors.length ? ` · ERRORS: ${errors.join(' | ')}` : ''}`);
+    await logActivity({
+      event_type: 'audit', event_source: 'cron', action: 'sequence_reply_alerts',
+      status: errors.length || stats.convoErrors || stats.postFailures ? 'degraded' : 'ok',
+      output: stats, error_message: errors.length ? errors.join(' | ').slice(0, 2000) : null,
+      correlation_id: correlationId,
+    });
+    return { ok: !errors.length, stats, errors };
+  } finally {
+    _seqRunning = false;
+  }
+}
+
+// Every 10 min around the clock: an alert posts whenever a reply lands; only
+// the reminder waits for the window. Declared in STATIC_CRON_SCHEDULES.
+cron.schedule('*/10 * * * *', wrapCronJob('runSequenceReplyAlerts', async (c) => { await runSequenceReplyAlerts(c); }, { timeoutMs: 8 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: sequence email reply alerts (*/10 * * * *)');
+// ─── end sequence email reply alerts ────────────────────────────────────────
+
 // ─── CONTENT BRIDGE: 24H SETTER CARD ────────────────────────────────────────
 // The day before each flywheel strategy call, DM the setter who owns the
 // prospect a card with the ready-to-copy WhatsApp from section (d) of
@@ -21343,6 +21704,7 @@ const STATIC_CRON_SCHEDULES = {
   runSetterHotRepliesDigest:    '0 18 * * 1-5',
   runStaleLeadNagCheck:         '*/30 7-20 * * *',
   runHotReplyCheck:             '*/15 * * * *',
+  runSequenceReplyAlerts:       '*/10 * * * *',
   runBridge24hCards:            '15 8-20 * * *',
   runIgGuideCheck:              '*/5 * * * *',
   runStalledProspectFollowups:  '0 11 * * 1-5',
@@ -22546,7 +22908,8 @@ slack.event('reaction_added', async ({ event }) => {
     }
 
     // Route -0.5: client attention alert (✅ handled, 💤 snoozed), channel or
-    // DM (dry-run alerts land in Ron's DMs), identified by message metadata.
+    // DM (dry-run alerts land in Ron's DMs), and sequence email reply alerts
+    // (✅ handled), both identified by message metadata.
     // Sits ahead of Route 0 because Route 0/1 swallow DM ✅ with no matching
     // metadata. Falls through untouched on any miss.
     if (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || baseEmoji === OPEN_DEAL_SNOOZE_EMOJI) {
@@ -22557,6 +22920,12 @@ slack.event('reaction_added', async ({ event }) => {
         const msg = hist.messages && hist.messages[0];
         if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === 'client_attention_alert' && msg.metadata.event_payload) {
           await handleClientAttentionReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+        // Sequence email reply alert in #ng-sales-goats: ✅ = handled. Ahead of
+        // the lead-claim route, which also takes ✅ in that channel.
+        if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === SEQ_REPLY_EVENT && CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) {
+          await handleSequenceReplyReaction(event, msg.metadata.event_payload);
           return;
         }
       } catch (caErr) {
