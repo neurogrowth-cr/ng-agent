@@ -19066,6 +19066,24 @@ const reelsWeeklyDisabled = () => String(process.env.REELS_WEEKLY_DISABLED || ''
 // Routing is tested in test/reels-channel.test.js.
 const reelsWeeklyLive = () => String(process.env.REELS_WEEKLY_MODE || 'live') === 'live' && !!REELS_CHANNEL;
 const reelsMetaWired = () => !!String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
+const reelsOutlier = require('./lib/reelsOutlier');
+
+// Trailing weeks of reel_stats for the outlier multiple and the verdict
+// (lib/reelsOutlier.js, Ron 2026-10-23): reel rows give the account's median,
+// account rows give new followers. Null when the read fails, so the report
+// prints s/d (or falls back to the batch median and says so) instead of a wrong
+// multiple. Shared by the weekly, the daily brief and the monthly report.
+async function fetchReelHistory(isoWeeks) {
+  try {
+    const { data, error } = await supabase.from('reel_stats').select('iso_week, post_id, kind, reach, views, shares, followers')
+      .in('iso_week', isoWeeks).in('kind', ['reel', 'account']);
+    if (error) throw new Error(error.message);
+    return data || [];
+  } catch (err) {
+    console.warn(`[reels] reel_stats history read failed: ${err.message}`);
+    return null;
+  }
+}
 
 async function fetchReelsGhlPosts(window) {
   const locationId = process.env.GHL_LOCATION_ID;
@@ -19169,7 +19187,8 @@ async function runReelsWeekly({ now = new Date() } = {}) {
     console.warn(`[reels-weekly] previous week read failed: ${err.message}`);
   }
 
-  const text = reelsWeekly.formatPost({ window, posts, account, prevAccount, metaWired });
+  const history = await fetchReelHistory(reelsOutlier.trailingWeeks(window.start));
+  const text = reelsWeekly.formatPost({ window, posts, account, prevAccount, metaWired, history });
   const verdict = reelsWeekly.validatePost(text, { posts, account });
   if (!verdict.ok) {
     await reportReelsWeeklyFailure(verdict.problems.join('; '));
@@ -19295,7 +19314,8 @@ async function runReelsDailyBrief({ now = new Date() } = {}) {
   try {
     reels = reelsBriefs.normalizeMedia(await fetchIgReels(Math.min(w.prevWeekStart.getTime(), w.monthStart.getTime())));
   } catch (err) { errors.push(`meta: ${err.message}`); }
-  const text = reelsBriefs.formatDaily({ now, schedule, reels, viewsBlock: await organicViewsDailyBlock(now) });
+  const history = reels ? await fetchReelHistory(reelsOutlier.trailingWeeks(w.weekStart)) : null;
+  const text = reelsBriefs.formatDaily({ now, schedule, reels, viewsBlock: await organicViewsDailyBlock(now), history });
   const verdict = reelsBriefs.validateDaily(text);
   if (!verdict.ok) return reportReelsBriefFailure('runReelsDailyBrief', `contrato: ${verdict.problems.join('; ')}`);
   await slack.client.chat.postMessage({ channel: reelsBriefsTarget(), text, unfurl_links: false, unfurl_media: false });
@@ -19313,7 +19333,8 @@ async function runReelsMonthlyReport({ now = new Date() } = {}) {
     reels = reelsBriefs.normalizeMedia(await fetchIgReels(mw.previousStart.getTime()));
   } catch (err) { metaError = err.message; }
   const reportedCount = reels ? reels.filter((r) => r.publishedAt >= mw.reportedStart && r.publishedAt < mw.reportedEnd).length : 0;
-  const text = reelsBriefs.formatMonthly({ now, reels });
+  const history = reportedCount ? await fetchReelHistory(reelsOutlier.trailingWeeks(now)) : null;
+  const text = reelsBriefs.formatMonthly({ now, reels, history });
   const verdict = reelsBriefs.validateMonthly(text, { reportedCount });
   if (!verdict.ok) return reportReelsBriefFailure('runReelsMonthlyReport', `contrato: ${verdict.problems.join('; ')}`);
   // "Lectura": 2-3 lines on what the top reels share and one suggestion. Optional
