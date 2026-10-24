@@ -9379,7 +9379,7 @@ slack.message(async ({ message, say }) => {
   // A reply in the thread of an Instagram guide draft is Ron's edited text for
   // the lead, not a message to Max: never answer it (the chat model once
   // invented a contact name replying to one). ✅ sends it; one hint, no LLM.
-  if (dmThreadTs && await igGuideDraftParent(message.channel, message.ts)) {
+  if (dmThreadTs && await slackMetadataParent(message.channel, message.ts, new Set(['ig_guide_draft', GUARDIAN_EVENT]))) {
     try { await slack.client.reactions.add({ channel: message.channel, timestamp: message.ts, name: 'pencil2' }); } catch (_) { /* already reacted */ }
     return;
   }
@@ -16648,6 +16648,11 @@ const STRIKE_LEAD_SILENCE_MS = 24 * 60 * 60 * 1000; // lead quiet this long ⇒ 
 const STRIKE_TOUCH_TYPES = new Set([
   'TYPE_WHATSAPP', 'TYPE_FACEBOOK', 'TYPE_INSTAGRAM', 'TYPE_SMS', 'TYPE_EMAIL', 'TYPE_CALL',
 ]);
+// The pipeline guardian sends approved strikes through the API as the GHL user
+// "Max AI" (phase A spec, step 10). Those arrive with a non-'app' source, which
+// the automated-send rule below would discard, so a message whose userId is
+// Max AI's counts as a human touch. Same id as IG_GUIDE_MAX_GHL_USER_ID.
+const STRIKE_MAX_AI_USER_ID = process.env.IG_GUIDE_MAX_GHL_USER_ID || 'cfLku0XE7BznqtmBSDmX';
 // Meta Business Suite auto replies (Inbox → Automations: "Auto reply" on the
 // first DM, "Comment to message" on ad/post comments, both enabled 2026-09-22)
 // exist so that GHL creates the contact + New Lead card the moment someone
@@ -16797,7 +16802,8 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
 
   const newest = touches[touches.length - 1];
   if (String(newest.direction || '').toLowerCase() !== 'outbound') return { skip: 'lead_spoke_last' };
-  if (String(newest.source    || '').toLowerCase() !== 'app')      return { skip: 'automated_send' };
+  if (String(newest.source    || '').toLowerCase() !== 'app'
+      && String(newest.userId || '') !== STRIKE_MAX_AI_USER_ID)    return { skip: 'automated_send' };
   if (strikeIsAutomatedBody(newest.body))                          return { skip: 'automated_send' };
 
   const touchTs = Date.parse(newest.dateAdded || newest.createdAt || 0) || 0;
@@ -20297,6 +20303,8 @@ async function runHotReplyLadder(now, correlationId, stats) {
 
   // Ron holds Instagram guide replies (ig_guide_drafts); the setter is the 12 h backstop.
   const igHeld = work.length ? await igGuideHeldConversations(now) : new Set();
+  // The pipeline guardian holds leads whose card (younger than 12 h) waits on the setter.
+  const guardianHeld = work.length ? await guardianHeldConversations(now) : new Set();
   const known = await hotReadKnowledge(work.flatMap(w => [
     `${HOT_REPLY_KEY}:verdict:${w.analysis.newestId}`,
     `${HOT_REPLY_KEY}:poke1:${w.analysis.anchorId}`,
@@ -20334,6 +20342,7 @@ async function runHotReplyLadder(now, correlationId, stats) {
       poke2At: hotParse(known.get(p2Key))?.at || (_hotSentGuard.has(p2Key) ? now : null),
     };
     if (igHeld.has(w.convo.id)) { stats.skips.ig_guide_pending = (stats.skips.ig_guide_pending || 0) + 1; continue; }
+    if (guardianHeld.has(w.convo.id)) { stats.skips.guardian_pending = (stats.skips.guardian_pending || 0) + 1; continue; }
     const step = hotReplies.nextAlertStep({ now, anchorAt: w.analysis.anchorAt, verdict: verdict.verdict, sent });
     if (!step) continue;
     const key = step === 'poke1' ? p1Key : p2Key;
@@ -21256,9 +21265,12 @@ async function igGuideHandBack({ conversationId, contactId, contactName, reason,
   logActivity({ event_type: 'report', event_source: 'cron', action: 'igGuideHandBack', status: 'ok', output: { contact_id: contactId, reason: reason.kind } });
 }
 
-// The ig_guide_draft message a thread reply hangs under, or null. Reads the
-// reply, then its parent with metadata. Any failure means "not a draft thread".
-async function igGuideDraftParent(channel, replyTs) {
+// The card a thread reply hangs under, or null: reads the reply, then its
+// parent with metadata, and returns the parent when its event_type is one of
+// `eventTypes` (a string or a Set). Any failure means "not a card thread".
+// Shared by the Instagram guide drafts and the pipeline guardian cards.
+async function slackMetadataParent(channel, replyTs, eventTypes) {
+  const wanted = eventTypes instanceof Set ? eventTypes : new Set([eventTypes]);
   try {
     const r = await slack.client.conversations.replies({ channel, ts: replyTs, limit: 1, inclusive: true });
     const reply = (r.messages || []).find((m) => m.ts === replyTs) || (r.messages || [])[0];
@@ -21266,8 +21278,12 @@ async function igGuideDraftParent(channel, replyTs) {
     if (!threadTs || threadTs === replyTs) return null;
     const p = await slack.client.conversations.replies({ channel, ts: threadTs, limit: 1, inclusive: true, include_all_metadata: true });
     const parent = p.messages && p.messages[0];
-    return parent && parent.ts === threadTs && parent.metadata?.event_type === 'ig_guide_draft' && parent.metadata.event_payload ? parent : null;
+    return parent && parent.ts === threadTs && wanted.has(parent.metadata?.event_type) && parent.metadata.event_payload ? parent : null;
   } catch (_) { return null; }
+}
+// The ig_guide_draft message a thread reply hangs under, or null.
+async function igGuideDraftParent(channel, replyTs) {
+  return slackMetadataParent(channel, replyTs, 'ig_guide_draft');
 }
 
 async function igGuideThreadReply(channel, ts, text) {
@@ -21354,6 +21370,666 @@ async function igGuideHeldConversations(now) {
 cron.schedule('*/5 * * * *', wrapCronJob('runIgGuideCheck', async (c) => { await runIgGuideCheck(c); }, { timeoutMs: 4 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: Instagram guide replies (*/5 * * * *)');
 // ─── end Instagram guide replies ────────────────────────────────────────────
+
+// ─── PIPELINE GUARDIAN (phase A: draft, Sebastián approves) ─────────────────
+// Max reads every inbound message and every silence on the Appointment Setting
+// pipeline (New Lead to Strike 3 plus Hot Strike), drafts the next reply or
+// strike in usted, and DMs Sebastián a one-tap card: ✅ sends through GHL on the
+// lead's channel (his thread reply, if any, is sent instead of the draft), ❌
+// discards. Leads that need a person (call request, question outside the FAQ,
+// hot verdict, objection outside the playbook) get a signal card with a
+// suggestion and are assigned to Sebastián in GHL; nothing is sent. Stops
+// (unsubscribe, angry, legal, sensitive, already a client) tag the contact
+// `guardian-off`; legal and sensitive also DM Ron. One row per action in
+// guardian_actions (migration 022); the send is claimed atomically through the
+// RPC guardian_claim_send so a double ✅ never sends twice. Meta allows free text
+// only within 24 h of the lead's last message: a closed window moves the
+// message to email when the contact has one, otherwise it is skipped
+// (WhatsApp templates are a later step). While a card younger than 12 h waits,
+// hot reply alerts do not poke the setter for that conversation.
+//   GUARDIAN_MODE=off (default) | shadow (cards to Ron's DM only, nothing to
+//   Sebastián, nothing to GHL) | draft (phase A). GUARDIAN_DISABLED=true stops
+//   drafting, sending and assigning in one deploy.
+// Decision: plan-of-record UPDATE 2026-10-24 (Oscar leaves 2026-10-31; shadow
+// from 2026-11-03, draft from 2026-11-06). Spec: tasks/specs/pipeline-guardian-
+// phase-a.md. Rules in lib/pipelineGuardian.js, tested in
+// test/pipeline-guardian.test.js.
+const guardian = require('./lib/pipelineGuardian');
+const GUARDIAN_KEY = 'guardian';
+const GUARDIAN_EVENT = 'guardian_action';
+const GUARDIAN_OFF_TAG = 'guardian-off';
+const GUARDIAN_MODES = new Set(['off', 'shadow', 'draft']);
+// 'live' (phase B) is not built: any value outside the set reads as off.
+function guardianMode() {
+  const m = String(process.env.GUARDIAN_MODE || 'off').trim().toLowerCase();
+  return GUARDIAN_MODES.has(m) ? m : 'off';
+}
+const guardianDisabled = () => String(process.env.GUARDIAN_DISABLED || '') === 'true';
+const guardianActive = () => !guardianDisabled() && guardianMode() !== 'off';
+// A channel left out is read but never written to.
+const GUARDIAN_CHANNELS = new Set(String(process.env.GUARDIAN_CHANNELS || 'whatsapp,instagram,facebook,email').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+const GUARDIAN_MAX_DRAFTS_PER_RUN = Number(process.env.GUARDIAN_MAX_DRAFTS_PER_RUN || guardian.CONFIG.maxDraftsPerRun);
+// The 4b green ceiling. Without it a 1,000-card backlog of silent leads would
+// flood the DM with strikes at 8 per run, 52 runs a day.
+const GUARDIAN_MAX_CARDS_PER_DAY = Number(process.env.GUARDIAN_MAX_CARDS_PER_DAY || 40);
+// Silent cards are read round robin, this many per run; replies always go first.
+const GUARDIAN_MAX_SILENT_READS = Number(process.env.GUARDIAN_MAX_SILENT_READS || 40);
+const GUARDIAN_SETTER_SLACK_ID = process.env.GUARDIAN_SETTER_SLACK_ID || 'U0BFA4SRVQC'; // Sebastián
+const GUARDIAN_SETTER_GHL_ID = process.env.GUARDIAN_SETTER_GHL_ID || 'Wdjte1temxfR0lpi5RGV';
+const GUARDIAN_FAQ = String(process.env.GUARDIAN_FAQ || '').trim() || guardian.DEFAULT_FAQ;
+const GUARDIAN_EMAIL_SUBJECT = process.env.GUARDIAN_EMAIL_SUBJECT || 'Seguimiento de NeuroGrowth';
+const _guardianThreadCache = new Map();  // conversationId → { lastMessageDate, messages }
+const _guardianVerdictCache = new Map(); // newest inbound message id → classification
+let _guardianSilentCursor = 0;
+let _guardianFirstRunStored = false;
+const guardianSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const guardianReact = igGuideReact;
+const guardianThreadReply = igGuideThreadReply;
+
+function guardianLog(action, status, output, correlationId = null) {
+  logActivity({ event_type: 'guardian', event_source: 'cron', action, status, output, correlation_id: correlationId });
+}
+
+// Intent + verdict with Haiku (Kai's intent classes plus the hot/normal/noise
+// verdict already in use). Cached per newest lead message in process and in
+// agent_knowledge without the summary or the ficha (a quote can carry an email
+// or phone, which the knowledge store refuses).
+async function guardianClassify(convo, analysis, correlationId) {
+  const cached = _guardianVerdictCache.get(analysis.newestId);
+  if (cached) return cached;
+  const key = `${GUARDIAN_KEY}:verdict:${analysis.newestId}`;
+  const stored = hotParse((await hotReadKnowledge([key])).get(key));
+  if (stored && stored.intent) { _guardianVerdictCache.set(analysis.newestId, stored); return stored; }
+  const prompt = guardian.buildClassifierPrompt({ contactName: convo.contactName || convo.fullName, tail: analysis.tail, faq: GUARDIAN_FAQ });
+  let cls = null;
+  for (let attempt = 0; attempt < 2 && !cls; attempt++) {
+    try {
+      const t0 = Date.now();
+      const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: 400, messages: [{ role: 'user', content: prompt }] });
+      logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'guardian_classifier');
+      cls = guardian.parseClassification((res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(''));
+    } catch (err) {
+      if (attempt) throw err;
+      await guardianSleep(15000); // spec 5: reprompt once, 15 s backoff
+    }
+  }
+  _guardianVerdictCache.set(analysis.newestId, cls);
+  await upsertKnowledge('process', key, JSON.stringify({ verdict: cls.verdict, intent: cls.intent, callRequest: cls.callRequest, faqCovered: cls.faqCovered, reason_es: cls.reason_es }), GUARDIAN_KEY);
+  return cls;
+}
+
+// The reply, strike, or signal suggestion: one reprompt on a broken or invalid
+// draft; a second failure reaches the setter as ⚠️ BORRADOR INVÁLIDO (4a).
+async function guardianDraft({ action, messages, convo, cls, stageName }, correlationId) {
+  const { system, user } = guardian.buildDraftPrompt({
+    action, thread: guardian.threadForPrompt(messages), contactName: convo.contactName || convo.fullName || '',
+    intentLabel: cls ? (guardian.INTENT_LABEL[cls.intent] || cls.intent) : guardian.INTENT_LABEL.silence,
+    stageName, faq: GUARDIAN_FAQ, channel: action.channel, bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL,
+  });
+  let feedback = '';
+  let last = { draft: '', problems: ['drafter returned nothing'], reason_es: '' };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      const t0 = Date.now();
+      res = await anthropic.messages.create({
+        model: MODEL_AGENT, max_tokens: 700, thinking: THINKING_OFF,
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: user + feedback }],
+      });
+      logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, action.kind === 'signal' ? 'guardian_suggester' : 'guardian_drafter');
+    } catch (err) {
+      last = { draft: '', problems: [`drafter failed: ${String(err.message || err).slice(0, 120)}`], reason_es: '' };
+      if (attempt) return last;
+      await guardianSleep(15000);
+      continue;
+    }
+    const parsed = guardian.parseDraft((res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(''));
+    if (!parsed.ok) { last = { draft: '', problems: [parsed.error], reason_es: '' }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
+    const v = guardian.validateDraft(parsed.draft, { allowedUrls: [IG_GUIDE_BOOKING_URL, IG_GUIDE_URL] });
+    last = { draft: parsed.draft, problems: v.problems, reason_es: parsed.reason_es };
+    if (v.ok) return last;
+    feedback = `\n\nSu borrador anterior rompió estas reglas: ${v.problems.join('; ')}. Corríjalo.`;
+  }
+  return last;
+}
+
+// Step 1: open cards in the guardian stages (same pipeline and paging helper as
+// the strike mover), joined to conversations both ways: leads who wrote in the
+// last 48 h come from conversations/search with tags, email, phone and opps on
+// the row; everyone else on the pipeline is silent and is read round robin.
+async function guardianPopulation(now, stats) {
+  const cards = [];
+  for (const stageId of guardian.GUARDIAN_STAGE_IDS) cards.push(...await ghlSearchOppsByStage(stageId));
+  const byContact = new Map();
+  for (const o of cards) if (o.contactId && !byContact.has(o.contactId)) byContact.set(o.contactId, o);
+  stats.cards = byContact.size;
+  const inbound = await hotSearchConversations(now - guardian.CONFIG.inboundLookbackMs, '&lastMessageDirection=inbound');
+  const waiting = [];
+  const seen = new Set();
+  for (const c of inbound) {
+    const card = byContact.get(c.contactId);
+    if (!card || seen.has(c.contactId)) continue;
+    seen.add(c.contactId);
+    const opps = Array.isArray(c.opportunities) ? c.opportunities.slice() : [];
+    if (!opps.some((o) => o.id === card.id)) opps.push({ id: card.id, pipelineId: card.pipelineId, pipelineStageId: card.pipelineStageId, status: card.status });
+    waiting.push({ convo: { ...c, opportunities: opps }, card });
+  }
+  const silentCards = [...byContact.values()].filter((o) => !seen.has(o.contactId)).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const silent = [];
+  if (silentCards.length) {
+    const start = _guardianSilentCursor % silentCards.length;
+    for (let i = 0; i < Math.min(GUARDIAN_MAX_SILENT_READS, silentCards.length); i++) silent.push(silentCards[(start + i) % silentCards.length]);
+    _guardianSilentCursor = (start + silent.length) % silentCards.length;
+  }
+  stats.silentCandidates = silentCards.length;
+  return { waiting, silent };
+}
+
+// A silent card has no conversation row: shape one from the opportunity.
+function guardianConvoFromCard(card, conversationId) {
+  const ct = card.contact || {};
+  return {
+    id: conversationId, contactId: card.contactId, contactName: ct.name || card.name || null, tags: ct.tags || [],
+    email: ct.email || null, phone: ct.phone || null, assignedTo: card.assignedTo || null,
+    lastMessageDirection: 'outbound', lastMessageType: null, lastMessageDate: null,
+    opportunities: [{ id: card.id, pipelineId: card.pipelineId, pipelineStageId: card.pipelineStageId, status: card.status }],
+  };
+}
+
+async function guardianMessages(convo) {
+  const cached = _guardianThreadCache.get(convo.id);
+  if (cached && convo.lastMessageDate && cached.lastMessageDate === convo.lastMessageDate) return cached.messages;
+  const messages = await ghlGetConversationMessages(convo.id);
+  if (convo.lastMessageDate) _guardianThreadCache.set(convo.id, { lastMessageDate: convo.lastMessageDate, messages });
+  return messages;
+}
+
+// Fail-closed counter (spec 5): 3 failed runs in a row post CHECK BROKEN.
+async function guardianFailureState(failed) {
+  const key = `${GUARDIAN_KEY}:failures`;
+  let prev = 0;
+  try { prev = Number(hotParse((await hotReadKnowledge([key])).get(key))?.count) || 0; } catch (_) { /* a failed read counts from zero */ }
+  const next = hotReplies.nextFailureState(prev, failed);
+  if (next.count !== prev) await upsertKnowledge('process', key, JSON.stringify({ count: next.count, at: Date.now() }), GUARDIAN_KEY);
+  return next;
+}
+
+// Shadow: the card goes to Ron's DM with the prefix and no metadata, so no
+// reaction can ever send. Draft mode posts to the setter inline, with the
+// metadata the reaction handler keys on.
+async function guardianPostShadowCard(text) {
+  return slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[SHADOW] Guardián en modo sombra: nada se envía ni se asigna. Así vería <@${GUARDIAN_SETTER_SLACK_ID}> esta tarjeta:\n${text}` });
+}
+
+async function runGuardianCheck(correlationId) {
+  if (!guardianActive()) return;
+  const mode = guardianMode();
+  const now = Date.now();
+  const stats = { mode, cards: 0, waiting: 0, silentCandidates: 0, silentRead: 0, leadsRead: 0, classified: 0, drafted: 0, signals: 0, stops: 0, skips: {}, failures: 0, capHit: false, dayCapHit: false };
+  try {
+    await guardianRun(now, mode, stats, correlationId);
+    await guardianFailureState(false);
+  } catch (err) {
+    stats.failures++;
+    const st = await guardianFailureState(true).catch(() => ({ count: 0, postBroken: false }));
+    if (st.postBroken) {
+      await postToSlack(AGENT_CHANNEL, `⚠️ CHECK BROKEN <@${RON_SLACK_ID}>: el guardián del pipeline falló ${st.count} corridas seguidas. Último error: ${String(err.message || err).slice(0, 200)}. No se redactó ni se envió nada.`).catch(() => {});
+    }
+    guardianLog('guardian_run', 'error', { ...stats, error: String(err.message || err).slice(0, 300) }, correlationId);
+    throw err;
+  }
+  guardianLog('guardian_run', 'ok', stats, correlationId);
+  if (!_guardianFirstRunStored) {
+    const key = `${GUARDIAN_KEY}:first_run_at`;
+    try {
+      const known = await hotReadKnowledge([key]);
+      if (!known.has(key)) await upsertKnowledge('process', key, new Date(now).toISOString(), GUARDIAN_KEY);
+      _guardianFirstRunStored = true;
+    } catch (_) { /* next run retries */ }
+  }
+}
+
+async function guardianRun(now, mode, stats, correlationId) {
+  const skip = (r) => { stats.skips[r] = (stats.skips[r] || 0) + 1; };
+  // Clients write to the same WhatsApp number. Without the client list a client
+  // could get a strike, so the run holds and counts as a failure (fail closed).
+  const clientEmails = await loadActiveClientEmails();
+  if (!clientEmails) throw new Error('client list unavailable (portal client_dashboards)');
+  const { waiting, silent } = await guardianPopulation(now, stats);
+  stats.waiting = waiting.length;
+
+  // One card per conversation, step and CR day; never a second card on a lead
+  // whose card still waits for a ✅.
+  const today = guardian.crDay(now);
+  const { data: todayRows, error: tErr } = await supabase.from('guardian_actions').select('conversation_id, step, status').eq('day', today);
+  if (tErr) throw new Error(`guardian_actions read: ${tErr.message}`);
+  const { data: openRows, error: oErr } = await supabase.from('guardian_actions').select('conversation_id').in('status', ['drafted', 'signal', 'approved', 'sending']);
+  if (oErr) throw new Error(`guardian_actions read: ${oErr.message}`);
+  const doneToday = new Set((todayRows || []).map((r) => `${r.conversation_id}|${r.step}`));
+  const openConvos = new Set((openRows || []).map((r) => r.conversation_id));
+  let cardsToday = (todayRows || []).filter((r) => !['skipped', 'stopped'].includes(r.status)).length;
+  const igHeld = await igGuideHeldConversations(now);
+  const made = () => stats.drafted + stats.signals;
+
+  const handle = async (convo, card) => {
+    try {
+      let c = convo;
+      if (!c) {
+        const convoId = await ghlFindConversationId(card.contactId);
+        if (!convoId) { skip('no_conversation'); return; }
+        c = guardianConvoFromCard(card, convoId);
+        stats.silentRead++;
+      }
+      const screen = guardian.guardianScreen(c, { now, clientEmails, igHeld, personalTag: PERSONAL_CONTACT_TAG, offTag: GUARDIAN_OFF_TAG });
+      if (!screen.keep) { skip(screen.reason); return; }
+      if (openConvos.has(c.id)) { skip('card_waiting'); return; }
+      if (cardsToday >= GUARDIAN_MAX_CARDS_PER_DAY) { stats.dayCapHit = true; skip('day_cap'); return; }
+      const messages = await guardianMessages(c);
+      stats.leadsRead++;
+      const thread = guardian.threadState(messages, { isAutomatedBody: strikeIsAutomatedBody });
+      const analysis = thread.leadSpokeLast ? hotReplies.analyzeThread(messages, { isAutomatedBody: strikeIsAutomatedBody }) : null;
+      let cls = null;
+      if (analysis) {
+        if (now - analysis.newestAt < guardian.CONFIG.settleMs) { skip('settling'); return; }
+        cls = await guardianClassify(c, analysis, correlationId);
+        stats.classified++;
+      }
+      const stageId = card.pipelineStageId;
+      const action = guardian.decideAction({
+        analysis, intent: cls && cls.intent, verdict: cls && cls.verdict,
+        signals: cls ? { callRequest: cls.callRequest, faqCovered: cls.faqCovered } : {},
+        thread, contact: { email: c.email, phone: c.phone }, stageId, now,
+      });
+      if (action.kind === 'skip') { skip(action.reason); return; }
+      if ((action.kind === 'reply' || action.kind === 'strike') && !GUARDIAN_CHANNELS.has(action.channel)) { skip(`channel_off_${action.channel}`); return; }
+      if (doneToday.has(`${c.id}|${action.step}`)) { skip('already_today'); return; }
+      const stageName = guardian.STAGE_NAME[stageId] || 'sin etapa';
+
+      let d = { draft: '', problems: [], reason_es: '' };
+      const needsDraft = action.kind === 'reply' || action.kind === 'strike' || (action.kind === 'signal' && ['outside_faq', 'objection'].includes(action.reason));
+      if (needsDraft) d = await guardianDraft({ action, messages, convo: c, cls, stageName }, correlationId);
+      else if (action.kind === 'signal') {
+        d.draft = action.reason === 'call_request'
+          ? 'El prospecto pide hablar: confirme el día y la hora y mande el enlace para agendar.'
+          : (cls && (cls.summary_es || cls.reason_es)) || 'Respuesta caliente: tómela usted.';
+      }
+      const row = {
+        contact_id: c.contactId, conversation_id: c.id, opportunity_id: card.id, contact_name: c.contactName || c.fullName || null,
+        channel: action.channel || thread.channel || 'whatsapp', step: action.step, kind: action.kind,
+        intent: cls ? cls.intent : (action.kind === 'strike' ? 'silence' : null), verdict: cls ? cls.verdict : null,
+        stage_id: stageId, mode, draft: d.draft || '', problems: d.problems.length ? d.problems.join('; ') : null,
+        status: action.kind === 'signal' ? 'signal' : action.kind === 'stop' ? 'stopped' : 'drafted',
+        lead_message_at: analysis ? new Date(analysis.newestAt).toISOString() : (thread.lastInboundAt ? new Date(thread.lastInboundAt).toISOString() : null),
+        our_last_message_at: thread.lastOutboundAt ? new Date(thread.lastOutboundAt).toISOString() : null,
+        window_closes_at: action.closesAt ? new Date(action.closesAt).toISOString() : null,
+        correlation_id: correlationId,
+      };
+      // Claim the (conversation, step, day) slot first: two overlapping runs must not DM twice.
+      const { data: ins, error: insErr } = await supabase.from('guardian_actions')
+        .upsert(row, { onConflict: 'conversation_id,step,day', ignoreDuplicates: true }).select('id');
+      if (insErr) throw new Error(`guardian_actions insert: ${insErr.message}`);
+      if (!ins || !ins.length) { skip('already_today'); return; }
+      const actionId = ins[0].id;
+      doneToday.add(`${c.id}|${action.step}`);
+      openConvos.add(c.id);
+      const contactLink = ghlContactLink(c.contactId);
+      const leadQuote = analysis ? analysis.quote : thread.lastInboundText;
+
+      if (action.kind === 'stop') {
+        stats.stops++;
+        await guardianStop({ convo: c, action, cls, leadQuote, contactLink, mode, actionId }, correlationId);
+        return;
+      }
+      const cardText = guardian.formatCard({
+        kind: action.kind, step: action.step, contactName: row.contact_name, channel: row.channel, intent: row.intent,
+        leadQuote, leadAt: analysis ? analysis.newestAt : thread.lastInboundAt, stageName, draft: d.draft, problems: d.problems,
+        closesAt: action.closesAt || null, ficha: cls && cls.ficha, contactLink, bookingUrl: IG_GUIDE_BOOKING_URL,
+      }, { now });
+      const contract = guardian.validateCard(cardText);
+      if (!contract.ok) throw new Error(`card contract: ${contract.problems.join('; ')}`);
+      const posted = mode === 'draft'
+        ? await slack.client.chat.postMessage({ channel: GUARDIAN_SETTER_SLACK_ID, text: cardText, metadata: { event_type: GUARDIAN_EVENT, event_payload: { action_id: actionId } } })
+        : await guardianPostShadowCard(cardText);
+      await supabase.from('guardian_actions').update({ slack_channel_id: posted.channel, slack_message_ts: posted.ts, updated_at: new Date().toISOString() }).eq('id', actionId);
+      cardsToday++;
+      const out = { action_id: actionId, contact_id: c.contactId, step: action.step, channel: row.channel, intent: row.intent, reason: action.reason, mode, problems: d.problems };
+      if (action.kind === 'signal') {
+        stats.signals++;
+        guardianLog('guardian_signal', 'ok', out, correlationId);
+        if (mode === 'draft') await guardianAssignSignal(c, card, correlationId);
+      } else {
+        stats.drafted++;
+        guardianLog('guardian_card', d.problems.length ? 'invalid_draft' : 'ok', out, correlationId);
+      }
+    } catch (err) {
+      stats.failures++;
+      console.error(`[guardian] ${card && card.contactId}: ${err.message}`);
+    }
+  };
+
+  for (const w of waiting) {
+    if (made() >= GUARDIAN_MAX_DRAFTS_PER_RUN) { stats.capHit = true; break; }
+    await handle(w.convo, w.card);
+  }
+  for (const card of silent) {
+    if (made() >= GUARDIAN_MAX_DRAFTS_PER_RUN) { stats.capHit = true; break; }
+    await handle(null, card);
+  }
+  if (stats.failures && !made() && stats.leadsRead === 0) throw new Error(`${stats.failures} conversation(s) failed and nothing was read`);
+}
+
+// Stop (3.1 row 5): the card is marked, the contact is tagged guardian-off in
+// draft mode, and Ron hears about legal_risk and sensitive in both modes.
+async function guardianStop({ convo, action, cls, leadQuote, contactLink, mode, actionId }, correlationId) {
+  let tagged = false;
+  if (mode === 'draft') {
+    try { await ghlAddContactTag(convo.contactId, GUARDIAN_OFF_TAG); tagged = true; }
+    catch (err) { console.error(`[guardian] tag ${GUARDIAN_OFF_TAG} failed for ${convo.contactId}: ${err.message}`); }
+  }
+  if (action.ron) {
+    const text = [
+      `${mode === 'shadow' ? '[SHADOW] ' : ''}🛡️ Guardián · alto · ${convo.contactName || 'Prospecto'} · ${guardian.INTENT_LABEL[action.reason] || action.reason}`,
+      `> ${String(leadQuote || '').replace(/\s+/g, ' ').slice(0, 300)}`,
+      cls && cls.reason_es ? `Por qué: ${cls.reason_es}` : null,
+      tagged ? `Etiqueta \`${GUARDIAN_OFF_TAG}\` puesta: el guardián no vuelve a escribirle.` : 'En modo sombra no se etiqueta ni se envía nada.',
+      `🔗 ${contactLink}`,
+    ].filter(Boolean).join('\n');
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text });
+  }
+  guardianLog('guardian_stop', 'ok', { action_id: actionId, contact_id: convo.contactId, reason: action.reason, tagged, ron: !!action.ron, mode }, correlationId);
+}
+
+// Signal handoff (step 9): the setter owns the card unless a human already does.
+async function guardianAssignSignal(convo, card, correlationId) {
+  const assigned = String(convo.assignedTo || card.assignedTo || '').toLowerCase();
+  if (assigned && assigned !== IG_GUIDE_MAX_GHL_USER_ID.toLowerCase() && assigned !== GUARDIAN_SETTER_GHL_ID.toLowerCase()) return;
+  if (assigned === GUARDIAN_SETTER_GHL_ID.toLowerCase()) return;
+  try {
+    const opps = await igGuideAssignInGhl(convo.contactId, GUARDIAN_SETTER_GHL_ID);
+    guardianLog('guardian_assigned', 'ok', { contact_id: convo.contactId, to: 'setter', opps }, correlationId);
+  } catch (err) {
+    guardianLog('guardian_assigned', 'error', { contact_id: convo.contactId, to: 'setter', error: err.message.slice(0, 200) }, correlationId);
+  }
+}
+
+// Step 9 on the first sent message: Max AI owns the contact and its setter
+// pipeline cards unless a human already does.
+async function guardianOwnOnFirstSend(row, correlationId) {
+  const { count, error } = await supabase.from('guardian_actions').select('id', { count: 'exact', head: true }).eq('contact_id', row.contact_id).eq('status', 'sent');
+  if (error || (count || 0) > 1) return;
+  const contact = await ghlGetContact(row.contact_id).catch(() => null);
+  const assigned = String((contact && contact.assignedTo) || '').toLowerCase();
+  if (assigned && assigned !== IG_GUIDE_MAX_GHL_USER_ID.toLowerCase()) return;
+  try {
+    const opps = await igGuideAssignInGhl(row.contact_id, IG_GUIDE_MAX_GHL_USER_ID);
+    guardianLog('guardian_assigned', 'ok', { contact_id: row.contact_id, to: 'max_ai', opps }, correlationId);
+  } catch (err) {
+    guardianLog('guardian_assigned', 'error', { contact_id: row.contact_id, to: 'max_ai', error: err.message.slice(0, 200) }, correlationId);
+  }
+}
+
+// ✅ / ❌ on a guardian card (Sebastián or Ron). ✅ on a signal marks it handled;
+// ✅ on a draft approves it, claims the send through the RPC, re-checks the
+// Meta window and the live thread, and sends on the row's channel.
+async function handleGuardianReaction(event, baseEmoji, msg, payload) {
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+  if (event.user !== GUARDIAN_SETTER_SLACK_ID && event.user !== RON_SLACK_ID) return;
+  const actionId = payload && payload.action_id;
+  if (!actionId) return;
+  const nowIso = new Date().toISOString();
+
+  if (CAMPAIGN_SKIP_EMOJIS.has(baseEmoji)) {
+    const { data } = await supabase.from('guardian_actions').update({ status: 'rejected', approved_by: event.user, updated_at: nowIso })
+      .eq('id', actionId).in('status', ['drafted', 'signal']).select('id, kind');
+    if (data && data.length) {
+      await guardianReact(channel, ts, 'no_entry');
+      guardianLog('guardian_card', 'rejected', { action_id: actionId, by: event.user, kind: data[0].kind });
+    }
+    return;
+  }
+  if (!CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) return;
+
+  const { data: sig } = await supabase.from('guardian_actions').update({ status: 'handled', approved_by: event.user, approved_at: nowIso, updated_at: nowIso })
+    .eq('id', actionId).eq('status', 'signal').select('id');
+  if (sig && sig.length) {
+    await guardianReact(channel, ts, 'white_check_mark');
+    guardianLog('guardian_signal', 'handled', { action_id: actionId, by: event.user });
+    return;
+  }
+
+  const { data: appr, error: aErr } = await supabase.from('guardian_actions').update({ status: 'approved', approved_by: event.user, approved_at: nowIso, updated_at: nowIso })
+    .eq('id', actionId).eq('status', 'drafted').select('id');
+  if (aErr) { await guardianThreadReply(channel, ts, `⚠️ No pude aprobar la tarjeta: ${aErr.message}`); return; }
+  if (!appr || !appr.length) {
+    const { data: cur } = await supabase.from('guardian_actions').select('status').eq('id', actionId).maybeSingle();
+    await guardianThreadReply(channel, ts, `Esta tarjeta ya no está pendiente (${cur ? cur.status : 'no existe'}). No envié nada.`);
+    return;
+  }
+  await guardianSendApproved(actionId, { channel, ts, actor: event.user });
+}
+
+async function guardianSendApproved(actionId, { channel, ts, actor }) {
+  const nowIso = () => new Date().toISOString();
+  // Zero tolerance (4b): nothing reaches a lead outside draft mode.
+  if (guardianMode() !== 'draft' || guardianDisabled()) {
+    await supabase.from('guardian_actions').update({ status: 'skipped', last_error: `mode ${guardianMode()}${guardianDisabled() ? ' disabled' : ''}`, updated_at: nowIso() }).eq('id', actionId);
+    await guardianThreadReply(channel, ts, 'El guardián no está en modo draft: no se envía nada.');
+    return;
+  }
+  const { data: claimed, error: cErr } = await supabase.rpc('guardian_claim_send', { p_id: actionId, p_actor: actor });
+  if (cErr) { await guardianThreadReply(channel, ts, `⚠️ No pude reclamar el envío: ${cErr.message}`); return; }
+  const row = Array.isArray(claimed) ? claimed[0] : claimed;
+  if (!row) { await guardianThreadReply(channel, ts, 'Otra persona ya tomó esta tarjeta. No envié nada.'); return; }
+  const now = Date.now();
+  const expire = async (why, emoji = 'hourglass') => {
+    await supabase.from('guardian_actions').update({ status: 'expired', last_error: why, updated_at: nowIso() }).eq('id', actionId);
+    await guardianThreadReply(channel, ts, `${why}. No envié nada.`);
+    await guardianReact(channel, ts, emoji);
+  };
+  if (row.window_closes_at && Date.parse(row.window_closes_at) <= now) {
+    await expire('La ventana de Meta ya cerró (ventana cerrada): Meta no deja enviar texto libre');
+    return;
+  }
+  // Live thread check (4d): never a second message while ours is the newest
+  // for a reply, never answer what a person already answered, never chase a
+  // lead who wrote since the card was made.
+  let messages;
+  try { messages = await ghlGetConversationMessages(row.conversation_id); }
+  catch (err) {
+    await supabase.from('guardian_actions').update({ status: 'drafted', last_error: `thread read: ${err.message.slice(0, 200)}`, updated_at: nowIso() }).eq('id', actionId);
+    await guardianThreadReply(channel, ts, `⚠️ No pude leer la conversación en GHL (${err.message.slice(0, 120)}). Quite y vuelva a poner ✅ para reintentar.`);
+    return;
+  }
+  const createdAt = Date.parse(row.created_at) || now;
+  if (row.kind === 'reply') {
+    const leadAt = Date.parse(row.lead_message_at) || createdAt;
+    if (hotReplies.firstAnswerAfter(messages, leadAt, strikeIsAutomatedBody)) { await expire('Alguien del equipo ya respondió'); return; }
+    if (messages.some((m) => m.direction === 'inbound' && hotReplies.msgTime(m) > leadAt)) { await expire('El prospecto escribió de nuevo: el borrador quedó viejo'); return; }
+  } else {
+    if (messages.some((m) => m.direction === 'inbound' && hotReplies.msgTime(m) > createdAt)) { await expire('El prospecto escribió después de la tarjeta'); return; }
+    if (hotReplies.firstAnswerAfter(messages, createdAt, strikeIsAutomatedBody)) { await expire('Alguien del equipo ya le escribió'); return; }
+  }
+
+  let threadReplies = [];
+  try {
+    const r = await slack.client.conversations.replies({ channel, ts, limit: 50 });
+    threadReplies = (r.messages || []).filter((m) => m.ts !== ts);
+  } catch (e) { console.warn('[guardian] thread read failed:', e.message); }
+  const pick = guardian.pickSendText({ draft: row.draft, threadReplies, approverIds: [GUARDIAN_SETTER_SLACK_ID, RON_SLACK_ID] });
+  if (!pick.text || (!pick.edited && row.problems)) {
+    await supabase.from('guardian_actions').update({ status: 'drafted', updated_at: nowIso() }).eq('id', actionId);
+    await guardianThreadReply(channel, ts, 'No hay texto válido para enviar. Escriba la respuesta en este hilo y vuelva a marcar ✅.');
+    return;
+  }
+
+  const sendType = guardian.CHANNEL_SEND_TYPE[row.channel];
+  if (!sendType || !GUARDIAN_CHANNELS.has(row.channel)) {
+    await supabase.from('guardian_actions').update({ status: 'skipped', last_error: `channel ${row.channel} not enabled`, updated_at: nowIso() }).eq('id', actionId);
+    await guardianThreadReply(channel, ts, `El canal ${row.channel} no está habilitado para el guardián. No envié nada.`);
+    return;
+  }
+  const body = { type: sendType, contactId: row.contact_id, message: pick.text };
+  if (sendType === 'Email') { body.subject = GUARDIAN_EMAIL_SUBJECT; body.html = pick.text.split('\n').map(escapeHtml).join('<br>'); }
+  let data = null, lastErr = null;
+  for (let attempt = 0; attempt < 2 && !data; attempt++) {
+    if (attempt) await guardianSleep(30000); // spec 5: retry once after 30 s
+    try {
+      const res = await ghlFetch('https://services.leadconnectorhq.com/conversations/messages', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, { retries: 0, label: 'guardian send' });
+      if (!res.ok) { lastErr = `GHL ${res.status}: ${(await res.text()).slice(0, 200)}`; continue; }
+      data = await res.json().catch(() => ({}));
+    } catch (err) { lastErr = err.message; }
+  }
+  if (!data) {
+    await supabase.from('guardian_actions').update({ status: 'send_failed', last_error: String(lastErr).slice(0, 300), updated_at: nowIso() }).eq('id', actionId);
+    await guardianReact(channel, ts, 'warning');
+    await guardianThreadReply(channel, ts, `❌ No se envió: ${String(lastErr).slice(0, 200)}. El prospecto sigue con quien lo tenía; la tarjeta queda en el resumen de las 18:00.`);
+    guardianLog('guardian_sent', 'error', { action_id: actionId, channel: row.channel, error: String(lastErr).slice(0, 200) });
+    return;
+  }
+  await supabase.from('guardian_actions').update({
+    status: 'sent', sent_at: nowIso(), sent_text: pick.text, edited: pick.edited, message_id: data.messageId || null, last_error: null, updated_at: nowIso(),
+  }).eq('id', actionId);
+  await guardianReact(channel, ts, 'white_check_mark');
+  await guardianThreadReply(channel, ts, pick.edited ? 'Enviado con su texto.' : 'Enviado.');
+  guardianLog('guardian_sent', 'ok', { action_id: actionId, contact_id: row.contact_id, channel: row.channel, step: row.step, edited: pick.edited, by: actor, mode: guardianMode() });
+  await guardianOwnOnFirstSend(row, null);
+}
+
+// Conversations whose fresh card waits on the setter: hot reply alerts hold off.
+async function guardianHeldConversations(now) {
+  if (!guardianActive() || guardianMode() !== 'draft') return new Set();
+  const { data, error } = await supabase.from('guardian_actions').select('conversation_id')
+    .in('status', ['drafted', 'signal']).gte('created_at', new Date(now - guardian.CONFIG.holdMs).toISOString());
+  if (error) { console.warn(`[guardian] held read failed: ${error.message}`); return new Set(); }
+  return new Set((data || []).map((r) => r.conversation_id));
+}
+
+// Day and 7-day numbers shared by the digest and the watchdog.
+async function guardianStats(now) {
+  const dayStartIso = new Date(Date.parse(`${guardian.crDay(now)}T00:00:00-06:00`)).toISOString();
+  const weekAgoIso = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const { data: rows, error } = await supabase.from('guardian_actions')
+    .select('id, kind, status, mode, approved_by, lead_message_at, created_at, approved_at, sent_at, updated_at, window_closes_at')
+    .gte('created_at', weekAgoIso).limit(5000);
+  if (error) throw new Error(`guardian_actions read: ${error.message}`);
+  const all = rows || [];
+  const today = all.filter((r) => r.created_at >= dayStartIso);
+  const decided = all.filter((r) => ['approved', 'sending', 'sent', 'send_failed', 'handled', 'rejected'].includes(r.status));
+  const approvals = decided.filter((r) => r.status !== 'rejected').length;
+  const rejections = decided.length - approvals;
+  const cards7 = all.filter((r) => r.kind !== 'stop');
+  const expired7 = cards7.filter((r) => r.status === 'expired').length;
+  const minutes = today.filter((r) => r.kind === 'reply' && r.lead_message_at).map((r) => (Date.parse(r.created_at) - Date.parse(r.lead_message_at)) / 60000);
+  return {
+    dayStartIso,
+    leadsRead: 0,
+    drafts: today.filter((r) => r.kind === 'reply' || r.kind === 'strike').length,
+    signals: today.filter((r) => r.kind === 'signal').length,
+    sent: today.filter((r) => r.status === 'sent' || (r.sent_at && r.sent_at >= dayStartIso)).length,
+    expired: today.filter((r) => r.status === 'expired').length,
+    cardsToday: today.filter((r) => !['skipped', 'stopped'].includes(r.status) && r.kind !== 'stop').length,
+    medianMinutes: guardian.median(minutes),
+    approvals, rejections,
+    approvalRate: decided.length ? approvals / decided.length : null,
+    expiredShare: cards7.length ? expired7 / cards7.length : null,
+    sentInShadowOrOff: all.filter((r) => r.status === 'sent' && r.mode !== 'draft').length,
+    sentWithoutApproval: all.filter((r) => r.status === 'sent' && !r.approved_by).length,
+    divergence: all.filter((r) => ['approved', 'sending'].includes(r.status) && now - Date.parse(r.updated_at || r.approved_at || r.created_at) > 10 * 60 * 1000).length,
+  };
+}
+
+// 18:00 Mon to Sat: cards still waiting, grouped by expiry, with the day's counts.
+async function runGuardianDigest(correlationId) {
+  if (!guardianActive()) return;
+  const now = Date.now();
+  const mode = guardianMode();
+  const { data: waiting, error } = await supabase.from('guardian_actions')
+    .select('contact_name, channel, step, status, window_closes_at, created_at')
+    .in('status', ['drafted', 'signal']).order('created_at', { ascending: true });
+  if (error) throw new Error(`guardian_actions read: ${error.message}`);
+  const stats = await guardianStats(now);
+  const { data: runs } = await portalSupabase.from('agent_activity').select('output').eq('event_type', 'guardian').eq('action', 'guardian_run').gte('created_at', stats.dayStartIso);
+  stats.leadsRead = (runs || []).reduce((n, r) => n + (Number(r.output && r.output.leadsRead) || 0), 0);
+  const text = guardian.formatDigest(waiting, { now, stats });
+  if (!text) return;
+  if (mode === 'draft') await slack.client.chat.postMessage({ channel: GUARDIAN_SETTER_SLACK_ID, text });
+  else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[SHADOW] ${text}` });
+  guardianLog('guardian_digest', 'ok', { waiting: (waiting || []).length, drafts: stats.drafts, signals: stats.signals, sent: stats.sent, expired: stats.expired, mode }, correlationId);
+}
+
+// Hourly (4b). Red posts to #ng-pm-agent with <@Ron>, once per metric per CR
+// day (the state lives in agent_knowledge); the two zero-tolerance rows post
+// whenever their count grows. Green is silent. The first six rows warm up for
+// seven days from the first run.
+async function runGuardianWatchdog(correlationId) {
+  if (!guardianActive()) return;
+  const now = Date.now();
+  const stats = await guardianStats(now);
+  const [{ data: okRuns }, { data: runRows }, { data: sentRows }] = await Promise.all([
+    portalSupabase.from('agent_activity').select('id', { count: 'exact', head: false }).eq('event_type', 'cron_run').eq('action', 'runGuardianCheck').eq('status', 'ok').gte('created_at', stats.dayStartIso).limit(200),
+    portalSupabase.from('agent_activity').select('output, created_at').eq('event_type', 'guardian').eq('action', 'guardian_run').gte('created_at', stats.dayStartIso).order('created_at', { ascending: false }).limit(60),
+    portalSupabase.from('agent_activity').select('id').eq('event_type', 'guardian').eq('action', 'guardian_sent').eq('status', 'ok').gte('created_at', stats.dayStartIso).limit(500),
+  ]);
+  let capStreak = 0;
+  for (const r of runRows || []) { if (r.output && r.output.capHit) capStreak++; else break; }
+  const inboundToday = (runRows || []).reduce((n, r) => Math.max(n, Number(r.output && r.output.waiting) || 0), 0);
+  const firstKey = `${GUARDIAN_KEY}:first_run_at`;
+  const stateKey = `${GUARDIAN_KEY}:watchdog:state`;
+  const known = await hotReadKnowledge([firstKey, stateKey]);
+  const firstRun = Date.parse(known.get(firstKey)) || now;
+  const daysActive = Math.floor((now - firstRun) / (24 * 60 * 60 * 1000));
+  const dow = new Date(now - 6 * 60 * 60 * 1000).getUTCDay();
+  // Sends the activity log saw that no sent row with an approver explains.
+  const sentWithoutApproval = Math.max(stats.sentWithoutApproval, (sentRows || []).length - stats.sent);
+  const m = {
+    daysActive, runsToday: (okRuns || []).length, capStreak, cardsToday: stats.cardsToday, isWeekday: dow >= 1 && dow <= 5, inboundToday,
+    approvals: stats.approvals, rejections: stats.rejections, medianMinutes: stats.medianMinutes, expiredShare: stats.expiredShare,
+    sentInShadowOrOff: stats.sentInShadowOrOff + (guardianMode() !== 'draft' ? (sentRows || []).length : 0),
+    sentWithoutApproval, divergence: stats.divergence, maxDraftsPerRun: GUARDIAN_MAX_DRAFTS_PER_RUN,
+  };
+  const results = guardian.evaluateWatchdog(m);
+  const state = hotParse(known.get(stateKey)) || {};
+  const today = guardian.crDay(now);
+  const zero = new Set(['sent_in_shadow', 'sent_without_approval']);
+  const toPost = results.filter((r) => {
+    if (r.level !== 'red') return false;
+    const s = state[r.metric] || {};
+    if (zero.has(r.metric)) return s.text !== r.text;
+    return !(s.level === 'red' && s.day === today);
+  });
+  for (const r of results) state[r.metric] = { level: r.level, day: today, text: r.text };
+  await upsertKnowledge('process', stateKey, JSON.stringify(state), GUARDIAN_KEY);
+  const red = results.filter((r) => r.level === 'red');
+  const yellow = results.filter((r) => r.level === 'yellow');
+  if (toPost.length) {
+    const lines = [
+      `🛡️ *Guardián watchdog* <@${RON_SLACK_ID}>: ${red.length} métrica(s) en rojo (modo ${guardianMode()}).`,
+      ...red.map((r) => `🔴 ${r.text}`),
+      ...yellow.map((r) => `🟡 ${r.text}`),
+      guardian.verdictLine({ issues: red.map((r) => r.text).concat(['nada se corrigió solo', 'necesita a Ron']) }),
+    ];
+    await postToSlack(AGENT_CHANNEL, lines.join('\n'));
+  }
+  guardianLog('guardian_watchdog', red.length ? 'red' : yellow.length ? 'yellow' : 'ok', { metrics: results, inputs: m, posted: toPost.map((r) => r.metric) }, correlationId);
+}
+
+// The guardian card a thread reply hangs under, or null (same lookup the
+// Instagram guide uses).
+async function guardianCardParent(channel, replyTs) {
+  return slackMetadataParent(channel, replyTs, GUARDIAN_EVENT);
+}
+
+cron.schedule('*/15 8-20 * * *', wrapCronJob('runGuardianCheck', async (c) => { await runGuardianCheck(c); }, { timeoutMs: 9 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 18 * * 1-6', wrapCronJob('runGuardianDigest', async (c) => { await runGuardianDigest(c); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('5 * * * *', wrapCronJob('runGuardianWatchdog', async (c) => { await runGuardianWatchdog(c); }), { timezone: 'America/Costa_Rica' });
+console.log(`Registered static cron: pipeline guardian (*/15 8-20, digest 0 18 Mon-Sat, watchdog 5 * * * *) mode=${guardianMode()}${guardianDisabled() ? ' DISABLED' : ''}`);
+// ─── end pipeline guardian ──────────────────────────────────────────────────
 
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
 // The customer lifecycle alerts (Make 4356754 + 5975679) had no criteria at all.
@@ -21728,6 +22404,9 @@ const STATIC_CRON_SCHEDULES = {
   runSequenceReplyAlerts:       '*/10 * * * *',
   runBridge24hCards:            '15 8-20 * * *',
   runIgGuideCheck:              '*/5 * * * *',
+  runGuardianCheck:             '*/15 8-20 * * *',
+  runGuardianDigest:            '0 18 * * 1-6',
+  runGuardianWatchdog:          '5 * * * *',
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
   runUnloggedOutcomeReminders:  '0 21 * * *',
@@ -22969,9 +23648,19 @@ slack.event('reaction_added', async ({ event }) => {
           await handleIgGuideReaction(event, baseEmoji, msg, msg.metadata.event_payload);
           return;
         }
-        // ✅ on Ron's own edited text in the draft's thread is the natural tap:
-        // treat it as ✅ on the draft (the handler sends Ron's latest thread reply).
-        const parent = await igGuideDraftParent(event.item.channel, event.item.ts);
+        // Pipeline guardian card in the setter's (or Ron's) DM: ✅ send or
+        // handled, ❌ discard. Same history fetch, same metadata key.
+        if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === GUARDIAN_EVENT && msg.metadata.event_payload) {
+          await handleGuardianReaction(event, baseEmoji, msg, msg.metadata.event_payload);
+          return;
+        }
+        // ✅ on the approver's own edited text in the card's thread is the natural
+        // tap: treat it as ✅ on the card (the handler sends the latest thread reply).
+        const parent = await slackMetadataParent(event.item.channel, event.item.ts, new Set(['ig_guide_draft', GUARDIAN_EVENT]));
+        if (parent && parent.metadata.event_type === GUARDIAN_EVENT) {
+          await handleGuardianReaction({ ...event, item: { ...event.item, ts: parent.ts } }, baseEmoji, parent, parent.metadata.event_payload);
+          return;
+        }
         if (parent) {
           await handleIgGuideReaction({ ...event, item: { ...event.item, ts: parent.ts } }, baseEmoji, parent, parent.metadata.event_payload);
           return;
