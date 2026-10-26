@@ -37,6 +37,18 @@ check('2j a phone reply before the inbox reply still credits the inbox one', pic
 check('2k replies older than sinceMs are skipped', pick([msg({ userId: 'Wdjte1temxfR0lpi5RGV', dateAdded: new Date(T0 - 48 * 3600e3).toISOString() })], { sinceMs: T0 - 3600e3 }), null);
 check('2l email reply from the inbox claims', pick([msg({ messageType: 'TYPE_EMAIL', userId: 'Wdjte1temxfR0lpi5RGV' })]), { slack: 'USEB', type: 'TYPE_EMAIL', un: 0 });
 
+// 2bis. default setter for phone replies (Ron, 2026-10-26: Sebastián is the only setter on new leads)
+const SEB = { ghlUserId: 'Wdjte1temxfR0lpi5RGV', slackUserId: 'USEB' };
+const isAuto = (b) => /para responderle con algo util/i.test(String(b));
+const pickD = (msgs) => { const r = rc.firstSetterReply(msgs, { setterIds, defaultSetter: SEB, isAutomatedBody: isAuto }); return r && { slack: r.setter && r.setter.slackUserId, type: r.messageType, un: r.unattributed, d: r.defaulted }; };
+check('2m phone reply with a default setter credits him, flagged defaulted', pickD([inbound(), msg()]), { slack: 'USEB', type: 'TYPE_WHATSAPP', un: 1, d: true });
+check('2n Instagram reply from the Meta inbox defaults too', pickD([inbound({ messageType: 'TYPE_INSTAGRAM' }), msg({ messageType: 'TYPE_INSTAGRAM' })]), { slack: 'USEB', type: 'TYPE_INSTAGRAM', un: 1, d: true });
+check('2o Meta auto reply alone is not a human reply', pickD([inbound(), msg({ body: 'Gracias por escribir, para responderle con algo util...' })]), null);
+check('2p auto reply then a real phone reply defaults', pickD([msg({ body: 'para responderle con algo util' }), inbound(), msg({ body: 'hola, soy Seb' })]), { slack: 'USEB', type: 'TYPE_WHATSAPP', un: 1, d: true });
+check('2q an inbox reply by Oscar beats the default', pickD([msg(), msg({ userId: 'ZcmdIz2EEraPd80W2zop' })]), { slack: 'UOSC', type: 'TYPE_WHATSAPP', un: 1, d: false });
+check('2r workflow sends never trigger the default', pickD([msg({ userId: 'Wdjte1temxfR0lpi5RGV', source: 'workflow' })]), null);
+check('2s no default configured keeps the old behavior', pick([inbound(), msg()]), { slack: null, type: null, un: 1 });
+
 // 3. matching convos to unclaimed cards
 const unclaimed = [{ contactId: 'K1', fullName: 'A' }, { contactId: 'K2', fullName: 'B' }];
 const convos = [{ id: 'C1', contactId: 'K1' }, { id: 'C9', contactId: 'K9' }, { id: 'C1', contactId: 'K1' }, { id: 'C2', contactId: 'K2' }];
