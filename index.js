@@ -2,6 +2,7 @@ require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
 const hotReplies = require('./lib/hotReplies');
+const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
 const triageFicha = require('./lib/triageFicha');
@@ -14870,6 +14871,117 @@ cron.schedule('0 9,17 * * *', wrapCronJob('runWonHandoffNotes', async (c) => { a
 // dedupe key stale-lead-nag:<contact_id> gates on "≥1h since last nag", not one-shot).
 cron.schedule('*/30 7-20 * * *', wrapCronJob('runStaleLeadNagCheck', async (c) => { await runStaleLeadNagCheck(c); }), { timezone: 'America/Costa_Rica' });
 
+// ─── REPLY CLAIMS: answering from the GHL inbox claims the card ──────────────
+// Sebastián (2026-10-26): a lead he answers from GHL or Instagram should be
+// assigned and ✅'d in Slack the same way a reaction does it, so every surface
+// agrees on who owns the lead. GHL has no "outbound message" workflow trigger,
+// so Max polls: every 5 min in business hours it takes the cards still unclaimed
+// (lead_posts minus setter_claims, last REPLY_CLAIM_LEAD_WINDOW_H hours), lists
+// the conversations that moved since the last run, and claims each card for
+// the setter whose userId is on the first human outbound message
+// (lib/replyClaims.js). A reply typed in the WhatsApp phone app or the Meta
+// inbox carries no userId, so it cannot be credited; those are counted as
+// `unattributed` in the audit row and the 2h nag still covers them.
+// The claim itself is claimLeadForSetter, the same routine the ✅ reaction uses
+// (contact + setter-pipeline opps reassigned, ✅, thread, setter_claims row
+// with claim_source 'ghl_reply'). The GHL "Mirror Setter Claim to Slack"
+// workflow then sees an already-✅'d card and skips, so no double credit.
+// Kill switch: REPLY_CLAIM_DISABLED=true.
+const REPLY_CLAIM_LEAD_WINDOW_MS = Number(process.env.REPLY_CLAIM_LEAD_WINDOW_H || 72) * 60 * 60 * 1000;
+// Conversation lookback per run. Runs are 5 min apart; 30 min absorbs a slow
+// GHL index and a skipped run without re-reading the whole day.
+const REPLY_CLAIM_CONVO_LOOKBACK_MS = Number(process.env.REPLY_CLAIM_CONVO_LOOKBACK_MIN || 30) * 60 * 1000;
+const REPLY_CLAIM_MAX_READS = Number(process.env.REPLY_CLAIM_MAX_READS || 40);
+
+// Unclaimed lead cards: lead_posts rows in the window with no setter_claims
+// row for the contact. Test leads and self-serve bookings are dropped the same
+// way getUnclaimedLeads drops them; the GHL tag lookup is skipped on purpose
+// (a dispositioned lead that a setter answers is still theirs).
+async function getReplyClaimCandidates(now) {
+  const { data: rows, error } = await supabase
+    .from('lead_posts')
+    .select('contact_id, slack_message_ts, slack_channel_id, full_name, email_lower, source')
+    .is('personal_excluded_at', null)
+    .gte('posted_at', new Date(now - REPLY_CLAIM_LEAD_WINDOW_MS).toISOString())
+    .order('posted_at', { ascending: false });
+  if (error) throw new Error(`lead_posts read failed: ${error.message}`);
+  const leads = (rows || []).filter(r => r.contact_id && r.slack_message_ts
+    && !isTestLeadName(r.full_name) && !SELF_SERVE_SOURCE_RE.test(r.source || ''));
+  if (!leads.length) return [];
+  const claimed = new Set();
+  const ids = leads.map(l => l.contact_id);
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data: c, error: cErr } = await supabase.from('setter_claims').select('ghl_contact_id').in('ghl_contact_id', ids.slice(i, i + 200));
+    if (cErr) throw new Error(`setter_claims read failed: ${cErr.message}`);
+    for (const r of c || []) claimed.add(r.ghl_contact_id);
+  }
+  return leads.filter(l => !claimed.has(l.contact_id)).map(l => ({
+    contactId: l.contact_id, slackMessageTs: l.slack_message_ts, slackChannelId: l.slack_channel_id,
+    fullName: l.full_name || null, email: l.email_lower || null,
+  }));
+}
+
+async function runReplyClaimSweep(correlationId, { now = Date.now() } = {}) {
+  if (String(process.env.REPLY_CLAIM_DISABLED || '') === 'true') { console.log('Reply claim sweep disabled (REPLY_CLAIM_DISABLED=true).'); return { ok: true, disabled: true }; }
+  const stats = { unclaimed: 0, convos: 0, matched: 0, reads: 0, claimed: 0, unattributed: 0, alreadyMarked: 0, failed: 0 };
+  const claimedNames = [];
+  const unclaimed = await getReplyClaimCandidates(now);
+  stats.unclaimed = unclaimed.length;
+  if (unclaimed.length) {
+    const convos = await hotSearchConversations(now - REPLY_CLAIM_CONVO_LOOKBACK_MS);
+    stats.convos = convos.length;
+    const matches = replyClaims.matchConversations(unclaimed, convos).slice(0, REPLY_CLAIM_MAX_READS);
+    stats.matched = matches.length;
+    const setterIds = replyClaims.setterIdLookup(SLACK_TO_GHL_USER, [RON_SLACK_ID]);
+    for (const { lead, conversationId } of matches) {
+      let reply;
+      try {
+        stats.reads++;
+        reply = replyClaims.firstSetterReply(await ghlGetConversationMessages(conversationId), { setterIds });
+      } catch (err) { stats.failed++; console.warn(`reply claim: messages read failed for ${lead.contactId}: ${err.message}`); continue; }
+      if (!reply) continue;
+      if (!reply.setter) { stats.unattributed++; continue; }
+      // Race guard: the ✅ reaction or the GHL mirror webhook may have landed
+      // since the candidate list was read. Max's own ✅ on the card is the anchor.
+      try {
+        const history = await slack.client.conversations.history({ channel: lead.slackChannelId, latest: lead.slackMessageTs, limit: 1, inclusive: true });
+        const msg = history.messages && history.messages[0];
+        const mark = msg && msg.ts === lead.slackMessageTs && (msg.reactions || []).find(r => r.name === LEAD_CLAIMED_EMOJI);
+        if (mark && mark.users && mark.users.includes(process.env.SLACK_BOT_USER_ID)) { stats.alreadyMarked++; continue; }
+      } catch (err) { console.warn(`reply claim: Slack history read failed for ${lead.contactId}: ${err.message}`); }
+      const { ghlUserId, slackUserId } = reply.setter;
+      try {
+        await claimLeadForSetter({
+          contactId: lead.contactId, locationId: process.env.GHL_LOCATION_ID, fullName: lead.fullName, email: lead.email,
+          ghlUserId, channel: lead.slackChannelId, timestamp: lead.slackMessageTs, actorSlackId: slackUserId,
+          claimSource: 'ghl_reply', correlationId,
+          claimedBy: `<@${slackUserId}> (replied to the lead on ${replyClaims.channelLabel(reply.messageType)} from GHL, synced here)`,
+        });
+        stats.claimed++;
+        claimedNames.push(lead.fullName || lead.contactId);
+      } catch (err) {
+        stats.failed++;
+        console.error(`reply claim: GHL write failed for ${lead.contactId}: ${err.message}`);
+        logActivity({
+          event_type: 'ghl_lead_claim_failed', event_source: 'cron', action: 'reply_claim',
+          actor_user_id: slackUserId, channel_id: lead.slackChannelId, status: 'error',
+          output: { contact_id: lead.contactId, ghl_user_id: ghlUserId, full_name: lead.fullName, error: err.message },
+          correlation_id: correlationId,
+        });
+      }
+    }
+  }
+  if (stats.claimed || stats.failed || stats.unattributed) {
+    console.log(`Reply claim sweep: ${JSON.stringify(stats)}${claimedNames.length ? ` claimed: ${claimedNames.join(', ')}` : ''}`);
+  }
+  await logActivity({
+    event_type: 'audit', event_source: 'cron', action: 'reply_claim_sweep',
+    status: stats.failed ? 'degraded' : 'ok', output: stats, correlation_id: correlationId,
+  });
+  return { ok: !stats.failed, stats };
+}
+cron.schedule('*/5 7-21 * * *', wrapCronJob('runReplyClaimSweep', async (c) => { await runReplyClaimSweep(c); }, { timeoutMs: 4 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+
 // Stale-lead daily sweep — 6:00 PM CR every day (no weekend exclusion — leads
 // can go unclaimed on weekends too). DMs Ron ONE summary of every lead still
 // unclaimed at sweep time; repeat appearances are intentional, not deduped.
@@ -23597,6 +23709,118 @@ async function handleVocPdfReaction(event, msg) {
   }
 }
 
+// Shared claim routine: one lead card, one setter. Used by the ✅/✋ reaction in
+// #ng-sales-goats (claimSource 'slack_reaction') and by the reply sweep that
+// claims a card when a setter answers the lead from the GHL inbox (claimSource
+// 'ghl_reply', runReplyClaimSweep). Reassigns the GHL contact and its setter
+// pipeline opportunities, adds ✅ to the card, threads the result and writes
+// setter_claims. Throws on a GHL write failure so the caller owns the retry
+// message; Slack and setter_claims failures are non-fatal.
+async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlUserId, channel, timestamp, actorSlackId, claimSource, claimedBy, correlationId }) {
+  const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // 1. Reassign the contact
+  const putRes = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
+  }, { label: `PUT /contacts/${contactId} (claim)` });
+  if (!putRes.ok) {
+    const errBody = await putRes.text();
+    throw new Error(`GHL PUT /contacts/${contactId} → ${putRes.status}: ${errBody.slice(0, 200)}`);
+  }
+
+  // 2. Reassign opportunities tied to this contact — but ONLY in setter pipelines.
+  //    VSL self-bookings live in a separate pipeline and must NOT be reassigned.
+  //    Allow-list comes from GHL_SETTER_PIPELINE_IDS env var (comma-separated).
+  const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const oppsRes = await ghlFetch(
+    `https://services.leadconnectorhq.com/opportunities/search?location_id=${locationId}&contact_id=${contactId}`,
+    { headers: ghlAuth },
+    { label: `GET /opportunities/search (claim ${contactId})` },
+  );
+  const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
+  const allOpps = oppsData.opportunities || [];
+  const opps = allOpps.filter(o => setterPipelineIds.includes(o.pipelineId));
+  const skippedNonSetterOpps = allOpps.length - opps.length;
+  if (skippedNonSetterOpps > 0) {
+    console.log(`Skipped ${skippedNonSetterOpps} non-setter-pipeline opp(s) for contact ${contactId}`);
+  }
+  const oppResults = await Promise.all(opps.map(async (opp) => {
+    try {
+      const r = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
+        method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
+      }, { label: `PUT /opportunities/${opp.id} (claim)` });
+      if (!r.ok) {
+        const eb = await r.text();
+        console.warn(`opp PUT ${opp.id} → ${r.status}: ${eb.slice(0, 150)}`);
+        return { id: opp.id, ok: false };
+      }
+      return { id: opp.id, ok: true };
+    } catch (e) { console.warn(`opp PUT ${opp.id} threw:`, e.message); return { id: opp.id, ok: false }; }
+  }));
+  const oppsOk = oppResults.filter(r => r.ok).length;
+  const oppsFail = oppResults.length - oppsOk;
+
+  // Mark message as claimed (idempotency anchor for future reactions)
+  try { await slack.client.reactions.add({ channel, timestamp, name: LEAD_CLAIMED_EMOJI }); }
+  catch (reactErr) {
+    if (!String(reactErr.data?.error || reactErr.message).includes('already_reacted')) {
+      console.warn('reactions.add failed:', reactErr.message);
+    }
+  }
+
+  const lines = [`✅ Claimed by ${claimedBy}.`];
+  if (opps.length === 0) {
+    lines.push(`• GHL contact reassigned to you.`);
+    lines.push(`• No opportunity on the Appointment Setting Pipeline for this lead.`);
+  } else if (oppsFail === 0) {
+    const oppWord = oppsOk === 1 ? 'opportunity' : 'opportunities';
+    lines.push(`• GHL contact reassigned to you.`);
+    lines.push(`• ${oppsOk} setter ${oppWord} on the Appointment Setting Pipeline reassigned to you.`);
+  } else {
+    lines.push(`• GHL contact reassigned to you.`);
+    lines.push(`• ${oppsOk} of ${opps.length} setter opportunities reassigned, ${oppsFail} failed — check logs.`);
+  }
+  if (skippedNonSetterOpps > 0) {
+    const oppWord = skippedNonSetterOpps === 1 ? 'opportunity' : 'opportunities';
+    lines.push(`• ${skippedNonSetterOpps} ${oppWord} on another pipeline (e.g. VSL self-booking) left as-is.`);
+  }
+  await slack.client.chat.postMessage({
+    channel, thread_ts: timestamp,
+    text: lines.join('\n'),
+  });
+
+  logActivity({
+    event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
+    actor_user_id: actorSlackId, channel_id: channel,
+    output: { contact_id: contactId, ghl_user_id: ghlUserId, full_name: fullName, opps_in_setter_pipelines: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail, opps_skipped_non_setter: skippedNonSetterOpps },
+    correlation_id: correlationId,
+  });
+
+  // Audit trail — record the claim with seconds-to-claim for offline SLA mining
+  try {
+    const secondsToClaim = Math.max(0, Math.round(Date.now() / 1000 - parseFloat(timestamp)));
+    await supabase.from('setter_claims').insert({
+      ghl_contact_id: contactId,
+      contact_name: fullName,
+      prospect_email: email,
+      slack_message_ts: timestamp,
+      slack_channel_id: channel,
+      claimed_by_slack_user_id: actorSlackId,
+      claimed_by_setter_name: GHL_USER_NAMES[ghlUserId] || GHL_USER_NAMES[ghlUserId.toLowerCase()] || null,
+      ghl_user_id: ghlUserId,
+      opps_reassigned: oppsOk,
+      seconds_to_claim: secondsToClaim,
+      claim_source: claimSource,
+    });
+  } catch (claimErr) {
+    // Non-fatal — Slack post + GHL writes already succeeded
+    console.error('setter_claims insert failed:', claimErr.message);
+  }
+
+  console.log(`Lead ${contactId} (${fullName}) claimed by ${actorSlackId} (${claimSource}) → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
+  return { oppsOk, oppsFail, oppsTotal: opps.length, skippedNonSetterOpps };
+}
+
 slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
@@ -23935,108 +24159,12 @@ slack.event('reaction_added', async ({ event }) => {
     }
 
     const claimCorr = newCorrelationId();
-    const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
     try {
-      // 1. Reassign the contact
-      const putRes = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${meta.contact_id}`, {
-        method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
-      }, { label: `PUT /contacts/${meta.contact_id} (claim)` });
-      if (!putRes.ok) {
-        const errBody = await putRes.text();
-        throw new Error(`GHL PUT /contacts/${meta.contact_id} → ${putRes.status}: ${errBody.slice(0, 200)}`);
-      }
-
-      // 2. Reassign opportunities tied to this contact — but ONLY in setter pipelines.
-      //    VSL self-bookings live in a separate pipeline and must NOT be reassigned.
-      //    Allow-list comes from GHL_SETTER_PIPELINE_IDS env var (comma-separated).
-      const setterPipelineIds = (process.env.GHL_SETTER_PIPELINE_IDS || 'KH1IQuaN8aNB1lfRpvP4')
-        .split(',').map(s => s.trim()).filter(Boolean);
-      const oppsRes = await ghlFetch(
-        `https://services.leadconnectorhq.com/opportunities/search?location_id=${meta.location_id}&contact_id=${meta.contact_id}`,
-        { headers: ghlAuth },
-        { label: `GET /opportunities/search (claim ${meta.contact_id})` },
-      );
-      const oppsData = oppsRes.ok ? await oppsRes.json() : { opportunities: [] };
-      const allOpps = oppsData.opportunities || [];
-      const opps = allOpps.filter(o => setterPipelineIds.includes(o.pipelineId));
-      const skippedNonSetterOpps = allOpps.length - opps.length;
-      if (skippedNonSetterOpps > 0) {
-        console.log(`Skipped ${skippedNonSetterOpps} non-setter-pipeline opp(s) for contact ${meta.contact_id}`);
-      }
-      const oppResults = await Promise.all(opps.map(async (opp) => {
-        try {
-          const r = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${opp.id}`, {
-            method: 'PUT', headers: ghlAuth, body: JSON.stringify({ assignedTo: ghlUserId }),
-          }, { label: `PUT /opportunities/${opp.id} (claim)` });
-          if (!r.ok) {
-            const eb = await r.text();
-            console.warn(`opp PUT ${opp.id} → ${r.status}: ${eb.slice(0, 150)}`);
-            return { id: opp.id, ok: false };
-          }
-          return { id: opp.id, ok: true };
-        } catch (e) { console.warn(`opp PUT ${opp.id} threw:`, e.message); return { id: opp.id, ok: false }; }
-      }));
-      const oppsOk = oppResults.filter(r => r.ok).length;
-      const oppsFail = oppResults.length - oppsOk;
-
-      // Mark message as claimed (idempotency anchor for future reactions)
-      try { await slack.client.reactions.add({ channel, timestamp, name: LEAD_CLAIMED_EMOJI }); }
-      catch (reactErr) {
-        if (!String(reactErr.data?.error || reactErr.message).includes('already_reacted')) {
-          console.warn('reactions.add failed:', reactErr.message);
-        }
-      }
-
-      const lines = [`✅ Claimed by <@${event.user}>.`];
-      if (opps.length === 0) {
-        lines.push(`• GHL contact reassigned to you.`);
-        lines.push(`• No opportunity on the Appointment Setting Pipeline for this lead.`);
-      } else if (oppsFail === 0) {
-        const oppWord = oppsOk === 1 ? 'opportunity' : 'opportunities';
-        lines.push(`• GHL contact reassigned to you.`);
-        lines.push(`• ${oppsOk} setter ${oppWord} on the Appointment Setting Pipeline reassigned to you.`);
-      } else {
-        lines.push(`• GHL contact reassigned to you.`);
-        lines.push(`• ${oppsOk} of ${opps.length} setter opportunities reassigned, ${oppsFail} failed — check logs.`);
-      }
-      if (skippedNonSetterOpps > 0) {
-        const oppWord = skippedNonSetterOpps === 1 ? 'opportunity' : 'opportunities';
-        lines.push(`• ${skippedNonSetterOpps} ${oppWord} on another pipeline (e.g. VSL self-booking) left as-is.`);
-      }
-      await slack.client.chat.postMessage({
-        channel, thread_ts: timestamp,
-        text: lines.join('\n'),
+      await claimLeadForSetter({
+        contactId: meta.contact_id, locationId: meta.location_id, fullName: meta.full_name, email: meta.email || null,
+        ghlUserId, channel, timestamp, actorSlackId: event.user, claimSource: 'slack_reaction',
+        claimedBy: `<@${event.user}>`, correlationId: claimCorr,
       });
-
-      logActivity({
-        event_type: 'ghl_lead_claimed', event_source: 'slack', action: 'lead_claim',
-        actor_user_id: event.user, channel_id: channel,
-        output: { contact_id: meta.contact_id, ghl_user_id: ghlUserId, full_name: meta.full_name, opps_in_setter_pipelines: opps.length, opps_reassigned: oppsOk, opps_failed: oppsFail, opps_skipped_non_setter: skippedNonSetterOpps },
-        correlation_id: claimCorr,
-      });
-
-      // Audit trail — record the claim with seconds-to-claim for offline SLA mining
-      try {
-        const secondsToClaim = Math.max(0, Math.round(Date.now() / 1000 - parseFloat(timestamp)));
-        await supabase.from('setter_claims').insert({
-          ghl_contact_id: meta.contact_id,
-          contact_name: meta.full_name,
-          prospect_email: meta.email || null,
-          slack_message_ts: timestamp,
-          slack_channel_id: channel,
-          claimed_by_slack_user_id: event.user,
-          claimed_by_setter_name: GHL_USER_NAMES[ghlUserId] || GHL_USER_NAMES[ghlUserId.toLowerCase()] || null,
-          ghl_user_id: ghlUserId,
-          opps_reassigned: oppsOk,
-          seconds_to_claim: secondsToClaim,
-          claim_source: 'slack_reaction',
-        });
-      } catch (claimErr) {
-        // Non-fatal — Slack post + GHL writes already succeeded
-        console.error('setter_claims insert failed:', claimErr.message);
-      }
-
-      console.log(`Lead ${meta.contact_id} (${meta.full_name}) claimed by ${event.user} → GHL user ${ghlUserId}; opps ${oppsOk}/${opps.length}`);
     } catch (apiErr) {
       console.error('Lead claim GHL write failed:', apiErr.message);
       // A dropped claim used to leave nothing but a console line — no row to query
