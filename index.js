@@ -14892,6 +14892,13 @@ const REPLY_CLAIM_LEAD_WINDOW_MS = Number(process.env.REPLY_CLAIM_LEAD_WINDOW_H 
 // GHL index and a skipped run without re-reading the whole day.
 const REPLY_CLAIM_CONVO_LOOKBACK_MS = Number(process.env.REPLY_CLAIM_CONVO_LOOKBACK_MIN || 30) * 60 * 1000;
 const REPLY_CLAIM_MAX_READS = Number(process.env.REPLY_CLAIM_MAX_READS || 40);
+// Default setter for a human reply that carries no userId (WhatsApp phone app,
+// Meta inbox). Ron, 2026-10-26: Sebastián is the only setter taking new leads
+// (Oscar leaves 2026-10-31 and only works his own pipeline), so an unclaimed
+// card someone answered from the phone is his. Slack user id; set to 'off'
+// to disable, or to another id when the roster changes. Ron's own phone
+// replies to a brand-new lead would also credit him; he can re-✅ in Slack.
+const REPLY_CLAIM_DEFAULT_SETTER_SLACK_ID = process.env.REPLY_CLAIM_DEFAULT_SETTER_SLACK_ID || 'U0BFA4SRVQC';
 
 // Unclaimed lead cards: lead_posts rows in the window with no setter_claims
 // row for the contact. Test leads and self-serve bookings are dropped the same
@@ -14923,7 +14930,7 @@ async function getReplyClaimCandidates(now) {
 
 async function runReplyClaimSweep(correlationId, { now = Date.now() } = {}) {
   if (String(process.env.REPLY_CLAIM_DISABLED || '') === 'true') { console.log('Reply claim sweep disabled (REPLY_CLAIM_DISABLED=true).'); return { ok: true, disabled: true }; }
-  const stats = { unclaimed: 0, convos: 0, matched: 0, reads: 0, claimed: 0, unattributed: 0, alreadyMarked: 0, failed: 0 };
+  const stats = { unclaimed: 0, convos: 0, matched: 0, reads: 0, claimed: 0, unattributed: 0, defaulted: 0, alreadyMarked: 0, failed: 0 };
   const claimedNames = [];
   const unclaimed = await getReplyClaimCandidates(now);
   stats.unclaimed = unclaimed.length;
@@ -14933,14 +14940,17 @@ async function runReplyClaimSweep(correlationId, { now = Date.now() } = {}) {
     const matches = replyClaims.matchConversations(unclaimed, convos).slice(0, REPLY_CLAIM_MAX_READS);
     stats.matched = matches.length;
     const setterIds = replyClaims.setterIdLookup(SLACK_TO_GHL_USER, [RON_SLACK_ID]);
+    const defaultGhlId = SLACK_TO_GHL_USER[REPLY_CLAIM_DEFAULT_SETTER_SLACK_ID];
+    const defaultSetter = defaultGhlId ? { ghlUserId: defaultGhlId, slackUserId: REPLY_CLAIM_DEFAULT_SETTER_SLACK_ID } : null;
     for (const { lead, conversationId } of matches) {
       let reply;
       try {
         stats.reads++;
-        reply = replyClaims.firstSetterReply(await ghlGetConversationMessages(conversationId), { setterIds });
+        reply = replyClaims.firstSetterReply(await ghlGetConversationMessages(conversationId), { setterIds, defaultSetter, isAutomatedBody: strikeIsAutomatedBody });
       } catch (err) { stats.failed++; console.warn(`reply claim: messages read failed for ${lead.contactId}: ${err.message}`); continue; }
       if (!reply) continue;
       if (!reply.setter) { stats.unattributed++; continue; }
+      if (reply.defaulted) stats.defaulted++;
       // Race guard: the ✅ reaction or the GHL mirror webhook may have landed
       // since the candidate list was read. Max's own ✅ on the card is the anchor.
       try {
@@ -14955,7 +14965,9 @@ async function runReplyClaimSweep(correlationId, { now = Date.now() } = {}) {
           contactId: lead.contactId, locationId: process.env.GHL_LOCATION_ID, fullName: lead.fullName, email: lead.email,
           ghlUserId, channel: lead.slackChannelId, timestamp: lead.slackMessageTs, actorSlackId: slackUserId,
           claimSource: 'ghl_reply', correlationId,
-          claimedBy: `<@${slackUserId}> (replied to the lead on ${replyClaims.channelLabel(reply.messageType)} from GHL, synced here)`,
+          claimedBy: reply.defaulted
+            ? `<@${slackUserId}> (someone answered the lead on ${replyClaims.channelLabel(reply.messageType)} from the phone; credited to the setter on duty, synced here)`
+            : `<@${slackUserId}> (replied to the lead on ${replyClaims.channelLabel(reply.messageType)} from GHL, synced here)`,
         });
         stats.claimed++;
         claimedNames.push(lead.fullName || lead.contactId);
