@@ -19373,10 +19373,14 @@ console.log('Registered static cron: weekly report status post (0 11 * * 1 CR)')
 
 // ─── REELS WEEKLY ────────────────────────────────────────────────────────────
 // Monday 08:00 CR: last week's Instagram reels for #ng-content (Ron,
-// 2026-10-07). Sources: the GHL Social Planner (published child posts with
-// like/comment/share insights, plus account statistics for impressions, reach
-// and new followers) and the Instagram Graph API for per-reel reach, views and
-// saves when META_IG_INSIGHTS_TOKEN is set (system user ng-agent, no expiry).
+// 2026-10-07). Sources: the Instagram Graph API for the reel list and per-reel
+// reach, views, saves and shares (`fetchIgReels`, the same /media call the
+// briefs use, META_IG_INSIGHTS_TOKEN, system user ng-agent, no expiry), and the
+// GHL Social Planner statistics for the account's impressions, reach and new
+// followers. Until 2026-10-26 the reel list came from GHL's published posts,
+// which only holds reels scheduled through GHL: W42 stored 2 of 10 reels and
+// W43 posted "0" while Meta showed 3, because reels now go out straight from
+// Instagram. Meta is the only list that sees every reel.
 // Rules and formatting live in lib/reelsWeekly.js (tested in
 // test/reels-weekly.test.js); this block is only I/O. Each run upserts one row
 // per reel plus an `account` row into reel_stats (migration 018), and reads
@@ -19397,7 +19401,6 @@ const reelsWeeklyDisabled = () => String(process.env.REELS_WEEKLY_DISABLED || ''
 // Unset or `live` posts to the channel; any other value (say `dry`) is a dry run.
 // Routing is tested in test/reels-channel.test.js.
 const reelsWeeklyLive = () => String(process.env.REELS_WEEKLY_MODE || 'live') === 'live' && !!REELS_CHANNEL;
-const reelsMetaWired = () => !!String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
 const reelsOutlier = require('./lib/reelsOutlier');
 
 // Trailing weeks of reel_stats for the outlier multiple and the verdict
@@ -19417,23 +19420,6 @@ async function fetchReelHistory(isoWeeks) {
   }
 }
 
-async function fetchReelsGhlPosts(window) {
-  const locationId = process.env.GHL_LOCATION_ID;
-  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
-  // The list endpoint takes the window with a day of slack on each side; the
-  // module filters on publishedAt, so over-fetching is harmless.
-  const body = {
-    type: 'published', accounts: REELS_GHL_ACCOUNT_ID, skip: '0', limit: '50', includeUsers: 'false',
-    fromDate: new Date(window.start.getTime() - 86400000).toISOString(),
-    toDate: new Date(window.end.getTime() + 86400000).toISOString(),
-  };
-  const res = await ghlFetch(`https://services.leadconnectorhq.com/social-media-posting/${locationId}/posts/list`,
-    { method: 'POST', headers, body: JSON.stringify(body) }, { label: 'social posts/list' });
-  if (!res.ok) throw new Error(`GHL ${res.status} on social posts/list`);
-  const json = await res.json();
-  return (json.results && json.results.posts) || [];
-}
-
 async function fetchReelsGhlStatistics() {
   const locationId = process.env.GHL_LOCATION_ID;
   const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
@@ -19443,30 +19429,6 @@ async function fetchReelsGhlStatistics() {
     { label: 'social statistics' });
   if (!res.ok) throw new Error(`GHL ${res.status} on social statistics`);
   return res.json();
-}
-
-// Per-reel insights from Meta, keyed by media id. A failing media id is
-// skipped (the GHL counts stay), a failing token fails the whole call so the
-// run can say so.
-async function fetchReelsMetaInsights(mediaIds) {
-  const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
-  if (!token || !mediaIds.length) return null;
-  const out = {};
-  for (const id of mediaIds) {
-    const url = `https://graph.facebook.com/v21.0/${id}/insights?metric=views,reach,saved,shares,likes,comments&access_token=${token}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const code = json && json.error && json.error.code;
-      if (code === 190 || code === 10 || res.status === 401) throw new Error(`Meta token rejected (${code || res.status})`);
-      console.warn(`[reels-weekly] Meta insights skipped for ${id}: ${res.status} ${(json.error && json.error.message) || ''}`);
-      continue;
-    }
-    const m = {};
-    for (const row of json.data || []) m[row.name] = Number(row.values && row.values[0] && row.values[0].value);
-    out[id] = m;
-  }
-  return out;
 }
 
 async function reportReelsWeeklyFailure(reason) {
@@ -19485,27 +19447,20 @@ async function reportReelsWeeklyFailure(reason) {
 async function runReelsWeekly({ now = new Date() } = {}) {
   if (reelsWeeklyDisabled()) return;
   const window = reelsWeekly.weekWindow(now);
-  let ghlPosts, stats, meta = null;
+  // Meta is the reel list now, so a Meta failure fails closed (DM Ron, post
+  // nothing): without it there is no list to report, and "0 reels" would be a lie.
+  let media, stats;
   try {
-    ghlPosts = await fetchReelsGhlPosts(window);
+    media = await fetchIgReels(window.start.getTime());
     stats = await fetchReelsGhlStatistics();
   } catch (err) {
     await reportReelsWeeklyFailure(err.message);
     return;
   }
-  let posts = reelsWeekly.normalizePosts(ghlPosts, window);
-  let metaWired = reelsMetaWired();
-  if (metaWired) {
-    try {
-      meta = await fetchReelsMetaInsights(posts.map((p) => p.postId));
-      posts = reelsWeekly.mergeMetaInsights(posts, meta);
-    } catch (err) {
-      // A dead Meta token should not hide the GHL numbers; the post says reach is pending.
-      console.warn(`[reels-weekly] Meta insights unavailable: ${err.message}`);
-      logActivity({ event_type: 'alert', event_source: 'cron', action: 'runReelsWeekly', status: 'error', error_message: `meta: ${err.message}` });
-      metaWired = false;
-    }
-  }
+  const posts = reelsWeekly.mediaToPosts(media, window);
+  // fetchIgReels drops the insights expansion when Meta refuses it; the post then
+  // ranks by interactions and says per-reel reach is missing.
+  const metaWired = !posts.length || posts.some((p) => Number.isFinite(p.reach));
   const account = reelsWeekly.accountTotals(stats);
 
   // Last week's account row gives the WoW deltas; the first run has none.
@@ -19570,6 +19525,8 @@ const reelsBriefsDisabled = () => String(process.env.REELS_BRIEFS_DISABLED || ''
 // fallback only matters if that default is ever removed. Failures always DM Ron.
 const reelsBriefsTarget = () => REELS_CHANNEL || RON_SLACK_ID;
 const IG_REEL_FIELDS = 'id,timestamp,media_product_type,caption,permalink,like_count,comments_count';
+// views joined the expansion on 2026-10-26 (checked on REELS and FEED media) for the weekly's outlier multiple.
+const IG_REEL_INSIGHTS = 'insights.metric(reach,saved,shares,views)';
 
 // Every Instagram post in GHL (any status) between two instants. The parent of a
 // published post stays `scheduled` forever; reelsBriefs.normalizeSchedule drops it.
@@ -19595,7 +19552,7 @@ async function fetchIgReels(sinceMs) {
   const token = String(process.env.META_IG_INSIGHTS_TOKEN || '').trim();
   if (!token) throw new Error('META_IG_INSIGHTS_TOKEN is not set');
   const page = async (withInsights) => {
-    const fields = withInsights ? `${IG_REEL_FIELDS},insights.metric(reach,saved,shares)` : IG_REEL_FIELDS;
+    const fields = withInsights ? `${IG_REEL_FIELDS},${IG_REEL_INSIGHTS}` : IG_REEL_FIELDS;
     let url = `https://graph.facebook.com/v21.0/${REELS_IG_USER_ID}/media?fields=${encodeURIComponent(fields)}&limit=100&access_token=${token}`;
     const out = [];
     for (let i = 0; i < 10 && url; i++) {
