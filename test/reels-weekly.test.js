@@ -1,10 +1,11 @@
 // Rules test for the Monday reels summary.  Run:  node test/reels-weekly.test.js
 //
 // lib/reelsWeekly.js is pure (no Slack, no network, no Supabase), so it is
-// required directly. The posts below have the shape of GHL Social Planner
-// child posts (POST /social-media-posting/{locationId}/posts/list); the stats
-// object has the shape of POST /social-media-posting/statistics. All values
-// are synthetic (public repo, never prod rows).
+// required directly. The reels below have the shape of Meta GET
+// /{ig-user}/media with the insights.metric(reach,saved,shares,views) field
+// expansion (index.js fetchIgReels); the stats object has the shape of GHL
+// POST /social-media-posting/statistics. All values are synthetic (public
+// repo, never prod rows).
 const rw = require('../lib/reelsWeekly');
 
 let failures = 0;
@@ -24,37 +25,55 @@ check('range label', W.label, '5 a 11 oct');
 check('week window works on a Sunday night CR', rw.weekWindow(new Date('2026-10-12T04:00:00Z')).isoWeek, '2026-W40');
 check('range label across months', rw.weekWindow(new Date('2026-11-02T14:00:00Z')).label, '26 oct a 1 nov');
 
-const post = (over) => ({
-  _id: 'g1', platform: 'instagram', status: 'published', deleted: false, type: 'reel', postId: '17900000000000001',
-  publishedAt: '2026-10-07T17:48:28.528Z', previewLink: 'https://www.instagram.com/reel/AAA/',
-  summary: 'En Facebook está el que regatea. En LinkedIn, el que firma.\n\nComente "LinkedIn" y le paso una guía.',
-  insights: { like: 72, share: 9, comment: 4 }, ...over,
+// One Meta /media row. `ins` = { reach, views, saved, shares }; omit it for a reel Meta has no insights for yet.
+const media = (id, ts, likes, comments, caption, ins, over = {}) => ({
+  id, timestamp: ts, media_product_type: 'REELS', caption, permalink: `https://www.instagram.com/reel/${id}/`,
+  like_count: likes, comments_count: comments,
+  insights: ins ? { data: Object.entries(ins).map(([name, value]) => ({ name, values: [{ value }] })) } : undefined,
+  ...over,
 });
-const POSTS = [
-  post(),
-  post({ _id: 'g2', postId: '17900000000000002', publishedAt: '2026-10-07T22:01:00Z', summary: 'Dos garantías por contrato, no por promesa.\n\nGarantía de tiempo: ...', insights: { like: 40, share: 2, comment: 1 } }),
-  post({ _id: 'g3', postId: '17900000000000003', publishedAt: '2026-10-04T22:00:00Z' }),            // previous week: out
-  post({ _id: 'g4', postId: '17900000000000004', status: 'scheduled', publishedAt: null }),        // not published: out
-  post({ _id: 'g5', postId: '17900000000000005', platform: 'facebook' }),                           // other platform: out
-  post({ _id: 'g6', postId: undefined }),                                                           // no media id: out
+const CAP1 = 'En Facebook está el que regatea. En LinkedIn, el que firma.\n\nComente "LinkedIn" y le paso una guía.';
+const CAP2 = 'Dos garantías por contrato, no por promesa.\n\nGarantía de tiempo: ...';
+const MEDIA = [
+  media('17900000000000001', '2026-10-07T17:48:28+0000', 72, 4, CAP1, { reach: 12400, views: 15000, saved: 31, shares: 9 }),
+  media('17900000000000002', '2026-10-07T22:01:00+0000', 40, 1, CAP2),                                      // no insights yet
+  media('17900000000000003', '2026-10-04T22:00:00+0000', 1, 0, 'Semana anterior', { reach: 1, views: 1 }),  // previous week: out
+  media('17900000000000004', '2026-10-12T06:00:00+0000', 1, 0, 'Esta semana', { reach: 1, views: 1 }),      // Mon 00:00 CR = next week: out
+  media('17900000000000005', '2026-10-08T15:00:00+0000', 9, 0, 'Una foto', { reach: 5 }, { media_product_type: 'FEED' }), // not a reel: out
+  media('', '2026-10-08T15:00:00+0000', 1, 0, 'Sin id'),                                                     // no media id: out
 ];
 
-const norm = rw.normalizePosts(POSTS, W);
-check('keeps only published instagram posts inside the window', norm.map((p) => p.ghlPostId), ['g1', 'g2']);
-check('hook is the first sentence of the caption', norm[0].hook, 'En Facebook está el que regatea.');
+const merged = rw.mediaToPosts(MEDIA, W);
+check('keeps only reels with an id inside the window, oldest first', merged.map((p) => p.postId), ['17900000000000001', '17900000000000002']);
+check('hook is the first sentence of the caption', merged[0].hook, 'En Facebook está el que regatea.');
 check('hook is truncated with an ellipsis', rw.hookOf('x'.repeat(100)).length, 70);
 check('hook falls back when the caption is empty', rw.hookOf(''), '(sin caption)');
-check('insights are copied as numbers', [norm[0].likes, norm[0].comments, norm[0].shares], [72, 4, 9]);
-check('reach is null before Meta', norm[0].reach, null);
+check('counts and insights are read from Meta', [merged[0].likes, merged[0].comments, merged[0].shares, merged[0].reach, merged[0].views, merged[0].saved], [72, 4, 9, 12400, 15000, 31]);
+check('a reel without insights keeps them null, never 0', [merged[1].reach, merged[1].views, merged[1].saved, merged[1].shares], [null, null, null, null]);
+check('publishedAt is ISO and there is no GHL id', [merged[0].publishedAt, merged[0].ghlPostId], ['2026-10-07T17:48:28.000Z', null]);
+check('no media list is an empty week, not a crash', rw.mediaToPosts(null, W), []);
 
-const merged = rw.mergeMetaInsights(norm, { '17900000000000001': { reach: 12400, views: 15000, saved: 31 } });
-check('meta insights merge by media id', [merged[0].reach, merged[0].views, merged[0].saved], [12400, 15000, 31]);
-check('posts without meta data are untouched', merged[1].reach, null);
-check('no meta map returns the same list', rw.mergeMetaInsights(norm, null), norm);
+// The 2026-10-26 incident: W43 posted "Reels publicados: 0" because the list came
+// from GHL, which only holds reels scheduled through it. Reels published straight
+// from Instagram are in Meta, so they are in the report.
+const W43 = rw.weekWindow(new Date('2026-10-26T14:00:00Z'));
+const DIRECT = [
+  media('17900000000000011', '2026-10-21T18:32:40+0000', 10, 1, 'Uno.', { reach: 640, views: 950, saved: 2, shares: 1 }),
+  media('17900000000000012', '2026-10-24T01:02:02+0000', 20, 0, 'Dos.', { reach: 960, views: 1600, saved: 4, shares: 2 }),
+  media('17900000000000013', '2026-10-24T21:20:12+0000', 8, 0, 'Tres.', { reach: 540, views: 930, saved: 1, shares: 0 }),
+];
+const w43 = rw.formatPost({ window: W43, posts: rw.mediaToPosts(DIRECT, W43), account: null, prevAccount: null, metaWired: true });
+check('reels posted outside GHL are counted (W43 incident)', w43.split('\n')[1], 'Reels publicados: 3');
+check('and ranked, not a quiet week', w43.includes('*Ranking por'), true);
+check('a week Meta also shows empty is still the quiet line', rw.formatPost({ window: W43, posts: rw.mediaToPosts([], W43), account: null, prevAccount: null, metaWired: true }).split('\n')[1],
+  'Reels publicados: 0. Sin publicaciones esta semana, no hay nada que medir.');
 
-check('ranking by engagement when no reach', rw.rankReels(norm).map((p) => p.ghlPostId), ['g1', 'g2']);
-const flipped = rw.mergeMetaInsights(norm, { '17900000000000002': { reach: 50000 } });
-check('ranking by reach when any reel has it', rw.rankReels(flipped).map((p) => p.ghlPostId), ['g2', 'g1']);
+const flipped = rw.mediaToPosts([
+  media('17900000000000001', '2026-10-07T17:48:28+0000', 72, 4, CAP1, { reach: 12400, views: 15000, saved: 31, shares: 9 }),
+  media('17900000000000002', '2026-10-07T22:01:00+0000', 40, 1, CAP2, { reach: 50000, shares: 2 }),
+], W);
+check('ranking by engagement when no reach', rw.rankReels(rw.mediaToPosts([MEDIA[0], MEDIA[1]].map((m) => ({ ...m, insights: undefined })), W)).map((p) => p.postId), ['17900000000000001', '17900000000000002']);
+check('ranking by sends per reach when any reel has it', rw.rankReels(flipped).map((p) => p.postId), ['17900000000000001', '17900000000000002']);
 
 const STATS = { results: { totals: { posts: 6, likes: 285, followers: 64, impressions: 50325, comments: 12 },
   breakdowns: { reach: { total: 31132 }, engagement: { instagram: { likes: 285, comments: 12, shares: 60 } } } } };
@@ -82,13 +101,13 @@ check('ranking header names env/1k when no median is possible', L[9], '*Ranking 
 check('ranking table, sends first, unknown = s/d, reach and views kept', L.slice(11, 14), [
   '#  Reel                            Env/1k  Alcance  Vistas  Likes  Com  Comp  Guard',
   '1  En Facebook está el que regat…     0.7   12,400  15,000     72    4     9     31',
-  '2  Dos garantías por contrato, n…     s/d      s/d     s/d     40    1     2    s/d',
+  '2  Dos garantías por contrato, n…     s/d      s/d     s/d     40    1   s/d    s/d',
 ]);
-check('links go under the table', L[15], 'Ver: <https://www.instagram.com/reel/AAA/|1> · <https://www.instagram.com/reel/AAA/|2>');
+check('links go under the table', L[15], 'Ver: <https://www.instagram.com/reel/17900000000000001/|1> · <https://www.instagram.com/reel/17900000000000002/|2>');
 check('footnote says the median floor was not met', L[16], '_xMed: s/d, la mediana necesita al menos 5 reels con vistas (hay 1). Env/1k = compartidos por cada 1,000 alcanzados._');
 check('verdict is s/d under the floor, never a diagnosis', L[17], '_Veredicto: s/d (hacen falta 5 reels con alcance; hay 1)._');
-check('caveat when meta is not wired', L[18].startsWith('_Alcance y vistas por reel: pendiente'), true);
-check('no caveat when meta is wired', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).includes('pendiente'), false);
+check('caveat when meta gave no insights', L[18].startsWith('_Alcance y vistas por reel: Meta no entregó'), true);
+check('no caveat when meta is wired', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).includes('Meta no entregó'), false);
 check('no delta column without last week', rw.formatPost({ window: W, posts: merged, account: acct, prevAccount: null, metaWired: true }).includes('vs anterior'), false);
 check('delta cell', [rw.deltaCell(10, 7), rw.deltaCell(5, 11), rw.deltaCell(3, 3), rw.deltaCell(3, null)], ['+3', '-6', '=', '']);
 check('validate accepts the post', rw.validatePost(text, { posts: merged, account: acct }), { ok: true, problems: [] });
@@ -112,19 +131,13 @@ check('validate does not treat a word containing null as banned', rw.validatePos
 // Five reels with Meta data and 12 weeks of synthetic history: the median comes
 // from reel_stats (views 1,000 to 2,100, median 1,550) and every reel gets xMed.
 const o = require('../lib/reelsOutlier');
-const FIVE = rw.mergeMetaInsights(rw.normalizePosts([
-  post(),
-  post({ _id: 'g2', postId: '17900000000000002', publishedAt: '2026-10-07T22:01:00Z', summary: 'Dos garantías por contrato, no por promesa.', insights: { like: 40, share: 2, comment: 1 } }),
-  post({ _id: 'g3', postId: '17900000000000003', publishedAt: '2026-10-08T22:01:00Z', summary: 'Tres.', insights: { like: 10, share: 20, comment: 1 } }),
-  post({ _id: 'g4', postId: '17900000000000004', publishedAt: '2026-10-09T22:01:00Z', summary: 'Cuatro.', insights: { like: 10, share: 0, comment: 1 } }),
-  post({ _id: 'g5', postId: '17900000000000005', publishedAt: '2026-10-10T22:01:00Z', summary: 'Cinco.', insights: { like: 10, share: 1, comment: 1 } }),
-], W), {
-  '17900000000000001': { reach: 12400, views: 15000, saved: 31, shares: 9 },
-  '17900000000000002': { reach: 3000, views: 3500, saved: 2, shares: 2 },
-  '17900000000000003': { reach: 2000, views: 2400, saved: 1, shares: 20 },
-  '17900000000000004': { reach: 1500, views: 1800, saved: 0, shares: 0 },
-  '17900000000000005': { reach: 900, views: 1000, saved: 0, shares: 1 },
-});
+const FIVE = rw.mediaToPosts([
+  media('17900000000000001', '2026-10-07T17:48:28+0000', 72, 4, CAP1, { reach: 12400, views: 15000, saved: 31, shares: 9 }),
+  media('17900000000000002', '2026-10-07T22:01:00+0000', 40, 1, 'Dos garantías por contrato, no por promesa.', { reach: 3000, views: 3500, saved: 2, shares: 2 }),
+  media('17900000000000003', '2026-10-08T22:01:00+0000', 10, 1, 'Tres.', { reach: 2000, views: 2400, saved: 1, shares: 20 }),
+  media('17900000000000004', '2026-10-09T22:01:00+0000', 10, 1, 'Cuatro.', { reach: 1500, views: 1800, saved: 0, shares: 0 }),
+  media('17900000000000005', '2026-10-10T22:01:00+0000', 10, 1, 'Cinco.', { reach: 900, views: 1000, saved: 0, shares: 1 }),
+], W);
 const HIST = [];
 for (let i = 0; i < 12; i++) HIST.push({ iso_week: '2026-W40', post_id: `h${i}`, kind: 'reel', reach: 800 + i * 100, views: 1000 + i * 100, shares: 1 });
 HIST.push({ iso_week: '2026-W40', post_id: 'account', kind: 'account', reach: 30000, views: 40000, shares: 10, followers: 50 });
@@ -138,12 +151,12 @@ check('median base falls back to the batch below the floor', (({ median, n, sour
 check('median base knows an unreadable history from a short one', rw.medianBase(FIVE, null).historyN, null);
 check('median base gives no median under the floor on both sides', rw.medianBase(FIVE.slice(0, 2), []).median, null);
 check('account rows never feed the median', rw.medianBase(FIVE.slice(0, 2), [HIST[12]]).median, null);
-check('rankReels: multiple first', rw.rankReels(FIVE, HIST).map((p) => [p.ghlPostId, p.multiple, p.sendsPer1k]),
-  [['g1', 9.7, 0.7], ['g2', 2.3, 0.7], ['g3', 1.5, 10], ['g4', 1.2, 0], ['g5', 0.6, 1.1]]);
+check('rankReels: multiple first', rw.rankReels(FIVE, HIST).map((p) => [p.postId, p.multiple, p.sendsPer1k]),
+  [['17900000000000001', 9.7, 0.7], ['17900000000000002', 2.3, 0.7], ['17900000000000003', 1.5, 10], ['17900000000000004', 1.2, 0], ['17900000000000005', 0.6, 1.1]]);
 const TIE = FIVE.map((p) => ({ ...p, views: 3100, reach: 1000 }));
-check('rankReels: equal multiple, more sends per reach first', rw.rankReels(TIE, HIST).map((p) => p.ghlPostId), ['g3', 'g1', 'g2', 'g5', 'g4']);
-const GAP = FIVE.map((p) => (p.ghlPostId === 'g2' ? { ...p, reach: null, views: null } : p));
-check('rankReels: a reel without views or reach sits last with s/d, never 0', (({ ghlPostId, multiple, sendsPer1k }) => [ghlPostId, multiple, sendsPer1k])(rw.rankReels(GAP, HIST)[4]), ['g2', null, null]);
+check('rankReels: equal multiple, more sends per reach first', rw.rankReels(TIE, HIST).map((p) => p.postId), ['17900000000000003', '17900000000000001', '17900000000000002', '17900000000000005', '17900000000000004']);
+const GAP = FIVE.map((p) => (p.postId === '17900000000000002' ? { ...p, reach: null, views: null } : p));
+check('rankReels: a reel without views or reach sits last with s/d, never 0', (({ postId, multiple, sendsPer1k }) => [postId, multiple, sendsPer1k])(rw.rankReels(GAP, HIST)[4]), ['17900000000000002', null, null]);
 
 const PREV = { impressions: 40000, reach: 30000, followers: 70 };
 const full = rw.formatPost({ window: W, posts: FIVE, account: acct, prevAccount: PREV, metaWired: true, history: HIST });
@@ -168,12 +181,12 @@ const gapPost = rw.formatPost({ window: W, posts: GAP, account: acct, prevAccoun
 check('missing reach on one reel prints s/d in xMed, Env/1k, Alcance and Vistas', gapPost.split('\n')[16], '5  Dos garantías por contrato, n…   s/d     s/d      s/d     s/d     40    1     2      2');
 check('fewer than 5 reels with reach: no verdict, s/d with the count', gapPost.includes('_Veredicto: s/d (hacen falta 5 reels con alcance; hay 4)._'), true);
 check('no meta: ranking by interactions, no multiple, no verdict', (() => {
-  const t = rw.formatPost({ window: W, posts: rw.normalizePosts(POSTS, W), account: acct, prevAccount: null, metaWired: false, history: HIST });
+  const t = rw.formatPost({ window: W, posts: rw.mediaToPosts(MEDIA.map((m) => ({ ...m, insights: undefined })), W), account: acct, prevAccount: null, metaWired: false, history: HIST });
   return [t.includes('*Ranking por interacciones (likes + comentarios + compartidos)*'), t.includes('xMed'), t.includes('Veredicto')];
 })(), [true, false, false]);
 
 // Verdict branches (ig-audit: views but no follows = profile; no views = hook).
-const scored = (multiples) => multiples.map((m, i) => ({ reach: 1000, multiple: m, ghlPostId: `v${i}` }));
+const scored = (multiples) => multiples.map((m, i) => ({ reach: 1000, multiple: m, postId: `v${i}` }));
 check('verdict floor: fewer than 5 reels with reach', o.verdict({ reels: scored([3, 3, 3, 3]), reach: 30000, prevReach: 20000, newFollowers: 30 }).kind, 'floor');
 check('verdict perfil: a 2x+ reel and under 5 followers per 1,000 reached', o.verdict({ reels: scored([3, 1, 1, 1, 1]), reach: 30000, prevReach: 20000, newFollowers: 30 }), { kind: 'perfil', best: 3, followsPer1k: 1, deltaPct: 50, newFollowers: 30 });
 check('verdict ok: a hit that converted', o.verdict({ reels: scored([3, 1, 1, 1, 1]), reach: 30000, prevReach: 20000, newFollowers: 300 }).kind, 'ok');
