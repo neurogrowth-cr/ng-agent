@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
+const firstTouchAdLib = require('./lib/firstTouchAd');
 const hotReplies = require('./lib/hotReplies');
 const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
@@ -15707,6 +15708,11 @@ async function handleGHLWebhook(req, res) {
         const isSelfServe = SELF_SERVE_SOURCE_RE.test(sourceRaw || '')
           || SELF_SERVE_SOURCE_RE.test(ghlContact?.source || '')
           || attributionMediumIds.includes(SELF_SERVE_CALENDAR_ID);
+        // First-touch ad, stamped on the contact so later sessions cannot hide
+        // it (lib/firstTouchAd.js). GHL only, for reporting: the Slack card
+        // stays as is. Fire-and-forget: never delays the card.
+        const leadAd = firstTouchAdLib.firstTouchAd(ghlContact);
+        if (contactId && leadAd) stampFirstTouchAd(contactId, leadAd);
         if (isSelfServe) console.log(`GHL lead ${contactId} detected as SELF-SERVE (source="${sourceRaw}", contactSource="${ghlContact?.source || ''}") — no setter DM, no claim card`);
 
         console.log('GHL parsed:', { fullName, email, phone, source, assignedTo: resolvedAssignedTo, contactId });
@@ -15944,6 +15950,27 @@ async function handleGHLWebhook(req, res) {
       } catch (parseErr) { console.error('GHL webhook parse error:', parseErr.message); }
     });
   } catch (err) { console.error('GHL webhook handler error:', err.message); res.writeHead(500); res.end('error'); }
+}
+
+// Writes the first-touch ad into the "Anuncio de origen" contact field. Never
+// creates the field (writeGhlContactFieldsByName); a missing field is logged
+// once per boot. Errors are logged, never thrown: the lead card matters more.
+let _firstTouchAdFieldMissingLogged = false;
+async function stampFirstTouchAd(contactId, ad) {
+  try {
+    const value = firstTouchAdLib.adFieldValue(ad);
+    const w = await writeGhlContactFieldsByName(contactId, { [firstTouchAdLib.AD_FIELD_NAME]: value });
+    if (!w.ok) { console.warn(`first-touch ad stamp failed for ${contactId}: ${w.message}`); return; }
+    if (w.missing.length) {
+      if (!_firstTouchAdFieldMissingLogged) console.warn(`first-touch ad: GHL custom field "${firstTouchAdLib.AD_FIELD_NAME}" does not exist, nothing stamped`);
+      _firstTouchAdFieldMissingLogged = true;
+      return;
+    }
+    console.log(`first-touch ad stamped on ${contactId}: ${value}`);
+    logActivity({ event_type: 'ghl_update', event_source: 'ghl', action: 'first_touch_ad_stamped', correlation_id: newCorrelationId(), output: { contact_id: contactId, ad_id: ad.adId, value } });
+  } catch (e) {
+    console.error(`first-touch ad stamp threw for ${contactId}:`, e.message);
+  }
 }
 
 // ─── REVERSE-MIRROR: GHL claim → Slack post update ───────────────────────────
