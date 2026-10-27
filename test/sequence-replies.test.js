@@ -110,7 +110,14 @@ check('3k2 "reunión" in passing is not a request to book', tags('En la reunión
 check('3l weekday plus a time', tags('El jueves a las 3:30 pm me queda bien'), ['quiere agendar']);
 check('3m no me interesa', tags('Gracias pero no me interesa'), ['no interesado']);
 check('3n "sería un no" (real Outlook reply)', tags('De momento, sería un no.\n\nSaludos.'), ['no interesado']);
-check('3o darse de baja', tags('Favor de darme de baja de su lista'), ['no interesado']);
+check('3o darse de baja is an opt-out', tags('Favor de darme de baja de su lista'), ['pide baja']);
+check('3o2 "me dejas de enviar correos" (2026-10-24 reply, paraphrased)', tags('Hola, me dejas de enviar correos por favor, gracias'), ['pide baja']);
+check('3o3 quitenme de la lista', tags('Por favor quítenme de la lista'), ['pide baja']);
+check('3o4 no quiero recibir', tags('No quiero recibir más correos'), ['pide baja']);
+check('3o5 dejen de escribirme', tags('Dejen de escribirme, gracias'), ['pide baja']);
+check('3o6 English remove me', tags('Please remove me from this list'), ['pide baja']);
+check('3o7 "no me interesa" stays no interesado, not an opt-out', tags('No me interesa por ahora'), ['no interesado']);
+check('3o8 "dejar de" about something else is not an opt-out', tags('Tuve que dejar de usar LinkedIn un tiempo'), ['respuesta']);
 check('3p price question', tags('Buen día cuál es el costo del sistema'), ['pregunta el precio']);
 check('3q sigue igual', tags('Buenos días,\n\nSigue igual'), ['sigue igual']);
 check('3r anything else is "respuesta"', tags('Hola Ron, una disculpa, creo que hubo una confusión de mi parte'), ['respuesta']);
@@ -279,6 +286,15 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
     '⏸️ Pausa: ya pasa al correo mensual.',
     '<https://app.gohighlevel.com/v2/location/L/contacts/detail/K1|Abrir en GHL> · Reaccione ✅ cuando esté atendido.',
   ]);
+  const optOut = sr.formatAlert({
+    contactName: 'Luis Mora', intents: ['pide baja'], subject: 'Seguimiento', group: 'post-llamada',
+    quote: 'me dejas de enviar correos por favor', link: 'https://app.gohighlevel.com/v2/location/L/contacts/detail/K2',
+    mentions: ['U_SETTER'], fallback: false,
+  });
+  check('9a2 an opt-out card carries the DND action line',
+    optOut.split('\n').includes('🛑 Pide no recibir más correos: active DND de email en GHL hoy.'), true);
+  check('9a3 the opt-out card passes its contract', sr.validateAlert(optOut), null);
+  check('9a4 a pausa card has no opt-out line', card.includes('🛑'), false);
   check('9b a valid card passes its contract', sr.validateAlert(card), null);
   check('9c a card with no quote fails', sr.validateAlert(card.split('\n').filter(l => !l.startsWith('> ')).join('\n')), 'missing quote');
   check('9d "undefined" outside the quote fails', sr.validateAlert(card.replace('Ana Ruiz', 'undefined')), 'placeholder value');
