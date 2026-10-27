@@ -55,6 +55,14 @@ const convos = [{ id: 'C1', contactId: 'K1' }, { id: 'C9', contactId: 'K9' }, { 
 check('3a only unclaimed contacts, each conversation once', rc.matchConversations(unclaimed, convos).map(m => `${m.lead.contactId}:${m.conversationId}`), ['K1:C1', 'K2:C2']);
 check('3b no convos: nothing to read', rc.matchConversations(unclaimed, []), []);
 
+// 3bis. claim time (Ron, 2026-10-26: the sweep cadence must not count against claim speed)
+const POST = Date.parse('2026-10-26T15:00:00-06:00'), NOWT = POST + 9 * 60e3;
+check('3c reply time is the claim time', rc.claimTimeMs({ replyAtMs: POST + 2 * 60e3, postedAtMs: POST, nowMs: NOWT }), POST + 2 * 60e3);
+check('3d reply before the card clamps to the card post (0 s)', rc.claimTimeMs({ replyAtMs: POST - 60e3, postedAtMs: POST, nowMs: NOWT }), POST);
+check('3e future reply time clamps to now', rc.claimTimeMs({ replyAtMs: NOWT + 60e3, postedAtMs: POST, nowMs: NOWT }), NOWT);
+check('3f no reply time (reaction claim) is now', rc.claimTimeMs({ replyAtMs: null, postedAtMs: POST, nowMs: NOWT }), NOWT);
+check('3g reply atMs from firstSetterReply feeds it', rc.firstSetterReply([msg({ userId: 'Wdjte1temxfR0lpi5RGV', dateAdded: new Date(POST + 3 * 60e3).toISOString() })], { setterIds }).atMs, POST + 3 * 60e3);
+
 // 4. labels
 check('4a channel labels', ['TYPE_INSTAGRAM', 'TYPE_WHATSAPP', 'TYPE_FACEBOOK', 'TYPE_X'].map(rc.channelLabel), ['Instagram', 'WhatsApp', 'Messenger', 'GHL']);
 
