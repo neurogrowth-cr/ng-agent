@@ -6,6 +6,7 @@ const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
 const triageFicha = require('./lib/triageFicha');
+const maxBacklog = require('./lib/maxBacklog');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -1117,6 +1118,162 @@ async function upsertKnowledge(category, key, value, source = 'agent', userId = 
     return `Knowledge save error: ${err.message}`;
   }
 }
+
+// ─── MAX SELF-IMPROVEMENT BACKLOG (I/O half; pure logic in lib/maxBacklog.js) ─
+// Max writes down what he could not do: a capability he lacks or a rule that
+// blocked him (judged from his own reply), a tool that threw, a BLOCKED tool
+// result, a failed cron, a saved correction. One row per slug in max_backlog
+// (migration 023, primary project), repeats bump `occurrences`. A monthly digest
+// ranks the open rows in #ng-pm-agent; Ron works them with /max-backlog.
+// Never throws and never blocks a reply. Kill switch: MAX_BACKLOG_DISABLED=true.
+const MAX_BACKLOG_ENABLED = process.env.MAX_BACKLOG_DISABLED !== 'true';
+
+async function recordBacklogItem(item, { retried = false } = {}) {
+  if (!MAX_BACKLOG_ENABLED || !item || !item.slug || !item.kind) return 'skipped';
+  try {
+    const clean = { ...item };
+    if (containsSensitiveData(clean.title)) clean.title = `${clean.kind} (detalle omitido)`;
+    if (containsSensitiveData(clean.summary)) clean.summary = null;
+    const nowIso = new Date().toISOString();
+    const { data: existing, error: readErr } = await supabase.from('max_backlog')
+      .select('id, occurrences, last_seen, permalink, summary, status, notes')
+      .eq('slug', clean.slug).maybeSingle();
+    if (readErr) throw new Error(`read: ${readErr.message}`);
+    let result;
+    if (!existing) {
+      const { error } = await supabase.from('max_backlog').insert(maxBacklog.newRow(clean, nowIso));
+      if (error) {
+        // Two captures of the same slug in the same second: the loser merges.
+        if (!retried && /duplicate key|unique/i.test(error.message)) return recordBacklogItem(item, { retried: true });
+        throw new Error(`insert: ${error.message}`);
+      }
+      result = 'inserted';
+    } else {
+      const patch = maxBacklog.mergeOccurrence(existing, clean, nowIso);
+      if (!patch) return 'unchanged';
+      const { error } = await supabase.from('max_backlog').update(patch).eq('id', existing.id);
+      if (error) throw new Error(`update: ${error.message}`);
+      result = patch.status === 'open' && existing.status === 'done' ? 'reopened' : 'updated';
+    }
+    logActivity({ event_type: 'backlog', event_source: 'internal', action: 'backlog_record', status: 'ok',
+      output: { slug: clean.slug, kind: clean.kind, result }, correlation_id: clean.correlation_id || null });
+    return result;
+  } catch (err) {
+    console.error(`recordBacklogItem(${item.slug}) failed:`, err.message);
+    logActivity({ event_type: 'backlog', event_source: 'internal', action: 'backlog_record', status: 'error',
+      output: { slug: item.slug, kind: item.kind }, error_message: String(err.message).slice(0, 500), correlation_id: item.correlation_id || null });
+    return 'error';
+  }
+}
+
+// After Max replies in Slack: did he just say he cannot do what was asked?
+// Regex gate first (3 of 1,173 replies hit it in the 30 days to 2026-10-26),
+// then one Haiku call decides and names the capability. Fire-and-forget.
+function noteGapFromReply(args) {
+  if (!MAX_BACKLOG_ENABLED) return;
+  captureGapFromReply(args).catch(err => console.error('backlog gap capture failed:', err.message));
+}
+
+async function captureGapFromReply({ replyText, userText, userId, channel, messageTs, correlationId }) {
+  if (!maxBacklog.looksLikeGap(replyText)) return null;
+  const { data: openItems } = await supabase.from('max_backlog').select('slug, title')
+    .in('status', ['open', 'planned']).order('last_seen', { ascending: false }).limit(30);
+  const known = openItems || [];
+  const tLlm = Date.now();
+  const res = await anthropic.messages.create({
+    model: MODEL_LIGHT,
+    thinking: THINKING_OFF,
+    max_tokens: 250,
+    messages: [{ role: 'user', content: maxBacklog.buildGapPrompt({ userText, replyText, openItems: known }) }],
+  });
+  logLlmFromAnthropicResponse(res, Date.now() - tLlm, correlationId, 'backlog_gap');
+  const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  const gap = maxBacklog.parseGapJson(raw, known.map(o => o.slug));
+  if (!gap) return null;
+  let permalink = null;
+  if (channel && messageTs) {
+    permalink = await slack.client.chat.getPermalink({ channel, message_ts: messageTs }).then(r => r.permalink, () => null);
+  }
+  return recordBacklogItem({ ...gap, requested_by: userId || null, channel: channel || null, permalink,
+    correlation_id: correlationId, times: [new Date().toISOString()] });
+}
+
+// Weekly: fold the last 7 days of failed crons/audits (portal agent_activity)
+// and saved corrections (agent_knowledge) into the backlog. Re-reading a window
+// already read is safe: mergeOccurrence only counts events newer than last_seen.
+async function syncMaxBacklogFromActivity(correlationId) {
+  if (!MAX_BACKLOG_ENABLED) return { skipped: 'disabled' };
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const [acts, lessons] = await Promise.all([
+    portalSupabase.from('agent_activity').select('event_type, action, status, error_message, created_at')
+      .eq('agent', 'max').in('event_type', ['cron_run', 'audit']).in('status', ['error', 'degraded'])
+      .gte('created_at', since).order('created_at', { ascending: false }).limit(500),
+    supabase.from('agent_knowledge').select('key, value, source, user_id, updated_at')
+      .eq('category', 'process').eq('visibility', 'shared').in('source', ['correction', 'report-feedback'])
+      .gte('updated_at', since).limit(100),
+  ]);
+  if (acts.error) throw new Error(`agent_activity read: ${acts.error.message}`);
+  if (lessons.error) throw new Error(`agent_knowledge read: ${lessons.error.message}`);
+  const items = [...maxBacklog.activityRowsToItems(acts.data || []), ...maxBacklog.lessonRowsToItems(lessons.data || [])];
+  const results = {};
+  for (const it of items) {
+    const r = await recordBacklogItem({ ...it, correlation_id: correlationId });
+    results[r] = (results[r] || 0) + 1;
+  }
+  return { items: items.length, results };
+}
+
+// Counts for the Monday brief line: new rows in the last 7 days, open total.
+async function getMaxBacklogStats(sinceIso) {
+  const [fresh, open] = await Promise.all([
+    supabase.from('max_backlog').select('id', { count: 'exact', head: true }).gte('first_seen', sinceIso),
+    supabase.from('max_backlog').select('id', { count: 'exact', head: true }).eq('status', 'open'),
+  ]);
+  if (fresh.error) throw new Error(fresh.error.message);
+  if (open.error) throw new Error(open.error.message);
+  return { newThisWeek: fresh.count || 0, openTotal: open.count || 0 };
+}
+
+// Monthly digest to #ng-pm-agent. The cron fires every Monday 09:00 CR so the
+// liveness audit sees it weekly; only the first Monday of the month posts.
+// Nothing open = no post (Ron's grooming bar: no change, no post). Fails
+// closed: a read error or a contract failure posts CHECK BROKEN, never a
+// partial list.
+async function runMaxBacklogDigest(correlationId, { now = new Date(), force = false } = {}) {
+  if (!MAX_BACKLOG_ENABLED) {
+    logActivity({ event_type: 'backlog', event_source: 'cron', action: 'backlog_digest', status: 'ok', output: { skipped: 'disabled' }, correlation_id: correlationId });
+    return;
+  }
+  if (!force && !maxBacklog.isFirstMondayCR(now)) {
+    logActivity({ event_type: 'backlog', event_source: 'cron', action: 'backlog_digest', status: 'ok', output: { skipped: 'not first monday' }, correlation_id: correlationId });
+    return;
+  }
+  try { await syncMaxBacklogFromActivity(correlationId); }
+  catch (err) { console.error('Max backlog sync before digest failed (digest continues):', err.message); }
+
+  const { data, error } = await supabase.from('max_backlog')
+    .select('slug, kind, title, summary, requested_by, permalink, occurrences, first_seen, last_seen, status')
+    .eq('status', 'open').order('occurrences', { ascending: false }).order('last_seen', { ascending: false }).limit(200);
+  if (error) {
+    await postToSlack(AGENT_CHANNEL, `⚠️ *CHECK BROKEN*: Max backlog digest could not read max_backlog (${error.message}). Nothing was posted; this is not an all-clear.\n<@${RON_SLACK_ID}>`).catch(() => {});
+    throw new Error(`max_backlog read: ${error.message}`);
+  }
+  const rows = data || [];
+  if (!rows.length) {
+    logActivity({ event_type: 'backlog', event_source: 'cron', action: 'backlog_digest', status: 'ok', output: { skipped: 'nothing open' }, correlation_id: correlationId });
+    return;
+  }
+  const text = maxBacklog.formatDigest({ rows, openTotal: rows.length, monthLabel: maxBacklog.monthLabelCR(now), ronId: RON_SLACK_ID });
+  const verdict = maxBacklog.validateDigest(text);
+  if (!verdict.ok) {
+    await postToSlack(AGENT_CHANNEL, `⚠️ *CHECK BROKEN*: Max backlog digest failed its contract (${verdict.problems.join('; ')}) and was NOT posted.\n<@${RON_SLACK_ID}>`).catch(() => {});
+    throw new Error(`digest contract: ${verdict.problems.join('; ')}`);
+  }
+  await postToSlack(AGENT_CHANNEL, text);
+  logActivity({ event_type: 'backlog', event_source: 'cron', action: 'backlog_digest', status: 'ok',
+    output: { open: rows.length, posted: Math.min(rows.length, maxBacklog.DIGEST_TOP) }, correlation_id: correlationId });
+}
+// ─── end Max self-improvement backlog ────────────────────────────────────────
 
 // ── Report feedback learning loop ────────────────────────────────────────────
 
@@ -5879,6 +6036,16 @@ ${clipText(nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.ke
   }
 
   const proposals = selectProposals(proposalLines, dismissedSlugs);
+  // Max's own backlog: counts only here (management audience); titles go to the
+  // monthly digest in #ng-pm-agent. A failure is stated in place, never fatal.
+  let backlogBlock = '• Backlog check failed this week; the monthly digest will retry.';
+  if (MAX_BACKLOG_ENABLED) {
+    try {
+      await syncMaxBacklogFromActivity(correlationId);
+      const stats = await getMaxBacklogStats(since7);
+      backlogBlock = maxBacklog.formatBriefLine({ ...stats, nextDigest: maxBacklog.nextFirstMondayCR(new Date()) });
+    } catch (err) { console.error('Weekly brief: backlog line failed:', err.message); }
+  } else backlogBlock = '• Backlog capture is off (MAX_BACKLOG_DISABLED).';
   const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday: 'long', month: 'long', day: 'numeric' });
   const brief = [
     `\`WEEKLY REFLECTION — MANAGEMENT BRIEF\` — ${today}`,
@@ -5887,6 +6054,7 @@ ${clipText(nightly.map(r => `${r.updated_at.slice(0, 10)} [${r.category}] ${r.ke
     '', '`ACTIONS ALREADY TAKEN`', actionsBlock,
     '', '`PROPOSALS`', proposals.length ? `${proposals.length} below in this thread — Ron approves with ✅, dismisses with ❌.` : '• None this week.',
     '', '`WATCHING`', watchingBlock,
+    '', '`MAX SELF-IMPROVEMENT`', backlogBlock,
   ].join('\n');
 
   const posted = await postToSlack(MGMT_CHANNEL, brief);
@@ -8469,6 +8637,20 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
           }
           const duration_ms = Date.now() - tTool;
           const resultSummary = res && res.content != null ? String(res.content).slice(0, 2000) : '';
+          // Backlog: a tool that threw, or a tool result that refused the ask.
+          if (errored) {
+            recordBacklogItem({ kind: 'tool_error', slug: maxBacklog.slugify('tool_error', toolUse.name),
+              title: `La herramienta ${toolUse.name} falló`, summary: err && err.message, requested_by: userId || null,
+              correlation_id, times: [new Date().toISOString()] });
+          } else if (resultSummary.startsWith('"BLOCKED: ')) {
+            // Only the two gates produce a result that IS a BLOCKED string (the
+            // Ron-only tool gate above, ghlMcpGateDecision); data that merely
+            // mentions BLOCKED (ops tracker tiers) never starts with it.
+            const op = toolUse.input && toolUse.input.operationId;
+            recordBacklogItem({ kind: 'policy_block', slug: maxBacklog.slugify('policy_block', op ? `${toolUse.name}:${op}` : toolUse.name),
+              title: `${op || toolUse.name} bloqueada por regla`, summary: resultSummary.slice(1, 300),
+              requested_by: userId || null, correlation_id, times: [new Date().toISOString()] });
+          }
           logActivity({
             event_type: 'tool_call',
             event_source: 'internal',
@@ -9506,6 +9688,7 @@ slack.message(async ({ message, say }) => {
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
     await dmSay(reply);
+    noteGapFromReply({ replyText: reply, userText: message.text, userId, channel: message.channel, messageTs: message.ts, correlationId: correlation_id });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: dmThreadTs, output: { text: String(reply).slice(0, 2000) }, correlation_id });
   } catch (err) { console.error('Claude API error (DM):', err); await dmSay('Got turned around for a second — go ahead and ask again.'); }
 });
@@ -9562,6 +9745,7 @@ slack.event('app_mention', async ({ event, say }) => {
     await saveMessage(userId, 'user', cleanText);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: event.thread_ts || event.ts });
+    noteGapFromReply({ replyText: reply, userText: cleanText, userId, channel: event.channel, messageTs: event.ts, correlationId: mentionCid });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: event.channel, thread_ts: event.thread_ts || event.ts, output: { text: String(reply).slice(0, 2000) }, correlation_id: mentionCid });
   } catch (err) { console.error('Claude API error (mention):', err); await say({ text: 'Got turned around — try again.', thread_ts: event.thread_ts || event.ts }); }
 });
@@ -9636,6 +9820,7 @@ slack.message(async ({ message, say }) => {
     await saveMessage(userId, 'user', message.text);
     await saveMessage(userId, 'assistant', reply);
     await say({ text: reply, thread_ts: message.thread_ts || message.ts });
+    noteGapFromReply({ replyText: reply, userText: message.text, userId, channel: message.channel, messageTs: message.ts, correlationId: chCid });
     logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: message.channel, thread_ts: message.thread_ts || message.ts, output: { text: String(reply).slice(0, 2000) }, correlation_id: chCid });
   } catch (err) { console.error('Claude API error (channel):', err); }
 });
@@ -14363,6 +14548,10 @@ cron.schedule('0 6 1 * *', wrapCronJob('runVocExtractionMonthly', async () => { 
 cron.schedule('30 5 * * *',  wrapCronJob('runNightlyLearning', runNightlyLearning),     { timezone: 'America/Costa_Rica' });
 // Monday 08:00 CR — after the 07:00 closer comparison, before the 08:30 roster.
 cron.schedule('0 8 * * 1',   wrapCronJob('runWeeklyReflectionBrief', async (c) => { await runWeeklyReflectionBrief(c); }), { timezone: 'America/Costa_Rica' });
+// Monday 09:00 CR: Max's own backlog digest to #ng-pm-agent. Fires weekly so the
+// liveness audit watches it; only the first Monday of the month posts.
+cron.schedule('0 9 * * 1',   wrapCronJob('runMaxBacklogDigest', async (c) => { await runMaxBacklogDigest(c); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: Max backlog digest (0 9 * * 1 CR, posts the first Monday of the month)');
 
 // Weekly portal trend analysis — Friday 4:30 PM CR (infrastructure — saves intel to knowledge base)
 cron.schedule('30 22 * * 5', wrapCronJob('runWeeklyPortalTrends', async (c) => { await runWeeklyPortalTrends(c); }),  { timezone: 'America/Costa_Rica' });
@@ -22549,6 +22738,7 @@ const STATIC_CRON_SCHEDULES = {
   runMondayGapDetection:        '0 14 * * 1',
   runNightlyLearning:           '30 5 * * *',
   runWeeklyReflectionBrief:     '0 8 * * 1',
+  runMaxBacklogDigest:          '0 9 * * 1',
   runOpenDealFollowupSweep:     '0 21 * * *',
   runOpenDealZombieDigest:      '45 8 * * 1',
   runIcmCostReport:             '45 7 * * 3',
