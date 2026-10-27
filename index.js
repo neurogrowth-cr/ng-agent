@@ -18980,6 +18980,9 @@ let lastClientAttentionFailureDm = 0;
 
 const clientAttentionDisabled = () => String(process.env.CLIENT_ATTENTION_DISABLED || '') === 'true';
 const clientAttentionLive = () => String(process.env.CLIENT_ATTENTION_MODE || '') === 'live';
+// Uptime alerts (plan-of-record UPDATE 2026-10-26) start as a dry run to Ron
+// whatever CLIENT_ATTENTION_MODE says; Ron sets CLIENT_ATTENTION_ALERTS_MODE=live.
+const clientAttentionAlertsLive = () => String(process.env.CLIENT_ATTENTION_ALERTS_MODE || '') === 'live';
 
 async function fetchClientAttentionFeed() {
   const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
@@ -19004,9 +19007,9 @@ async function fetchClientAttentionFeed() {
 // Alerts carry Slack message metadata so a ✅ on them maps back to the item
 // (the reaction handler reads the message). The dry run keeps the metadata on
 // Ron's DM so the ✅ path can be tested before going live.
-async function postClientAttention(text, metadata = null) {
+async function postClientAttention(text, metadata = null, { live = clientAttentionLive() } = {}) {
   const extra = metadata ? { metadata } : {};
-  if (clientAttentionLive()) {
+  if (live) {
     return slack.client.chat.postMessage({ channel: CLIENT_ATTENTION_CHANNEL.replace(/^#/, ''), text, ...extra });
   }
   return slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${CLIENT_ATTENTION_CHANNEL}]\n${text}`, ...extra });
@@ -19130,61 +19133,71 @@ async function alertedClientAttentionKeys(keys) {
 // One record per alert key (JSON: name, code, fingerprint, channel, ts, post
 // time). A fleet alert also marks every member's own key, so the per-client
 // items it covers never alert again on their own.
-async function markClientAttentionAlerted(item, posted = null) {
+async function markClientAttentionAlerted(item, posted = null, { dry = false } = {}) {
   const record = clientAttention.alertRecord(item, posted);
-  for (const key of [clientAttention.alertKey(item), ...clientAttention.memberKeys(item)]) {
+  for (const key of [clientAttention.alertKey(item, { dry }), ...clientAttention.memberKeys(item, { dry })]) {
     const saved = await upsertKnowledge('alert', key, record);
     if (!String(saved).startsWith('Knowledge saved')) throw new Error(saved);
   }
 }
 
+// Uptime alerts (plan-of-record UPDATE 2026-10-26): the dash feed serves only
+// LinkedIn disconnected, campaign stalled and leads running out. Every 30
+// minutes on weekdays 07:00 to 19:00 CR, one post per item with @fulfillment.
+// Dry run (DM to Ron, own dedupe keys) until CLIENT_ATTENTION_ALERTS_MODE=live.
 async function runClientAttentionAlerts() {
   if (clientAttentionDisabled()) return;
   const feed = await loadClientAttentionFeed('alerts', { throttle: true });
   if (!feed) return;
+  const live = clientAttentionAlertsLive();
+  const dry = !live;
   const urgent = feed.items.filter((i) => i.level === 'urgent');
 
   let alerted;
   let armed;
   try {
-    alerted = await alertedClientAttentionKeys(urgent.map(clientAttention.alertKey));
+    alerted = await alertedClientAttentionKeys(urgent.map((i) => clientAttention.alertKey(i, { dry })));
     armed = (await alertedClientAttentionKeys([CLIENT_ATTENTION_SEED_KEY])).size > 0;
   } catch (err) {
     await reportClientAttentionFailure('alerts', err.message, { throttle: true });
     return;
   }
 
-  // First run: everything already open is the backlog the Mon + Thu report
-  // carries. Mark it seen without posting, so the channel is not flooded; from
-  // here on only new evidence alerts.
+  // First run ever: everything already open is marked seen without posting,
+  // so the channel is not flooded; from here on only new evidence alerts.
   if (!armed) {
-    for (const item of urgent) await markClientAttentionAlerted(item).catch((err) => console.error('[client-attention] seed:', err.message));
+    for (const item of urgent) await markClientAttentionAlerted(item, null, { dry }).catch((err) => console.error('[client-attention] seed:', err.message));
     await upsertKnowledge('alert', CLIENT_ATTENTION_SEED_KEY, new Date().toISOString());
     await slack.client.chat.postMessage({
       channel: RON_SLACK_ID,
-      text: `Client attention alerts armed (${clientAttentionLive() ? 'live' : 'dry run'}). ${urgent.length} urgent items already open were marked as seen; they are in the Mon + Thu report. From now on only new evidence alerts.`,
+      text: `Client attention alerts armed (${live ? 'live' : 'dry run'}). ${urgent.length} urgent items already open were marked as seen. From now on only new evidence alerts.`,
     }).catch((err) => console.error('[client-attention] armed DM failed:', err.message));
     return;
   }
 
-  const { send, overflow } = clientAttention.planAlerts(feed, alerted);
+  const mention = live ? fulfillmentMention() : '';
+  const { send, overflow } = clientAttention.planAlerts(feed, alerted, { dry });
   for (const item of send) {
-    const text = clientAttention.formatAlert(item, feed.adminUrl);
+    const text = clientAttention.formatAlert(item, feed.adminUrl, { mention });
     const verdict = clientAttention.validateAlert(text);
     if (!verdict.ok) {
       await reportClientAttentionFailure('alerts', `${item.clientName.trim()}: ${verdict.problems.join('; ')}`, { throttle: true });
       continue;
     }
     try {
-      const posted = await postClientAttention(text, clientAttention.alertMetadata(item));
-      await markClientAttentionAlerted(item, posted);
+      const posted = await postClientAttention(text, clientAttention.alertMetadata(item), { live });
+      await markClientAttentionAlerted(item, posted, { dry });
     } catch (err) {
       await reportClientAttentionFailure('alerts', err.message, { throttle: true });
       return;
     }
   }
-  if (overflow > 0) await postClientAttention(clientAttention.formatAlertOverflow(overflow, feed.adminUrl));
+  if (overflow > 0) await postClientAttention(clientAttention.formatAlertOverflow(overflow, feed.adminUrl), null, { live });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runClientAttentionAlerts', status: 'ok',
+    output: { live, items: feed.items.length, urgent: urgent.length, sent: send.length, overflow } });
 }
+cron.schedule('*/30 7-19 * * 1-5', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: client attention uptime alerts (*/30 7-19 * * 1-5 CR)');
 
 // Monday WBR reminder (Ron, 2026-10-14): with the Slack alerts retired, Josué
 // reviews Campaign health in the Monday 16:00 CR WBR. One DM at 15:30 with the
@@ -19204,11 +19217,11 @@ async function runCampaignHealthWbrReminder() {
 cron.schedule('30 15 * * 1', wrapCronJob('runCampaignHealthWbrReminder', async () => { await runCampaignHealthWbrReminder(); }), { timezone: 'America/Costa_Rica' });
 
 // Slack side RETIRED 2026-10-14 (Ron: "this is just spam right now, lets just
-// use the dashboard"). The report, urgent alerts, Friday digest and Monday
-// scorecard no longer run; Admin -> Campaign health in the dash is the only
-// surface. The functions stay so re-enabling is one cron.schedule line each
-// (plus its STATIC_CRON_SCHEDULES entry). The ✅/💤 handler still works on
-// alerts already in the channel.
+// use the dashboard"). The report, Friday digest and Monday scorecard still
+// do not run; Admin -> Campaign health in the dash is their surface. The
+// urgent alerts came back on 2026-10-26 for the three uptime signals only
+// (runClientAttentionAlerts above). Re-enabling another is one cron.schedule
+// line plus its STATIC_CRON_SCHEDULES entry.
 
 // Friday "still open" digest: every urgent item still in the feed, with how
 // long it has been open (from the alert record). Same channel and dry-run
@@ -22719,6 +22732,7 @@ const STATIC_CRON_SCHEDULES = {
   checkMakeScenarioHealth:      '*/10 * * * *',
   checkAxonHealth:              '*/10 * * * *',
   checkKaiHealth:              '*/15 * * * *',
+  runClientAttentionAlerts:     '*/30 7-19 * * 1-5',
   runReelsWeekly:               '0 8 * * 1',
   runReelsDailyBrief:           '40 7 * * *',
   runReelsMonthlyReport:        '0 8 1 * *',
