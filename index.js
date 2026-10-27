@@ -14964,7 +14964,7 @@ async function runReplyClaimSweep(correlationId, { now = Date.now() } = {}) {
         await claimLeadForSetter({
           contactId: lead.contactId, locationId: process.env.GHL_LOCATION_ID, fullName: lead.fullName, email: lead.email,
           ghlUserId, channel: lead.slackChannelId, timestamp: lead.slackMessageTs, actorSlackId: slackUserId,
-          claimSource: 'ghl_reply', correlationId,
+          claimSource: 'ghl_reply', correlationId, claimedAtMs: reply.atMs || null,
           claimedBy: reply.defaulted
             ? `<@${slackUserId}> (someone answered the lead on ${replyClaims.channelLabel(reply.messageType)} from the phone; credited to the setter on duty, synced here)`
             : `<@${slackUserId}> (replied to the lead on ${replyClaims.channelLabel(reply.messageType)} from GHL, synced here)`,
@@ -23728,7 +23728,10 @@ async function handleVocPdfReaction(event, msg) {
 // pipeline opportunities, adds ✅ to the card, threads the result and writes
 // setter_claims. Throws on a GHL write failure so the caller owns the retry
 // message; Slack and setter_claims failures are non-fatal.
-async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlUserId, channel, timestamp, actorSlackId, claimSource, claimedBy, correlationId }) {
+// `claimedAtMs` (optional): when the setter actually took the lead. The reply
+// sweep passes the reply's time so its 5 min cadence never inflates claim speed;
+// the reaction path omits it and the claim is stamped now.
+async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlUserId, channel, timestamp, actorSlackId, claimSource, claimedBy, correlationId, claimedAtMs = null }) {
   const ghlAuth = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
   // 1. Reassign the contact
   const putRes = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
@@ -23810,7 +23813,8 @@ async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlU
 
   // Audit trail — record the claim with seconds-to-claim for offline SLA mining
   try {
-    const secondsToClaim = Math.max(0, Math.round(Date.now() / 1000 - parseFloat(timestamp)));
+    const claimAt = replyClaims.claimTimeMs({ replyAtMs: claimedAtMs, postedAtMs: parseFloat(timestamp) * 1000, nowMs: Date.now() });
+    const secondsToClaim = Math.max(0, Math.round(claimAt / 1000 - parseFloat(timestamp)));
     await supabase.from('setter_claims').insert({
       ghl_contact_id: contactId,
       contact_name: fullName,
@@ -23822,6 +23826,7 @@ async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlU
       ghl_user_id: ghlUserId,
       opps_reassigned: oppsOk,
       seconds_to_claim: secondsToClaim,
+      claimed_at: new Date(claimAt).toISOString(),
       claim_source: claimSource,
     });
   } catch (claimErr) {
