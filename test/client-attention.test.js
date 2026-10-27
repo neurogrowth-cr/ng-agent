@@ -126,6 +126,11 @@ for (let k = 0; k < 6; k++) many.items.push({ ...clone(FEED.items[4]), clientId:
 const plan = ca.planAlerts(many, new Set());
 check('6n  alerts per run are capped with an overflow count', [plan.send.length, plan.overflow], [ca.MAX_ALERTS_PER_RUN, many.items.filter((i) => i.level === 'urgent').length - ca.MAX_ALERTS_PER_RUN]);
 check('6o  overflow line', ca.formatAlertOverflow(3, FEED.adminUrl), `🔴 *Client attention* · 3 more urgent items this run: <${FEED.adminUrl}|see the admin page>`);
+check('6o2 an alert can close with the @fulfillment mention and still passes', ca.validateAlert(ca.formatAlert(FEED.items[1], FEED.adminUrl, { mention: MENTION })).ok, true);
+check('6o3 the mention ends the alert', ca.formatAlert(FEED.items[1], FEED.adminUrl, { mention: MENTION }).endsWith(`Campaign health. ${MENTION}`), true);
+check('6o4 dry-run keys live apart from live keys', [ca.alertKey(FEED.items[1], { dry: true }), ca.memberKeys(FEED.items[0], { dry: true })[0]], ['attention-dry:c-uslegal:linkedin_disconnected:bb0000000001', 'attention-dry:c-action:sending_stopped:aa0000000001']);
+check('6o5 items seen only in the dry run are still fresh when alerts go live', ca.planAlerts(FEED, new Set(FEED.items.map((i) => ca.alertKey(i, { dry: true })))).send.map(ca.alertKey), urgentKeys);
+check('6o6 a dry run skips what it already sent', ca.planAlerts(FEED, new Set(FEED.items.map((i) => ca.alertKey(i, { dry: true }))), { dry: true }).send.length, 0);
 
 const meta = ca.alertMetadata(FEED.items[0]);
 check('6p  metadata carries the item and, for a fleet, its members as strings', [meta.event_type, meta.event_payload.client_id, meta.event_payload.code, typeof meta.event_payload.members, JSON.parse(meta.event_payload.members).length], ['client_attention_alert', 'fleet', 'sending_stopped', 'string', 4]);
