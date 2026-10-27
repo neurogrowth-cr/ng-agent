@@ -295,6 +295,19 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
     optOut.split('\n').includes('🛑 Pide no recibir más correos: active DND de email en GHL hoy.'), true);
   check('9a3 the opt-out card passes its contract', sr.validateAlert(optOut), null);
   check('9a4 a pausa card has no opt-out line', card.includes('🛑'), false);
+  const optOutCard = (dnd) => sr.formatAlert({ contactName: 'Luis Mora', intents: ['pide baja'], subject: 'Seguimiento', quote: 'ya no me envíen correos', link: 'https://x.example/a', mentions: ['U1'], dnd });
+  check('9a5 DND applied: the card says so and offers the undo',
+    optOutCard('applied').split('\n').includes('🛑 Pidió no recibir más correos: DND de email aplicado en GHL. Reaccione ↩️ para quitarlo.'), true);
+  check('9a6 DND already on', optOutCard('already').includes('ya tenía DND de email'), true);
+  check('9a7 unconfirmed, failed or off keep the manual instruction',
+    ['unconfirmed', 'failed', 'off', undefined].map(d => optOutCard(d).includes('active DND de email en GHL hoy')), [true, true, true, true]);
+  check('9a8 every opt-out card state passes the contract',
+    ['applied', 'already', 'failed'].map(d => sr.validateAlert(optOutCard(d))), [null, null, null]);
+  check('9a9 opt-out verdict: only a clear true lets Max write DND',
+    [sr.parseOptOutVerdict('{"optout": true}'), sr.parseOptOutVerdict('```json\n{"optout":true}\n```'), sr.parseOptOutVerdict('{"optout": false}'),
+     sr.parseOptOutVerdict('{"optout": "true"}'), sr.parseOptOutVerdict('yes'), sr.parseOptOutVerdict('')], [true, true, false, false, false, false]);
+  check('9a10 the opt-out prompt says "not interested" alone is not an opt-out',
+    /WITHOUT asking to stop the emails is NOT an opt-out/.test(sr.buildOptOutPrompt('no me interesa')), true);
   check('9b a valid card passes its contract', sr.validateAlert(card), null);
   check('9c a card with no quote fails', sr.validateAlert(card.split('\n').filter(l => !l.startsWith('> ')).join('\n')), 'missing quote');
   check('9d "undefined" outside the quote fails', sr.validateAlert(card.replace('Ana Ruiz', 'undefined')), 'placeholder value');
