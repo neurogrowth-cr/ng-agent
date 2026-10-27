@@ -7,6 +7,7 @@ const sequenceReplies = require('./lib/sequenceReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
 const triageFicha = require('./lib/triageFicha');
 const maxBacklog = require('./lib/maxBacklog');
+const reportLesson = require('./lib/reportLesson');
 const { App } = require('@slack/bolt');
 const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -1277,23 +1278,30 @@ async function runMaxBacklogDigest(correlationId, { now = new Date(), force = fa
 
 // ── Report feedback learning loop ────────────────────────────────────────────
 
-// When a team member @mentions Max in a thread on a Max-posted report, extract
-// the lesson from their feedback and store it so future reports apply the fix.
+// When a team member @mentions Max in a thread on a Max-posted report, decide
+// whether the message is feedback on the post; if it is, store the lesson so
+// future reports apply the fix. Questions and requests store nothing (2026-10-26).
 // `reportId` is resolved by the caller from the registry (lookupReportId) — this
 // function never inspects the report text to decide what it is.
 async function extractAndSaveReportLesson(originalReport, feedbackText, channelName, userId, correlationId, reportId) {
   try {
-    const prompt = `A team member gave feedback on a Max report posted in #${channelName}.\n\nOriginal report:\n${clipText(originalReport, 1500)}\n\nFeedback:\n${feedbackText}\n\nExtract the lesson in 2-3 sentences: (1) what was wrong or inaccurate in the report, (2) what Max should do differently in future reports for this channel. Be specific and actionable. No preamble.`;
+    // Gate first (lib/reportLesson.js): a question or a request is not feedback
+    // and saves nothing. Only a clear {feedback:true, lesson} is stored.
+    const prompt = reportLesson.buildReportLessonPrompt({ channelName, report: originalReport, message: feedbackText });
     const tLlm = Date.now();
     const res = await anthropic.messages.create({
       model: MODEL_LIGHT,
       thinking: THINKING_OFF,
-      max_tokens: 200,
+      max_tokens: 250,
       messages: [{ role: 'user', content: prompt }],
     });
     logLlmFromAnthropicResponse(res, Date.now() - tLlm, correlationId, 'report_lesson');
-    const lesson = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-    if (!lesson) return null;
+    const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const lesson = reportLesson.parseReportLessonVerdict(raw);
+    if (!lesson) {
+      console.log(`Report lesson skipped in #${channelName}: not feedback on the post.`);
+      return null;
+    }
     const scopedId = reportId || channelName || 'general-report';
     const key = `report_lesson:${scopedId}:${new Date().toISOString().slice(0, 10)}`;
     await upsertKnowledge('process', key, lesson, 'report-feedback', userId, 'shared');
