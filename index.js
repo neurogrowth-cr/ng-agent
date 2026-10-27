@@ -20856,6 +20856,76 @@ console.log('Registered static cron: hot reply alerts + social intake gap (*/15 
 const SEQ_REPLY_KEY = 'seq-reply';
 const SEQ_REPLY_RUN_KEY = 'seq-reply-run';
 const SEQ_REPLY_EVENT = 'sequence_reply_alert';
+
+// ─── OPT-OUT → EMAIL DND (Ron, 2026-10-26) ──────────────────────────────────
+// A reply tagged "pide baja" (lib/sequenceReplies.js) is confirmed by one Haiku
+// call, then Max sets email DND on the contact in GHL, so no workflow emails
+// them again. Only the Email channel: setters can still answer on WhatsApp. The
+// card says what happened; ↩️ on the card takes the DND off. Never throws: any
+// failure leaves the manual instruction on the card.
+// Kill switch: SEQ_OPTOUT_DND_DISABLED=true.
+const SEQ_OPTOUT_DND_UNDO_EMOJI = 'leftwards_arrow_with_hook';
+function seqOptOutDndDisabled() { return process.env.SEQ_OPTOUT_DND_DISABLED === 'true'; }
+
+async function ghlSetEmailDnd(contactId, on, message = '') {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dndSettings: { Email: { status: on ? 'active' : 'inactive', message } } }),
+  }, { label: `PUT /contacts/${contactId} email dnd` });
+  if (!res.ok) throw new Error(`email DND PUT ${contactId} -> ${res.status}: ${(await res.text()).slice(0, 150)}`);
+}
+
+// Returns 'applied' | 'already' | 'unconfirmed' | 'off' | 'failed'.
+async function seqApplyOptOutDnd({ contact, contactId, text, now = Date.now() }) {
+  if (seqOptOutDndDisabled()) return 'off';
+  if (contact && (contact.dnd === true || contact.dndSettings?.Email?.status === 'active')) return 'already';
+  try {
+    const tLlm = Date.now();
+    const res = await anthropic.messages.create({
+      model: MODEL_LIGHT,
+      thinking: THINKING_OFF,
+      max_tokens: 30,
+      messages: [{ role: 'user', content: sequenceReplies.buildOptOutPrompt(text) }],
+    });
+    logLlmFromAnthropicResponse(res, Date.now() - tLlm, null, 'seq_optout_check');
+    const raw = res.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    if (!sequenceReplies.parseOptOutVerdict(raw)) {
+      logActivity({ event_type: 'sequence_reply_optout', event_source: 'cron', action: 'seqReply:dnd_unconfirmed', status: 'ok', output: { contact_id: contactId } });
+      return 'unconfirmed';
+    }
+    const day = new Date(now).toISOString().slice(0, 10);
+    await ghlSetEmailDnd(contactId, true, `Pidió no recibir más correos (respuesta del ${day}). Aplicado por Max.`);
+    logActivity({ event_type: 'sequence_reply_optout', event_source: 'cron', action: 'seqReply:dnd_applied', status: 'ok', output: { contact_id: contactId } });
+    return 'applied';
+  } catch (err) {
+    console.error(`seq-reply: opt-out DND failed for ${contactId}:`, err.message);
+    logActivity({ event_type: 'sequence_reply_optout', event_source: 'cron', action: 'seqReply:dnd_applied', status: 'error',
+      output: { contact_id: contactId }, error_message: String(err.message).slice(0, 500) });
+    return 'failed';
+  }
+}
+
+// ↩️ on a card where Max applied DND: take it off. Anyone on Max's roster.
+async function handleSequenceOptOutUndo(event, payload) {
+  if (!payload || payload.dnd !== 'applied' || !payload.contact_id) return;
+  if (!isRosterMember(event.user)) return;
+  try {
+    const contact = await ghlGetContact(payload.contact_id);
+    if (contact && contact.dndSettings?.Email?.status !== 'active') return; // already off; nothing to undo
+    await ghlSetEmailDnd(payload.contact_id, false, '');
+    await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts,
+      text: `↩️ DND de email quitado por <@${event.user}>. Vuelve a recibir correos.` })
+      .catch(e => console.error('seq-reply: undo note failed:', e.message));
+    logActivity({ event_type: 'sequence_reply_optout', event_source: 'slack', action: 'seqReply:dnd_undone', status: 'ok',
+      actor_user_id: event.user, output: { contact_id: payload.contact_id } });
+  } catch (err) {
+    console.error(`seq-reply: DND undo failed for ${payload.contact_id}:`, err.message);
+    await slack.client.chat.postMessage({ channel: event.item.channel, thread_ts: event.item.ts,
+      text: `⚠️ No pude quitar el DND de email (${String(err.message).slice(0, 120)}). Quítelo en GHL.` }).catch(() => {});
+  }
+}
+// ─── end opt-out → email DND ────────────────────────────────────────────────
 const SEQ_CLOSER_EMAIL_FIELD = 'd43h5jq9Vl5QMFshKMjK'; // closer email (old contacts hold Jose's gmail)
 const SEQ_CLOSER_NAME_FIELD = 'ntpsrmtlw23vM9uJbiTw';  // closer name
 // GHL user id (lowercase) → Slack: the active setters plus the closers' raw GHL
@@ -20949,8 +21019,9 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
     || [contact && contact.firstName, contact && contact.lastName].filter(Boolean).join(' ') || 'Sin nombre';
   const intents = sequenceReplies.tagIntents(text);
   const group = sequenceReplies.groupLabel({ tags, opportunities: convo.opportunities });
+  const dnd = intents.includes('pide baja') ? await seqApplyOptOutDnd({ contact, contactId: convo.contactId, text, now }) : null;
   const card = sequenceReplies.formatAlert({
-    contactName, intents, group,
+    contactName, intents, group, dnd,
     subject: sequenceReplies.answeredSubject(email.subject) || sequenceReplies.answeredSubject(reply.threadSubject),
     quote: text, link: ghlContactLink(convo.contactId), mentions: who.mentions, fallback: who.fallback,
     replyAt: reply.at, now,
@@ -20969,7 +21040,7 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
   try {
     posted = await slack.client.chat.postMessage({
       channel: LEAD_CHANNEL_ID, text: card, unfurl_links: false, unfurl_media: false,
-      metadata: { event_type: SEQ_REPLY_EVENT, event_payload: { email_id: reply.id, contact_id: convo.contactId, conversation_id: convo.id } },
+      metadata: { event_type: SEQ_REPLY_EVENT, event_payload: { email_id: reply.id, contact_id: convo.contactId, conversation_id: convo.id, dnd } },
     });
   } catch (err) {
     // Release the claim: the next run retries instead of going quiet.
@@ -20982,12 +21053,12 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
   _seqDone.add(reply.id);
   const record = {
     s: 'posted', at: now, ch: posted.channel, ts: posted.ts, cid: convo.contactId, conv: convo.id, th: reply.threadId,
-    replyAt: reply.at, name: contactName, mentions: who.mentions, intents,
+    replyAt: reply.at, name: contactName, mentions: who.mentions, intents, dnd,
   };
   const saved = await seqSwap(key, claim, record, now).catch(e => { console.warn(`seq-reply: record write failed for ${key}: ${e.message}`); return false; });
   if (!saved) stats.reportErrors++;
   stats.posted++;
-  stats.alerts.push({ contact_id: convo.contactId, intents, group, mentions: who.mentions.length, fallback: who.fallback });
+  stats.alerts.push({ contact_id: convo.contactId, intents, group, mentions: who.mentions.length, fallback: who.fallback, dnd });
   return true;
 }
 
@@ -24063,7 +24134,7 @@ slack.event('reaction_added', async ({ event }) => {
     // (✅ handled), both identified by message metadata.
     // Sits ahead of Route 0 because Route 0/1 swallow DM ✅ with no matching
     // metadata. Falls through untouched on any miss.
-    if (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || baseEmoji === OPEN_DEAL_SNOOZE_EMOJI) {
+    if (CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji) || baseEmoji === OPEN_DEAL_SNOOZE_EMOJI || baseEmoji === SEQ_OPTOUT_DND_UNDO_EMOJI) {
       try {
         const hist = await slack.client.conversations.history({
           channel: event.item.channel, latest: event.item.ts, limit: 1, inclusive: true, include_all_metadata: true,
@@ -24077,6 +24148,11 @@ slack.event('reaction_added', async ({ event }) => {
         // the lead-claim route, which also takes ✅ in that channel.
         if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === SEQ_REPLY_EVENT && CAMPAIGN_APPROVE_EMOJIS.has(baseEmoji)) {
           await handleSequenceReplyReaction(event, msg.metadata.event_payload);
+          return;
+        }
+        // ↩️ on a card where Max applied email DND: take it off.
+        if (msg && msg.ts === event.item.ts && msg.metadata?.event_type === SEQ_REPLY_EVENT && baseEmoji === SEQ_OPTOUT_DND_UNDO_EMOJI) {
+          await handleSequenceOptOutUndo(event, msg.metadata.event_payload);
           return;
         }
       } catch (caErr) {
