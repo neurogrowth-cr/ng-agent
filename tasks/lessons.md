@@ -523,3 +523,6 @@ missing. That second data point is the only reason the real cause was found.
 
 ## 2026-10-26: the `major-change` label must be on the PR before CI reads it
 - `gh pr create --label major-change` applies the label after the `opened` event is emitted, so the revert detector ran with `LABELS` empty and failed (#380). `gh run rerun` replays the same event payload, still without the label. Fix: close and reopen the PR (the `reopened` event carries the label), or push a commit after labelling. Zero-cost next time: create the PR, add the label, then push the branch's last commit.
+
+## 2026-10-26: a refusal is data, not a lesson (#386)
+- On 2026-10-24 Max refused a GHL delete and the report-feedback loop, triggered only because he was mentioned in a thread he rooted, saved a fabricated "lesson" and made him promise a behaviour change that a templated card can never apply. Prompt lessons cannot change templated output and do not record missing capabilities. Capability gaps now go to `max_backlog`, a ledger a human works monthly; lessons stay for prompt-shaped mistakes only.
