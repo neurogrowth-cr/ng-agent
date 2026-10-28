@@ -319,6 +319,39 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
     sr.formatAlert({ contactName: 'Ana', intents: ['respuesta'], subject: 's', quote: 'hola', link: 'https://x.example/a', mentions: ['U1'], replyAt: NOW - 26 * H, now: NOW }).split('\n')[0],
     '<@U1> 📧 *Respuesta por correo* · *Ana* (hace 1d 2h)');
 
+  // ── 11. Exit the sales sequences on a reply (2026-10-28) ──────────────────
+  {
+    const D = 24 * H;
+    const reply = cr('2026-10-21T08:59:00');
+    // The real case: call held the afternoon before, reply to the post-call email next morning.
+    check('11a a reply the morning after the call is not about the call: exit',
+      sr.replyNearCall({ replyAt: reply, appointments: [{ start: cr('2026-10-20T15:00:00'), status: 'showed' }] }), false);
+    check('11b a reply the day before an upcoming call is about the call: no exit',
+      sr.replyNearCall({ replyAt: cr('2026-10-19T12:32:00'), appointments: [{ start: cr('2026-10-20T15:00:00'), status: 'confirmed' }] }), true);
+    check('11c "gracias por la llamada" two hours after the call start: no exit',
+      sr.replyNearCall({ replyAt: cr('2026-10-20T17:00:00'), appointments: [{ start: cr('2026-10-20T15:00:00'), status: 'showed' }] }), true);
+    check('11d a cancelled upcoming call does not count',
+      sr.replyNearCall({ replyAt: reply, appointments: [{ start: reply + 2 * D, status: 'cancelled' }] }), false);
+    check('11e no appointments: exit', sr.replyNearCall({ replyAt: reply, appointments: [] }), false);
+    check('11f sweep holds the day after the reply (the restart window)',
+      sr.exitHold({ replyAt: reply, now: reply + 19 * H, appointments: [{ start: cr('2026-10-20T15:00:00'), status: 'showed' }] }), 'hold');
+    check('11g a call held after the reply ends the hold',
+      sr.exitHold({ replyAt: reply, now: reply + 5 * D, appointments: [{ start: reply + 3 * D, status: 'showed' }] }), 'new_call');
+    check('11h a call booked for later does not end the hold yet',
+      sr.exitHold({ replyAt: reply, now: reply + 2 * D, appointments: [{ start: reply + 3 * D, status: 'confirmed' }] }), 'hold');
+    check('11i a no-show after the reply does not end the hold',
+      sr.exitHold({ replyAt: reply, now: reply + 5 * D, appointments: [{ start: reply + 3 * D, status: 'noshow' }] }), 'hold');
+    check('11j after 14 days the hold lapses', sr.exitHold({ replyAt: reply, now: reply + 15 * D, appointments: [] }), 'lapsed');
+    check('11k no reply time: lapsed, never held forever', sr.exitHold({ replyAt: 0, now: reply, appointments: [] }), 'lapsed');
+    const card = sr.formatAlert({ contactName: 'Ana', intents: ['respuesta'], subject: 'Ana, lo que le garantizo por contrato', group: 'post-llamada',
+      quote: 'Gracias, lo reviso', link: 'https://x.example/a', mentions: ['U1'], exit: 'exited' });
+    check('11l the card says Max took them out', card.includes('🔕 Max lo sacó de las secuencias automáticas'), true);
+    check('11m the card still passes its contract', sr.validateAlert(card), null);
+    check('11n the digest still reads the quote and group back', sr.cardParts(card), { quote: 'Gracias, lo reviso', group: 'post-llamada' });
+    check('11o a failed exit tells the team to do it in GHL', sr.exitLine('failed').includes('Sáquelo en GHL'), true);
+    check('11p no line when nothing was exited (call, off, null)', [sr.exitLine('call'), sr.exitLine('off'), sr.exitLine(null)], [null, null, null]);
+  }
+
   // ── 10. Wiring in index.js (text checks, the monolith is never required) ──
   const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
   check('10a declared in STATIC_CRON_SCHEDULES every 10 min', /runSequenceReplyAlerts:\s*'\*\/10 \* \* \* \*'/.test(SRC), true);
@@ -330,6 +363,10 @@ check('5h last message outbound skipped', scr(convo({ lastMessageDirection: 'out
   check('10h digest registered with the same schedule', SRC.includes("cron.schedule('0 9,15 * * 1-6', wrapCronJob('runSequenceReplyDigest'"), true);
   check('10i the 2h thread reminder is gone', /seqRunReminders|formatReminder|reminderDue/.test(SRC), false);
   check('10j digest posts to #ng-sales-goats, one per slot', /seqInsert\(slotKey/.test(SRC) && /channel: LEAD_CHANNEL_ID, text, unfurl_links: false/.test(SRC), true);
+  check('10k the reply flow exits the sequences on every human reply',
+    /const exit = base \? null : await seqExitOnReply\(/.test(SRC), true);
+  check('10l exit sweep declared and registered hourly at :07',
+    [/runSequenceExitSweep:\s*'7 \* \* \* \*'/.test(SRC), SRC.includes("cron.schedule('7 * * * *', wrapCronJob('runSequenceExitSweep'")], [true, true]);
   check('10f no em dash in the new code', /\u2014/.test(fs.readFileSync(path.join(__dirname, '..', 'lib', 'sequenceReplies.js'), 'utf8').replace(/'\\u2014'/g, '')), false);
 
   if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }

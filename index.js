@@ -20953,6 +20953,112 @@ async function handleSequenceOptOutUndo(event, payload) {
   }
 }
 // ─── end opt-out → email DND ────────────────────────────────────────────────
+
+// ─── EXIT THE SALES SEQUENCES ON A REPLY ────────────────────────────────────
+// Ron, 2026-10-28: a person who answers a sequence email comes out of it and
+// stays out. GHL "Stop on response" only ends the one run of the workflow that
+// was running. On 2026-10-22 a prospect who had answered the post-call email got
+// its first email again the next morning: his outcome was logged after his
+// reply, the stage moved to Open Deal, and that starts the workflow over.
+// So on every human reply (not a bounce, auto-reply, calendar notice or internal
+// sender) Max removes the contact from every sales sequence in
+// SEQ_EXIT_WORKFLOWS, and an hourly sweep removes them from the post-call
+// workflow again for 14 days (the only one that starts by itself), unless they
+// held a new call after replying. Reminders for a booked call (pre-call, webinar
+// reminders) are never touched, and a reply around a booked call is about that
+// call, so it exits nothing (lib/sequenceReplies.js replyNearCall).
+// A removal is safe to repeat: GHL answers 200 when the contact is not in the
+// workflow (checked 2026-10-28). Kill switch: SEQ_EXIT_DISABLED=true.
+const SEQ_EXIT_KEY = 'seq-exit';
+const SEQ_EXIT_POSTCALL_WORKFLOW = 'bcad7c86-2f26-4b16-8c93-fc8acd2f0b4d'; // Post-llamada · Deal abierto
+const SEQ_EXIT_WORKFLOWS = [
+  SEQ_EXIT_POSTCALL_WORKFLOW,
+  '63e3ba2c-0584-4116-926b-019a4fba9f0b', // Reactivación Oct 2026
+  '0be541de-de02-4136-a50f-46fb1fa1d2d7', // Webinar - Invitaciones - ALL LIST
+  '6acf444d-863e-45f8-8c12-83bdc912c5ea', // Webinar 27 - Post-clase
+];
+function seqExitDisabled() { return process.env.SEQ_EXIT_DISABLED === 'true'; }
+
+async function ghlRemoveFromWorkflow(contactId, workflowId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/workflow/${workflowId}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  }, { label: 'DELETE /contacts/:id/workflow/:id' });
+  if (!res.ok) throw new Error(`remove ${contactId} from workflow ${workflowId} -> ${res.status}: ${(await res.text()).slice(0, 150)}`);
+}
+
+// Throws on a read error, so a failed read is never mistaken for "no call".
+async function seqContactAppointments(contactId) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}/appointments`, {
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+  }, { label: 'GET /contacts/:id/appointments' });
+  if (!res.ok) throw new Error(`appointments ${contactId} -> ${res.status}`);
+  const data = await res.json();
+  return (data.events || []).filter(e => e && !e.deleted)
+    .map(e => ({ start: parseGhlApptTime(e.startTime), status: e.appointmentStatus || e.status || '' }));
+}
+
+// Returns 'exited' | 'partial' | 'failed' | 'call' | 'off'. Never throws. When
+// the appointments cannot be read, Max exits anyway: a missed post-call email
+// costs less than writing to someone who is already talking to the team.
+async function seqExitOnReply({ contactId, replyAt, now = Date.now() }) {
+  if (seqExitDisabled() || !contactId) return 'off';
+  let appointments = null;
+  try { appointments = await seqContactAppointments(contactId); } catch (err) {
+    console.warn(`seq-exit: appointments read failed for ${contactId}: ${err.message}`);
+  }
+  if (appointments && sequenceReplies.replyNearCall({ replyAt, appointments })) return 'call';
+  const removed = []; const failed = [];
+  for (const wid of SEQ_EXIT_WORKFLOWS) {
+    try { await ghlRemoveFromWorkflow(contactId, wid); removed.push(wid); } catch (err) {
+      failed.push(wid);
+      console.error(`seq-exit: ${err.message}`);
+    }
+  }
+  const exit = !failed.length ? 'exited' : removed.length ? 'partial' : 'failed';
+  if (removed.length) {
+    const { error } = await supabase.from('agent_knowledge').upsert({
+      category: 'process', key: `${SEQ_EXIT_KEY}:${contactId}`, source: SEQ_EXIT_KEY,
+      value: JSON.stringify({ cid: contactId, replyAt: Number(replyAt) || now, at: now, removed }),
+      user_id: RON_SLACK_ID, visibility: 'shared', updated_at: new Date(now).toISOString(),
+    }, { onConflict: 'category,key' });
+    if (error) console.warn(`seq-exit: record write failed for ${contactId}: ${error.message}`);
+  }
+  logActivity({ event_type: 'sequence_exit', event_source: 'cron', action: 'seqExit:on_reply',
+    status: failed.length ? 'error' : 'ok', output: { contact_id: contactId, exit, removed: removed.length, failed } });
+  return exit;
+}
+
+// Hourly: for 14 days after a reply, take the person out of the post-call
+// workflow again in case an outcome logged after the reply started it over.
+// A contact whose appointments cannot be read is left alone this hour.
+async function runSequenceExitSweep(correlationId, { now = Date.now() } = {}) {
+  if (seqExitDisabled()) { console.log('Sequence exit sweep disabled (SEQ_EXIT_DISABLED=true).'); return { ok: true, disabled: true }; }
+  const since = new Date(now - sequenceReplies.CONFIG.exitHoldMs).toISOString();
+  const { data, error } = await supabase.from('agent_knowledge').select('key, value')
+    .eq('category', 'process').like('key', `${SEQ_EXIT_KEY}:%`).gte('updated_at', since);
+  if (error) throw new Error(`seq-exit sweep read failed: ${error.message}`);
+  const stats = { records: (data || []).length, held: 0, new_call: 0, lapsed: 0, removed: 0, errors: 0 };
+  for (const row of data || []) {
+    let rec = null;
+    try { rec = JSON.parse(row.value); } catch (_) { stats.errors++; continue; }
+    if (!rec || !rec.cid) { stats.errors++; continue; }
+    let appointments;
+    try { appointments = await seqContactAppointments(rec.cid); } catch (_) { stats.errors++; continue; }
+    const state = sequenceReplies.exitHold({ replyAt: rec.replyAt, now, appointments });
+    stats[state === 'hold' ? 'held' : state]++;
+    if (state !== 'hold') continue;
+    try { await ghlRemoveFromWorkflow(rec.cid, SEQ_EXIT_POSTCALL_WORKFLOW); stats.removed++; } catch (err) {
+      stats.errors++;
+      console.error(`seq-exit sweep: ${err.message}`);
+    }
+  }
+  logActivity({ event_type: 'audit', event_source: 'cron', action: 'sequence_exit_sweep', correlation_id: correlationId,
+    status: stats.errors ? 'error' : 'ok', output: stats });
+  console.log(`Sequence exit sweep: ${JSON.stringify(stats)}`);
+  return { ok: !stats.errors, stats };
+}
+// ─── end exit the sales sequences on a reply ────────────────────────────────
 const SEQ_CLOSER_EMAIL_FIELD = 'd43h5jq9Vl5QMFshKMjK'; // closer email (old contacts hold Jose's gmail)
 const SEQ_CLOSER_NAME_FIELD = 'ntpsrmtlw23vM9uJbiTw';  // closer name
 // GHL user id (lowercase) → Slack: the active setters plus the closers' raw GHL
@@ -21021,12 +21127,15 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
   const key = seqKey(reply.id);
   const text = sequenceReplies.cleanReply(email.body);
   const from = sequenceReplies.emailAddress(email.from);
-  const reason = sequenceReplies.skipReason({ from: email.from, subject: email.subject, text })
+  const base = sequenceReplies.skipReason({ from: email.from, subject: email.subject, text });
+  // A person wrote back: out of every sales sequence, whatever happens to the card.
+  const exit = base ? null : await seqExitOnReply({ contactId: convo.contactId, replyAt: reply.at, now });
+  const reason = base
     || sequenceReplies.tagSkip(tags, PERSONAL_CONTACT_TAG)
     || (from && clientEmails.has(from) ? 'client' : null)
     || (sequenceReplies.answeredInGhl({ messages: msgs, replyAt: reply.at, isAutomatedBody: strikeIsAutomatedBody }) ? 'answered' : null);
   if (reason) {
-    await seqTake(key, prior, { s: 'skipped', reason, at: now, cid: convo.contactId }, now);
+    await seqTake(key, prior, { s: 'skipped', reason, at: now, cid: convo.contactId, exit }, now);
     _seqDone.add(reply.id);
     seqBump(stats.skips, reason);
     return true;
@@ -21048,7 +21157,7 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
   const group = sequenceReplies.groupLabel({ tags, opportunities: convo.opportunities });
   const dnd = intents.includes('pide baja') ? await seqApplyOptOutDnd({ contact, contactId: convo.contactId, text, now }) : null;
   const card = sequenceReplies.formatAlert({
-    contactName, intents, group, dnd,
+    contactName, intents, group, dnd, exit,
     subject: sequenceReplies.answeredSubject(email.subject) || sequenceReplies.answeredSubject(reply.threadSubject),
     quote: text, link: ghlContactLink(convo.contactId), mentions: who.mentions, fallback: who.fallback,
     replyAt: reply.at, now,
@@ -21080,12 +21189,12 @@ async function seqHandleReply({ convo, contact, tags, reply, email, msgs, prior,
   _seqDone.add(reply.id);
   const record = {
     s: 'posted', at: now, ch: posted.channel, ts: posted.ts, cid: convo.contactId, conv: convo.id, th: reply.threadId,
-    replyAt: reply.at, name: contactName, mentions: who.mentions, intents, dnd,
+    replyAt: reply.at, name: contactName, mentions: who.mentions, intents, dnd, exit,
   };
   const saved = await seqSwap(key, claim, record, now).catch(e => { console.warn(`seq-reply: record write failed for ${key}: ${e.message}`); return false; });
   if (!saved) stats.reportErrors++;
   stats.posted++;
-  stats.alerts.push({ contact_id: convo.contactId, intents, group, mentions: who.mentions.length, fallback: who.fallback, dnd });
+  stats.alerts.push({ contact_id: convo.contactId, intents, group, mentions: who.mentions.length, fallback: who.fallback, dnd, exit });
   return true;
 }
 
@@ -21330,6 +21439,10 @@ cron.schedule('*/10 * * * *', wrapCronJob('runSequenceReplyAlerts', async (c) =>
 console.log('Registered static cron: sequence email reply alerts (*/10 * * * *)');
 cron.schedule('0 9,15 * * 1-6', wrapCronJob('runSequenceReplyDigest', async (c) => { await runSequenceReplyDigest(c); }, { timeoutMs: 8 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: sequence email reply digest (0 9,15 * * 1-6)');
+// Hourly at :07, after the :00 reply run has recorded any new exits. In
+// STATIC_CRON_SCHEDULES.
+cron.schedule('7 * * * *', wrapCronJob('runSequenceExitSweep', async (c) => { await runSequenceExitSweep(c); }, { timeoutMs: 8 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: sequence exit sweep (7 * * * *)');
 // ─── end sequence email reply alerts ────────────────────────────────────────
 
 // ─── CONTENT BRIDGE: 24H SETTER CARD ────────────────────────────────────────
@@ -22834,6 +22947,7 @@ const STATIC_CRON_SCHEDULES = {
   runHotReplyCheck:             '*/15 * * * *',
   runSequenceReplyAlerts:       '*/10 * * * *',
   runSequenceReplyDigest:       '0 9,15 * * 1-6',
+  runSequenceExitSweep:         '7 * * * *',
   runBridge24hCards:            '15 8-20 * * *',
   runIgGuideCheck:              '*/5 * * * *',
   runGuardianCheck:             '*/15 8-20 * * *',
