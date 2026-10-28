@@ -2,6 +2,7 @@ require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
 const firstTouchAdLib = require('./lib/firstTouchAd');
+const adAttribution = require('./lib/adAttribution');
 const hotReplies = require('./lib/hotReplies');
 const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
@@ -727,6 +728,8 @@ const RON_ONLY_TOOLS = new Set([
   'get_revi_intelligence',
   // The weekly recap is a Ron-only DM surface (spend, CAC, revenue).
   'preview_weekly_recap',
+  // Revenue and spend per ad (same rule as the recap).
+  'get_ad_performance',
 ]);
 
 // Per-tool refusal reasons. The blocked-tool message is fed back to the model
@@ -734,6 +737,7 @@ const RON_ONLY_TOOLS = new Set([
 // here becomes a wrong claim from Max (the old shared OAuth wording had him
 // telling the team REVI was OAuth-gated; it never was).
 const RON_ONLY_REASONS = {
+  get_ad_performance: 'Ad performance shows revenue and ad spend, which are confidential to Ron. For which ad a specific person came from, use get_lead_ad_source: that one is open to the team.',
   get_revi_intelligence: 'REVI coaching teardowns, call scores, deal transcripts, and leadership initiatives are confidential to Ron. For client call summaries (quicksyncs, activation calls) or the client roster, use get_revi_client_context instead — that one is open to the whole team.',
 };
 const RON_ONLY_DEFAULT_REASON = 'Gmail and Calendar use Ron\'s personal OAuth.';
@@ -8390,6 +8394,8 @@ const ALL_TOOLS = [
           { name: 'get_meta_ads_summary', description: 'Get NeuroGrowth Meta Ads account-level performance summary — spend, impressions, reach, clicks, CTR, CPC, CPM, leads, and CPL.', input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'Date range: today, yesterday, last_7d (default), last_14d, last_30d, last_month, this_month, this_quarter' } } } },
           { name: 'get_meta_campaigns',   description: 'Get Meta Ads campaign-level breakdown.',                                                  input_schema: { type: 'object', properties: { datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' }, limit: { type: 'number', description: 'Number of campaigns, default 10' } } } },
           { name: 'get_meta_adsets',      description: 'Get Meta Ads ad set level breakdown.',                                                    input_schema: { type: 'object', properties: { campaignId: { type: 'string', description: 'Optional campaign ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
+          { name: 'get_ad_performance',   description: 'RON-ONLY. Leads, bookings, held calls and closes per Meta ad, each person credited to their FIRST-TOUCH ad (GHL attribution), with Meta spend per ad: CPL, cost per booking, cost per held call, CAC, revenue, lead-to-close. Also lists every close with its ad and closer, a cross-check of wins between the portal and GHL (won in one system but not the other, or no contact), and SCALE / KILL suggestions for windows of 28+ days. Use for "winner ads", "which ads close", "cost per call by ad", "CAC by ad". month = YYYY-MM for a calendar month; since/until = YYYY-MM-DD (default last 90 days); history = true for the stored monthly history (trend questions).', input_schema: { type: 'object', properties: { month: { type: 'string', description: 'YYYY-MM' }, since: { type: 'string', description: 'YYYY-MM-DD (CR)' }, until: { type: 'string', description: 'YYYY-MM-DD (CR), inclusive' }, history: { type: 'boolean', description: 'true = monthly history from ad_attribution_monthly' } } } },
+          { name: 'get_lead_ad_source',   description: 'Which ad (or organic channel) a specific client, prospect or lead came from: the ad, campaign and ad set GHL recorded on their FIRST contact, the date and their stage. Search by name or email. Open to the team; shows no money. Never answer this from the GHL contact page attribution: that is the latest session and loses the ad on Instagram DM leads.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Name or email (3+ characters)' } }, required: ['query'] } },
           { name: 'get_meta_ads',         description: 'Get individual ad-level performance.',                                                    input_schema: { type: 'object', properties: { adSetId: { type: 'string', description: 'Optional ad set ID filter' }, datePreset: { type: 'string', description: 'last_7d (default), last_14d, last_30d, this_month' } } } },
           { name: 'detect_anomalies',     description: 'Run the anomaly-detection pass on demand. Scrapes the 8 tracked metrics, recomputes rolling baselines, and returns any metric currently >= 1.5σ from baseline. By default this is a dry-run (no DMs, no knowledge writes). Use this to answer "what is drifting right now?" without waiting for the daily cron.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean', description: 'If true (default), do not record observations or fire DMs. If false, runs the full pipeline as if from cron.' } } } },
           { name: 'preview_weekly_recap', description: 'Generate the Weekly Sales & Marketing Recap right now (week-to-date: Monday CR through this moment) and return it as text WITHOUT posting it anywhere. Use when Ron asks to preview, test, or see the weekly recap on demand — the Friday 5 PM cron still posts the real one.', input_schema: { type: 'object', properties: {} } },
@@ -8573,6 +8579,8 @@ EMAIL PROXY (when a setter/closer asks you to send an email on their behalf):
         else if (toolUse.name === 'get_meta_ads_summary')   result = await getMetaAdsSummary(toolUse.input.datePreset || 'last_7d');
         else if (toolUse.name === 'get_meta_campaigns')     result = await getMetaCampaigns(toolUse.input.datePreset || 'last_7d', toolUse.input.limit || 10);
         else if (toolUse.name === 'get_meta_adsets')        result = await getMetaAdSets(toolUse.input.campaignId || null, toolUse.input.datePreset || 'last_7d');
+        else if (toolUse.name === 'get_ad_performance')     result = await getAdPerformanceTool(toolUse.input || {});
+        else if (toolUse.name === 'get_lead_ad_source')     result = await getLeadAdSourceTool(toolUse.input || {});
         else if (toolUse.name === 'get_meta_ads')           result = await getMetaAds(toolUse.input.adSetId || null, toolUse.input.datePreset || 'last_7d');
         else if (toolUse.name === 'detect_anomalies')       {
           const dryRun = toolUse.input.dry_run !== false;
@@ -14080,6 +14088,188 @@ async function composeRecapNarrative(statText, lessons) {
   }
 }
 
+// ─── AD ATTRIBUTION (lib/adAttribution.js) ───────────────────────────────────
+// Leads, bookings, held calls and closes per Meta ad (first touch), with Meta
+// spend per ad: CPL, cost per booking, cost per held call, CAC (Ron,
+// 2026-10-28). Surfaces: get_ad_performance (Ron-only: revenue and spend),
+// get_lead_ad_source (team: which ad a person came from, no money), the BY AD
+// block of the Weekly Recap and, on the first recap of each month, last month
+// by ad with SCALE / KILL plus a row per ad in ad_attribution_monthly.
+function adAttributionDeps() {
+  const ghlBase = 'https://services.leadconnectorhq.com';
+  return {
+    locationId: process.env.GHL_LOCATION_ID,
+    adAccountId: process.env.META_AD_ACCOUNT_ID,
+    portal: portalSupabase,
+    async ghl(method, path, body) {
+      const res = await ghlFetch(`${ghlBase}${path}`, {
+        method,
+        headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      }, { label: `ad-attribution ${method} ${path.split('?')[0]}` });
+      if (!res.ok) throw new Error(`${method} ${path.split('?')[0]} → ${res.status}`);
+      return res.json();
+    },
+    async meta(path, query) {
+      if (!process.env.META_ACCESS_TOKEN) throw new Error('Meta not configured');
+      const qs = new URLSearchParams({ ...query, access_token: process.env.META_ACCESS_TOKEN });
+      const res = await fetch(`https://graph.facebook.com/v19.0${path}?${qs}`);
+      const json = await res.json();
+      if (json.error) throw new Error(json.error.message);
+      return json;
+    },
+  };
+}
+
+async function getAdAttribution(win) {
+  const deps = adAttributionDeps();
+  deps.excludeIds = await getNonFlywheelCallIds();
+  return adAttribution.gatherAdAttribution(deps, win);
+}
+
+// CR calendar dates → window. until is inclusive.
+function adWindowFromDates(since, until) {
+  const next = new Date(Date.parse(`${until}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+  return { startIso: `${since}T06:00:00.000Z`, endIso: `${next}T06:00:00.000Z`, metaSince: since, metaUntil: until };
+}
+
+const closerDisplay = (id) => SALES_TEAM_MAP[id] || SALES_TEAM_MAP[String(id || '').toLowerCase()] || id;
+
+// producingOnly (the weekly, Ron 2026-10-28): only ads that brought a booking
+// or a close, organic only when it did too; no tail of quiet ads.
+function formatAdAttribution(out, { title, limit = 8, withScaleKill = false, producingOnly = false } = {}) {
+  const lines = [title];
+  lines.push(adAttribution.formatTotals(out.totals));
+  const o = out.totals.organic;
+  // Organic stays in the weekly when it brought calls or closes (Ron, 2026-10-28).
+  if (!producingOnly || o.booked || o.wins) lines.push(`Organic (no ad): ${o.leads} leads · ${o.booked} booked · ${o.held} held · ${o.wins} won${o.wins ? ` ($${Math.round(o.revenue).toLocaleString('en-US')})` : ''}`);
+  const ads = out.rows.filter(r => r.adKey !== adAttribution.ORGANIC
+    && (producingOnly ? (r.booked || r.wins) : (r.leads || r.booked || r.wins || r.spend >= 20)));
+  for (const r of ads.slice(0, limit)) lines.push(adAttribution.adLine(r));
+  if (producingOnly && !ads.length) lines.push('No ad brought a booking or a close this week.');
+  if (ads.length > limit) lines.push(`(+${ads.length - limit} more ads)`);
+  lines.push('', '_Closes_');
+  lines.push(...adAttribution.formatWins(out.wins, closerDisplay));
+  const cc = adAttribution.formatCrossCheck(out.crossCheck);
+  if (cc.length) lines.push('', '_Cross-check (fix these in GHL or the portal)_', ...cc);
+  if (withScaleKill) {
+    const sk = adAttribution.rankScaleKill(out.rows);
+    lines.push('', `_Scale / kill_ (recommendations only; account $/booking ${sk.avgCostPerBooked == null ? 'n/a' : '$' + sk.avgCostPerBooked})`);
+    lines.push(`SCALE: ${adAttribution.groupedAdNames(sk.scale.slice(0, 6)).join(', ') || 'none'}`);
+    lines.push(`KILL (no bookings, spend ≥ $${Math.round(sk.killFloor)}): ${adAttribution.groupedAdNames(sk.kill.slice(0, 6), { money: true }).join(', ') || 'none'}`);
+  }
+  if (!out.metaOk) lines.push('⚠️ Meta spend unavailable this run: cost columns read n/a.');
+  if (out.errors.length) console.warn(`ad attribution: ${out.errors.length} lookup errors, first: ${out.errors[0]}`);
+  return lines;
+}
+
+async function loadAdHistory(month) {
+  const { data, error } = await supabase.from('ad_attribution_monthly').select('*').eq('month', `${month}-01`);
+  if (error) throw new Error(`ad_attribution_monthly read: ${error.message}`);
+  return data || [];
+}
+
+async function saveAdHistory(month, rows) {
+  const { error } = await supabase.from('ad_attribution_monthly')
+    .upsert(adAttribution.historyRows(month, rows), { onConflict: 'month,ad_key' });
+  if (error) throw new Error(`ad_attribution_monthly upsert: ${error.message}`);
+}
+
+// Last month by ad, for the first Weekly Recap of a month. Saves the month's
+// history rows unless previewing.
+async function buildMonthlyAdBlock(month, { save = true } = {}) {
+  const out = await getAdAttribution(adAttribution.crMonthBounds(month));
+  let prevHist = [];
+  try { prevHist = await loadAdHistory(adAttribution.prevMonth(month)); } catch (e) { console.error(e.message); }
+  if (save) {
+    try { await saveAdHistory(month, out.rows); } catch (e) { console.error(e.message); }
+  }
+  const lines = formatAdAttribution(out, { title: `\`LAST MONTH BY AD\` (${month}, credited to the first-touch ad)`, limit: 10, withScaleKill: true });
+  lines.push('', '_vs previous month_', ...adAttribution.monthDeltaLines(out.rows, prevHist));
+  return lines;
+}
+
+async function getAdPerformanceTool(input = {}) {
+  try {
+    if (input.history) {
+      const { data, error } = await supabase.from('ad_attribution_monthly').select('*').order('month', { ascending: false }).limit(2000);
+      if (error) throw new Error(error.message);
+      const byMonth = new Map();
+      for (const r of data || []) {
+        const m = String(r.month).slice(0, 7);
+        if (!byMonth.has(m)) byMonth.set(m, []);
+        byMonth.get(m).push(r);
+      }
+      if (!byMonth.size) return 'No monthly ad history stored yet.';
+      const lines = ['AD ATTRIBUTION HISTORY (monthly, first-touch ad; spend for rebuilt months is what Meta reports today)'];
+      for (const [m, hist] of byMonth) {
+        const rows = hist.map(h => ({ adKey: h.ad_key, adId: h.ad_id, adName: h.ad_name, campaign: h.campaign, adSet: h.ad_set, leads: h.leads, booked: h.booked, held: h.held, wins: h.wins, revenue: Number(h.revenue), spend: Number(h.spend) }));
+        const t = adAttribution.totalsOf(rows);
+        const top = rows.filter(r => r.adKey !== adAttribution.ORGANIC && r.wins > 0).sort((a, z) => z.wins - a.wins || z.revenue - a.revenue);
+        lines.push('', `${m}: ${adAttribution.formatTotals(t)}`);
+        lines.push(`  organic: ${t.organic.leads} leads · ${t.organic.booked} booked · ${t.organic.wins} won`);
+        lines.push(`  closing ads: ${adAttribution.groupedAdNames(top).join(', ') || 'none'}`);
+      }
+      return lines.join('\n');
+    }
+    let win; let label;
+    if (input.month) { win = adAttribution.crMonthBounds(input.month); label = input.month; }
+    else {
+      const until = input.until || new Date(Date.now() - 6 * 3600000).toISOString().slice(0, 10);
+      const since = input.since || new Date(Date.parse(`${until}T00:00:00Z`) - 89 * 86400000).toISOString().slice(0, 10);
+      win = adWindowFromDates(since, until); label = `${since} → ${until}`;
+    }
+    const out = await getAdAttribution(win);
+    const days = (Date.parse(win.endIso) - Date.parse(win.startIso)) / 86400000;
+    return formatAdAttribution(out, { title: `AD PERFORMANCE (${label}; every person credited to their first-touch ad)`, limit: 20, withScaleKill: days >= 28 }).join('\n');
+  } catch (err) {
+    return `Ad performance error: ${err.message}`;
+  }
+}
+
+// Which ad a person came from. Team-safe: no revenue, no spend.
+async function getLeadAdSourceTool(input = {}) {
+  try {
+    const q = String(input.query || '').replace(/[,()*%\\]/g, ' ').trim();
+    if (q.length < 3) return 'Give me at least 3 characters of a name or an email.';
+    const deps = adAttributionDeps();
+    const ids = new Map(); // contactId -> portal status
+    const { data: prospects } = await portalSupabase.from('revops_prospects')
+      .select('full_name, email, status, ghl_contact_id')
+      .or(`full_name.ilike.%${q}%,email.ilike.%${q}%`).limit(5);
+    for (const p of prospects || []) {
+      const cid = p.ghl_contact_id || await ghlFindContactByEmail(p.email);
+      if (cid && !ids.has(cid)) ids.set(cid, p.status || null);
+    }
+    if (ids.size < 5) {
+      try {
+        const res = await deps.ghl('POST', '/contacts/search', { locationId: deps.locationId, pageLimit: 5, query: q });
+        for (const c of res.contacts || []) if (!ids.has(c.id) && ids.size < 5) ids.set(c.id, null);
+      } catch (e) { console.error('lead ad source search:', e.message); }
+    }
+    if (!ids.size) return `No GHL contact or prospect matches "${q}".`;
+    const lines = [];
+    for (const [cid, status] of ids) {
+      let c = null;
+      try { c = (await deps.ghl('GET', `/contacts/${cid}`)).contact; } catch (e) { lines.push(`• ${cid}: contact read failed (${e.message})`); continue; }
+      if (!c) continue;
+      const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.contactName || cid;
+      const ad = firstTouchAdLib.firstTouchAd(c);
+      const a = c.attributionSource || {};
+      const first = c.dateAdded ? c.dateAdded.slice(0, 10) : 'unknown date';
+      const tags = (c.tags || []).map(t => String(t).toLowerCase());
+      const stage = status || (tags.includes('won-deal') ? 'won' : tags.includes('call-showed') ? 'call held' : tags.includes('call-booked') ? 'call booked' : 'lead');
+      const src = ad
+        ? `ad *${ad.adName || `ad ${ad.adId}`}*${ad.campaign ? ` · campaign ${ad.campaign}` : ''}${ad.adSet ? ` · ad set ${ad.adSet}` : ''} (${a.medium || 'meta'})`
+        : `organic, no ad (${a.medium || a.sessionSource || 'unknown channel'})`;
+      lines.push(`• ${name}: ${src} · first contact ${first} · status: ${stage}`);
+    }
+    return `FIRST-TOUCH SOURCE (the ad GHL recorded on the person's first contact; later sessions never override it)\n${lines.join('\n')}`;
+  } catch (err) {
+    return `Lead ad source error: ${err.message}`;
+  }
+}
+
 async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } = {}) {
   console.log('Running weekly sales & marketing recap...');
   try {
@@ -14134,6 +14324,12 @@ async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } 
       }, 'client-updates'),
       safe(() => getReportLessons('weekly-sales-marketing-recap'), 'lessons'),
     ]);
+    const adWeek = await safe(() => getAdAttribution({ startIso: b.startIso, endIso: b.endIso, metaSince: b.metaSince, metaUntil: b.metaUntil }), 'ad-attribution');
+    // First recap of a CR month also carries last month by ad (and stores it).
+    const crDay = Number(new Date(Date.now() - 6 * 3600000).toISOString().slice(8, 10));
+    const adMonth = crDay <= 7
+      ? await safe(() => buildMonthlyAdBlock(adAttribution.prevMonth(adAttribution.crMonthOf(new Date())), { save: !preview }), 'ad-attribution-month')
+      : null;
 
     const parts = [`📈 Weekly Sales & Marketing Recap — ${b.monLabel} to ${b.endLabel} (week through report time)`];
 
@@ -14205,6 +14401,14 @@ async function runWeeklySalesMarketingRecap(_correlationId, { preview = false } 
     } else {
       parts.push('Meta data unavailable this run.');
     }
+
+    // ── BY AD (first-touch attribution, GHL closes) ───────────────────────
+    if (adWeek) {
+      parts.push('', ...formatAdAttribution(adWeek, { title: '`BY AD` (this week: ads that brought calls or closes, first-touch credit; CAC from real closes, not the pixel)', limit: 10, producingOnly: true }));
+    } else {
+      parts.push('', '`BY AD`', 'Ad attribution unavailable this run.');
+    }
+    if (adMonth) parts.push('', ...adMonth);
 
     // ── ANOMALIES (σ-detection only) ──────────────────────────────────────
     parts.push('', '`ANOMALIES` (σ-detection, this week)');
