@@ -903,3 +903,8 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **First read (Oct 1 to 28):** ads $1,878 spend, 142 leads, 32 booked, 16 held, 4 won, CAC $470 (Jul $1,129, Aug $1,056, Sep $881). Cross-check flags two portal wins whose GHL deal is still open (one in Oct, one in Sep).
 - **Tests:** new `test/ad-attribution.test.js` (fake GHL, Meta, portal).
 - **Open:** Winning Ads Sweep still ranks form CPL for the Monday reflection brief; moving it to this logic is a later change. Upsert never deletes, so an ad dropping out of a recomputed month keeps its old row.
+## 2026-10-29: styled Instagram names no longer drop the lead_posts row ([PR #403](https://github.com/neurogrowth-cr/ng-agent/pull/403), merged `58c9789`)
+- **Symptom:** SOCIAL INTAKE GAP at 18:45 CR for IG lead "𝓐𝓵𝓵𝓪𝓷" (contact `Ny0a6F7n0kX0apomM3sK`). Max did get the webhook (00:05:55 UTC) and posted the card (Sebastián claimed it), but no `lead_posts` row was written, and the gap check reads that table.
+- **Cause:** `name_prefix3` was `slice(0, 3)` on a name made of surrogate pairs, leaving half a character. Postgres rejects it ("Unicode low surrogate must follow a high surrogate"), and supabase-js returns that error instead of throwing, so the try/catch never logged it.
+- **Fix:** `hotReplies.namePrefix()` (NFKC fold, so styled letters become plain `all`, then a code-point slice) is now the one derivation for intake and the gap check. All three `lead_posts` upserts log the returned `error`. Test 7m.
+- **Rule:** a supabase-js write inside try/catch is not checked. Read `{ error }`.
