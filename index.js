@@ -17263,11 +17263,13 @@ const STRIKE_MAX_AI_USER_ID = process.env.IG_GUIDE_MAX_GHL_USER_ID || 'cfLku0XE7
 // `source` cannot tell them apart. The only stable signal is the text: both
 // templates carry this sentence. Matched accent- and case-insensitively as a
 // substring, so the {name} token and small edits around it don't matter.
+// The IG DM ads' ice-breaker reply (template 1809245817054854, 2026-10-28) says
+// "no info genérica" instead, so the default marker stops before that word.
 // Override with STRIKE_AUTOMATED_BODY_MARKERS (pipe-separated) if the copy
 // changes; keep the sentence in the templates otherwise.
 const STRIKE_AUTOMATED_BODY_MARKERS = String(
   process.env.STRIKE_AUTOMATED_BODY_MARKERS
-  || 'Para responderle con algo útil y no información genérica',
+  || 'Para responderle con algo útil y no',
 ).split('|').map(strikeNormalizeText).filter(Boolean);
 function strikeNormalizeText(text) {
   return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
