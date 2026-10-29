@@ -11,7 +11,7 @@ const block = SRC.slice(
   SRC.indexOf('const PROPOSAL_ACTIONS'),
   SRC.indexOf('// ─── end weekly brief helpers'),
 );
-const g = new Function(`${slugBlock}\n${block}; return { parseProposalLine, selectProposals, proposalExpired, formatWeekNumbers, PROPOSAL_MAX_PER_WEEK, PROPOSAL_EXPIRY_DAYS, PROPOSAL_SUPPRESS_DAYS };`)();
+const g = new Function(`${slugBlock}\n${block}; return { parseProposalLine, selectProposals, proposalExpired, formatWeekNumbers, plainAdSweep, WEEK_NUMBERS_PLAIN, PROPOSAL_MAX_PER_WEEK, PROPOSAL_EXPIRY_DAYS, PROPOSAL_SUPPRESS_DAYS };`)();
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -54,26 +54,41 @@ const tsDaysAgo = (d) => String((NOW - d * 86400000) / 1000);
 check('6 days old → still live', g.proposalExpired(tsDaysAgo(6), NOW), false);
 check('8 days old → expired', g.proposalExpired(tsDaysAgo(8), NOW), true);
 
-console.log('\nformatWeekNumbers — deterministic, honest about noise');
+console.log('\nformatWeekNumbers — plain language, honest about noise');
 {
   const rows = [
-    { label: 'ROAS', domain: 'marketing', value: 3.2, mean: 2.0, stdDev: 0.5 },   // > mean + 0.5σ → ▲
-    { label: 'Close rate', domain: 'sales', value: 0.10, mean: 0.20, stdDev: 0.05 }, // < mean − 0.5σ → ▼
-    { label: 'Show rate', domain: 'sales', value: 0.85, mean: 0.84, stdDev: 0.10 },  // inside noise → •
-    { label: 'Days to launch', domain: 'fulfillment', value: 21, mean: null, stdDev: null }, // no baseline yet
+    { name: 'roas_meta_7d', value: 3.2, mean: 2.0, stdDev: 0.5 },              // up, up is good → 🟢
+    { name: 'close_rate_7d', value: 0.10, mean: 0.20, stdDev: 0.05 },          // down, up is good → 🔴
+    { name: 'cpa_true_7d', value: 365.41, mean: 183.17, stdDev: 50 },          // up, down is good → 🔴
+    { name: 'show_rate_7d', value: 0.85, mean: 0.84, stdDev: 0.10 },           // inside noise → ⚪
+    { name: 'fulfillment_days_to_launch_avg', value: 21, mean: null, stdDev: null }, // no baseline yet
+    { name: 'iclosed_calls_booked_yest', value: 0, mean: 0.64, stdDev: 0.5 },  // daily key → left out
   ];
   const out = g.formatWeekNumbers(rows);
-  check('grouped under department headers',
-    ['MARKETING', 'SALES', 'FULFILLMENT'].every(h => out.includes(h)), true);
-  check('real drift up gets ▲', /ROAS: 3\.20 \(▲/.test(out), true);
-  check('real drift down gets ▼', /Close rate: 0\.10 \(▼/.test(out), true);
-  check('wiggle inside half a sigma gets a neutral dot, not a fake trend', /Show rate: 0\.85 \(•/.test(out), true);
-  check('a metric still in warmup shows its value without a baseline claim',
-    /Days to launch: 21\.00(?!.*baseline)/.test(out.split('\n').find(l => l.includes('Days to launch'))), true);
+  const line = (k) => out.split('\n').find(l => l.includes(k)) || '';
+  check('grouped under plain section headers', ['*Marketing*', '*Sales*', '*Clients*'].every(h => out.includes(h)), true);
+  check('a legend explains the dots', /🟢 better than usual · 🔴 worse than usual · ⚪ about normal/.test(out), true);
+  check('good move up gets green', line('Sales for every $1').startsWith('🟢') && line('Sales for every $1').includes('*$3.20* (usually $2.00)'), true);
+  check('bad move down gets red, rate shown as a percent', line('Calls that became a sale'), '🔴 Calls that became a sale: *10%* (usually 20%)');
+  check('a cost going UP is red, money rounded to whole dollars', line('Ad cost per new client'), '🔴 Ad cost per new client: *$365* (usually $183)');
+  check('wiggle inside half a sigma is normal, not a fake trend', line('Booked people who showed up').startsWith('⚪'), true);
+  check('a metric still in warmup says so instead of faking a baseline', line('Days to launch'), '⚪ Days to launch a new client: *21 days* (too new to compare)');
+  check('daily "yesterday" keys stay out of the weekly brief', /yesterday/i.test(out), false);
+  check('no decimals on counts', /: \*\d+\.\d+\*/.test(g.formatWeekNumbers([{ name: 'leads_total_7d', value: 81, mean: 45.93, stdDev: 10 }])), false);
 }
-check('no data at all is stated, not faked',
-  g.formatWeekNumbers([]).includes('No metrics have baselines yet'), true);
-check('null rows are skipped', g.formatWeekNumbers([null, { label: 'X', domain: 'sales', value: 1, mean: 1, stdDev: 1 }]).includes('X: 1.00'), true);
+check('no data at all is stated, not faked', g.formatWeekNumbers([]).startsWith('No numbers yet'), true);
+check('null rows are skipped', g.formatWeekNumbers([null, { name: 'leads_total_7d', value: 1, mean: 1, stdDev: 1 }]).includes('New leads: *1*'), true);
+check('every plain metric exists in the registry (a renamed key would silently vanish)',
+  g.WEEK_NUMBERS_PLAIN.every(m => SRC.includes(`name: '${m.name}'`)), true);
+
+console.log('\nplainAdSweep — stored format translated at print time');
+{
+  const out = g.plainAdSweep('Form-funnel ad ranking, 7d. Account CPL $1.90.\nSCALE: Ad A — $1.10 CPL on $120 spend (2nd week running)\nKILL: Ad B — $4.50 CPL on $80 spend');
+  check('account line in plain words', out.split('\n')[0], '• Average cost per lead: $1.90');
+  check('scale line', out.split('\n')[1], '• 🟢 Spend more on "Ad A": $1.10 per lead, $120 spent, 2nd week running');
+  check('kill line', out.split('\n')[2], '• 🔴 Think about pausing "Ad B": $4.50 per lead, $80 spent');
+  check('no jargon left', /CPL|SCALE|KILL/.test(out), false);
+}
 
 console.log('\nwiring (source-level)');
 check('the brief posts to the management channel',

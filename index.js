@@ -1512,25 +1512,76 @@ function proposalExpired(postedTsSec, nowMs = Date.now(), days = PROPOSAL_EXPIRY
   return (nowMs - parseFloat(postedTsSec) * 1000) > days * 86400000;
 }
 
-// THE WEEK IN NUMBERS — deterministic. rows: [{label, domain, value, mean, stdDev}].
+// THE WEEK IN NUMBERS: deterministic, written so anyone can read it in one
+// pass (Ron 2026-10-28: "high school level"). Only weekly metrics belong in a
+// weekly brief; the daily "yesterday"/"today" keys still drive anomaly DMs but
+// are left out here because one quiet day reads as a crisis. Each metric says
+// which way is good, so the dot means better or worse, not just up or down.
+// rows: [{name, value, mean, stdDev}].
+const WEEK_NUMBERS_PLAIN = [
+  { name: 'leads_total_7d',                  domain: 'marketing',   say: 'New leads',                                  fmt: 'count', good: 'up' },
+  { name: 'cpa_true_7d',                     domain: 'marketing',   say: 'Ad cost per new client',                     fmt: 'usd',   good: 'down' },
+  { name: 'roas_meta_7d',                    domain: 'marketing',   say: 'Sales for every $1 spent on ads',            fmt: 'usd2',  good: 'up' },
+  { name: 'revenue_won_7d',                  domain: 'sales',       say: 'Sales closed',                               fmt: 'usd',   good: 'up' },
+  { name: 'booking_rate_7d',                 domain: 'sales',       say: 'Leads who booked a call',                    fmt: 'pct',   good: 'up' },
+  { name: 'show_rate_7d',                    domain: 'sales',       say: 'Booked people who showed up',                fmt: 'pct',   good: 'up' },
+  { name: 'close_rate_7d',                   domain: 'sales',       say: 'Calls that became a sale',                   fmt: 'pct',   good: 'up' },
+  { name: 'fulfillment_days_to_launch_avg',  domain: 'fulfillment', say: 'Days to launch a new client',                fmt: 'days',  good: 'down' },
+  { name: 'fulfillment_pending_activations', domain: 'fulfillment', say: 'Clients waiting over a week to launch',      fmt: 'count', good: 'down' },
+  { name: 'day7_at_risk_count',              domain: 'fulfillment', say: 'Clients at risk',                            fmt: 'count', good: 'down' },
+  { name: 'phase0_to_phase1_conv_7d',        domain: 'fulfillment', say: 'Clients who moved from Phase 0 to Phase 1',  fmt: 'pct',   good: 'up' },
+  { name: 'phase1_cycle_days_p50',           domain: 'fulfillment', say: 'Days a typical client spends in Phase 1',    fmt: 'days',  good: 'down' },
+  { name: 'phase2_cycle_days_p50',           domain: 'fulfillment', say: 'Days a typical client spends in Phase 2',    fmt: 'days',  good: 'down' },
+];
+
+function formatPlainValue(v, fmt) {
+  const n = +v;
+  if (fmt === 'pct') return `${Math.round(n * 100)}%`;
+  if (fmt === 'usd') return `$${Math.round(n).toLocaleString('en-US')}`;
+  if (fmt === 'usd2') return `$${n.toFixed(2)}`;
+  if (fmt === 'days') return `${Math.round(n)} days`;
+  return String(Math.round(n));
+}
+
 // Direction marker only when the drift is over half a sigma; a number wiggling
-// inside noise gets a neutral dot rather than a fake trend.
+// inside noise is "normal" rather than a fake trend.
 function formatWeekNumbers(rows) {
-  const byDomain = { marketing: [], sales: [], fulfillment: [], client_success: [] };
-  for (const r of (rows || [])) {
-    if (!r || r.value === null || r.value === undefined) continue;
-    const dir = (r.mean !== null && r.mean !== undefined && r.stdDev)
-      ? (r.value > r.mean + 0.5 * r.stdDev ? '▲' : r.value < r.mean - 0.5 * r.stdDev ? '▼' : '•')
-      : '•';
-    const base = (r.mean !== null && r.mean !== undefined) ? ` (${dir} vs ${(+r.mean).toFixed(2)} baseline)` : '';
-    (byDomain[r.domain] || (byDomain[r.domain] = [])).push(`• ${r.label}: ${(+r.value).toFixed(2)}${base}`);
+  const byName = Object.fromEntries((rows || []).filter(r => r && r.value !== null && r.value !== undefined).map(r => [r.name, r]));
+  const byDomain = { marketing: [], sales: [], fulfillment: [] };
+  for (const spec of WEEK_NUMBERS_PLAIN) {
+    const r = byName[spec.name];
+    if (!r) continue;
+    const hasBase = r.mean !== null && r.mean !== undefined;
+    let dot = '⚪';
+    if (hasBase && r.stdDev) {
+      const moved = r.value > r.mean + 0.5 * r.stdDev ? 'up' : r.value < r.mean - 0.5 * r.stdDev ? 'down' : null;
+      if (moved) dot = moved === spec.good ? '🟢' : '🔴';
+    }
+    const usual = hasBase ? ` (usually ${formatPlainValue(r.mean, spec.fmt)})` : ' (too new to compare)';
+    byDomain[spec.domain].push(`${dot} ${spec.say}: *${formatPlainValue(r.value, spec.fmt)}*${usual}`);
   }
-  const section = (name, lines) => lines.length ? `${name}\n${lines.join('\n')}` : null;
-  return [
-    section('MARKETING', byDomain.marketing),
-    section('SALES', byDomain.sales),
-    section('FULFILLMENT', byDomain.fulfillment),
-  ].filter(Boolean).join('\n\n') || 'No metrics have baselines yet — the week in numbers starts once the scrapers warm up.';
+  const section = (name, lines) => lines.length ? `*${name}*\n${lines.join('\n')}` : null;
+  const body = [
+    section('Marketing', byDomain.marketing),
+    section('Sales', byDomain.sales),
+    section('Clients', byDomain.fulfillment),
+  ].filter(Boolean).join('\n\n');
+  return body
+    ? `_Last 7 days. 🟢 better than usual · 🔴 worse than usual · ⚪ about normal_\n\n${body}`
+    : 'No numbers yet. They show up once Max has a few weeks of history.';
+}
+
+// The ad sweep is stored in its own terse format (the next sweep parses the
+// SCALE lines back), so it is translated here, at print time, not at the source.
+function plainAdSweep(text) {
+  return String(text || '').split('\n').filter(Boolean).map(l => {
+    let m = l.match(/Account CPL \$(\S+?)\.?$/);
+    if (m) return `Average cost per lead: ${m[1] === 'n/a' ? 'not available' : `$${m[1]}`}`;
+    m = l.match(/^(SCALE|KILL): (.+?) — \$([\d.]+) CPL on \$(\d+) spend(.*)$/);
+    if (m) return `${m[1] === 'SCALE' ? '🟢 Spend more on' : '🔴 Think about pausing'} "${m[2]}": $${m[3]} per lead, $${m[4]} spent${m[5] ? `,${m[5].replace(/[()]/g, '').replace(/^ /, ' ')}` : ''}`;
+    if (/No ad deviates/.test(l)) return 'No ad is clearly better or worse than average this week.';
+    return l;
+  }).map(l => `• ${l}`).join('\n');
 }
 // ─── end weekly brief helpers (test slices to here) ───────────────────────────
 
@@ -5991,11 +6042,11 @@ async function runWeeklyReflectionBrief(correlationId) {
   const numberRows = METRIC_REGISTRY
     .filter(m => m.name in latestByMetric)
     .map(m => ({
-      label: m.label, domain: m.domain, value: latestByMetric[m.name],
+      name: m.name, value: latestByMetric[m.name],
       mean: baselineByMetric[m.name]?.mean ?? null, stdDev: baselineByMetric[m.name]?.std_dev ?? null,
     }));
   let numbersBlock = formatWeekNumbers(numberRows);
-  if (adSweepRows[0]) numbersBlock += `\n\nADS (weekly sweep)\n${String(adSweepRows[0].value).split('\n').map(l => `• ${l}`).join('\n')}`;
+  if (adSweepRows[0]) numbersBlock += `\n\n*Ads*\n${plainAdSweep(adSweepRows[0].value)}`;
 
   // ── ACTIONS ALREADY TAKEN + WATCHING (deterministic) ───────────────────────
   const actionsBlock = autoActions.length
@@ -6010,7 +6061,7 @@ async function runWeeklyReflectionBrief(correlationId) {
   const dismissedSlugs = new Set(dismissedRows
     .map(r => { try { const v = JSON.parse(r.value); return v.status === 'dismissed' ? slugifyReportName(v.title) : null; } catch { return null; } })
     .filter(Boolean));
-  const llmPrompt = `You are Max, NeuroGrowth's PM agent, writing the interpretive half of your Monday executive brief for the management channel. Audience: Ron and the management team. High-level, direct, numbers over adjectives.
+  const llmPrompt = `You are Max, NeuroGrowth's PM agent, writing the interpretive half of your Monday executive brief for the management channel. Audience: Ron and the management team. High-level, direct, numbers over adjectives. Write in plain words a high school student understands: no jargon or acronyms (say "cost per lead", not CPL; "sales per $1 of ads", not ROAS), whole numbers and percentages, short sentences.
 
 Write TWO things and nothing else:
 
