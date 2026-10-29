@@ -204,6 +204,15 @@ check('auto reply marker matches without accents, in any case, with a different 
     fbBody('outbound', '2026-09-22T20:00:03.000Z', 'MARIA, gracias por su comentario. PARA RESPONDERLE CON ALGO UTIL Y NO INFORMACION GENERICA, cuenteme...'),
   ], SEP).skip, 'automated_send');
 
+// IG DM ad ice-breaker reply (2026-10-28): "no info genérica", not "no información".
+const IG_AD_AUTO = 'Claro! Ayudamos a negocios y consultores a conseguir reuniones con dueños, gerentes y profesionales por LinkedIn, sin pagar anuncios. Para responderle con algo útil y no info genérica, cuénteme en una línea a qué se dedica su negocio y a quién le vende. Un miembro del equipo le responderá en breve.';
+check('IG DM ad auto reply alone does not move New Lead',
+  evaluateStrikeMove(opp(S.NL, '2026-10-29T00:42:41.000Z'), [
+    fbBody('inbound',  '2026-10-29T00:42:41.000Z', 'Buenas, podrían darme más información?'),
+    act('2026-10-29T00:42:44.000Z'),
+    fbBody('outbound', '2026-10-29T00:42:41.200Z', IG_AD_AUTO),
+  ], SEP).skip, 'automated_send');
+
 check('a real setter reply that merely quotes part of the template still counts',
   evaluateStrikeMove(opp(S.IC, '2026-09-18T12:00:00.000Z'), [
     wa('outbound', '2026-09-19T10:00:00.000Z'),
