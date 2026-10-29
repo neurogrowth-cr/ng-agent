@@ -916,3 +916,9 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **What:** `runWinningAdsSweep` ranks the last 30 days (`AD_SWEEP_DAYS`) via `getAdAttribution` and `lib/adAttribution.js` `sweepLines`: same SCALE / KILL rule as the monthly recap block, grouped by ad name, organic never ranked. Same `agent_knowledge` intel `ad_sweep:<week>` key and `SCALE: <name> —` shape (2nd-week-running mark intact). `rankAdsForSweep` removed. Read-only, as before.
 - **Dry run (2026-09-29 to 10-28):** SCALE Canada Ad (11 booked, 1 won), ugly ad Ron's house (6 booked, 1 won), Testimonial Recap Ad (1 won); KILL Very first ad Ron ($222), Ad 2 ($109), Ad 1 ($105).
 - **Tests:** `test/department-metrics.test.js` now covers `sweepLines` and the no-write wiring.
+
+## 2026-10-28: a logged win marks the GHL deal Won with the real value ([PR #409](https://github.com/neurogrowth-cr/ng-agent/pull/409), merged `28fce06`)
+- **Why:** Ron reported that logging an outcome moved the card but left the status and the amount untouched. `ghlMoveOpportunityForOutcome` PUT only `pipelineStageId`, so won deals sat in Closed with status open at the default value: the GHL "Opportunity Won" workflow never fired and the Purchase CAPI never reached Meta. A card already in Closed returned early and was never fixed.
+- **What:** pure `outcomeOppUpdate(opp, outcome, revenue)` decides the PUT. Won = stage + `status: 'won'` + `monetaryValue` (typed amount) in one write; a card already in Closed gets status and value fixed; other outcomes still move the stage only; a card closed out in another closed stage is never reopened. `logOutcomeToPortal` and `promoteOpenDealOutcome` pass `closedRevenue`.
+- **Tests:** 9 new checks in `test/outcome-loop.test.js`.
+- **Open:** two deals already stuck in Closed / open (one Sep, one Oct) need status won + value set once; GHL write pending Ron's OK.
