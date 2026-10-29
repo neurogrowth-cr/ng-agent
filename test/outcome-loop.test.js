@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS, OUTCOME_EMOJI, EMOJI_TO_OUTCOME };`)();
+const g = new Function(`${block}; return { outcomeOppUpdate, nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS, OUTCOME_EMOJI, EMOJI_TO_OUTCOME };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -107,6 +107,37 @@ check('won has no emoji — money is always typed', g.OUTCOME_EMOJI.won, undefin
 check('no tap emoji collides with the ✅/❌ reaction families',
   Object.keys(g.EMOJI_TO_OUTCOME).filter(e => ['white_check_mark', 'heavy_check_mark', 'check', 'ballot_box_with_check', 'x', 'no_entry', 'no_entry_sign', 'negative_squared_cross_mark'].includes(e)), []);
 check('an unknown pipeline never guesses a stage id', g.outcomeStageFor('not-a-pipeline', 'lost'), null);
+
+// ── outcomeOppUpdate: a won deal sets stage + status won + value in one PUT ──
+// The 2026-10-28 bug: only the stage moved, so cards sat in Closed / open / default value.
+{
+  const CLOSED = g.outcomeStageFor(APPT, 'won').id;
+  const OPEN_DEAL = g.outcomeStageFor(APPT, 'follow_up').id;
+  const LOST = g.outcomeStageFor(APPT, 'lost').id;
+  check('won from Open Deal: stage, status won and the real value in one write',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: OPEN_DEAL, status: 'open', monetaryValue: 2900 }, 'won', 5000).body,
+    { pipelineId: APPT, pipelineStageId: CLOSED, status: 'won', monetaryValue: 5000 });
+  check('already in Closed but still open: status and value are fixed, stage untouched',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: CLOSED, status: 'open', monetaryValue: 2900 }, 'won', 5000).body,
+    { status: 'won', monetaryValue: 5000 });
+  check('won with no amount typed: status won, value left as is',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: CLOSED, status: 'open', monetaryValue: 3500 }, 'won', null).body,
+    { status: 'won' });
+  check('already won at the right value: nothing to write',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: CLOSED, status: 'won', monetaryValue: 5000 }, 'won', 5000).already, true);
+  check('non-won outcomes move the stage only (no status, no value)',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: OPEN_DEAL, status: 'open', monetaryValue: 2900 }, 'lost', 5000).body,
+    { pipelineId: APPT, pipelineStageId: LOST });
+  check('a card closed out in another closed stage is never reopened',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: LOST, status: 'lost' }, 'won', 5000).terminal, true);
+  check('VSL won uses the VSL stage',
+    g.outcomeOppUpdate({ pipelineId: VSL, pipelineStageId: g.outcomeStageFor(VSL, 'follow_up').id, status: 'open' }, 'won', 4500).body.pipelineStageId,
+    g.outcomeStageFor(VSL, 'won').id);
+  check('unknown pipeline is an error, never a guess',
+    typeof g.outcomeOppUpdate({ pipelineId: 'x', pipelineStageId: 'y' }, 'won', 1).error, 'string');
+}
+check('both outcome writers pass the typed amount to GHL',
+  (SRC.match(/ghlMoveOpportunityForOutcome\(opportunityId, outcome, \{ revenue: closedRevenue \}\)/g) || []).length, 2);
 
 console.log('resolveAppointmentStatus — REVI proves a show; absence never proves a no-show');
 const R = (e) => { const v = g.resolveAppointmentStatus(e); return { status: v.status, action: v.action, reason: v.reason, conflict: v.conflict }; };

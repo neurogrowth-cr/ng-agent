@@ -10973,6 +10973,30 @@ function outcomeStageFor(pipelineId, outcome) {
 const GHL_TERMINAL_STAGE_IDS = new Set(
   Object.values(GHL_OUTCOME_STAGES).flatMap(s => [s.won.id, s.disqualified.id, s.lost.id]),
 );
+// What to PUT on the GHL opportunity for a logged outcome, from the card as it
+// is now. A won deal needs the STAGE, the STATUS won and the real VALUE in one
+// write: until 2026-10-28 only the stage moved, so won cards sat in "Closed"
+// with status open at the default value, GHL's "Opportunity Won" workflow
+// never fired and Meta never got the Purchase (reported by Ron on two real wins).
+// A card already in the target stage still gets its status and value fixed.
+// Other outcomes only move the stage, as before. Pure, no I/O.
+// Returns { body } to PUT, or { already, label }, or { error } / { terminal }.
+function outcomeOppUpdate(opp, outcome, revenue) {
+  const target = outcomeStageFor(opp.pipelineId, outcome);
+  if (!target) return { error: `no stage mapping for outcome "${outcome}" in pipeline ${opp.pipelineId || '(unknown)'}` };
+  const atTarget = opp.pipelineStageId === target.id;
+  // A card a human already closed out in ANOTHER closed stage is not ours to reopen.
+  if (!atTarget && GHL_TERMINAL_STAGE_IDS.has(opp.pipelineStageId)) return { terminal: true };
+  const body = {};
+  if (!atTarget) { body.pipelineId = opp.pipelineId; body.pipelineStageId = target.id; }
+  if (outcome === 'won') {
+    if (opp.status !== 'won') body.status = 'won';
+    const value = Number(revenue);
+    if (Number.isFinite(value) && value > 0 && Number(opp.monetaryValue) !== value) body.monetaryValue = value;
+  }
+  if (!Object.keys(body).length) return { already: true, label: target.label };
+  return { body, label: target.label };
+}
 // The distinct actions a closer can be offered on this pipeline. On VSL,
 // lost and disqualified collapse to one button because they are one stage.
 // no_show is included: it is the one attendance answer Max cannot derive, and
@@ -11824,7 +11848,7 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
     }
     if (opportunityId) {
       try {
-        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome);
+        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome, { revenue: closedRevenue });
       } catch (moveErr) {
         stageMove = { ok: false, message: moveErr.message };
       }
@@ -12447,7 +12471,7 @@ async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, c
     }
     if (opportunityId) {
       try {
-        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome);
+        stageMove = await ghlMoveOpportunityForOutcome(opportunityId, outcome, { revenue: closedRevenue });
       } catch (moveErr) {
         stageMove = { ok: false, message: moveErr.message };
       }
@@ -17345,22 +17369,25 @@ async function ghlFindSalesOpportunityByContact(contactId) {
   } catch (_) { return null; }
 }
 
-async function ghlMoveOpportunityForOutcome(oppId, outcome) {
+async function ghlMoveOpportunityForOutcome(oppId, outcome, { revenue = null } = {}) {
   const res = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
     headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
   }, { label: `opp-read ${oppId}` });
   if (!res.ok) return { ok: false, message: `opp GET ${oppId} → ${res.status}` };
   const opp = (await res.json()).opportunity || {};
-  const pipelineId = opp.pipelineId;
-  const target = outcomeStageFor(pipelineId, outcome);
-  if (!target) return { ok: false, message: `no stage mapping for outcome "${outcome}" in pipeline ${pipelineId || '(unknown)'}` };
-  if (opp.pipelineStageId === target.id) return { ok: true, already: true, label: target.label };
-  // A card a human already closed out is not ours to reopen.
-  if (GHL_TERMINAL_STAGE_IDS.has(opp.pipelineStageId)) {
+  const plan = outcomeOppUpdate(opp, outcome, revenue);
+  if (plan.error) return { ok: false, message: plan.error };
+  if (plan.terminal) {
     return { ok: false, terminal: true, message: `opportunity already in a closed stage (${APPT_PIPELINE_STAGE_LABELS[opp.pipelineStageId] || opp.pipelineStageId})` };
   }
-  await ghlMoveOpportunityStage(oppId, target.id, pipelineId);
-  return { ok: true, label: target.label };
+  if (plan.already) return { ok: true, already: true, label: plan.label };
+  const put = await ghlFetch(`https://services.leadconnectorhq.com/opportunities/${oppId}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify(plan.body),
+  }, { label: `PUT /opportunities/${oppId} (outcome ${outcome})` });
+  if (!put.ok) throw new Error(`opp PUT ${oppId} → ${put.status}: ${(await put.text()).slice(0, 150)}`);
+  return { ok: true, label: plan.label, statusSet: plan.body.status || null, valueSet: plan.body.monetaryValue ?? null };
 }
 
 // Pure decision function — all the semantics live here and it does no I/O, so the
