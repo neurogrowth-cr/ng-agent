@@ -156,6 +156,9 @@ const alert = hr.formatIntakeGapAlert([
 check('7k alert names both cases and where to look', [/NO GHL card/.test(alert), /Social DM Intake \(on reply\)\./.test(alert), /NO Slack lead post/.test(alert), /ghl-lead/.test(alert)], [true, true, true, true]);
 
 check('7l name prefix matches the intake derivation (Daniela vs Dani)', [hr.namePrefix3('Daniela Tenorio Consultora'), hr.namePrefix3('Dani Tenorio'), hr.namePrefix3('Jo'), hr.namePrefix3('')], ['dan', 'dan', null, null]);
+// 2026-10-29: "𝓐𝓵𝓵𝓪𝓷" (surrogate pairs) was cut mid-character, the lone half
+// made Postgres reject the lead_posts upsert, and the gap check fired.
+check('7m styled Instagram name folds to plain letters, never a lone surrogate', [hr.namePrefix3('𝓐𝓵𝓵𝓪𝓷'), hr.namePrefix('𝓐𝓵𝓵𝓪𝓷').isWellFormed(), hr.namePrefix('😀😀😀😀 x').isWellFormed(), Array.from(hr.namePrefix('😀😀😀😀')).length, hr.namePrefix('Jo')], ['all', true, true, 3, 'jo']);
 
 // ── 8. Fail closed ──────────────────────────────────────────────────────────
 let c = 0; const seen = [];

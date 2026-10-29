@@ -15950,8 +15950,7 @@ async function handleGHLWebhook(req, res) {
         // note on the original post instead of spamming a second top-level lead post.
         const phoneLast10 = (phone.match(/\d/g) || []).join('').slice(-10) || null;
         const emailLower  = (email || '').trim().toLowerCase() || null;
-        const firstNameLower = (fullName || '').trim().toLowerCase().split(/\s+/)[0] || '';
-        const namePrefix3    = firstNameLower.slice(0, 3) || null;
+        const namePrefix3    = hotReplies.namePrefix(fullName) || null;
         let dupOriginal = null;
         if (contactId && (phoneLast10 || emailLower)) {
           try {
@@ -15982,7 +15981,7 @@ async function handleGHLWebhook(req, res) {
         // Fuzzy-match instead: same name first-3-chars, within 5 min, original
         // came in with Source=Facebook, incoming is non-Facebook social. Tight
         // filters to keep false-positive rate low.
-        if (!dupOriginal && contactId && namePrefix3 && namePrefix3.length === 3 && !emailLower) {
+        if (!dupOriginal && contactId && hotReplies.namePrefix3(fullName) && !emailLower) {
           const incomingSource = (source || '').toLowerCase();
           const looksLikeWaSpawned = incomingSource && !incomingSource.includes('facebook') && !incomingSource.includes('vsl');
           if (looksLikeWaSpawned) {
@@ -16031,7 +16030,7 @@ async function handleGHLWebhook(req, res) {
             console.error('lead_posts dedup thread reply failed:', dupPostErr.message);
           }
           try {
-            await supabase.from('lead_posts').upsert({
+            const { error: lpDupErr } = await supabase.from('lead_posts').upsert({
               contact_id: contactId,
               slack_message_ts: dupOriginal.slack_message_ts,
               slack_channel_id: dupOriginal.slack_channel_id || LEAD_CHANNEL_ID,
@@ -16042,6 +16041,7 @@ async function handleGHLWebhook(req, res) {
               full_name: fullName || null,
               name_prefix3: namePrefix3,
             }, { onConflict: 'contact_id' });
+            if (lpDupErr) console.error(`lead_posts dup-row upsert failed for ${contactId}:`, lpDupErr.message);
           } catch (lpErr) {
             console.error('lead_posts dup-row upsert failed:', lpErr.message);
           }
@@ -16063,7 +16063,7 @@ async function handleGHLWebhook(req, res) {
             try {
               const ts = await postSelfServeLeadFyi({ text: fyiText, contactId, correlationId: ghlCorr });
               if (contactId && ts) {
-                await supabase.from('lead_posts').upsert({
+                const { error: lpFyiErr } = await supabase.from('lead_posts').upsert({
                   contact_id: contactId,
                   slack_message_ts: ts,
                   slack_channel_id: LEAD_CHANNEL_ID,
@@ -16076,6 +16076,7 @@ async function handleGHLWebhook(req, res) {
                   full_name: fullName || null,
                   name_prefix3: namePrefix3,
                 }, { onConflict: 'contact_id' });
+                if (lpFyiErr) console.error(`lead_posts self-serve upsert failed for ${contactId}:`, lpFyiErr.message);
               }
             } catch (fyiErr) {
               console.error('self-serve FYI post failed:', fyiErr.message);
@@ -16136,7 +16137,7 @@ async function handleGHLWebhook(req, res) {
         // GHL-direct claims back to this Slack post. Non-fatal on insert failure.
         if (contactId && leadPost?.ts) {
           try {
-            await supabase.from('lead_posts').upsert({
+            const { error: lpErr } = await supabase.from('lead_posts').upsert({
               contact_id: contactId,
               slack_message_ts: leadPost.ts,
               slack_channel_id: LEAD_CHANNEL_ID,
@@ -16147,8 +16148,11 @@ async function handleGHLWebhook(req, res) {
               full_name: fullName || null,
               name_prefix3: namePrefix3,
             }, { onConflict: 'contact_id' });
-          } catch (lpErr) {
-            console.error('lead_posts insert failed:', lpErr.message);
+            // supabase-js returns errors, it does not throw them. Unchecked, a
+            // failed write left a posted card with no row (2026-10-29, Allan).
+            if (lpErr) console.error(`lead_posts insert failed for ${contactId}:`, lpErr.message);
+          } catch (lpThrow) {
+            console.error('lead_posts insert failed:', lpThrow.message);
           }
         }
       } catch (parseErr) { console.error('GHL webhook parse error:', parseErr.message); }
