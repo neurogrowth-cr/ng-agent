@@ -8135,26 +8135,13 @@ async function _scrapePendingActivations() {
 // ── Winning-ads sweep (weekly) ───────────────────────────────────────────────
 // Individual ads churn with every creative refresh, so they get a weekly
 // RANKING, never baseline rows — a per-ad metric key would sever its history
-// the moment the ad is replaced. Ranks the Form-funnel ads (the ones that fire
-// `lead`) against the account's own 7d average CPL. Output feeds the Monday
-// reflection brief. Ranking ONLY: Max never touches campaigns — scaling or
-// killing an ad stays a human decision.
-// test/department-metrics.test.js slices rankAdsForSweep.
-function rankAdsForSweep(ads, { scaleFactor = 0.7, killFactor = 1.5, minSpendShare = 0.05 } = {}) {
-  const ranked = (ads || []).filter(a => a && a.spend > 0 && a.leads > 0)
-    .map(a => ({ ...a, cpl: a.spend / a.leads }));
-  const totalSpend = ranked.reduce((s, a) => s + a.spend, 0);
-  const totalLeads = ranked.reduce((s, a) => s + a.leads, 0);
-  if (!ranked.length || totalLeads <= 0) return { accountCpl: null, scale: [], kill: [] };
-  const accountCpl = totalSpend / totalLeads;
-  const meaningful = (a) => a.spend >= totalSpend * minSpendShare;
-  return {
-    accountCpl: +accountCpl.toFixed(2),
-    scale: ranked.filter(a => meaningful(a) && a.cpl <= accountCpl * scaleFactor).sort((x, y) => x.cpl - y.cpl),
-    kill:  ranked.filter(a => meaningful(a) && a.cpl >= accountCpl * killFactor).sort((x, y) => y.cpl - x.cpl),
-  };
-}
-// ─── end ad sweep ranking (test slices to here) ───────────────────────────────
+// the moment the ad is replaced. Since 2026-10-28 (Ron) it ranks by what the
+// ads actually produced: bookings and closes credited to the first-touch ad
+// over the last 30 days (lib/adAttribution.js, same SCALE / KILL rule as the
+// monthly recap block), instead of 7-day form CPL, which ignored IG DM ads and
+// never saw a close. Output feeds the Monday reflection brief. Ranking ONLY:
+// Max never touches campaigns — scaling or killing an ad stays a human decision.
+const AD_SWEEP_DAYS = 30;
 
 function _isoWeekKey(d = new Date()) {
   const dt = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -8164,22 +8151,10 @@ function _isoWeekKey(d = new Date()) {
 }
 
 async function runWinningAdsSweep(correlationId) {
-  const accountId = process.env.META_AD_ACCOUNT_ID;
-  const token     = process.env.META_ACCESS_TOKEN;
-  if (!accountId || !token) { console.log('Ad sweep: Meta credentials not configured, skipping.'); return; }
-  const fields = 'name,insights.date_preset(last_7d){spend,actions}';
-  const res  = await fetch(`https://graph.facebook.com/v19.0/${accountId}/ads?fields=${fields}&limit=100&access_token=${token}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  const ads = (data.data || []).map(ad => {
-    const ins = ad.insights?.data?.[0];
-    return ins ? {
-      name:  ad.name,
-      spend: parseFloat(ins.spend || 0),
-      leads: parseInt((ins.actions || []).find(a => a.action_type === 'lead')?.value || '0', 10),
-    } : null;
-  }).filter(Boolean);
-  const { accountCpl, scale, kill } = rankAdsForSweep(ads);
+  if (!process.env.META_AD_ACCOUNT_ID || !process.env.META_ACCESS_TOKEN) { console.log('Ad sweep: Meta credentials not configured, skipping.'); return; }
+  const until = new Date(Date.now() - 6 * 3600000).toISOString().slice(0, 10); // CR today
+  const since = new Date(Date.parse(`${until}T00:00:00Z`) - (AD_SWEEP_DAYS - 1) * 86400000).toISOString().slice(0, 10);
+  const out = await getAdAttribution(adWindowFromDates(since, until));
   const week = _isoWeekKey();
   // Stability: an ad that was a scale candidate LAST week too has earned the
   // label — one good week is variance.
@@ -8190,16 +8165,11 @@ async function runWinningAdsSweep(correlationId) {
       .neq('key', `ad_sweep:${week}`).order('updated_at', { ascending: false }).limit(1);
     if (prev && prev[0]) prevScale = new Set([...prev[0].value.matchAll(/SCALE: (.+?) —/g)].map(m => m[1]));
   } catch { /* first sweep has no history */ }
-  const fmtAd = (a, tag) => `${tag}: ${a.name} — $${a.cpl.toFixed(2)} CPL on $${a.spend.toFixed(0)} spend${tag === 'SCALE' && prevScale.has(a.name) ? ' (2nd week running)' : ''}`;
-  const lines = [
-    `Form-funnel ad ranking, 7d. Account CPL $${accountCpl ?? 'n/a'}.`,
-    ...scale.slice(0, 3).map(a => fmtAd(a, 'SCALE')),
-    ...kill.slice(0, 3).map(a => fmtAd(a, 'KILL')),
-  ];
-  if (scale.length === 0 && kill.length === 0) lines.push('No ad deviates meaningfully from the account average this week.');
+  const { lines, scale, kill } = adAttribution.sweepLines(out.rows, { days: AD_SWEEP_DAYS, prevScale });
+  if (!out.metaOk) lines.push('Meta spend unavailable this run: KILL needs spend, so none listed.');
   await upsertKnowledge('intel', `ad_sweep:${week}`, lines.join('\n'), 'ad-sweep');
-  logActivity({ event_type: 'cron_run', event_source: 'cron', action: 'runWinningAdsSweep', status: 'ok', output: { ads: ads.length, scale: scale.length, kill: kill.length }, correlation_id: correlationId });
-  console.log(`Ad sweep ${week}: ${ads.length} ads ranked, ${scale.length} scale / ${kill.length} kill candidates.`);
+  logActivity({ event_type: 'cron_run', event_source: 'cron', action: 'runWinningAdsSweep', status: 'ok', output: { ads: out.rows.length, scale, kill, meta_ok: out.metaOk }, correlation_id: correlationId });
+  console.log(`Ad sweep ${week}: ${out.rows.length} ads ranked over ${AD_SWEEP_DAYS}d, ${scale} scale / ${kill} kill candidates.`);
 }
 
 // ── Metric registry — single source of truth for what gets scraped ──────────
