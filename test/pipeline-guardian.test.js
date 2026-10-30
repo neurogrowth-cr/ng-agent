@@ -247,5 +247,25 @@ check('no thread reply sends the draft', pg.pickSendText({ draft: 'Hola', thread
 check('the approver\'s latest thread reply wins', pg.pickSendText({ draft: 'Hola', threadReplies: [{ user: 'SETTER', text: 'uno', ts: '2' }, { user: 'RON', text: 'dos', ts: '3' }], approverIds: ['SETTER', 'RON'] }), { text: 'dos', edited: true });
 check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agende> &amp; listo`), `${pg.APPROVED_URLS.booking} & listo`);
 
+// Silent ordering and the day cap (2026-10-29: the backlog spent the 40-card cap
+// by 09:00 and every lead who wrote later in the day was skipped).
+{
+  const card = (id, daysAgo) => ({ id, lastStageChangeAt: at(daysAgo * DAY) });
+  const cards = [card('old-b', 100), card('fresh-2', 3), card('old-a', 70), card('fresh-1', 1), card('old-c', 90)];
+  const r1 = pg.orderSilentCards(cards, { now: NOW, cursor: 0, max: 3 });
+  check('recent silences come first, newest first, then the backlog', r1.silent.map((c) => c.id), ['fresh-1', 'fresh-2', 'old-a']);
+  check('counts recent and backlog', [r1.recent, r1.backlog], [2, 3]);
+  const r2 = pg.orderSilentCards(cards, { now: NOW, cursor: r1.cursor, max: 3 });
+  check('the backlog rotates by cursor behind the recent ones', r2.silent.map((c) => c.id), ['fresh-1', 'fresh-2', 'old-b']);
+  const r3 = pg.orderSilentCards(cards, { now: NOW, cursor: 0, max: 1 });
+  check('a full run of recent cards leaves the backlog cursor where it was', [r3.silent.map((c) => c.id), r3.cursor], [['fresh-1'], 0]);
+  check('no cards, no reads', pg.orderSilentCards([], { now: NOW, cursor: 5, max: 40 }).silent, []);
+  check('a strike counts toward the day cap', pg.countsTowardDayCap('strike_1'), true);
+  check('a re-nurture counts toward the day cap', pg.countsTowardDayCap('renurture_2'), true);
+  check('a reply never counts toward the day cap', pg.countsTowardDayCap('reply'), false);
+  check('a signal never counts toward the day cap', pg.countsTowardDayCap('signal'), false);
+  check('a clarify never counts toward the day cap', pg.countsTowardDayCap('clarify'), false);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
