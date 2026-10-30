@@ -22315,14 +22315,12 @@ async function guardianPopulation(now, stats) {
     if (!opps.some((o) => o.id === card.id)) opps.push({ id: card.id, pipelineId: card.pipelineId, pipelineStageId: card.pipelineStageId, status: card.status });
     waiting.push({ convo: { ...c, opportunities: opps }, card });
   }
-  const silentCards = [...byContact.values()].filter((o) => !seen.has(o.contactId)).sort((a, b) => String(a.id).localeCompare(String(b.id)));
-  const silent = [];
-  if (silentCards.length) {
-    const start = _guardianSilentCursor % silentCards.length;
-    for (let i = 0; i < Math.min(GUARDIAN_MAX_SILENT_READS, silentCards.length); i++) silent.push(silentCards[(start + i) % silentCards.length]);
-    _guardianSilentCursor = (start + silent.length) % silentCards.length;
-  }
+  const silentCards = [...byContact.values()].filter((o) => !seen.has(o.contactId));
+  const order = guardian.orderSilentCards(silentCards, { now, cursor: _guardianSilentCursor, max: GUARDIAN_MAX_SILENT_READS });
+  const silent = order.silent;
+  _guardianSilentCursor = order.cursor;
   stats.silentCandidates = silentCards.length;
+  stats.silentRecent = order.recent;
   return { waiting, silent };
 }
 
@@ -22408,7 +22406,7 @@ async function guardianRun(now, mode, stats, correlationId) {
   if (oErr) throw new Error(`guardian_actions read: ${oErr.message}`);
   const doneToday = new Set((todayRows || []).map((r) => `${r.conversation_id}|${r.step}`));
   const openConvos = new Set((openRows || []).map((r) => r.conversation_id));
-  let cardsToday = (todayRows || []).filter((r) => !['skipped', 'stopped'].includes(r.status)).length;
+  let cardsToday = (todayRows || []).filter((r) => !['skipped', 'stopped'].includes(r.status) && guardian.countsTowardDayCap(r.step)).length;
   const igHeld = await igGuideHeldConversations(now);
   const made = () => stats.drafted + stats.signals;
 
@@ -22424,7 +22422,8 @@ async function guardianRun(now, mode, stats, correlationId) {
       const screen = guardian.guardianScreen(c, { now, clientEmails, igHeld, personalTag: PERSONAL_CONTACT_TAG, offTag: GUARDIAN_OFF_TAG });
       if (!screen.keep) { skip(screen.reason); return; }
       if (openConvos.has(c.id)) { skip('card_waiting'); return; }
-      if (cardsToday >= GUARDIAN_MAX_CARDS_PER_DAY) { stats.dayCapHit = true; skip('day_cap'); return; }
+      // Only silent cards are rationed: a lead who wrote to us is never capped.
+      if (!convo && cardsToday >= GUARDIAN_MAX_CARDS_PER_DAY) { stats.dayCapHit = true; skip('day_cap'); return; }
       const messages = await guardianMessages(c);
       stats.leadsRead++;
       const thread = guardian.threadState(messages, { isAutomatedBody: strikeIsAutomatedBody });
@@ -22492,7 +22491,7 @@ async function guardianRun(now, mode, stats, correlationId) {
         ? await slack.client.chat.postMessage({ channel: GUARDIAN_SETTER_SLACK_ID, text: cardText, metadata: { event_type: GUARDIAN_EVENT, event_payload: { action_id: actionId } } })
         : await guardianPostShadowCard(cardText);
       await supabase.from('guardian_actions').update({ slack_channel_id: posted.channel, slack_message_ts: posted.ts, updated_at: new Date().toISOString() }).eq('id', actionId);
-      cardsToday++;
+      if (guardian.countsTowardDayCap(action.step)) cardsToday++;
       const out = { action_id: actionId, contact_id: c.contactId, step: action.step, channel: row.channel, intent: row.intent, reason: action.reason, mode, problems: d.problems };
       if (action.kind === 'signal') {
         stats.signals++;
