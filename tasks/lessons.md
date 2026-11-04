@@ -526,3 +526,6 @@ missing. That second data point is the only reason the real cause was found.
 
 ## 2026-10-26: a refusal is data, not a lesson (#386)
 - On 2026-10-24 Max refused a GHL delete and the report-feedback loop, triggered only because he was mentioned in a thread he rooted, saved a fabricated "lesson" and made him promise a behaviour change that a templated card can never apply. Prompt lessons cannot change templated output and do not record missing capabilities. Capability gaps now go to `max_backlog`, a ledger a human works monthly; lessons stay for prompt-shaped mistakes only.
+
+## 2026-11-03: a departing seat's duties are assigned per duty, never inherited by the successor (#422)
+- My summary of what still pointed at Josué proposed moving the whole `tech_ops` role to Gerald, and the plan of record had already put the launch go/no-go on him as ops lead. Ron split it three ways: Phase 1 is Valeria's, Phase 2 is Gerald's, QA is Ron's. **Pattern:** when someone leaves, list each duty the role carries in code and ask who owns that duty; a role constant is a bundle of unrelated duties. Route a duty by the role that owns the work, so the next change of seat does not move it.
