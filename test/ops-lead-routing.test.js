@@ -9,7 +9,8 @@
 // BOTH Josué and Gerald must hold the role (Gerald through the new `roles`
 // list, so his primary `campaigns` role, persona and permissions do not change).
 // On 2026-12-01: move Josué to DEPARTED_MEMBERS, make Gerald's primary role
-// `tech_ops` with `roles: ['campaigns']`, and update section 2 below.
+// `tech_ops` with `roles: ['campaigns']`, and update section 2 below. Section 4
+// must keep passing unchanged: Phase 1 and the closes stay with Valeria.
 const fs   = require('fs');
 const path = require('path');
 
@@ -45,6 +46,25 @@ check('2d WBR reminder is not pinned to one Slack id', /const WBR_REMINDER_TO = 
 
 // ── 3. Deactivated accounts are not DM targets ───────────────────────────────
 check('3a Tania (deactivated Slack user) no longer in TEAM_MEMBERS', new RegExp(`${TANIA}':\\s*\\{`).test(rosterBlock), false);
+
+// ── 4. Phase ownership does not follow the ops-lead seat (Ron, 2026-11-03) ──
+// "phase one owner is Valeria. phase 2 owner is Gerald. QA is going to be done
+// by RON." Friday delta owner tags and the keep-or-close deciders route by the
+// phase owner's role, so the 12-01 flip of tech_ops to Gerald does not move
+// Phase 1 or the closes onto him.
+const fridayBlock = SRC.slice(SRC.indexOf('const FRIDAY_OWNER_ROLE'), SRC.indexOf('function fridayUpcoming'));
+if (fridayBlock.length < 50) { console.error('FAIL: could not extract the Friday owner block'); process.exit(1); }
+const { FRIDAY_OWNER_ROLE, fridayOwnersFrom, fridayOwnerTag } =
+  new Function(`const FRIDAY_WINDOW_DAYS = 14, FRIDAY_AT_RISK_DAYS = 7, FRIDAY_LAUNCH_MEMORY_DAYS = 28; ${fridayBlock}; return { FRIDAY_OWNER_ROLE, fridayOwnersFrom, fridayOwnerTag };`)();
+const owners = fridayOwnersFrom(TEAM_MEMBERS);
+check('4a Friday Phase 1 owner role is fulfillment', FRIDAY_OWNER_ROLE.phase_1, 'fulfillment');
+check('4b Friday Phase 2 owner role is campaigns', FRIDAY_OWNER_ROLE.phase_2, 'campaigns');
+check('4c Friday Phase 1 lines tag Valeria', fridayOwnerTag('phase_1', owners), ` Owner: <@${VALERIA}>.`);
+check('4d Friday Phase 2 lines tag Gerald', fridayOwnerTag('phase_2', owners), ` Owner: <@${GERALD}>.`);
+check('4e Friday blocked lines tag Valeria (client-side holds sit with Phase 0/1)', fridayOwnerTag('blocked', owners), ` Owner: <@${VALERIA}>.`);
+check('4f keep-or-close deciders are Ron plus the fulfillment role', /deciders: \[RON_SLACK_ID, \.\.\.slackIdsByRole\('fulfillment'\)\]/.test(SRC), true);
+check('4g no hardcoded "Flag Josue" left in the proactive copy', /Flag Josue/.test(SRC), false);
+check('4h the roster tells Max the pre-launch QA is Ron\'s', /pre-launch campaign QA \(the go\/no-go\)/.test(SRC), true);
 
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
