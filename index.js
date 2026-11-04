@@ -613,6 +613,10 @@ async function loadOfferCatalog() {
 
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
 const OPS_CHANNEL           = process.env.OPS_CHANNEL           || '#ng-fullfillment-ops';
+// Ron, 2026-11-03: the 09:00 ops brief and the Monday WBR reminder that used to DM
+// Josué (tech_ops, leaves 2026-12-01) post to #ng-marktech-internal for now. A Slack
+// user ID here turns them back into DMs.
+const OPS_BRIEF_CHANNEL     = process.env.OPS_BRIEF_CHANNEL     || 'C0B48H7NT41';
 const NEW_CLIENT_CHANNEL    = process.env.NEW_CLIENT_CHANNEL    || '#ng-new-client-alerts';
 const SALES_CHANNEL         = process.env.SALES_CHANNEL         || '#ng-sales-goats';
 const SYSTEMS_CHANNEL       = process.env.SYSTEMS_CHANNEL       || '#ng-app-and-systems-improvents';
@@ -10496,9 +10500,11 @@ async function runFulfillmentStandup(_correlationId) {
     const hitting14Today = clients.filter(d => getDayCount(d) === 14);
     const hitting7Today  = clients.filter(d => getDayCount(d) === 7);
 
-    // ── DM Josue — pipeline owner, activation calls, overall ops ──────────────
+    // ── Ops brief — pipeline owner view (blocked, Day 7/14, activation calls, handoffs).
+    // Posts to OPS_BRIEF_CHANNEL since 2026-11-03; the snapshot key stays 'josue' so the
+    // day-over-day delta did not reset on the move.
     const josueSnap = await getYesterdayStandupSnapshot('josue');
-    const josueLines = [`Good morning Josue! Here's your ${today} ops brief:\n`];
+    const josueLines = [`Good morning team! Here's the ${today} ops brief:\n`];
 
     const blockedNames    = blocked.map(d => d.client_name);
     const hitting14Names  = hitting14Today.map(d => d.client_name);
@@ -10541,11 +10547,9 @@ async function runFulfillmentStandup(_correlationId) {
     josueLines.push(`📊 *Pipeline:* ${phase1.length} Phase 1 | ${phase2.length} Phase 2 | ${phase3.length} Phase 3 | ${blocked.length} Blocked | ${(phase0||[]).length} Phase 0`);
     josueLines.push(`\nAnything blocking you today? Flag it here and I'll help unblock.`);
 
-    for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
-      await slack.client.chat.postMessage({ channel: id, text: josueLines.join('\n') });
-    }
+    await slack.client.chat.postMessage({ channel: OPS_BRIEF_CHANNEL, text: josueLines.join('\n') });
     await saveStandupSnapshot('josue', { blocked: blockedNames, hitting14: hitting14Names, hitting7: hitting7Names, phase0Needing: needsCallNames, phase0Handoff: handoffNames, counts: { phase1: phase1.length, phase2: phase2.length, phase3: phase3.length, blocked: blocked.length, phase0: (phase0||[]).length } });
-    console.log('Standup DM sent to tech_ops role');
+    console.log(`Ops brief posted to ${OPS_BRIEF_CHANNEL}`);
 
     // ── DM fulfillment role — delivery docs, Phase 1 ──────────────────────────
     const valeriaSnap = await getYesterdayStandupSnapshot('valeria');
@@ -14850,7 +14854,7 @@ cron.schedule('0 6 * * *',   async () => {
 // Heartbeat on REVI's ingestion + delivery; alert-only, silent when healthy.
 cron.schedule('30 6 * * 2-6', wrapCronJob('runReviCrossChecks', async (c) => { await runReviCrossChecks(c); }), { timezone: 'America/Costa_Rica' });
 
-// Fulfillment morning standup — 9:00 AM CR Mon–Fri (DMs Josue, Valeria, Gerald with daily priorities)
+// Fulfillment morning standup — 9:00 AM CR Mon–Fri (ops brief to OPS_BRIEF_CHANNEL; DMs Valeria, Gerald with daily priorities)
 cron.schedule('0 9 * * 1-5', wrapCronJob('runFulfillmentStandup', async (c) => { await runFulfillmentStandup(c); }),  { timezone: 'America/Costa_Rica' });
 
 // Sales morning standup — 9:00 AM CR Mon–Fri (DMs setters and closers with role-specific briefs)
@@ -19492,10 +19496,11 @@ async function runClientAttentionAlerts() {
 cron.schedule('*/30 7-19 * * 1-5', wrapCronJob('runClientAttentionAlerts', async () => { await runClientAttentionAlerts(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static cron: client attention uptime alerts (*/30 7-19 * * 1-5 CR)');
 
-// Monday WBR reminder (Ron, 2026-10-14): with the Slack alerts retired, Josué
-// reviews Campaign health in the Monday 16:00 CR WBR. One DM at 15:30 with the
+// Monday WBR reminder (Ron, 2026-10-14): with the Slack alerts retired, the team
+// reviews Campaign health in the Monday 16:00 CR WBR. One message at 15:30 with the
 // link and open counts. A broken feed still sends the link, without counts.
-const WBR_REMINDER_TO = 'U08ABBFNGUW'; // Josué
+// Was a DM to Josué until 2026-11-03; now the ops brief channel (Ron).
+const WBR_REMINDER_TO = OPS_BRIEF_CHANNEL;
 async function runCampaignHealthWbrReminder() {
   let feed = null;
   try {
