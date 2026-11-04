@@ -93,9 +93,10 @@ check('1p next state is dated today', d.nextState.date === TODAY);
   check('2a capped', u.length === FRIDAY_MAX_PRIORITIES, u);
   check('2b closest to Day 14 first', /^• A hits Day 14 in 1 day /.test(u[0]) && /^• B /.test(u[1]), u);
   check('2c Phase 2 routes to the campaigns owner', /B .*<@U2>/.test(u[1]), u[1]);
-  check('2d Phase 1 routes to tech ops', /A .*<@U1>/.test(u[0]), u[0]);
+  check('2d Phase 1 routes to the fulfillment owner (Valeria; Ron, 2026-11-03)', /A .*<@U3>/.test(u[0]), u[0]);
   const lone = fridayUpcoming(many, fridayOwnersFrom({ U1: { name: 'Josue', role: 'tech_ops' } }));
   check('2e with no campaigns owner, Phase 2 falls back to tech ops', /B .*<@U1>/.test(lone[1]), lone[1]);
+  check('2f with no fulfillment owner, Phase 1 falls back to tech ops', /A .*<@U1>/.test(lone[0]), lone[0]);
 }
 
 // ── 3. The post ─────────────────────────────────────────────────────────────

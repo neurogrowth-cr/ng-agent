@@ -258,11 +258,11 @@ Pricing, scope and terms are Ron's call. If a prospect needs anything outside th
 
 THE TEAM
 
-Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring.
+Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring. Since 2026-11-03 he also does the pre-launch campaign QA (the go/no-go) for every client.
 Josue Duran (U08ABBFNGUW): Technical Operations Manager (full-time fulfillment) until 2026-12-01, when he leaves NeuroGrowth (Ron, 2026-11-03). Activation calls, campaign ops, client launch sequencing. Through November he hands the seat to Gerald; never assign Josue ownership that runs past that date.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
-Valeria Rosales (U09Q3BXJ18B): Fulfillment Operations. Phase 0 and Phase 1 (onboarding, LinkedIn profile builds, Fase 1 documents, AXON factory approvals), client licenses, and owner of the Kai escalation queue since 2026-11-03.
-Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner and ops lead designate since 2026-11-03 (Ron). Campaign config, Prosp management, campaign launches, launch go/no-go, Fase 3 stabilization, the Monday 16:00 CR WBR on Campaign health, and the daily ops brief. Josue's successor from 2026-12-01.
+Valeria Rosales (U09Q3BXJ18B): Fulfillment Operations. Owner of Phase 0 and Phase 1 since 2026-11-03 (Ron): onboarding, LinkedIn profile builds, Fase 1 documents, AXON factory approvals, and every stalled or blocked Phase 1 client; client licenses; owner of the Kai escalation queue.
+Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner and ops lead designate since 2026-11-03 (Ron). Campaign config, Prosp management, campaign launches (Ron does the pre-launch QA and gives the go/no-go), Fase 3 stabilization, the Monday 16:00 CR WBR on Campaign health, and the daily ops brief. Josue's successor from 2026-12-01.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
@@ -754,7 +754,7 @@ const TEAM_MEMBERS = {
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
-  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG', roles: ['tech_ops'] }, // Phase 2 owner since Felipe left 2026-09-16. Ops lead designate since 2026-11-03 (Ron): also gets every tech_ops output (ops brief, day 7/14 flags, WBR reminder, keep-or-close asks) while Josue hands over
+  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG', roles: ['tech_ops'] }, // Phase 2 owner since Felipe left 2026-09-16. Ops lead designate since 2026-11-03 (Ron): co-holds tech_ops (persona, day 7/14 flags, unblock asks) while Josue hands over. Phase 1 stays Valeria's and the pre-launch QA is Ron's (Ron, 2026-11-03), so neither follows the seat.
   // Tania (U07SMMDMSLQ) removed 2026-11-03: Slack account deactivated, yet her
   // 'fulfillment' role made her a target of the daily delivery brief DM.
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
@@ -866,14 +866,14 @@ Key KPIs: 100% client retention, >80 health score average, <2hr response time, 9
 
 When they ask about a client, give them full health context: engagement level, last interaction, open action items, any risk signals. Help them draft client comms, check-in messages, expansion proposals, escalation summaries, and case study outreach. They cannot access Ron's Gmail, calendar, or GHL.`,
 
-    tech_ops: `You are speaking with ${member.name}, who holds the ops lead seat (Technical Operations Manager) at NeuroGrowth. They report to Ron (CEO) and are the single point of accountability for technical campaign excellence across all clients. Handover note: Josue Duran leaves on 2026-12-01 and Gerald Arias is the ops lead from then on; through November both hold the seat.
+    tech_ops: `You are speaking with ${member.name}, who holds the ops lead seat (Technical Operations Manager) at NeuroGrowth. They report to Ron (CEO) and are the single point of accountability for technical campaign excellence across all clients. Handover note: Josue Duran leaves on 2026-12-01 and Gerald Arias is the ops lead from then on; through November both hold the seat. Ownership since 2026-11-03 (Ron): Phase 0 and Phase 1 belong to Valeria, Phase 2 to Gerald, and the pre-launch QA (go/no-go) to Ron; the ops lead sequences and unblocks the launch cycle and does not take those over.
 
 CROSS-ROLE CONTEXT: Sales context matters to the ops lead. When a new client lands in delivery, the close-call promises, price tier, and setter-to-closer notes shape how they scope the 14-day build. When a client is blocked or at-risk, sales needs to know before the next renewal or case-study ask. Surface both sides freely.
 
 PORTAL FOCUS: Lead with fulfillment pipeline health: phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. They can ask about sales, setters, or any client. Answer freely, and flag cross-over risks (e.g. a stalled client whose renewal is near).
 
 The role has two halves:
-- Build & Release: Own the complete 14-day launch cycle from client activation through technical deployment. Phase 1 (Days 1-3): client activation & onboarding. Phase 2 (Days 4-10): fulfillment coordination. Phase 3 (Days 11-13): technical QA. Phase 4 (Day 14): launch execution & handoff.
+- Build & Release: Own the complete 14-day launch cycle from client activation through technical deployment. Phase 1 (Days 1-3): client activation & onboarding. Phase 2 (Days 4-10): fulfillment coordination. Phase 3 (Days 11-13): technical QA, signed off by Ron. Phase 4 (Day 14): launch execution & handoff.
 - Tier delivery (ROLEX / PATEK): Monitor and optimize ongoing campaigns for clients on a subscription tier after handoff. Monday 16:00 CR WBR on Campaign health (Admin in the dash). Monthly audits every 30-45 days per client.
 
 Key performance targets: 95%+ on-time launch rate within 14-day guarantee, 90%+ SLA compliance across the tier portfolio, keep CEO time on campaign ops under 5 hours/week.
@@ -5120,7 +5120,7 @@ async function runWeeklyPortalTrends(_correlationId) {
     const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica' });
     const trendReport = [`Week ending ${today}:`, `Phase distribution: ${Object.entries(phaseCounts).map(([k,v])=>`${k}:${v}`).join(', ')}`, `Client mix: ${fwCount} Flywheel AI, ${fsCount} Full Service`, topBlocked ? `Top blocked activities: ${topBlocked}` : 'No blocked activities this week.', workload ? `Team workload: ${workload}` : '', avgDaysToLiveLine].filter(Boolean).join(' | ');
     await upsertKnowledge('intel', `weekly-trends-${new Date().toISOString().slice(0,10)}`, trendReport, 'weekly-cron');
-    if (topBlocked) await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Josue and Gerald.`, 'weekly-cron');
+    if (topBlocked) await upsertKnowledge('process', 'recurring-blocked-activities', `As of ${today}: Most blocked activities are: ${topBlocked}. Review with Valeria (Phase 1) and Gerald (Phase 2).`, 'weekly-cron');
     if (workload)   await upsertKnowledge('team', 'current-workload', `As of ${today}: ${workload}`, 'weekly-cron');
     console.log('Weekly trend analysis complete.');
     await postToSlack(AGENT_CHANNEL, `📊 *Weekly trend analysis saved* — check knowledge base for latest intel and process insights.`);
@@ -5327,8 +5327,11 @@ const FRIDAY_MAX_PRIORITIES = 3;
 const FRIDAY_LAUNCH_MEMORY_DAYS = 28;
 const FRIDAY_PHASE_LABELS = { phase_1: 'Phase 1', phase_2: 'Phase 2', blocked: 'blocked' };
 // Phase 2 is campaign config and Prosp (Gerald since Felipe left 2026-09-16).
-// Phase 1 and blocked clients sit with tech ops (Josue).
-const FRIDAY_OWNER_ROLE = { phase_1: 'tech_ops', phase_2: 'campaigns', blocked: 'tech_ops' };
+// Phase 1 is Valeria's (fulfillment role; Ron, 2026-11-03: "phase one owner is
+// Valeria"). A blocked client is a hold on the client side (form, docs,
+// contract), which Phase 0/1 ownership covers, so it sits with her too. The
+// ops lead (tech_ops) is only the fallback when a role has no holder.
+const FRIDAY_OWNER_ROLE = { phase_1: 'fulfillment', phase_2: 'campaigns', blocked: 'fulfillment' };
 
 function fridayFlagged(status, days) {
   return status === 'blocked' || (days ?? 0) >= FRIDAY_WINDOW_DAYS;
@@ -5651,8 +5654,10 @@ async function runMondayGapDetection(correlationId) {
       delta,
       phase0: phase0Split,
       sales: { noShowCount, staleLeadCount },
-      // Keep-or-close is Ron's call with tech ops (Josue).
-      deciders: [RON_SLACK_ID, ...slackIdsByRole('tech_ops')],
+      // Keep-or-close on a stale Phase 0 signup is Ron's call with the Phase 0/1
+      // owner (Valeria, fulfillment role; Ron, 2026-11-03). Ron decides, she
+      // executes in the portal; the ops lead no longer co-decides.
+      deciders: [RON_SLACK_ID, ...slackIdsByRole('fulfillment')],
     });
 
     const stateJson = JSON.stringify({ date: new Date().toISOString().slice(0, 10), clients: delta.nextClients, phase0: phase0Split.nextPhase0 });
@@ -6514,24 +6519,24 @@ async function runProactiveDMs(_correlationId) {
       if (dash.customer_status === 'phase_2' && daysSince >= 4) stalledPhase2.push(dash);
     }
 
-    // ── DM Josue: clients hitting Day 14 today ──
+    // ── DM the ops lead (tech_ops role): clients hitting Day 14 today ──
     if (hitting14Tomorrow.length > 0) {
       const names = hitting14Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client is' : 'these clients are'} at or past the 14-day launch deadline: ${names}. If campaigns are not live, we have missed the SLA. What needs to happen right now to get them launched?`;
       for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Josue: ${hitting14Tomorrow.length} client(s) hitting Day 14 today`);
+      console.log(`Proactive DM sent to tech_ops role: ${hitting14Tomorrow.length} client(s) hitting Day 14 today`);
     }
 
-    // ── DM Josue: clients hitting at-risk threshold today ──
+    // ── DM the ops lead (tech_ops role): clients hitting at-risk threshold today ──
     if (hitting7Tomorrow.length > 0) {
       const names = hitting7Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client has' : 'these clients have'} passed Day 7, the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling later.`;
       for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to Josue: ${hitting7Tomorrow.length} client(s) past Day 7`);
+      console.log(`Proactive DM sent to tech_ops role: ${hitting7Tomorrow.length} client(s) past Day 7`);
     }
 
     // Record the milestones ONLY now, after the DMs actually went out. Marking them
@@ -6554,7 +6559,7 @@ async function runProactiveDMs(_correlationId) {
     // ── DM campaigns role (Gerald): clients stalled in phase_2 ──
     if (stalledPhase2.length > 0) {
       const names = stalledPhase2.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
-      const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag Josue if anything is blocked.`;
+      const msg = `These clients are still in Phase 2 and haven't moved in a few days: ${names}. If campaign config or Prosp setup is pending on your end, these need to be the first thing tomorrow. Flag ${opsLeadLabel()} if anything is blocked.`;
       for (const id of slackIdsByRole('campaigns')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
