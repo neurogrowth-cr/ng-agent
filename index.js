@@ -259,10 +259,10 @@ Pricing, scope and terms are Ron's call. If a prospect needs anything outside th
 THE TEAM
 
 Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring.
-Josue Duran (U08ABBFNGUW) — Technical Operations Manager (full-time fulfillment). Activation calls, campaign ops, client launch sequencing.
+Josue Duran (U08ABBFNGUW): Technical Operations Manager (full-time fulfillment) until 2026-12-01, when he leaves NeuroGrowth (Ron, 2026-11-03). Activation calls, campaign ops, client launch sequencing. Through November he hands the seat to Gerald; never assign Josue ownership that runs past that date.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
-Valeria (U09Q3BXJ18B) — Fulfillment Operations. Delivery documents, Claude Projects.
-Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner. Campaign config, Prosp management, campaign launches.
+Valeria Rosales (U09Q3BXJ18B): Fulfillment Operations. Phase 0 and Phase 1 (onboarding, LinkedIn profile builds, Fase 1 documents, AXON factory approvals), client licenses, and owner of the Kai escalation queue since 2026-11-03.
+Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner and ops lead designate since 2026-11-03 (Ron). Campaign config, Prosp management, campaign launches, launch go/no-go, Fase 3 stabilization, the Monday 16:00 CR WBR on Campaign health, and the daily ops brief. Josue's successor from 2026-12-01.
 Oscar M (U0B1S1UMH9P) — Appointment Setter. Books discovery calls.
 Sebastian Serrano (U0BFA4SRVQC) — Appointment Setter. Books discovery calls.
 Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
@@ -749,13 +749,14 @@ const RON_ONLY_DEFAULT_REASON = 'Gmail and Calendar use Ron\'s personal OAuth.';
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte NG' },
-  'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' },
+  'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' }, // leaves 2026-12-01 (Ron, 2026-11-03): that day move him to DEPARTED_MEMBERS and make Gerald's role 'tech_ops' with roles: ['campaigns']
   'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
   'U0B1S1UMH9P': { name: 'Oscar',    role: 'setter',         displayName: 'Oscar Neurogrowth' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
-  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG' }, // Phase 2 owner since Felipe left 2026-09-16
-  'U07SMMDMSLQ': { name: 'Tania',    role: 'fulfillment',    displayName: 'Tania NG' },
+  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG', roles: ['tech_ops'] }, // Phase 2 owner since Felipe left 2026-09-16. Ops lead designate since 2026-11-03 (Ron): also gets every tech_ops output (ops brief, day 7/14 flags, WBR reminder, keep-or-close asks) while Josue hands over
+  // Tania (U07SMMDMSLQ) removed 2026-11-03: Slack account deactivated, yet her
+  // 'fulfillment' role made her a target of the daily delivery brief DM.
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
   // Felipe Herrera (U09TNMVML3F) removed 2026-10-11, departed 2026-09-16. Gerald
   // took the campaigns role (Phase 2: campaign config, Prosp). See DEPARTED_MEMBERS.
@@ -828,10 +829,20 @@ function getMemberPermissions(userId) {
   return ROLE_PERMISSIONS[member.role] || ROLE_PERMISSIONS.fulfillment;
 }
 
+// A member's primary `role` drives permissions and the persona; an optional
+// `roles` list adds them to other roles' outputs (DMs, deciders) without
+// changing either. Used for the ops-lead handover (Gerald, 2026-11-03).
 function slackIdsByRole(role) {
   return Object.entries(TEAM_MEMBERS)
-    .filter(([, m]) => m.role === role)
+    .filter(([, m]) => m.role === role || (Array.isArray(m.roles) && m.roles.includes(role)))
     .map(([id]) => id);
+}
+
+// "Josue or Gerald": whoever holds the ops-lead (tech_ops) seat today, for
+// copy that used to hardcode Josue.
+function opsLeadLabel() {
+  const names = slackIdsByRole('tech_ops').map((id) => TEAM_MEMBERS[id] && TEAM_MEMBERS[id].name).filter(Boolean);
+  return names.length ? names.join(' or ') : 'the ops lead';
 }
 
 function buildRoleSystemPrompt(userId) {
@@ -855,21 +866,21 @@ Key KPIs: 100% client retention, >80 health score average, <2hr response time, 9
 
 When they ask about a client, give them full health context: engagement level, last interaction, open action items, any risk signals. Help them draft client comms, check-in messages, expansion proposals, escalation summaries, and case study outreach. They cannot access Ron's Gmail, calendar, or GHL.`,
 
-    tech_ops: `You are speaking with Josue, the Technical Operations Manager at NeuroGrowth. He reports to Ron (CEO) and is the single point of accountability for technical campaign excellence across all clients.
+    tech_ops: `You are speaking with ${member.name}, who holds the ops lead seat (Technical Operations Manager) at NeuroGrowth. They report to Ron (CEO) and are the single point of accountability for technical campaign excellence across all clients. Handover note: Josue Duran leaves on 2026-12-01 and Gerald Arias is the ops lead from then on; through November both hold the seat.
 
-CROSS-ROLE CONTEXT: Sales context matters to Josue. When a new client lands in delivery, the close-call promises, price tier, and setter-to-closer notes shape how he scopes the 14-day build. When a client is blocked or at-risk, sales needs to know before the next renewal or case-study ask. Surface both sides freely.
+CROSS-ROLE CONTEXT: Sales context matters to the ops lead. When a new client lands in delivery, the close-call promises, price tier, and setter-to-closer notes shape how they scope the 14-day build. When a client is blocked or at-risk, sales needs to know before the next renewal or case-study ask. Surface both sides freely.
 
-PORTAL FOCUS: Lead with fulfillment pipeline health — phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. He can ask about sales, setters, or any client — answer freely, and flag cross-over risks (e.g. a stalled client whose renewal is near).
+PORTAL FOCUS: Lead with fulfillment pipeline health: phase transitions, launch risk, clients hitting Day 7 or Day 14, SLA status. They can ask about sales, setters, or any client. Answer freely, and flag cross-over risks (e.g. a stalled client whose renewal is near).
 
-His role has two halves:
+The role has two halves:
 - Build & Release: Own the complete 14-day launch cycle from client activation through technical deployment. Phase 1 (Days 1-3): client activation & onboarding. Phase 2 (Days 4-10): fulfillment coordination. Phase 3 (Days 11-13): technical QA. Phase 4 (Day 14): launch execution & handoff.
-- Tier delivery (ROLEX / PATEK): Monitor and optimize ongoing campaigns for clients on a subscription tier after handoff. Monday 9AM: 60-min campaign fix session. Fridays: portfolio performance deep dive (GREEN/YELLOW/RED status). Monthly audits every 30-45 days per client.
+- Tier delivery (ROLEX / PATEK): Monitor and optimize ongoing campaigns for clients on a subscription tier after handoff. Monday 16:00 CR WBR on Campaign health (Admin in the dash). Monthly audits every 30-45 days per client.
 
 Key performance targets: 95%+ on-time launch rate within 14-day guarantee, 90%+ SLA compliance across the tier portfolio, keep CEO time on campaign ops under 5 hours/week.
 
-After Day 14, client success becomes primary client contact for satisfaction/admin — Josue remains owner of technical campaign performance.
+After Day 14, client success becomes primary client contact for satisfaction/admin; the ops lead remains owner of technical campaign performance.
 
-When Josue asks about a client, pull from knowledge base and fulfillment channel to give him full context: current status, last action taken, what's blocking them, and what the next step is. Be direct and operational — tell him exactly what to do, not a summary. Help him draft channel updates, client comms, campaign fix plans, and escalation messages. He cannot access Ron's email, calendar, or GHL.`,
+When the ops lead asks about a client, pull from knowledge base and fulfillment channel to give them full context: current status, last action taken, what's blocking them, and what the next step is. Be direct and operational: tell them exactly what to do, not a summary. Help them draft channel updates, client comms, campaign fix plans, and escalation messages. They cannot access Ron's email, calendar, or GHL.`,
 
     tech_lead: `You are speaking with David, the Lead Technology and Automation specialist at NeuroGrowth. He builds and maintains Make.com scenarios, Supabase infrastructure, and the Neurogrowth Portal. Help him with technical questions, systems channel activity, and process documentation.
 
@@ -6533,7 +6544,7 @@ async function runProactiveDMs(_correlationId) {
     // ── DM Valeria: clients stalled in phase_1 ──
     if (stalledPhase1.length > 0) {
       const names = stalledPhase1.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
-      const msg = `These clients are still in Phase 1 and have been for a while: ${names}. If any delivery documents are pending on your end, this is the priority. Let Josue know if you're blocked on anything.`;
+      const msg = `These clients are still in Phase 1 and have been for a while: ${names}. If any delivery documents are pending on your end, this is the priority. Let ${opsLeadLabel()} know if you're blocked on anything.`;
       for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
@@ -10579,7 +10590,7 @@ async function runFulfillmentStandup(_correlationId) {
     }
 
     valeriaLines.push(...renderDelta('Blocked', dVBlocked.new, dVBlocked.resolved, dVBlocked.unchanged, name => `${name} — check if docs are holding this up`));
-    valeriaLines.push(`Any docs blocked or waiting on client input? Let Josue know so he can follow up.`);
+    valeriaLines.push(`Any docs blocked or waiting on client input? Let ${opsLeadLabel()} know so they can follow up.`);
 
     for (const id of (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : ['U09Q3BXJ18B'])) {
       const recipientName = getMemberContext(id).name;
@@ -10628,7 +10639,7 @@ async function runFulfillmentStandup(_correlationId) {
       }));
     }
 
-    felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so Josue can sequence it.`);
+    felipeLines.push(`Any campaign setup blocked or waiting on Valeria's docs? Flag it in #ng-fullfillment-ops so ${opsLeadLabel()} can sequence it.`);
 
     for (const id of slackIdsByRole('campaigns')) {
       const greeting = `Good morning ${getMemberContext(id).name}! Here's your ${today} campaign brief:\n`;
@@ -10652,7 +10663,7 @@ async function runFulfillmentStandup(_correlationId) {
       '2_awaiting_terms':           'awaiting T&C acceptance',
       '3_awaiting_form':            'awaiting onboarding form',
       '4_awaiting_activation_call': 'awaiting activation call booking',
-      '5_ready_for_handoff':        'ready for Phase 1 → Josue to kick off',
+      '5_ready_for_handoff':        'ready for Phase 1 → ops lead to kick off',
     };
 
     // Phase 0 delta
@@ -19252,6 +19263,38 @@ cron.schedule('*/15 * * * *', wrapCronJob('checkKaiHealth', async () => { await 
 cron.schedule('0 8 * * 1-5', wrapCronJob('runKaiHealthDigest', async () => { await runKaiHealthDigest(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: Kai health watch (*/15 * * * *) + Kai daily digest (0 8 * * 1-5 CR)');
 
+// Kai escalations digest (2026-11-03). Recipe: ~/automations/ops/recipes/kai-escalations-digest.md
+// The queue Kai hands to humans had no owner: 365 escalations and 118 drafts
+// sat unsent on 2026-11-03 and no Slack message existed for the escalated
+// rows. One weekday DM at 08:30 CR to the fulfillment role (Valeria), per
+// client, only when something has waited over 48 h. Pure logic and SQL in
+// lib/kaiEscalations.js (read-only on portalPg). Kill switch
+// KAI_ESCALATION_DIGEST=off; KAI_ESCALATION_DIGEST_TO=U... reroutes it;
+// KAI_ESCALATION_SINCE moves the cutoff for the per-client list.
+const kaiEscalations = require('./lib/kaiEscalations');
+const KAI_ESCALATION_DIGEST_FALLBACK = 'U09Q3BXJ18B'; // Valeria, only if the roster carries no fulfillment member
+async function runKaiEscalationsDigest() {
+  if (String(process.env.KAI_ESCALATION_DIGEST || '') === 'off') return;
+  const override = String(process.env.KAI_ESCALATION_DIGEST_TO || '').trim();
+  const targets = override ? [override] : (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : [KAI_ESCALATION_DIGEST_FALLBACK]);
+  if (!portalPg) {
+    console.warn('[kai-escalations] PORTAL_READONLY_DATABASE_URL is not set; digest skipped');
+    logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'error', output: { error: 'portalPg not configured' } });
+    return;
+  }
+  const data = await kaiEscalations.readKaiEscalations(portalPg, new Date(), { since: process.env.KAI_ESCALATION_SINCE || undefined });
+  const summary = kaiEscalations.summarizeKaiEscalations(data);
+  const text = kaiEscalations.formatKaiEscalationsDigest(summary);
+  if (!text) {
+    logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'ok', output: { posted: false, ...summary.totals, legacy: summary.legacy.n } });
+    return;
+  }
+  for (const id of targets) await slack.client.chat.postMessage({ channel: id, text });
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'ok',
+    output: { posted: true, targets: targets.length, clients: summary.clients.length, ...summary.totals, legacy: summary.legacy.n } });
+}
+cron.schedule('30 8 * * 1-5', wrapCronJob('runKaiEscalationsDigest', async () => { await runKaiEscalationsDigest(); }), { timezone: 'America/Costa_Rica' });
+
 // ─── CLIENT ATTENTION (fulfillment) ─────────────────────────────────────────
 // Mon + Thu report and urgent alerts in #ng-fullfillment-ops (Ron, 2026-09-23).
 // Slack posting RETIRED 2026-10-14; the crons are unscheduled (see below).
@@ -23176,6 +23219,7 @@ const STATIC_CRON_SCHEDULES = {
   runReelsMonthlyReport:        '0 8 1 * *',
   runAppointmentStatusSync:     '0 15 * * *',
   runCampaignHealthWbrReminder: '30 15 * * 1',
+  runKaiEscalationsDigest:      '30 8 * * 1-5',
   runApptDeletionSweep:         '20 7-19/3 * * *',
   runAutoStrikeMover:           '0 7-21/2 * * *',
   // The audit declares itself, so a run where it dies shows up as stale on the
@@ -24867,7 +24911,7 @@ slack.event('member_joined_channel', async ({ event }) => {
     const roleIntros = {
       ceo:            `You are greeting Ron, the CEO and Founder of NeuroGrowth. This is your home base. Give him a sharp 2-line welcome that shows you're ready to work — mention you can pull emails, calendar, GHL, Slack channels, Drive, and Notion on demand.`,
       client_success: `You are greeting ${member.displayName}, the Client Success Operations Manager. Welcome them and let them know you can help with: client health checks, drafting client comms, checking fulfillment channel activity, contract reminders, and searching the knowledge base. Keep it to 3-4 lines max.`,
-      tech_ops:       `You are greeting Josue, the Technical Operations Manager. Welcome him and let him know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and his daily briefing every morning at 8:30 AM. Keep it to 3-4 lines max.`,
+      tech_ops:       `You are greeting ${member.displayName}, who holds the ops lead seat (Technical Operations Manager). Welcome them and let them know you can help with: client launch status, campaign blockers, fulfillment channel recaps, Notion SOPs, and their daily ops brief every weekday morning. Keep it to 3-4 lines max.`,
       tech_lead:      `You are greeting David, the Lead Technology and Automation specialist. Welcome him and let him know you can help with: systems channel activity, Make.com issue tracking, process documentation, and Notion. Keep it to 3-4 lines max.`,
       fulfillment:    `You are greeting ${member.displayName}, a Fulfillment Operations specialist. Welcome them and let them know you can help with: delivery doc status, client setup coordination, fulfillment channel recaps, and Notion. Keep it to 3-4 lines max.`,
       campaigns:      `You are greeting ${member.displayName}, who owns Phase 2 campaigns. Welcome them and let them know you can help with: campaign status per client, Prosp config questions, fulfillment channel updates, and content pipeline tracking. Keep it to 3-4 lines max.`,
