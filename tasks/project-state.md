@@ -976,3 +976,8 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Applied** `migrations/025_clarity_brief.sql` to Max's Supabase on Ron's go. `clarity_runs`, `clarity_items` and `clarity_dismissals` exist with RLS on, three policies each, and no delete for `anon`.
 - **Proof:** a rolled-back probe as `anon` inserted, updated and read all three tables, and its delete was blocked. The tables are empty; the probe consumed id 1 on both sequences, which is harmless.
 - **Still off:** `CLARITY_BRIEF_MODE` is unset. Left for Ron: `GOOGLE_TOKEN_CONTACT`, the wider `GITHUB_TOKEN`, Max in every allowlisted channel, then `CLARITY_BRIEF_MODE=live` in one Railway batch.
+
+## 2026-11-04: a prospect's no never reaches a human ([PR #426](https://github.com/neurogrowth-cr/ng-agent/pull/426); ng-automation #86, dash #418, strategy #93)
+- **Ruling (Ron):** replies that only say no, not interested or stop are never escalated and never shown to the client or the team. Kai closes them and leaves the door open.
+- **Max side:** the 08:30 digest to Valeria (`lib/kaiEscalations.js`) leaves out `unsubscribe` rows and threads the client answered or marked handled. First run 2026-11-04 listed 109 escalated and 95 drafts; the same read now gives about 20 escalated and 69 drafts in 10 clients. `lib/kaiHealth.js` no longer counts `prospect_declined` as a skip or a sent `decline_close` as a draft that never reached Slack.
+- **Pending on Ron:** `KAI_DECLINE_CLOSE=on` on ng-automation-KAI (default dry, nothing sent); closing the 239 old escalated `unsubscribe` rows is a prod write.
