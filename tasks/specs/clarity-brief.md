@@ -1,6 +1,6 @@
 # Recipe: Clarity Brief (Ron's morning signal)
 
-**Owner:** Ron   **Status:** draft (code in a PR, nothing live; `CLARITY_BRIEF_MODE=off` until Ron does section 8)
+**Owner:** Ron   **Status:** live since 2026-11-04 (`CLARITY_BRIEF_MODE=live`); no brief has run on real data yet; three sources still partial, see section 8
 **Written:** 2026-11-03   **Last verified:** n/a
 **Decision:** brainstorm with Ron on 2026-11-03 (chat). Rulings folded in: runs inside Max on Railway (not a Claude task on the Mac, which ran 8 hours late on 2026-11-03); English; Slack scope is mentions, #ng-pm-agent and alerts that tag Ron, not every channel; the Monday brief covers Saturday and Sunday; contact@ is a separate mailbox that must be read.
 **Watched by:** the cron liveness audit (07:30 daily, Ron DM) plus its own divergence check `checkClarityBriefPosted` (section 3, step 14). Until step 14 exists the recipe stays `off`.
@@ -115,13 +115,15 @@ The brief writes to Ron's DM and its own three tables, nothing else. A ✅ only 
 
 (Verdict lines go to the `clarity_runs` row and to the cron liveness audit, not to the brief itself.)
 
-## 8. Needs Ron before go-live (production changes, ask first)
+## 8. Go-live state (production changes, ask first)
 
-1. **contact@ consent.** One-time OAuth consent signed in as contact@ with Max's existing Google client id, then `GOOGLE_TOKEN_CONTACT` on ng-pm-MAX. Ron does the sign-in; nobody pastes the token in chat.
-2. **`GITHUB_TOKEN` widened** to a fine-grained PAT with contents and pull requests read across the `neurogrowth-cr` repos (including private `ng-wiki`), keeping Actions write on `roi-rm-okr-reporting` for the VoC PDF.
-3. **Migration 025** (`migrations/025_clarity_brief.sql`, 023 and 024 were taken while this spec was in review): `clarity_runs` (id, posted_at, window_from, window_to, counts jsonb, verdict, error), `clarity_items` (id, run_id, ts, dedupe_key, source, tier, title, url, status, accepted_at, snoozed_until), `clarity_dismissals` (signature, source, count, muted boolean, first_at, last_at). Apply before merge, grants explicit (public tables lose auto grants since 2026-10-30).
-4. **Railway vars in one batch**: `CLARITY_BRIEF_MODE=live`, `CLARITY_SLACK_CHANNELS` (default: #ng-pm-agent, #ng-sales-goats, #ng-fullfillment-ops, #ng-marktech-internal, #ng-ops-management, #ng-content-machine, #ng-fulfillment-axon, #ng-automation), `GOOGLE_TOKEN_CONTACT`.
-5. Confirm Max is a member of every channel on that list.
+Done 2026-11-04: migration 025 applied and probed, `CLARITY_BRIEF_MODE=live` on ng-pm-MAX, default `CLARITY_SLACK_CHANNELS` in use.
+
+Still open, all Ron's hands. The brief runs without them and names what it could not read:
+
+1. **contact@ consent with its own OAuth client.** contact@ lives in the `neurogrowthconsulting.com` Google organization and Max's client is Internal to `neurogrowth.io`, so Google answers `403 org_internal`. Do not switch Max's client to External: every Max Google feature shares it, and Gmail read would need Google's restricted-scope verification. Instead, signed in as contact@: a Google Cloud project with the Gmail API on, consent screen Audience Internal, a Desktop app client. Then `GOOGLE_CREDENTIALS_CONTACT` (that client's JSON) and `GOOGLE_TOKEN_CONTACT` (its refresh token, `gmail.readonly`) on ng-pm-MAX. Ron does the sign-in; nobody pastes either value in chat. A refresh token only works with the client that issued it, so the two variables always change together.
+2. **`GITHUB_TOKEN` widened.** Fine-grained PAT, contents and pull requests read on ng-agent, dash, ng-revi, ng-axon, ng-automation-KAI, ng-wiki and roi-rm-okr-reporting, keeping Actions write on `roi-rm-okr-reporting` for the VoC PDF. Editing an existing token keeps its value, so Railway does not change. Checked 2026-11-04: only ng-agent reads pull requests; the wiki follow-ups file is unreachable.
+3. **Max in `#ng-automation`** (`C0BDFHGF9DZ`, private). The other 7 channels on the default list are confirmed.
 
 ## 9. Lessons folded in
 
