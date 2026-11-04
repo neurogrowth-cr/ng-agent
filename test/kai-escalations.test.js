@@ -8,7 +8,7 @@
 //     item a human must answer;
 //   • the pre-cutoff backlog is one number, never a per-client list;
 //   • no 'undefined', 'null' or 'NaN' ever reaches Slack.
-const { summarizeKaiEscalations, formatKaiEscalationsDigest, daysAgo } = require('../lib/kaiEscalations');
+const { SQL, summarizeKaiEscalations, formatKaiEscalationsDigest, daysAgo } = require('../lib/kaiEscalations');
 
 let failures = 0;
 function check(label, ok, detail = '') {
@@ -73,6 +73,12 @@ check('4a capped at 10 client lines plus a remainder line', (capped.match(/^• 
 // ── 5. daysAgo guards ────────────────────────────────────────────────────────
 check('5a bad timestamp is null', daysAgo('not a date', now) === null && daysAgo(null, now) === null);
 check('5b future timestamp clamps to 0', daysAgo(new Date(now.getTime() + 3600e3).toISOString(), now) === 0);
+
+// ── 6. A no and an answered thread are never in the count (Ron, 2026-11-04) ──
+for (const [name, sql] of Object.entries(SQL)) {
+  check(`6a ${name} leaves out a prospect's no`, /classified_intent, ''\) <> 'unsubscribe'/.test(sql));
+  check(`6b ${name} leaves out what the client answered`, /q\.client_answered_at IS NULL/.test(sql) && /q\.customer_handled_at IS NULL/.test(sql) && /thread_state, ''\) <> 'answered'/.test(sql));
+}
 
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');

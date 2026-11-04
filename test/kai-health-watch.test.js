@@ -287,6 +287,10 @@ function digestData({ yesterday, baseline, extra = {} }) {
   check('15c intake window passed as hours', seen.find((q) => q.sql === kai.SQL.received).params[1], kai.INTAKE_WINDOW_HOURS);
   check('15d read-only: no writes in any SQL', [...Object.values(kai.SQL), ...Object.values(kai.DIGEST_SQL)].some((s) => /\b(insert|update|delete|drop|alter)\b/i.test(s)), false);
 
-  if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
+  // A prospect's no closed by Kai is the normal path: not a skip, not a missing Slack post.
+check('decline closes are not counted as skipped', /status = 'skipped' AND COALESCE\(status_reason, ''\) <> 'prospect_declined'/.test(kai.DIGEST_SQL.daily), true);
+check('a sent decline close is not a divergence', /status_reason, ''\) <> 'decline_close'/.test(kai.DIGEST_SQL.divergence), true);
+
+if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
 })();
