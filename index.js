@@ -23275,6 +23275,8 @@ const STATIC_CRON_SCHEDULES = {
   runWeeklySalesMarketingRecap: '0 17 * * 5',
   runWinningAdsSweep:           '0 20 * * 0',
   runWonHandoffNotes:           '0 9,17 * * *',
+  runClarityBrief:              '50 6 * * 1-5',
+  checkClarityBriefPosted:      '15 7 * * 1-5',
 };
 
 // How long may pass with no successful run before something is wrong?
@@ -24530,6 +24532,526 @@ async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlU
   return { oppsOk, oppsFail, oppsTotal: opps.length, skippedNonSetterOpps };
 }
 
+
+// ─── CLARITY BRIEF (Ron's morning signal) ────────────────────────────────────
+// Spec: tasks/specs/clarity-brief.md (Ron, 2026-11-03). One DM to Ron at 06:50
+// CR Mon to Fri: at most 7 items only he can act on, his projects in flight,
+// and one line saying what was scanned and dropped. Ron teaches it with ✅
+// (take), ❌ (never again, learns a signature; three on one sender mute it)
+// and ⏭ (tomorrow). Everything content-shaped lives in lib/clarityBrief.js
+// (pure, tested); this section owns the collectors, the two model calls, the
+// Slack posting and the reaction route.
+//
+// Confidentiality: Gmail content reaches the classifier and Ron's DM, nothing
+// else. The poster below has RON_SLACK_ID hardcoded and no channel fallback.
+// Mode: CLARITY_BRIEF_MODE=off (default) | live. Kill switch CLARITY_BRIEF_DISABLED=true.
+const clarityBrief = require('./lib/clarityBrief');
+const clarityMode = () => String(process.env.CLARITY_BRIEF_MODE || 'off').trim().toLowerCase();
+const clarityDisabled = () => String(process.env.CLARITY_BRIEF_DISABLED || '') === 'true';
+const CLARITY_RON_EMAIL = (process.env.RON_EMAIL || 'ronny.duarte@neurogrowth.io').toLowerCase();
+// Channel names resolve through conversations.list; ids are used as given.
+const CLARITY_SLACK_CHANNELS_DEFAULT = [AGENT_CHANNEL, SALES_CHANNEL, OPS_CHANNEL, 'C0B48H7NT41', MGMT_CHANNEL, REELS_CHANNEL, AXON_OPS_CHANNEL, 'C0BDFHGF9DZ'];
+const CLARITY_GITHUB_REPOS_DEFAULT = ['neurogrowth-cr/ng-agent', 'neurogrowth-cr/dash', 'neurogrowth-cr/ng-revi', 'neurogrowth-cr/ng-axon', 'neurogrowth-cr/ng-automation-KAI', 'neurogrowth-cr/roi-rm-okr-reporting', 'neurogrowth-cr/ng-wiki'];
+const CLARITY_WIKI_REPO = 'neurogrowth-cr/ng-wiki';
+const CLARITY_WIKI_PATH = 'ops/open-followups.md';
+const CLARITY_GMAIL_CAP = 100; // per inbox, 200 across both (spec 4b)
+// Recipes that sit in a dry-run or shadow mode until Ron flips them. Shown once
+// a week until live, dismissed or snoozed (updatedAt is the Monday of the week).
+const CLARITY_FLAGS = [
+  { env: 'OPEN_DEAL_SWEEP_MODE', liveWhen: (v) => v === 'live' },
+  { env: 'CLIENT_ATTENTION_ALERTS_MODE', liveWhen: (v) => v === 'live' },
+  { env: 'GUARDIAN_MODE', liveWhen: (v) => v === 'draft' || v === 'live' },
+];
+
+function clarityList(envName, fallback) {
+  const v = String(process.env[envName] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return v.length ? v : fallback;
+}
+
+const _clarityChannelCache = new Map(); // name or id -> { id, name } | null
+async function clarityChannel(nameOrId) {
+  if (_clarityChannelCache.has(nameOrId)) return _clarityChannelCache.get(nameOrId);
+  let info = null;
+  if (/^[CG][A-Z0-9]+$/.test(nameOrId)) {
+    const r = await slack.client.conversations.info({ channel: nameOrId }).catch(() => null);
+    if (r && r.channel) info = { id: r.channel.id, name: r.channel.name || nameOrId };
+  } else {
+    const want = nameOrId.replace(/^#/, '');
+    let cursor;
+    do {
+      const r = await slack.client.conversations.list({ limit: 200, cursor, types: 'public_channel,private_channel' });
+      const hit = (r.channels || []).find((c) => c.name === want);
+      if (hit) { info = { id: hit.id, name: hit.name }; break; }
+      cursor = r.response_metadata && r.response_metadata.next_cursor;
+    } while (cursor);
+  }
+  _clarityChannelCache.set(nameOrId, info);
+  return info;
+}
+
+// Ron's DM channel id: the one stored on past brief items when there is one,
+// else opened the way the rest of index.js does (conversations.open).
+async function clarityDmChannel(shownItems) {
+  const hit = (shownItems || []).find((r) => r.channel);
+  if (hit) return hit.channel;
+  try { const r = await slack.client.conversations.open({ users: RON_SLACK_ID }); return (r.channel && r.channel.id) || null; }
+  catch (e) { console.warn(`[clarity] conversations.open failed: ${e.message}`); return null; }
+}
+
+function clarityUnslack(text) {
+  return String(text || '')
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<#[A-Z0-9]+\|([^>]+)>/g, '#$1')
+    .replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:\/\/[^>]+)>/g, '$1');
+}
+
+async function clarityPermalink(channel, ts) {
+  try { const r = await slack.client.chat.getPermalink({ channel, message_ts: ts }); return r.permalink || null; } catch (_) { return null; }
+}
+
+function clarityWeekStartIso(now) {
+  const p = clarityBrief.crParts(now);
+  const d = new Date(`${p.ymd}T12:00:00Z`);
+  const dow = (d.getUTCDay() + 6) % 7; // Monday = 0
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d.toISOString();
+}
+
+// Every collector returns { candidates, scanned, ...extras }. A throw is caught
+// by the runner and reported on the Scanned: line as "⚠️ <source> unavailable".
+// A candidate with needsClassification goes through Haiku; the rest already
+// carry kind, tier, whyRon and action from the collector.
+async function collectClaritySlack(window) {
+  const mention = `<@${RON_SLACK_ID}>`;
+  const candidates = [];
+  let scanned = 0;
+  const skipped = [];
+  const agent = await clarityChannel(AGENT_CHANNEL);
+  for (const ref of clarityList('CLARITY_SLACK_CHANNELS', CLARITY_SLACK_CHANNELS_DEFAULT)) {
+    const ch = await clarityChannel(ref);
+    if (!ch) { skipped.push(ref); continue; }
+    let r;
+    try {
+      r = await slack.client.conversations.history({
+        channel: ch.id, oldest: String(window.from.getTime() / 1000), latest: String(window.to.getTime() / 1000), limit: 200, inclusive: true,
+      });
+    } catch (e) { skipped.push(`#${ch.name} (${e.data && e.data.error ? e.data.error : e.message})`); continue; }
+    for (const m of (r.messages || [])) {
+      scanned++;
+      if (!m.text || m.user === RON_SLACK_ID || m.subtype === 'channel_join') continue;
+      const isCheck = !!agent && ch.id === agent.id && (/CHECK BROKEN/.test(m.text) || m.text.startsWith('⚠️'));
+      const mentions = m.text.includes(mention);
+      if (!isCheck && !mentions) continue;
+      const createdAt = new Date(Number(m.ts) * 1000).toISOString();
+      let updatedAt = createdAt;
+      if (mentions && Number(m.reply_count) > 0) {
+        const rep = await slack.client.conversations.replies({ channel: ch.id, ts: m.ts, limit: 50 }).catch(() => null);
+        const replies = ((rep && rep.messages) || []).filter((x) => x.ts !== m.ts);
+        const last = replies[replies.length - 1];
+        if (last && last.user === RON_SLACK_ID) continue; // Ron already answered
+        if (last) updatedAt = new Date(Number(last.ts) * 1000).toISOString();
+      }
+      const url = await clarityPermalink(ch.id, m.ts);
+      if (!url) continue;
+      const clean = clarityUnslack(m.text);
+      candidates.push({
+        source: 'slack', actor: ch.id, kind: isCheck ? 'check_broken' : 'mention',
+        title: `#${ch.name}: ${clarityBrief.clip(clean, 90)}`, snippet: clean.slice(0, 400),
+        url, dedupeKey: `slack:${ch.id}:${m.ts}`, createdAt, updatedAt,
+        needsClassification: !isCheck,
+        whyRon: isCheck ? 'A check is broken and only you decide whether to fix it or retire it.' : undefined,
+        action: isCheck ? 'Open the thread and decide: fix, retire, or hand it to a session.' : undefined,
+      });
+      if (candidates.length >= 40) break;
+    }
+  }
+  return { candidates, scanned, skipped };
+}
+
+async function collectClarityMax(window, now, shownItems) {
+  const candidates = [];
+  let scanned = 0;
+  const dm = await clarityDmChannel(shownItems);
+  const dmUrl = `https://slack.com/app_redirect?channel=${dm || 'max'}`;
+  const weekStart = clarityWeekStartIso(now);
+  const pend = pendingApprovals[RON_SLACK_ID];
+  if (pend) {
+    scanned++;
+    candidates.push({
+      source: 'max', actor: 'max', kind: 'approval', tier: 2,
+      title: `An approval is waiting in your DM (${pend.kind || 'request'})`,
+      whyRon: 'Only you approve what goes out under your name.', action: 'Open the DM and reply "looks good" or ask for changes.',
+      url: dmUrl, dedupeKey: `max:approval:${pend.createdAt || 'x'}`, createdAt: new Date(pend.createdAt || now).toISOString(),
+    });
+  }
+  for (const f of CLARITY_FLAGS) {
+    scanned++;
+    const v = String(process.env[f.env] || 'off').trim().toLowerCase();
+    if (f.liveWhen(v)) continue;
+    candidates.push({
+      source: 'max', actor: 'railway', kind: 'flag_flip', tier: 2,
+      title: `${f.env}=${v}: still not live`,
+      whyRon: 'Only you flip production flags on ng-pm-MAX.', action: `Decide whether ${f.env} goes live this week; set it with the other Railway vars in one batch.`,
+      url: 'https://railway.com/dashboard', dedupeKey: `max:flag:${f.env}`, createdAt: weekStart, updatedAt: weekStart,
+    });
+  }
+  const { data: igRows } = await supabase.from('ig_guide_drafts').select('message_id, created_at').eq('status', 'pending').order('created_at', { ascending: false }).limit(20);
+  if (igRows && igRows.length) {
+    scanned += igRows.length;
+    candidates.push({
+      source: 'max', actor: 'ig_guide', kind: 'approval', tier: 2,
+      title: `${igRows.length} Instagram guide draft${igRows.length === 1 ? '' : 's'} waiting for your ✅`,
+      whyRon: 'The drafts send only on your ✅ and the 24 h Instagram window closes without it.', action: 'Open the newest draft card in your DM and ✅ or ❌ each.',
+      url: dmUrl, dedupeKey: 'max:ig_guide:pending', createdAt: igRows[igRows.length - 1].created_at, updatedAt: igRows[0].created_at,
+    });
+  }
+  if (dm) {
+    // Max's own posts to Ron, 24 h to 72 h old, that Ron never reacted to.
+    const r = await slack.client.conversations.history({
+      channel: dm, oldest: String((now.getTime() - 72 * 3600e3) / 1000), latest: String((now.getTime() - 24 * 3600e3) / 1000), limit: 100,
+    });
+    for (const m of (r.messages || [])) {
+      scanned++;
+      if (!m.text || m.user === RON_SLACK_ID || (m.thread_ts && m.thread_ts !== m.ts)) continue;
+      if (/^CLARITY BRIEF/.test(m.text) || /^⚠️ CHECK BROKEN: no Clarity Brief/.test(m.text)) continue;
+      if ((m.reactions || []).some((x) => (x.users || []).includes(RON_SLACK_ID))) continue;
+      const url = await clarityPermalink(dm, m.ts);
+      if (!url) continue;
+      const clean = clarityUnslack(m.text);
+      candidates.push({
+        source: 'max', actor: 'max_dm', kind: 'approval',
+        title: clarityBrief.clip(clean.split('\n')[0], 90), snippet: clean.slice(0, 400),
+        url, dedupeKey: `max:dm:${m.ts}`, createdAt: new Date(Number(m.ts) * 1000).toISOString(), needsClassification: true,
+      });
+      if (candidates.length >= 25) break;
+    }
+  }
+  return { candidates, scanned };
+}
+
+// Second Google account (contact@) uses the same OAuth client with its own
+// refresh token, consented once by Ron. Missing token = source unavailable.
+function clarityGoogleAuth(tokenEnv) {
+  const raw = process.env[tokenEnv];
+  if (!raw) throw new Error(`${tokenEnv} not set`);
+  const credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('./credentials.json'));
+  const { client_id, client_secret } = credentials.installed;
+  const oauth2Client = new google.auth.OAuth2(client_id, client_secret, 'http://localhost:3000/callback');
+  oauth2Client.setCredentials(JSON.parse(raw));
+  return oauth2Client;
+}
+
+async function collectClarityGmail(account, window) {
+  const source = account === 'contact' ? 'gmail_contact' : 'gmail_ron';
+  const auth = account === 'contact' ? clarityGoogleAuth('GOOGLE_TOKEN_CONTACT') : getGoogleAuth();
+  const gmail = google.gmail({ version: 'v1', auth });
+  const q = `in:inbox -category:promotions -category:social -category:forums after:${Math.floor(window.from.getTime() / 1000)}`;
+  const list = await gmail.users.messages.list({ userId: 'me', maxResults: CLARITY_GMAIL_CAP, q });
+  const ids = list.data.messages || [];
+  const byThread = new Map();
+  for (const m of ids) {
+    const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'metadata', metadataHeaders: ['From', 'Subject', 'Date'] });
+    const d = msg.data;
+    const labels = d.labelIds || [];
+    if (labels.includes('SENT') || labels.includes('DRAFT')) continue;
+    const header = (n) => (((d.payload && d.payload.headers) || []).find((x) => x.name === n) || {}).value || '';
+    const from = header('From');
+    const email = ((from.match(/<([^>]+)>/) || [null, from])[1] || '').trim().toLowerCase();
+    const name = from.replace(/<[^>]+>/, '').replace(/"/g, '').trim() || email;
+    if (!email || email === CLARITY_RON_EMAIL) continue;
+    const createdAt = new Date(Number(d.internalDate)).toISOString();
+    const prev = byThread.get(d.threadId);
+    if (prev && prev.createdAt >= createdAt) continue;
+    byThread.set(d.threadId, {
+      source, actor: email,
+      title: `${clarityBrief.clip(name, 30)}: ${clarityBrief.clip(header('Subject') || '(no subject)', 70)}`,
+      snippet: clarityBrief.clip(d.snippet || '', 400),
+      url: `https://mail.google.com/mail/u/0/#inbox/${d.threadId}`,
+      dedupeKey: `${source}:${d.threadId}`, createdAt, updatedAt: createdAt, needsClassification: true,
+    });
+  }
+  return { candidates: [...byThread.values()], scanned: ids.length, capped: ids.length >= CLARITY_GMAIL_CAP };
+}
+
+async function collectClarityCalendar() {
+  const calendar = google.calendar({ version: 'v3', auth: getGoogleAuth() });
+  const start = _crMidnightUtc(0);
+  const end = new Date(start.getTime() + 86400e3);
+  const res = await calendar.events.list({ calendarId: 'primary', timeMin: start.toISOString(), timeMax: end.toISOString(), singleEvents: true, orderBy: 'startTime' });
+  const clients = await loadActiveClientEmails().catch(() => new Set());
+  const today = (res.data.items || [])
+    .filter((e) => e.start && e.start.dateTime && e.status !== 'cancelled')
+    .map((e) => {
+      const attendees = (e.attendees || []).map((a) => String(a.email || '').toLowerCase());
+      const isClient = attendees.some((a) => clients.has(a));
+      const hm = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Costa_Rica', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(e.start.dateTime));
+      return { hm, label: `${isClient ? 'Client: ' : ''}${e.summary || '(no title)'}${attendees.length ? ` (${attendees.length})` : ''}` };
+    });
+  return { candidates: [], scanned: today.length, today };
+}
+
+async function clarityGithub(path, accept = 'application/vnd.github+json') {
+  if (!process.env.GITHUB_TOKEN) throw new Error('GITHUB_TOKEN not set');
+  const res = await fetch(`https://api.github.com${path}`, {
+    headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: accept, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'ng-agent' },
+  });
+  if (!res.ok) throw new Error(`GitHub ${res.status} on ${path}`);
+  return accept.includes('raw') ? res.text() : res.json();
+}
+
+// Open PRs feed block 2 (projects in flight). A PR becomes a block-1 item
+// only when it waits on Ron by his own rule: backlog PRs, bot or Claude
+// authored PRs, or the needs-ron label.
+async function collectClarityGitHub() {
+  const candidates = [], prs = [];
+  let scanned = 0;
+  for (const repo of clarityList('CLARITY_GITHUB_REPOS', CLARITY_GITHUB_REPOS_DEFAULT)) {
+    let list;
+    try { list = await clarityGithub(`/repos/${repo}/pulls?state=open&per_page=50`); }
+    catch (e) { if (/GitHub 404/.test(e.message)) continue; throw e; }
+    for (const pr of list) {
+      scanned++;
+      const labels = (pr.labels || []).map((l) => String(l.name || '').toLowerCase());
+      const author = String((pr.user && pr.user.login) || '').toLowerCase();
+      const needsRon = labels.includes('needs-ron') || /claude|\[bot\]|github-actions/.test(author) || /backlog/i.test(pr.title);
+      const title = `${repo.split('/')[1]}#${pr.number}: ${clarityBrief.clip(pr.title, 70)}`;
+      prs.push({ title, url: pr.html_url, repo, updatedAt: pr.updated_at, tier: needsRon ? 2 : 3 });
+      if (needsRon && !pr.draft) {
+        candidates.push({
+          source: 'github', actor: repo, kind: 'pr_review', tier: 2, title, url: pr.html_url,
+          dedupeKey: `github:${repo}#${pr.number}`, createdAt: pr.created_at, updatedAt: pr.updated_at,
+          whyRon: 'Backlog and bot PRs wait for your approval by your own rule.', action: 'Read the diff, then merge, request changes or close.',
+        });
+      }
+    }
+  }
+  return { candidates, scanned, prs };
+}
+
+async function collectClarityWiki(shownItems, now) {
+  const md = await clarityGithub(`/repos/${CLARITY_WIKI_REPO}/contents/${CLARITY_WIKI_PATH}`, 'application/vnd.github.raw+json');
+  const rows = clarityBrief.parseFollowupTable(md);
+  const candidates = clarityBrief.eligibleFollowups({ rows, shownItems, now, pageUrl: `https://github.com/${CLARITY_WIKI_REPO}/blob/main/${CLARITY_WIKI_PATH}` });
+  return { candidates, scanned: rows.length };
+}
+
+// Haiku decides needs_ron / team / fyi / noise for everything a collector could
+// not judge itself, 20 per call. A junk answer drops the batch (fail closed:
+// nothing invented reaches the brief) and is counted as an issue.
+async function clarityClassify(cands, correlationId, usage, issues) {
+  const ready = cands.filter((c) => !c.needsClassification);
+  const need = cands.filter((c) => c.needsClassification);
+  const out = [];
+  for (let i = 0; i < need.length; i += 20) {
+    const batch = need.slice(i, i + 20).map((c, idx) => ({ ...c, idx, ageHours: Math.round((Date.now() - new Date(c.createdAt).getTime()) / 3600e3) }));
+    const t0 = Date.now();
+    const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: 1800, messages: [{ role: 'user', content: clarityBrief.buildClassifyPrompt(batch) }] });
+    logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'clarity_classifier');
+    usage.push(res);
+    const parsed = clarityBrief.parseClassification(res.content.filter((b) => b.type === 'text').map((b) => b.text).join(''), batch.length);
+    if (!parsed) { issues.push(`classifier returned junk for ${batch.length} candidates`); continue; }
+    for (const c of batch) {
+      const v = parsed.get(c.idx);
+      if (!v || v.verdict !== 'needs_ron') continue;
+      out.push({ ...c, tier: v.tier, title: v.title || c.title, whyRon: v.whyRon || c.whyRon, action: v.action || c.action });
+    }
+  }
+  return [...ready, ...out];
+}
+
+function clarityCost(responses) {
+  let usd = 0;
+  for (const r of responses) {
+    const rate = icmRates(r.model) || { in: 3, out: 15 };
+    const u = r.usage || {};
+    usd += ((u.input_tokens || 0) * rate.in + (u.output_tokens || 0) * rate.out) / 1e6;
+  }
+  return Math.round(usd * 10000) / 10000;
+}
+
+async function runClarityBrief(correlationId, { now = new Date(), force = false } = {}) {
+  const log = (status, output) => logActivity({ event_type: 'clarity_brief', event_source: 'cron', action: 'clarity_brief', status, output, correlation_id: correlationId });
+  if (clarityDisabled()) { log('ok', { skipped: 'disabled' }); return; }
+  if (clarityMode() !== 'live' && !force) { log('ok', { skipped: `mode ${clarityMode()}` }); return; }
+  const runDate = clarityBrief.crParts(now).ymd;
+
+  // Run-once: two boots a minute apart (a Railway var batch) must not DM twice.
+  const { data: todays, error: todayErr } = await supabase.from('clarity_runs').select('id').eq('run_date', runDate).not('posted_at', 'is', null).limit(1);
+  if (todayErr) throw new Error(`clarity_runs read: ${todayErr.message}`);
+  if (todays && todays.length && !force) { log('ok', { skipped: 'already posted today' }); return; }
+  const { data: lastRows } = await supabase.from('clarity_runs').select('posted_at').not('posted_at', 'is', null).order('posted_at', { ascending: false }).limit(1);
+  const window = clarityBrief.briefWindow({ lastPostedAt: lastRows && lastRows[0] && lastRows[0].posted_at, now });
+  const { data: runRow, error: runErr } = await supabase.from('clarity_runs')
+    .insert({ run_date: runDate, window_from: window.from.toISOString(), window_to: window.to.toISOString() }).select('id').single();
+  if (runErr) throw new Error(`clarity_runs insert: ${runErr.message}`);
+  const runId = runRow.id;
+
+  const usage = [], issues = [], counts = {};
+  if (window.clamped) issues.push(`window clamped to ${window.hours} h`);
+  try {
+    const since30 = new Date(now.getTime() - 30 * 86400e3).toISOString();
+    const [shownRes, dismissRes] = await Promise.all([
+      supabase.from('clarity_items').select('id, ts, channel, dedupe_key, signature, source, tier, title, url, status, shown_at, accepted_at, snoozed_until').gte('shown_at', since30).order('shown_at', { ascending: false }).limit(2000),
+      supabase.from('clarity_dismissals').select('signature, source, muted, count, last_at').limit(2000),
+    ]);
+    if (shownRes.error) throw new Error(`clarity_items read: ${shownRes.error.message}`);
+    if (dismissRes.error) throw new Error(`clarity_dismissals read: ${dismissRes.error.message}`);
+    const shownItems = shownRes.data || [];
+    const dismissals = dismissRes.data || [];
+
+    // Yesterday's unreacted items expire; they are counted, never re-shown.
+    const expireIds = clarityBrief.expireUnreacted(shownItems, now);
+    if (expireIds.length) {
+      await supabase.from('clarity_items').update({ status: 'expired' }).in('id', expireIds).eq('status', 'shown');
+      for (const r of shownItems) if (expireIds.includes(r.id)) r.status = 'expired';
+    }
+
+    const collectors = {
+      slack: () => collectClaritySlack(window),
+      max: () => collectClarityMax(window, now, shownItems),
+      gmail_ron: () => collectClarityGmail('ron', window),
+      gmail_contact: () => collectClarityGmail('contact', window),
+      calendar: () => collectClarityCalendar(),
+      github: () => collectClarityGitHub(),
+      wiki: () => collectClarityWiki(shownItems, now),
+    };
+    const enabled = clarityBrief.SOURCES;
+    const results = await Promise.all(enabled.map(async (src) => {
+      try { return [src, await collectors[src]()]; }
+      catch (e) { console.warn(`[clarity] ${src} failed: ${e.message}`); return [src, { failed: String(e.message).slice(0, 120) }]; }
+    }));
+    const candidates = [];
+    let today = [], prs = [];
+    for (const [src, r] of results) {
+      if (r.failed) { counts[src] = { scanned: 0, failed: r.failed }; issues.push(`${src} unavailable`); continue; }
+      counts[src] = { scanned: r.scanned || 0, kept: (r.candidates || []).length };
+      if (r.capped) issues.push(`${src} capped at ${CLARITY_GMAIL_CAP}`);
+      if (r.skipped && r.skipped.length) issues.push(`slack skipped ${r.skipped.join(', ')}`);
+      candidates.push(...(r.candidates || []));
+      if (r.today) today = r.today;
+      if (r.prs) prs = r.prs;
+    }
+
+    const classified = await clarityClassify(candidates, correlationId, usage, issues);
+    const sup = clarityBrief.applySuppression({ candidates: classified, dismissals, shownItems, now });
+    const ranked = clarityBrief.rankAndCap(sup.kept, { now });
+    const items = ranked.shown;
+    const accepted = shownItems.filter((r) => r.status === 'accepted');
+    const projects = clarityBrief.projectsInFlight({ accepted, prs, now });
+    const scanned = clarityBrief.scannedLine(counts, {
+      dropped: Math.max(0, candidates.length - items.length), expired: expireIds.length, muted: dismissals.filter((d) => d.muted).length,
+    });
+
+    // Draft with Sonnet, validate, reprompt once, then the numbers-only fallback.
+    const draftOnce = async (extra) => {
+      const prompt = clarityBrief.buildDraftPrompt({ items: items.map((it, idx) => ({ ...it, idx })), projects: projects.map((p, idx) => ({ ...p, idx })) }) + (extra ? `\n\n${extra}` : '');
+      const t0 = Date.now();
+      const res = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 2000, messages: [{ role: 'user', content: prompt }] });
+      logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'clarity_draft');
+      usage.push(res);
+      const draft = clarityBrief.parseDraftJson(res.content.filter((b) => b.type === 'text').map((b) => b.text).join(''), { nItems: items.length, nProjects: projects.length });
+      const merged = clarityBrief.mergeDraft({ items, projects, draft });
+      const parent = clarityBrief.formatParent({ date: now, items: merged.items, projects: merged.projects, scanned, today });
+      const replies = merged.items.map((it, i) => clarityBrief.formatItemReply(it, i + 1));
+      return { parent, replies, verdict: clarityBrief.validateClarityBrief({ parent, replies }) };
+    };
+    let parent, replies;
+    let d = (items.length || projects.length) ? await draftOnce() : null;
+    if (d && !d.verdict.ok) d = await draftOnce(`Your previous answer failed validation: ${d.verdict.problems.join(', ')}. Fix it and return the JSON only.`);
+    if (d && d.verdict.ok) { ({ parent, replies } = d); }
+    else {
+      parent = clarityBrief.formatParent({ date: now, items, projects, scanned, today });
+      replies = clarityBrief.fallbackReplies(items);
+      const v = clarityBrief.validateClarityBrief({ parent, replies });
+      if (!v.ok) throw new Error(`fallback failed contract: ${v.problems.join('; ')}`);
+      if (d) { issues.push('draft failed validation twice, fallback used'); parent += '\n⚠️ ISSUES: draft failed validation twice'; }
+    }
+
+    // Post. Ron's DM only, by construction.
+    const posted = await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: parent, metadata: { event_type: 'clarity_brief', event_payload: { run_id: runId } } });
+    const dmChannel = posted.channel;
+    const rows = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const rep = await slack.client.chat.postMessage({ channel: dmChannel, thread_ts: posted.ts, text: replies[i], metadata: { event_type: 'clarity_item', event_payload: { run_id: runId, idx: i } } });
+      for (const name of ['white_check_mark', 'x', 'next_track_button']) await slack.client.reactions.add({ channel: dmChannel, timestamp: rep.ts, name }).catch(() => {});
+      rows.push({
+        run_id: runId, ts: rep.ts, channel: dmChannel, dedupe_key: it.dedupeKey, signature: it.signature || clarityBrief.signatureFor(it),
+        source: it.source, tier: clarityBrief.tierFor(it), title: clarityBrief.clip(it.title, 200), url: it.url, status: 'shown',
+      });
+    }
+    if (rows.length) {
+      const { error: itemErr } = await supabase.from('clarity_items').insert(rows);
+      if (itemErr) issues.push(`clarity_items insert: ${itemErr.message}`);
+    }
+    const cost = clarityCost(usage);
+    const sourcesOk = enabled.filter((s) => !counts[s].failed).length;
+    const verdict = clarityBrief.verdictLine({ ok: issues.length === 0, postedAt: new Date(), items: items.length, projects: projects.length, sourcesOk, sourcesTotal: enabled.length, costUsd: cost, issues });
+    await supabase.from('clarity_runs').update({ posted_at: new Date().toISOString(), parent_ts: posted.ts, counts, items_shown: items.length, projects: projects.length, verdict, cost_usd: cost }).eq('id', runId);
+    log('ok', { items: items.length, projects: projects.length, candidates: candidates.length, counts, issues, cost });
+    console.log(`[clarity] ${verdict}`);
+  } catch (err) {
+    try { await supabase.from('clarity_runs').update({ error: String(err.message).slice(0, 500) }).eq('id', runId); } catch (_) { /* best effort */ }
+    throw err;
+  }
+}
+
+// Divergence check (spec step 14): a weekday with no posted brief by 07:15 is
+// a CHECK BROKEN to Ron, the operator. Silent when the recipe is off.
+async function checkClarityBriefPosted(correlationId, { now = new Date() } = {}) {
+  if (clarityDisabled() || clarityMode() !== 'live') return;
+  const runDate = clarityBrief.crParts(now).ymd;
+  const { data, error } = await supabase.from('clarity_runs').select('id, posted_at, error').eq('run_date', runDate).order('started_at', { ascending: false }).limit(1);
+  if (error) {
+    await postToSlack(RON_SLACK_ID, `⚠️ CHECK BROKEN: could not read clarity_runs (${error.message}); whether today's Clarity Brief posted is unknown.`);
+    return;
+  }
+  const row = data && data[0];
+  if (row && row.posted_at) {
+    logActivity({ event_type: 'clarity_brief', event_source: 'cron', action: 'clarity_posted_check', status: 'ok', output: { posted_at: row.posted_at }, correlation_id: correlationId });
+    return;
+  }
+  const why = row && row.error ? row.error : (row ? 'the run started and never posted' : 'the 06:50 run never started');
+  await postToSlack(RON_SLACK_ID, `⚠️ CHECK BROKEN: no Clarity Brief today (${why}).`);
+  logActivity({ event_type: 'clarity_brief', event_source: 'cron', action: 'clarity_posted_check', status: 'error', output: { why }, correlation_id: correlationId });
+}
+
+// Reaction route body. Returns true when the message was a brief item (handled
+// or deliberately ignored), false when it belongs to another route.
+async function handleClarityReaction(event, baseEmoji) {
+  const { data: rows, error } = await supabase.from('clarity_items').select('*').eq('ts', event.item.ts).eq('channel', event.item.channel).limit(1);
+  if (error) throw new Error(`clarity_items read: ${error.message}`);
+  const row = rows && rows[0];
+  if (!row) return false;
+  const decision = clarityBrief.applyReaction({ item: row, reaction: baseEmoji, userId: event.user, ronId: RON_SLACK_ID });
+  if (decision.ignore) return true;
+  // Atomic: only a row still in the status we read moves.
+  const { data: moved } = await supabase.from('clarity_items').update(decision.set).eq('id', row.id).eq('status', row.status).select('id');
+  if (!moved || !moved.length) return true;
+  if (decision.dismissal) {
+    const nowIso = new Date().toISOString();
+    const sig = decision.dismissal.signature;
+    const { data: ex } = await supabase.from('clarity_dismissals').select('signature, count').eq('signature', sig).limit(1);
+    if (ex && ex.length) await supabase.from('clarity_dismissals').update({ count: (Number(ex[0].count) || 1) + 1, last_at: nowIso, sample_title: clarityBrief.clip(row.title, 120) }).eq('signature', sig);
+    else await supabase.from('clarity_dismissals').insert({ signature: sig, source: row.source, count: 1, sample_title: clarityBrief.clip(row.title, 120) });
+    const actorPrefix = sig.split('|').slice(0, 2).join('|');
+    const actorSig = `${actorPrefix}|*`;
+    const { data: forActor } = await supabase.from('clarity_dismissals').select('signature, count, last_at, first_at').like('signature', `${actorPrefix}|%`);
+    const m = clarityBrief.muteDecision({ dismissalsForActor: forActor || [], actorSignature: actorSig });
+    if (m.mute && !(forActor || []).some((d) => d.signature === actorSig)) {
+      await supabase.from('clarity_dismissals').insert({ signature: actorSig, source: row.source, count: m.count, muted: true, sample_title: clarityBrief.clip(row.title, 120) });
+      console.log(`[clarity] muted ${actorSig} after ${m.count} dismissals`);
+    }
+  }
+  logActivity({ event_type: 'clarity_brief', event_source: 'slack', action: 'clarity_reaction', status: 'ok', channel_id: event.item.channel, output: { item_id: row.id, reaction: baseEmoji, from: row.status, to: decision.status } });
+  return true;
+}
+
+cron.schedule('50 6 * * 1-5', wrapCronJob('runClarityBrief', async (c) => { await runClarityBrief(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('15 7 * * 1-5', wrapCronJob('checkClarityBriefPosted', async (c) => { await checkClarityBriefPosted(c); }), { timezone: 'America/Costa_Rica' });
+// ─── end Clarity Brief ───────────────────────────────────────────────────────
+
 slack.event('reaction_added', async ({ event }) => {
   try {
     if (!event || !event.item || event.item.type !== 'message') return;
@@ -24579,6 +25101,16 @@ slack.event('reaction_added', async ({ event }) => {
         console.log('weekly-proposal pre-route miss:', wpErr.message);
         // fall through — this reaction belongs to another route
       }
+    }
+
+    // Route -0.75: Clarity Brief item in Ron's DM (✅ take, ❌ never again,
+    // ⏭ tomorrow). DMs only, and the item is found by its own ts in
+    // clarity_items, so nothing else in the DM is touched. Falls through on
+    // any miss, so Route 0 still owns the rest of the DM.
+    if (String(event.item.channel || '').startsWith('D') && !clarityDisabled() &&
+        (clarityBrief.ACCEPT_EMOJIS.has(baseEmoji) || clarityBrief.DISMISS_EMOJIS.has(baseEmoji) || clarityBrief.SNOOZE_EMOJIS.has(baseEmoji))) {
+      try { if (await handleClarityReaction(event, baseEmoji)) return; }
+      catch (cbErr) { console.log('clarity reaction pre-route miss:', cbErr.message); }
     }
 
     // Route -0.5: client attention alert (✅ handled, 💤 snoozed), channel or
