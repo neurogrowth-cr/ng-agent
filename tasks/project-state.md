@@ -971,3 +971,8 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Go-live, all Ron's hands (spec section 8):** apply migration 025; one-time OAuth consent signed in as contact@, saved as `GOOGLE_TOKEN_CONTACT`; widen `GITHUB_TOKEN` to contents and pull requests read across neurogrowth-cr, including private ng-wiki; set Railway vars in one batch with `CLARITY_BRIEF_MODE=live`; confirm Max is a member of every allowlisted channel. Missing tokens degrade one source, they do not stop the brief.
 - **Provisional:** ranking is revenue now, then operation health, then hygiene, because the 90-day frame closed 2026-10-31 and no November frame exists. The header says so until the rubric table in `lib/clarityBrief.js` changes.
 - **Not built (phase 2):** Ron user token for his DMs and Slack search, nightly Mac push of the Claude sessions board (20:00 to 23:00 CR into a `clarity_sources` row, read the next morning), Fathom action items, a ✅ that creates a task.
+
+## 2026-11-04: migration 025 applied (Clarity Brief still off)
+- **Applied** `migrations/025_clarity_brief.sql` to Max's Supabase on Ron's go. `clarity_runs`, `clarity_items` and `clarity_dismissals` exist with RLS on, three policies each, and no delete for `anon`.
+- **Proof:** a rolled-back probe as `anon` inserted, updated and read all three tables, and its delete was blocked. The tables are empty; the probe consumed id 1 on both sequences, which is harmless.
+- **Still off:** `CLARITY_BRIEF_MODE` is unset. Left for Ron: `GOOGLE_TOKEN_CONTACT`, the wider `GITHUB_TOKEN`, Max in every allowlisted channel, then `CLARITY_BRIEF_MODE=live` in one Railway batch.
