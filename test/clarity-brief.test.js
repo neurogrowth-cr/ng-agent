@@ -140,5 +140,9 @@ const merged = cb.mergeDraft({ items: [items[0]], projects: [projects[0]], draft
 check('8g merge keeps facts, takes prose', [merged.items[0].url, merged.items[0].action, merged.projects[0].why], ['https://mail.example/1', 'Pay it', 'Leaks cost leads']);
 check('8h prompts carry no em dash', /\u2014/.test(cb.buildClassifyPrompt([{ idx: 0, source: 's', actor: 'a', title: 't' }]) + cb.buildDraftPrompt({ items: [{ idx: 0, ...items[0] }], projects: [{ idx: 0, ...projects[0] }] })), false);
 
+// 9. Gmail links name the mailbox; /u/0/ would open contact@ threads in Ron's inbox
+check('9a contact link names the mailbox', cb.gmailThreadUrl('contact@example.com', 'abc123'), 'https://mail.google.com/mail/u/contact@example.com/#inbox/abc123');
+check('9b no mailbox falls back to the first account', cb.gmailThreadUrl('', 'abc123'), 'https://mail.google.com/mail/u/0/#inbox/abc123');
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall clarity-brief checks passed');

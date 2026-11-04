@@ -24549,6 +24549,7 @@ const clarityBrief = require('./lib/clarityBrief');
 const clarityMode = () => String(process.env.CLARITY_BRIEF_MODE || 'off').trim().toLowerCase();
 const clarityDisabled = () => String(process.env.CLARITY_BRIEF_DISABLED || '') === 'true';
 const CLARITY_RON_EMAIL = (process.env.RON_EMAIL || 'ronny.duarte@neurogrowth.io').toLowerCase();
+const CLARITY_CONTACT_EMAIL = (process.env.CLARITY_CONTACT_EMAIL || 'contact@neurogrowthconsulting.com').toLowerCase();
 // Channel names resolve through conversations.list; ids are used as given.
 const CLARITY_SLACK_CHANNELS_DEFAULT = [AGENT_CHANNEL, SALES_CHANNEL, OPS_CHANNEL, 'C0B48H7NT41', MGMT_CHANNEL, REELS_CHANNEL, AXON_OPS_CHANNEL, 'C0BDFHGF9DZ'];
 const CLARITY_GITHUB_REPOS_DEFAULT = ['neurogrowth-cr/ng-agent', 'neurogrowth-cr/dash', 'neurogrowth-cr/ng-revi', 'neurogrowth-cr/ng-axon', 'neurogrowth-cr/ng-automation-KAI', 'neurogrowth-cr/roi-rm-okr-reporting', 'neurogrowth-cr/ng-wiki'];
@@ -24732,11 +24733,15 @@ async function collectClarityMax(window, now, shownItems) {
 
 // Second Google account (contact@) uses the same OAuth client with its own
 // refresh token, consented once by Ron. Missing token = source unavailable.
-function clarityGoogleAuth(tokenEnv) {
-  const raw = process.env[tokenEnv];
-  if (!raw) throw new Error(`${tokenEnv} not set`);
-  const credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('./credentials.json'));
-  const { client_id, client_secret } = credentials.installed;
+// contact@ lives in another Google Workspace (neurogrowthconsulting.com) and Max's
+// OAuth app is internal to neurogrowth.io (Google: 403 org_internal), so that
+// mailbox has its own client. A refresh token only works with the client that
+// issued it, so there is no fallback to GOOGLE_CREDENTIALS.
+function clarityContactGoogleAuth() {
+  const raw = process.env.GOOGLE_TOKEN_CONTACT;
+  if (!raw) throw new Error('GOOGLE_TOKEN_CONTACT not set');
+  if (!process.env.GOOGLE_CREDENTIALS_CONTACT) throw new Error('GOOGLE_CREDENTIALS_CONTACT not set');
+  const { client_id, client_secret } = JSON.parse(process.env.GOOGLE_CREDENTIALS_CONTACT).installed;
   const oauth2Client = new google.auth.OAuth2(client_id, client_secret, 'http://localhost:3000/callback');
   oauth2Client.setCredentials(JSON.parse(raw));
   return oauth2Client;
@@ -24744,7 +24749,8 @@ function clarityGoogleAuth(tokenEnv) {
 
 async function collectClarityGmail(account, window) {
   const source = account === 'contact' ? 'gmail_contact' : 'gmail_ron';
-  const auth = account === 'contact' ? clarityGoogleAuth('GOOGLE_TOKEN_CONTACT') : getGoogleAuth();
+  const auth = account === 'contact' ? clarityContactGoogleAuth() : getGoogleAuth();
+  const mailbox = account === 'contact' ? CLARITY_CONTACT_EMAIL : CLARITY_RON_EMAIL;
   const gmail = google.gmail({ version: 'v1', auth });
   const q = `in:inbox -category:promotions -category:social -category:forums after:${Math.floor(window.from.getTime() / 1000)}`;
   const list = await gmail.users.messages.list({ userId: 'me', maxResults: CLARITY_GMAIL_CAP, q });
@@ -24767,7 +24773,7 @@ async function collectClarityGmail(account, window) {
       source, actor: email,
       title: `${clarityBrief.clip(name, 30)}: ${clarityBrief.clip(header('Subject') || '(no subject)', 70)}`,
       snippet: clarityBrief.clip(d.snippet || '', 400),
-      url: `https://mail.google.com/mail/u/0/#inbox/${d.threadId}`,
+      url: clarityBrief.gmailThreadUrl(mailbox, d.threadId),
       dedupeKey: `${source}:${d.threadId}`, createdAt, updatedAt: createdAt, needsClassification: true,
     });
   }
