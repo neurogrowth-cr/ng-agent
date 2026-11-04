@@ -53,9 +53,16 @@ The 90-day frame in the strategy repo closed 2026-10-31 and no November frame is
 
 Within a tier, older first. Block 2 ranks projects by the tier they serve, then by days since last activity.
 
-### 3.2 What the bot token cannot see (phase 2)
+### 3.2 What runs where (Ron's ruling, 2026-11-03)
 
-A Slack bot reads only channels it is a member of and its own DMs. Ron's DMs with teammates and Slack search are out of reach in v1. Phase 2 adds a Ron user token (`SLACK_RON_USER_TOKEN`, scopes `search:read`, `im:history`) and the Claude sessions board pushed from the Mac when it is awake. Both are listed, not built, here.
+Everything in this recipe runs on Railway inside Max. The Mac is not a dependency: if it is off, asleep or mid-reinstall the brief still posts at 06:50 with every source above.
+
+Two inputs cannot be reached from Railway and are phase 2, not this spec:
+
+| Input | Why Railway cannot see it | Phase 2 shape |
+|---|---|---|
+| Ron's DMs with teammates, Slack search | a bot token reads only channels it is a member of and its own DMs | a Ron user token (`SLACK_RON_USER_TOKEN`, scopes `search:read`, `im:history`) stored on ng-pm-MAX; no Mac involved |
+| The Claude sessions board (`~/.claude/handoffs/recover.sh board`) | it lives on the Mac | a nightly push from the Mac between 20:00 and 23:00 CR (a `launchd` job, while Ron is still working) writes the board to a `clarity_sources` row; the 06:50 brief reads the row and, when it is older than 36 h, says `sessions: last push <date>` instead of failing. Ron accepted an evening cutoff for Mac-sourced data; nothing Mac-sourced is read in the morning |
 
 ## 4. CRITERIA
 
