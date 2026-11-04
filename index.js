@@ -24552,7 +24552,7 @@ const CLARITY_RON_EMAIL = (process.env.RON_EMAIL || 'ronny.duarte@neurogrowth.io
 const CLARITY_CONTACT_EMAIL = (process.env.CLARITY_CONTACT_EMAIL || 'contact@neurogrowthconsulting.com').toLowerCase();
 // Channel names resolve through conversations.list; ids are used as given.
 const CLARITY_SLACK_CHANNELS_DEFAULT = [AGENT_CHANNEL, SALES_CHANNEL, OPS_CHANNEL, 'C0B48H7NT41', MGMT_CHANNEL, REELS_CHANNEL, AXON_OPS_CHANNEL, 'C0BDFHGF9DZ'];
-const CLARITY_GITHUB_REPOS_DEFAULT = ['neurogrowth-cr/ng-agent', 'neurogrowth-cr/dash', 'neurogrowth-cr/ng-revi', 'neurogrowth-cr/ng-axon', 'neurogrowth-cr/ng-automation-KAI', 'neurogrowth-cr/roi-rm-okr-reporting', 'neurogrowth-cr/ng-wiki'];
+const CLARITY_GITHUB_REPOS_DEFAULT = ['neurogrowth-cr/ng-agent', 'neurogrowth-cr/dash.neurogrowth.io', 'neurogrowth-cr/ng-revi', 'neurogrowth-cr/ng-axon', 'neurogrowth-cr/ng-automation', 'neurogrowth-cr/roi-rm-okr-reporting', 'neurogrowth-cr/ng-wiki'];
 const CLARITY_WIKI_REPO = 'neurogrowth-cr/ng-wiki';
 const CLARITY_WIKI_PATH = 'ops/open-followups.md';
 const CLARITY_GMAIL_CAP = 100; // per inbox, 200 across both (spec 4b)
