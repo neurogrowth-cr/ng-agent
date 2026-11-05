@@ -993,3 +993,7 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **#430:** `CLARITY_GITHUB_REPOS_DEFAULT` listed `dash` and `ng-automation-KAI`, which do not exist. The real names are `dash.neurogrowth.io` and `ng-automation`.
 - **`#ng-automation`:** Max is a member, so all 8 channels on the default list read. This supersedes the same line in the entry above.
 - **Still partial:** `GITHUB_TOKEN` reads pull requests only on ng-agent, so the other repos and the wiki follow-ups file show as `unavailable` until Ron edits the token (spec section 8). The first brief on real data runs Thursday 2026-11-05 at 06:50 CR.
+
+## 2026-11-04: Clarity Brief GitHub source connected
+- **`GITHUB_TOKEN`:** Ron edited the fine-grained token `max-voc-pdf-dispatch` to read Contents and Pull requests on all 7 repos and kept Actions write. The value did not change, so Railway did not change. Checked with the Railway value: 200 on pull requests in all 7 repos, and on the wiki follow-ups file. This supersedes "Still partial" in the entry above.
+- **State:** every source on the spec's list is connected. No brief has run on real data yet; the first run is Thursday 2026-11-05 at 06:50 CR.
