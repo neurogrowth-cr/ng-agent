@@ -17298,6 +17298,28 @@ function strikeIsAutomatedBody(body) {
   const norm = strikeNormalizeText(body);
   return !!norm && STRIKE_AUTOMATED_BODY_MARKERS.some(m => norm.includes(m));
 }
+// The approved WhatsApp strike templates (GHL Settings → WhatsApp). In the hybrid
+// model a strike moves the card whoever sends it: Sebastián from the inbox, the
+// guardian, or a GHL workflow (the backlog campaign, plan-of-record 2026-10-29).
+// A workflow send arrives as source 'workflow', which the automated-send rule
+// would discard, but GHL stores the filled template text, so the text identifies
+// it. Every other workflow message (intake, reminders, webinar) still never counts.
+const STRIKE_TEMPLATE_MARKERS = [
+  'Estuve revisando la información que nos compartió', // template_nuevo
+  'Sigo acá. Quiero entender su negocio',              // variacion_st1_st2
+  'entiendo que el tiempo escasea',                    // variacion_st2_st3
+  'pasaba a darle un seguimiento y preguntarle',       // 2nd_follow_up
+  'pasaba a darle un ultimo seguimiento',              // last_follow_up_attempt
+].map(strikeNormalizeText);
+// template_strike3_y_lost closes the case, so it lands on Strike 3 from any stage.
+const STRIKE_CLOSING_MARKER = strikeNormalizeText('Voy a cerrar su caso por ahora');
+function strikeIsClosingTemplate(body) {
+  return strikeNormalizeText(body).includes(STRIKE_CLOSING_MARKER);
+}
+function strikeIsTemplateStrike(body) {
+  const norm = strikeNormalizeText(body);
+  return !!norm && (norm.includes(STRIKE_CLOSING_MARKER) || STRIKE_TEMPLATE_MARKERS.some(m => norm.includes(m)));
+}
 
 // contactId → conversationId. Saves one API call per card on every sweep after
 // the first. A stale entry self-heals: a failed messages fetch drops the card for
@@ -17428,7 +17450,11 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
 
   const newest = touches[touches.length - 1];
   if (String(newest.direction || '').toLowerCase() !== 'outbound') return { skip: 'lead_spoke_last' };
-  if (String(newest.source    || '').toLowerCase() !== 'app'
+  const templateStrike = strikeIsTemplateStrike(newest.body);
+  // A template Meta did not deliver is not a touch, whoever sent it.
+  if (templateStrike && String(newest.status || '').toLowerCase() === 'failed') return { skip: 'send_failed' };
+  if (!templateStrike
+      && String(newest.source || '').toLowerCase() !== 'app'
       && String(newest.userId || '') !== STRIKE_MAX_AI_USER_ID)    return { skip: 'automated_send' };
   if (strikeIsAutomatedBody(newest.body))                          return { skip: 'automated_send' };
 
@@ -17449,6 +17475,8 @@ function evaluateStrikeMove(opp, messages, now = Date.now()) {
   const lastInbound   = [...touches].reverse().find(m => String(m.direction || '').toLowerCase() === 'inbound');
   const lastInboundTs = lastInbound ? (Date.parse(lastInbound.dateAdded || lastInbound.createdAt || 0) || 0) : 0;
   if (lastInboundTs && now - lastInboundTs < STRIKE_LEAD_SILENCE_MS) return { skip: 'lead_engaged' };
+
+  if (strikeIsClosingTemplate(newest.body)) return { move: STRIKE_STAGE.STRIKE_3, reason: 'closing template' };
 
   const next = STRIKE_NEXT_STAGE[stage];
   if (!next) return { skip: 'no_next_stage' };
@@ -17903,7 +17931,7 @@ async function strikeBuildDailyDigest(hours = 24) {
     salesLines.push('', ...allMoves.slice(0, 20).map(m => `› ${m.name}: ${m.from} → ${m.to}`));
     if (allMoves.length > 20) salesLines.push(`› …and ${allMoves.length - 20} more.`);
   }
-  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (only follow-ups a setter actually sent count: any GHL channel, or an email through Max; workflow sends and the Meta auto reply do not), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
+  salesLines.push('', '_Cards are NOT moved when: the lead replied last, the last touch was an automated send (a follow-up a setter sent on any GHL channel, an email through Max, or an approved strike template from any sender counts; other workflow sends and the Meta auto reply do not), or the card already moved in the past 20h. Spot a card that should have moved? Reply here with the contact name and Ron will trace it._');
 
   return {
     digestBlock: lines.join('\n'),
