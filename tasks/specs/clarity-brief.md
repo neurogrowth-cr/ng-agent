@@ -1,6 +1,6 @@
 # Recipe: Clarity Brief (Ron's morning signal)
 
-**Owner:** Ron   **Status:** live since 2026-11-04 (`CLARITY_BRIEF_MODE=live`); no brief has run on real data yet; three sources still partial, see section 8
+**Owner:** Ron   **Status:** live since 2026-11-04 (`CLARITY_BRIEF_MODE=live`); no brief has run on real data yet; contact@ is read since 2026-11-04; `GITHUB_TOKEN` still partial, see section 8
 **Written:** 2026-11-03   **Last verified:** n/a
 **Decision:** brainstorm with Ron on 2026-11-03 (chat). Rulings folded in: runs inside Max on Railway (not a Claude task on the Mac, which ran 8 hours late on 2026-11-03); English; Slack scope is mentions, #ng-pm-agent and alerts that tag Ron, not every channel; the Monday brief covers Saturday and Sunday; contact@ is a separate mailbox that must be read.
 **Watched by:** the cron liveness audit (07:30 daily, Ron DM) plus its own divergence check `checkClarityBriefPosted` (section 3, step 14). Until step 14 exists the recipe stays `off`.
@@ -119,11 +119,14 @@ The brief writes to Ron's DM and its own three tables, nothing else. A ✅ only 
 
 Done 2026-11-04: migration 025 applied and probed, `CLARITY_BRIEF_MODE=live` on ng-pm-MAX, default `CLARITY_SLACK_CHANNELS` in use.
 
-Still open, all Ron's hands. The brief runs without them and names what it could not read:
+Done 2026-11-04, later the same day:
 
-1. **contact@ consent with its own OAuth client.** contact@ lives in the `neurogrowthconsulting.com` Google organization and Max's client is Internal to `neurogrowth.io`, so Google answers `403 org_internal`. Do not switch Max's client to External: every Max Google feature shares it, and Gmail read would need Google's restricted-scope verification. Instead, signed in as contact@: a Google Cloud project with the Gmail API on, consent screen Audience Internal, a Desktop app client. Then `GOOGLE_CREDENTIALS_CONTACT` (that client's JSON) and `GOOGLE_TOKEN_CONTACT` (its refresh token, `gmail.readonly`) on ng-pm-MAX. Ron does the sign-in; nobody pastes either value in chat. A refresh token only works with the client that issued it, so the two variables always change together.
-2. **`GITHUB_TOKEN` widened.** Fine-grained PAT, contents and pull requests read on ng-agent, dash.neurogrowth.io, ng-revi, ng-axon, ng-automation, ng-wiki and roi-rm-okr-reporting, keeping Actions write on `roi-rm-okr-reporting` for the VoC PDF. Editing an existing token keeps its value, so Railway does not change. Checked 2026-11-04: only ng-agent reads pull requests; the wiki follow-ups file is unreachable.
-3. **Max in `#ng-automation`** (`C0BDFHGF9DZ`, private): done 2026-11-04, Max is a member of all 8 channels on the default list.
+1. **contact@ reads through its own OAuth client.** contact@ lives in the `neurogrowthconsulting.com` Google organization and Max's client is Internal to `neurogrowth.io`, so Max's client answers `403 org_internal`. Do not switch Max's client to External: every Max Google feature shares it, and Gmail read would need Google's restricted-scope verification. Instead: Google Cloud project `ng-agent-contact` in the contact@ organization, Gmail API on, consent screen Audience Internal, Desktop client `Max Clarity Brief`, `GOOGLE_CREDENTIALS_CONTACT` and `GOOGLE_TOKEN_CONTACT` (`gmail.readonly`) on ng-pm-MAX. Checked with the Railway values: the refresh works and Gmail answers as contact@. A refresh token only works with the client that issued it, so the two variables always change together; nobody pastes either value in chat. To redo it, Ron signs in and runs a loopback consent as contact@.
+2. **Max in `#ng-automation`** (`C0BDFHGF9DZ`, private): Max is a member of all 8 channels on the default list.
+
+Still open, Ron's hands. The brief runs without it and names what it could not read:
+
+3. **`GITHUB_TOKEN` widened.** Fine-grained PAT, contents and pull requests read on ng-agent, dash.neurogrowth.io, ng-revi, ng-axon, ng-automation, ng-wiki and roi-rm-okr-reporting, keeping Actions write on `roi-rm-okr-reporting` for the VoC PDF. Editing an existing token keeps its value, so Railway does not change; Regenerate would break the VoC dispatch. Checked 2026-11-04: only ng-agent reads pull requests, roi-rm-okr-reporting answers 403 on pulls, the other five answer 404, and the wiki follow-ups file is unreachable.
 
 ## 9. Lessons folded in
 
