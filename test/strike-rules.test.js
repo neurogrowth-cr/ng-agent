@@ -232,6 +232,39 @@ check('a real setter reply that merely quotes part of the template still counts'
     evaluateStrikeMove(o, [api('2026-11-10T12:00:00Z', 'someoneElse')], NOW2).skip, 'automated_send');
 }
 
+// Hybrid model (Ron, 2026-11-04): a strike moves the card whoever sends it. Shapes
+// read live from GHL: workflow template sends are source 'workflow' with the
+// filled text in body; failed sends carry status 'failed'. Names are made up.
+{
+  const T = Date.parse('2026-11-10T15:00:00.000Z');
+  const tpl = (body, source, ts = '2026-11-10T14:00:00.000Z', extra = {}) => ({ messageType: 'TYPE_WHATSAPP', direction: 'outbound', source, dateAdded: ts, body, ...extra });
+  const NUEVO = 'Hola, Ana. Gracias por su interés. Estuve revisando la información que nos compartió y creo que podríamos ayudarle.';
+  const ST2 = 'Hola! Ana, entiendo que el tiempo escasea. Si sigue interesado, con gusto lo agendamos.';
+  const CLOSE = 'Hola Ana, espero le siente bien este mensaje. Voy a cerrar su caso por ahora.';
+  const OLD = '2026-08-01T12:00:00.000Z';
+
+  check('workflow strike template moves Initial Contact → Strike 1',
+    evaluateStrikeMove(opp(S.IC, OLD), [tpl(NUEVO, 'workflow')], T), { move: S.S1, reason: 'chase — lead never replied' });
+  check('workflow strike template moves Strike 1 → Strike 2',
+    evaluateStrikeMove(opp(S.S1, OLD), [tpl(ST2, 'workflow')], T).move, S.S2);
+  check('workflow strike template moves New Lead → Initial Contact',
+    evaluateStrikeMove(opp(S.NL, OLD), [tpl(NUEVO, 'workflow')], T).move, S.IC);
+  check('the same template sent by a setter moves the card the same way',
+    evaluateStrikeMove(opp(S.IC, OLD), [tpl(NUEVO, 'app', '2026-11-10T14:00:00.000Z', { userId: 'SETTER' })], T).move, S.S1);
+  check('the closing template lands on Strike 3 from Strike 1',
+    evaluateStrikeMove(opp(S.S1, OLD), [tpl(CLOSE, 'workflow')], T), { move: S.S3, reason: 'closing template' });
+  check('any other workflow message still never counts',
+    evaluateStrikeMove(opp(S.IC, OLD), [tpl('Hola Ana, le recordamos su llamada de mañana.', 'workflow')], T).skip, 'automated_send');
+  check('a template Meta failed to deliver is not a touch',
+    evaluateStrikeMove(opp(S.IC, OLD), [tpl(NUEVO, 'workflow', '2026-11-10T14:00:00.000Z', { status: 'failed' })], T).skip, 'send_failed');
+  check('a template older than the last stage change is not counted twice',
+    evaluateStrikeMove(opp(S.S1, '2026-11-10T14:30:00.000Z'), [tpl(NUEVO, 'workflow')], T).skip, 'already_counted');
+  check('a second template inside 20h does not move the card again',
+    evaluateStrikeMove(opp(S.S1, '2026-11-10T13:00:00.000Z'), [tpl(ST2, 'workflow')], T).skip, 'debounced');
+  check('a lead who answered the template stops the move',
+    evaluateStrikeMove(opp(S.IC, OLD), [tpl(NUEVO, 'workflow'), wa('inbound', '2026-11-10T14:30:00.000Z')], T).skip, 'lead_spoke_last');
+}
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);
