@@ -86,6 +86,9 @@ const FIRST_MONDAY = new Date('2026-11-02T15:00:00Z');
   {
     const t = load({ haiku: GAP });
     const r1 = await t.api.captureGapFromReply({ replyText: REFUSAL, userText: 'borra a X', userId: 'USEB', channel: 'C1', messageTs: '111.1', correlationId: 'c1' });
+    // Two captures in the same millisecond merge by design (mergeOccurrence keeps
+    // only times after last_seen); a fast CI runner hit that, so space them out.
+    await new Promise((r) => setTimeout(r, 5));
     const r2 = await t.api.captureGapFromReply({ replyText: REFUSAL, userText: 'borra a Y', userId: 'USEB', channel: 'C1', messageTs: '222.2', correlationId: 'c2' });
     const row = t.tables.max_backlog[0];
     check('1a first refusal inserts, second identical one updates', [r1, r2], ['inserted', 'updated']);
