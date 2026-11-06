@@ -1015,3 +1015,10 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Max (#437):** `lib/backlogReactivation.js` (selection, health, verdict line) and `runBacklogReactivation` (cron `30 9 * * 1-5` CR). Before tagging it checks contacts tagged in the last 4 days got strike 1 (failed > 20% or missing > 5%, warmup 20, pauses itself via agent_knowledge `backlog-react:paused`), then tags up to `BACKLOG_REACT_DAILY` (100) and DMs Ron one verdict line. `BACKLOG_REACT_MODE` off by default (`dry_run` tags nobody). The guardian skips silent campaign cards; a reply still reaches it. The workflow joined `SEQ_EXIT_WORKFLOWS`. The strike mover moves the card on each template (#433). Same PR spaced two captures in `test/max-backlog-io.test.js` (a same-millisecond flake failed CI three times).
 - **Spec:** `~/automations/ops/recipes/backlog-reactivation-whatsapp.md` (automations #21).
 - **Next, in order:** test send to Ron's own contact on a weekday morning (publish the workflow, tag only him, confirm the header shows his name: `template_nuevo` stores the example "Pedro" for its header variable), then `BACKLOG_REACT_MODE=dry_run` one day, then `live`. Not built: moving cards to Lost after the closing template (check the "Outcome: Generic Lost" workflow and the dash Lost handling first).
+
+## 2026-11-06: Kai watch ignores auto-replies waiting for their send time (#439)
+
+- **Why:** ng-automation #99 holds an auto-send reply as `drafted` + `send_after` until the client's reply time, instead of sending it about 20 seconds after the prospect writes.
+- **Change:** `lib/kaiHealth.js`. The digest's "Waiting for review" (`daily.drafted`), the 24 h `backlog` and `divergence` (never shown in Slack) skip `kind='reply' AND send_after IS NOT NULL` rows still drafted. `autoSend24h.skipped` skips stand-downs with `detail.scheduled = true`, since a client answering by hand during the wait is not auto-send holding back.
+- **Errors check:** it now also sees the worker's `error` events (`context: 'reply_send_timing'`) when a scheduled send fails, which is intended.
+- **Tests:** 4 new checks in `test/kai-health-watch.test.js`; all tests pass.
