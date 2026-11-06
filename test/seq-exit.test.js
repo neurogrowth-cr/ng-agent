@@ -62,7 +62,7 @@ function load({ events = [], apptOk = true, deleteOk = () => true, env = {}, row
   {
     const t = load({ events: [{ startTime: ghlTime(NOW - 23 * H), appointmentStatus: 'showed' }] });
     const r = await t.api.seqExitOnReply({ contactId: 'C1', replyAt: NOW - 5 * H, now: NOW });
-    check('1a a human reply removes the contact from all four sales sequences', [r, t.deletes.length, t.deletes.every(d => d.cid === 'C1')], ['exited', 4, true]);
+    check('1a a human reply removes the contact from all five sales sequences', [r, t.deletes.length, t.deletes.every(d => d.cid === 'C1')], ['exited', 5, true]);
     check('1b the post-call workflow is in the list', t.deletes.some(d => d.wid === POSTCALL), true);
     check('1c the exit is recorded for the sweep with the reply time', [t.upserts.length, JSON.parse(t.upserts[0].row.value).replyAt, t.upserts[0].row.key], [1, NOW - 5 * H, 'seq-exit:C1']);
     check('1d the record upserts on category,key (newest reply wins)', t.upserts[0].opts, { onConflict: 'category,key' });
@@ -75,7 +75,7 @@ function load({ events = [], apptOk = true, deleteOk = () => true, env = {}, row
   {
     const t = load({ apptOk: false });
     const r = await t.api.seqExitOnReply({ contactId: 'C1', replyAt: NOW - 1 * H, now: NOW });
-    check('2b appointments unreadable: exits anyway', [r, t.deletes.length], ['exited', 4]);
+    check('2b appointments unreadable: exits anyway', [r, t.deletes.length], ['exited', 5]);
   }
   {
     const t = load({ deleteOk: (wid) => wid !== POSTCALL });

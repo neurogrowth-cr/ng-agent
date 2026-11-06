@@ -21319,6 +21319,7 @@ const SEQ_EXIT_WORKFLOWS = [
   '63e3ba2c-0584-4116-926b-019a4fba9f0b', // Reactivación Oct 2026
   '0be541de-de02-4136-a50f-46fb1fa1d2d7', // Webinar - Invitaciones - ALL LIST
   '6acf444d-863e-45f8-8c12-83bdc912c5ea', // Webinar 27 - Post-clase
+  '8ee3a848-1602-46c7-b30e-e133f0942477', // Reactivación backlog · WhatsApp (3 strikes)
 ];
 function seqExitDisabled() { return process.env.SEQ_EXIT_DISABLED === 'true'; }
 
@@ -22506,6 +22507,9 @@ async function guardianRun(now, mode, stats, correlationId) {
       }
       const screen = guardian.guardianScreen(c, { now, clientEmails, igHeld, personalTag: PERSONAL_CONTACT_TAG, offTag: GUARDIAN_OFF_TAG });
       if (!screen.keep) { skip(screen.reason); return; }
+      // The backlog campaign chases these by WhatsApp template; the guardian only
+      // steps in once the lead writes back.
+      if (!convo && backlogReact.inCampaign(c.tags)) { skip('backlog_campaign'); return; }
       if (openConvos.has(c.id)) { skip('card_waiting'); return; }
       // Only silent cards are rationed: a lead who wrote to us is never capped.
       if (!convo && cardsToday >= GUARDIAN_MAX_CARDS_PER_DAY) { stats.dayCapHit = true; skip('day_cap'); return; }
@@ -22913,6 +22917,99 @@ cron.schedule('*/15 8-20 * * *', wrapCronJob('runGuardianCheck', async (c) => { 
 cron.schedule('0 18 * * 1-6', wrapCronJob('runGuardianDigest', async (c) => { await runGuardianDigest(c); }), { timezone: 'America/Costa_Rica' });
 cron.schedule('5 * * * *', wrapCronJob('runGuardianWatchdog', async (c) => { await runGuardianWatchdog(c); }), { timezone: 'America/Costa_Rica' });
 console.log(`Registered static cron: pipeline guardian (*/15 8-20, digest 0 18 Mon-Sat, watchdog 5 * * * *) mode=${guardianMode()}${guardianDisabled() ? ' DISABLED' : ''}`);
+
+// ─── BACKLOG REACTIVATION (WhatsApp templates) ───────────────────────────────
+// Plan-of-record UPDATE 2026-10-29; Ron 2026-11-05: Initial Contact to Strike 3
+// cards silent 14+ days, WhatsApp only, 100 new contacts a weekday. Max tags the
+// contact; the GHL workflow sends the three templates (strike mover #433 moves the
+// card on each). Before tagging, Max checks that yesterday's contacts got strike 1
+// and pauses itself on a red health check. Spec:
+// ~/automations/ops/recipes/backlog-reactivation-whatsapp.md
+//   BACKLOG_REACT_MODE  off (default) | dry_run (counts, tags nobody) | live
+//   BACKLOG_REACT_DAILY contacts tagged per run (default 100)
+// Pause: agent_knowledge `backlog-react:paused` (set by a red check, cleared by hand).
+const backlogReact = require('./lib/backlogReactivation');
+backlogReact.inCampaign = (tags) => {
+  const t = (Array.isArray(tags) ? tags : []).map((x) => String(x || '').toLowerCase());
+  return t.includes(backlogReact.CONFIG.enrolTag) || t.includes(backlogReact.CONFIG.closedTag);
+};
+const BACKLOG_REACT_PAUSE_KEY = 'backlog-react:paused';
+function backlogReactMode() {
+  const m = String(process.env.BACKLOG_REACT_MODE || 'off').trim().toLowerCase();
+  return ['off', 'dry_run', 'live'].includes(m) ? m : 'off';
+}
+
+// The first strike-1 template in the thread after the tag, or null.
+async function backlogReactFirstSend(contactId, sinceMs) {
+  const convoId = await ghlFindConversationId(contactId);
+  if (!convoId) return null;
+  const marker = STRIKE_TEMPLATE_MARKERS[0]; // template_nuevo
+  for (const m of await ghlGetConversationMessages(convoId)) {
+    if (m.direction !== 'outbound' || m.messageType !== 'TYPE_WHATSAPP') continue;
+    const at = Date.parse(m.dateAdded || m.createdAt || 0) || 0;
+    if (at >= sinceMs - 60 * 1000 && strikeNormalizeText(m.body).includes(marker)) return { at, status: m.status || null };
+  }
+  return null;
+}
+
+async function runBacklogReactivation(correlationId) {
+  const mode = backlogReactMode();
+  if (mode === 'off') return;
+  const now = Date.now();
+  const log = (action, status, output) => logActivity({ event_type: 'backlog_react', event_source: 'cron', action, status, output, correlation_id: correlationId });
+
+  // Health of the contacts tagged in the last 4 days (spec 4b).
+  const { data: runs, error: rErr } = await portalSupabase.from('agent_activity')
+    .select('output, created_at').eq('event_type', 'backlog_react').eq('action', 'backlog_react_run')
+    .gte('created_at', new Date(now - 4 * 24 * 3600 * 1000).toISOString()).limit(20);
+  if (rErr) throw new Error(`backlog runs read: ${rErr.message}`);
+  const enrolled = [];
+  for (const r of runs || []) {
+    if (r.output?.mode !== 'live') continue;
+    const at = Date.parse(r.created_at);
+    for (const id of r.output?.tagged || []) enrolled.push({ contactId: id, at });
+  }
+  const sends = new Map();
+  for (const e of enrolled) {
+    if (now - e.at < backlogReact.CONFIG.sendGraceMs) continue;
+    try { sends.set(e.contactId, await backlogReactFirstSend(e.contactId, e.at)); } catch (err) { sends.set(e.contactId, null); }
+  }
+  for (const [k, v] of [...sends]) if (!v) sends.delete(k);
+  const health = backlogReact.evaluateHealth(enrolled, sends, now);
+
+  const pausedRaw = (await hotReadKnowledge([BACKLOG_REACT_PAUSE_KEY])).get(BACKLOG_REACT_PAUSE_KEY);
+  let paused = pausedRaw ? (hotParse(pausedRaw)?.reason || 'pausa manual') : null;
+  if (!paused && health.level === 'red') {
+    paused = health.reasons.join('; ');
+    await upsertKnowledge('process', BACKLOG_REACT_PAUSE_KEY, JSON.stringify({ reason: paused, at: now }), 'backlog_react');
+  }
+
+  let picked = [], eligible = 0, skips = {};
+  if (!paused) {
+    const clientEmails = await loadActiveClientEmails();
+    if (!clientEmails) throw new Error('client list unavailable (portal client_dashboards)');
+    const cards = [];
+    for (const stageId of Object.values(backlogReact.CONFIG.stages)) cards.push(...await ghlSearchOppsByStage(stageId));
+    const limit = Math.max(0, Number(process.env.BACKLOG_REACT_DAILY || 100));
+    ({ picked, eligible, skips } = backlogReact.selectBacklog(cards, { now, limit, clientEmails, personalTag: PERSONAL_CONTACT_TAG }));
+  }
+  const tagged = [], tagFailed = [];
+  if (mode === 'live') {
+    for (const o of picked) {
+      try { await ghlAddContactTag(o.contactId, backlogReact.CONFIG.enrolTag); tagged.push(o.contactId); }
+      catch (err) { tagFailed.push(o.contactId); console.error(`backlog-react: tag failed ${o.contactId}:`, err.message); }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+  const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length : picked.length, eligible, health, paused });
+  log('backlog_react_run', paused || health.level === 'red' || tagFailed.length ? 'warning' : 'ok',
+    { mode, tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, health: { ...health }, paused });
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: mode === 'dry_run' ? `[DRY RUN] ${line}` : line })
+    .catch((e) => console.error('backlog-react: DM failed:', e.message));
+}
+
+cron.schedule('30 9 * * 1-5', wrapCronJob('runBacklogReactivation', async (c) => { await runBacklogReactivation(c); }, { timeoutMs: 15 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log(`Registered static cron: backlog reactivation (30 9 * * 1-5) mode=${backlogReactMode()}`);
 // ─── end pipeline guardian ──────────────────────────────────────────────────
 
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
@@ -23296,6 +23393,7 @@ const STATIC_CRON_SCHEDULES = {
   runGuardianCheck:             '*/15 8-20 * * *',
   runGuardianDigest:            '0 18 * * 1-6',
   runGuardianWatchdog:          '5 * * * *',
+  runBacklogReactivation:       '30 9 * * 1-5',
   runStalledProspectFollowups:  '0 11 * * 1-5',
   runStrikeSalesDigest:         '30 21 * * *',
   runUnloggedOutcomeReminders:  '0 21 * * *',
