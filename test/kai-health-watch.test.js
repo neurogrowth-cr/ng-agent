@@ -290,6 +290,10 @@ function digestData({ yesterday, baseline, extra = {} }) {
   // A prospect's no closed by Kai is the normal path: not a skip, not a missing Slack post.
 check('decline closes are not counted as skipped', /status = 'skipped' AND COALESCE\(status_reason, ''\) <> 'prospect_declined'/.test(kai.DIGEST_SQL.daily), true);
 check('a sent decline close is not a divergence', /status_reason, ''\) <> 'decline_close'/.test(kai.DIGEST_SQL.divergence), true);
+check('an auto-reply waiting for its send time is not a divergence', /q\.send_after IS NOT NULL/.test(kai.DIGEST_SQL.divergence), true);
+check('an auto-reply waiting for its send time is not waiting for review', /status = 'drafted' AND NOT \(COALESCE\(kind, 'reply'\) = 'reply' AND send_after IS NOT NULL\)/.test(kai.DIGEST_SQL.daily), true);
+check('an auto-reply waiting for its send time is not backlog', /send_after IS NOT NULL/.test(kai.DIGEST_SQL.backlog), true);
+check('a stand-down during the wait is not auto-send holding back', /detail->>'scheduled'/.test(kai.SQL.autoSend24h), true);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
