@@ -107,8 +107,8 @@ const reviSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE
   db: { schema: 'revi' },
 });
 
-// Read-only view into AXON's schema for the ICM cost report (llm_usage +
-// factory_runs carry SELECT policies for anon; writes stay AXON's own).
+// Read-only view into AXON's schema for the ICM cost report (llm_usage,
+// factory_usage and factory_runs carry SELECT policies for anon; writes stay AXON's own).
 const axonSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
   auth: { persistSession: false },
   db: { schema: 'axon' },
@@ -14947,7 +14947,7 @@ cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => 
 // (Max's own ops channel — operational API costs, not company financials); every
 // unreachable source is NAMED in the report body, never silently omitted;
 // every dollar derives from the usage tables (agent_activity for Max and Kai, axon.llm_usage,
-// revi.llm_usage, axon.factory_runs), never estimated; cache writes are billed
+// revi.llm_usage, axon.factory_usage), never estimated; cache writes are billed
 // at the 1h rate (2x) even where 5-min was used, so savings are UNDERstated,
 // never overstated.
 const ICM_MODEL_RATES = [
@@ -15112,12 +15112,16 @@ async function icmLlmUsageRows(client, sinceIso, untilIso) {
   return (data || []).map((r) => ({ model: r.model, site: r.call_site || 'untagged', calls: 1, tin: r.tokens_in || 0, tout: r.tokens_out || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
 
+// AXON factory spend comes from axon.factory_usage: one row per leg, dated when
+// the leg's response arrived (ng-axon migration 014). factory_runs only holds
+// running totals dated by the run's start, so a run started on the 2nd and
+// finished on the 5th never appeared as any day's "yesterday".
 async function icmFactoryRows(sinceIso, untilIso) {
-  let q = axonSupabase.from('factory_runs')
+  let q = axonSupabase.from('factory_usage')
     .select('model, service_tier, tokens_input, tokens_output, tokens_cache_write, tokens_cache_read')
     .gte('created_at', sinceIso);
   if (untilIso) q = q.lt('created_at', untilIso);
-  const { data, error } = await q.limit(500);
+  const { data, error } = await q.limit(10000);
   if (error) throw new Error(error.message);
   return (data || []).map((r) => ({ model: r.model || 'claude-sonnet-5', tier: r.service_tier || 'realtime', calls: 1, tin: r.tokens_input || 0, tout: r.tokens_output || 0, cw: r.tokens_cache_write || 0, cr: r.tokens_cache_read || 0 }));
 }
