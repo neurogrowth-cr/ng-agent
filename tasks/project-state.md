@@ -1022,3 +1022,10 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Change:** `lib/kaiHealth.js`. The digest's "Waiting for review" (`daily.drafted`), the 24 h `backlog` and `divergence` (never shown in Slack) skip `kind='reply' AND send_after IS NOT NULL` rows still drafted. `autoSend24h.skipped` skips stand-downs with `detail.scheduled = true`, since a client answering by hand during the wait is not auto-send holding back.
 - **Errors check:** it now also sees the worker's `error` events (`context: 'reply_send_timing'`) when a scheduled send fails, which is intended.
 - **Tests:** 4 new checks in `test/kai-health-watch.test.js`; all tests pass.
+
+## 2026-11-06: Blocked clients read as one line of signal, never the activity roster (#442)
+
+- **Why:** the Nov 6 ops brief listed 17 activity titles for John Rodvill under "blocked on:". Blocking a client in the portal flips every `customer_activities` row to `blocked`, so the list was the template roster, not a reason. Ron: noise, nobody reads it.
+- **Change:** `lib/blockedSummary.js` returns `blocked since <date>: <latest portal note>` or `blocked since <date>: no reason logged in the portal` (notes clipped to 140 chars). Used in the 09:00 ops brief (`runFulfillmentStandup`), the client-attention 🔴 BLOCKED alert (`getPortalAlerts`) and the client status card. `updated_at` added to those activity selects.
+- **Gap this exposes:** the portal has no blocked-reason field for a client (only `phase_0_kanban_operator_block_note`, Phase 0 only). The reason only shows if someone writes it in an activity note. A dash follow-up: a required reason when flipping a client to blocked.
+- **Tests:** `test/blocked-summary.test.js`; all tests pass.
