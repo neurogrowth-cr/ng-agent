@@ -1038,3 +1038,8 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
   - `thread_watch_reads` ("Later-messages reader cannot read threads"): over 30% of reads failed on a run of 20 or more. Needs 3 polls.
   - Both are skipped when the mode is off, when an older Kai sends no status, and when Kai is down.
 - **Tests:** 13 cases in `test/kai-health-watch.test.js`; all 93 test files pass.
+
+## 2026-11-06: Clarity Brief, classifier matches again and a late tick no longer skips the run ([PR #446](https://github.com/neurogrowth-cr/ng-agent/pull/446))
+- **Classifier (found on the 2026-11-05 brief):** Haiku answered every candidate without `idx`, so nothing matched and every Gmail and Slack candidate was dropped; only Max and wiki items reached Ron (4 items). Now `idx` is required, an in-order answer without it matches by position, an answer with nothing matchable counts as junk, batches are 10 at 3000 tokens, and a cut-off answer is reported. Probe on synthetic candidates: old prompt matched 0 of 20 in 3 of 3 runs, new prompt 10 of 10 in 4 of 4.
+- **Missed run (2026-11-06):** the 06:50 run never started while four other 06:50 crons ran. node-cron 3 drops a minute whose second 0 a late tick stepped over unless `recoverMissedExecutions` is set; both brief crons set it now. The 07:15 check caught the miss and DMed Ron.
+- **Open:** every other Max cron has the same missed-minute exposure (session card task_119bbcec). The first brief with the fix runs Monday 2026-11-09 06:50 CR and covers back to Thursday's.
