@@ -3413,7 +3413,7 @@ async function getClientStatus(clientName = null) {
     while (true) {
       let dashQuery = portalSupabase
         .from('client_dashboards')
-        .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler')
+        .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler, blocked_reason, blocked_at')
         .eq('is_active', true)
         .order('customer_status', { ascending: true })
         .range(dashFrom, dashFrom + PAGE_SIZE - 1);
@@ -3475,7 +3475,7 @@ async function getClientStatus(clientName = null) {
       const blocked = activities.filter(a => a.status === 'blocked').length;
       const phase1  = activities.filter(a => a.status === 'phase_1').length;
       const phase2  = activities.filter(a => a.status === 'phase_2').length;
-      const blockedActs = blockedSummary(activities); // one line, never the roster (Ron, 2026-11-06)
+      const blockedActs = blockedSummary(activities, dash); // one line, never the roster (Ron, 2026-11-06)
       const pendingActs = activities
         .filter(a => a.status === 'phase_1' || a.status === 'phase_2')
         .sort((a,b) => (templateMap[a.template_id]?.order_index||99) - (templateMap[b.template_id]?.order_index||99))
@@ -3667,7 +3667,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
   try {
     const { data: dashboards, error } = await portalSupabase
       .from('client_dashboards')
-      .select('id, client_name, email, customer_status, customer_type, created_at')
+      .select('id, client_name, email, customer_status, customer_type, created_at, blocked_reason, blocked_at')
       .eq('is_active', true)
       .in('customer_status', ['blocked', 'phase_1', 'phase_2'])
       .order('created_at', { ascending: true });
@@ -3712,7 +3712,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
       // ── Blocked activity details ──
-      const blockedDetails = blockedSummary(allActs); // one line, never the roster (Ron, 2026-11-06)
+      const blockedDetails = blockedSummary(allActs, dash); // one line, never the roster (Ron, 2026-11-06)
 
       if (dash.customer_status === 'blocked') {
         if (dailyMode) continue; // long-standing blocked clients: Monday gap report count, full list on request
@@ -10479,7 +10479,7 @@ async function runFulfillmentStandup(_correlationId) {
     // ── Fetch all active client data once ──────────────────────────────────────
     const { data: dashboards } = await portalSupabase
       .from('client_dashboards')
-      .select('id, client_name, email, customer_status, customer_type, created_at, stabilization_started_at, linkedin_handler')
+      .select('id, client_name, email, customer_status, customer_type, created_at, stabilization_started_at, linkedin_handler, blocked_reason, blocked_at')
       .eq('is_active', true);
 
     const { data: templates } = await portalSupabase
@@ -10556,7 +10556,7 @@ async function runFulfillmentStandup(_correlationId) {
     josueLines.push(...renderDelta('Blocked', dBlocked.new, dBlocked.resolved, dBlocked.unchanged, name => {
       const d = blocked.find(x => x.client_name === name);
       // One line of signal, never the activity roster (Ron, 2026-11-06).
-      const why = d ? blockedSummary(actsByClient[d.id]) : '';
+      const why = d ? blockedSummary(actsByClient[d.id], d) : '';
       const anchor = d ? getDayAnchor(d) : null;
       return `${name} — Day ${anchor?.daysSince ?? '?'}${anchor?.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : ''}${why ? ` | ${why}` : ''}`;
     }));
