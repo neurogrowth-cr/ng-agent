@@ -10,9 +10,10 @@ const { makeSchedule, wrapNodeCron, MIN_GAP_MS } = require('../lib/cronSchedule'
 const root = path.join(__dirname, '..');
 const indexSrc = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
 
-// 1. index.js gets `cron` from the wrapper, never from node-cron directly.
-assert.ok(/^const cron = require\('\.\/lib\/cronSchedule'\);$/m.test(indexSrc), 'index.js must bind cron to lib/cronSchedule');
-assert.ok(!/require\(\s*['"]node-cron['"]\s*\)/.test(indexSrc), 'index.js must not require node-cron directly');
+// 1. index.js binds `cron` to the wrapper, and that is its only door to node-cron.
+const BIND = "const cron = require('./lib/cronSchedule').wrapNodeCron(require('node-cron'));";
+assert.strictEqual(indexSrc.split('\n').filter(l => l.trim() === BIND).length, 1, 'index.js must bind cron through lib/cronSchedule');
+assert.strictEqual((indexSrc.match(/require\(\s*['"]node-cron['"]\s*\)/g) || []).length, 1, 'index.js requires node-cron somewhere other than the wrapped binding');
 
 // 2. Nothing else in the app requires node-cron (a second door would bypass the wrapper).
 const appFiles = ['lib', 'scripts']
@@ -20,7 +21,6 @@ const appFiles = ['lib', 'scripts']
   .filter(d => fs.existsSync(d))
   .flatMap(d => fs.readdirSync(d).filter(f => f.endsWith('.js')).map(f => path.join(d, f)));
 for (const file of appFiles) {
-  if (path.basename(file) === 'cronSchedule.js') continue;
   assert.ok(!/require\(\s*['"]node-cron['"]\s*\)/.test(fs.readFileSync(file, 'utf8')), `${path.relative(root, file)} requires node-cron directly`);
 }
 
@@ -61,10 +61,14 @@ clock += 1; taskA.fire('10:15');           // a second later: a real next run
 assert.deepStrictEqual(runs, [['A', '10:00'], ['B', '10:00'], ['A', '10:15']]);
 
 // 6. Against the real node-cron, the scheduler is built with recovery on.
-const real = require('../lib/cronSchedule');
-const task = real.schedule('50 6 * * 1-5', () => {}, { timezone: 'America/Costa_Rica', scheduled: false });
-assert.strictEqual(task._scheduler.autorecover, true, 'node-cron scheduler autorecover');
-assert.strictEqual(task.options.timezone, 'America/Costa_Rica');
-task.stop();
+// CI runs with no npm install, so this part runs where node_modules exists.
+let realCron = null;
+try { realCron = require('node-cron'); } catch (_) { console.log('cron-recovery: node-cron not installed, skipping the real-scheduler check'); }
+if (realCron) {
+  const task = wrapNodeCron(realCron).schedule('50 6 * * 1-5', () => {}, { timezone: 'America/Costa_Rica', scheduled: false });
+  assert.strictEqual(task._scheduler.autorecover, true, 'node-cron scheduler autorecover');
+  assert.strictEqual(task.options.timezone, 'America/Costa_Rica');
+  task.stop();
+}
 
 console.log(`cron-recovery: all checks passed (${viaCron.length} cron.schedule calls guarded)`);
