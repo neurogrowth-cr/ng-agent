@@ -1062,6 +1062,7 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Why:** ng-automation #115 closes a reply that is only thanks or a reaction as `skipped` + `pleasantry` (Ron, plan-of-record UPDATE 2026-11-07).
 - **Change:** the daily Kai digest's `skipped` count excludes `pleasantry` as well as `prospect_declined` (`lib/kaiHealth.js`, `DIGEST_SQL.daily`).
 - **Tests:** `test/kai-health-watch.test.js`; all 94 test files pass.
+
 ## 2026-11-07: Ron runs the Clarity Brief on demand ([PR #451](https://github.com/neurogrowth-cr/ng-agent/pull/451))
 - **Why:** on Saturday Ron asked for a brief. Weekends are off by his own rule (06:50 CR Mon to Fri) and Max had no manual trigger.
 - **What:** Ron DMs Max `brief now`, `brief ahora` or `clarity brief` (exact phrases, top-level DM, Ron only). Max runs `runClarityBrief` with `force: true`, one run at a time, and DMs back a failure. The window still starts at the last posted brief, so Monday's brief starts where an on-demand one ends.
