@@ -1056,3 +1056,9 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Fix:** the guard in `lib/cronSchedule.js` is 30 s per task (all Max schedules are minute resolution). Live 15:23 UTC; the 09:25 fires ran once. Test check 5b covers a duplicate 1002 ms later.
 - **Damage:** none found. The second runs did no extra work: IG guide claims each draft with an `ig_guide_drafts` upsert, sequence reply alerts skip while a run is in flight (`_seqRunning`), and the appointment sweep calls the idempotent `ng_mark_appt_deleted`.
 - **Also:** the two Clarity Brief crons set `recoverMissedExecutions` directly in #446, so they had the same double fire waiting for Monday 06:50; they now go through the wrapper too.
+
+## 2026-11-07: a pleasantry Kai closed is not counted as held back (#454)
+
+- **Why:** ng-automation #115 closes a reply that is only thanks or a reaction as `skipped` + `pleasantry` (Ron, plan-of-record UPDATE 2026-11-07).
+- **Change:** the daily Kai digest's `skipped` count excludes `pleasantry` as well as `prospect_declined` (`lib/kaiHealth.js`, `DIGEST_SQL.daily`).
+- **Tests:** `test/kai-health-watch.test.js`; all 94 test files pass.
