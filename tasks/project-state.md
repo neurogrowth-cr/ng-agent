@@ -1029,3 +1029,12 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Change:** `lib/blockedSummary.js` returns `blocked since <date>: <latest portal note>` or `blocked since <date>: no reason logged in the portal` (notes clipped to 140 chars). Used in the 09:00 ops brief (`runFulfillmentStandup`), the client-attention 🔴 BLOCKED alert (`getPortalAlerts`) and the client status card. `updated_at` added to those activity selects.
 - **Gap this exposes:** the portal has no blocked-reason field for a client (only `phase_0_kanban_operator_block_note`, Phase 0 only). The reason only shows if someone writes it in an activity note. A dash follow-up: a required reason when flipping a client to blocked.
 - **Tests:** `test/blocked-summary.test.js`; all tests pass.
+
+## 2026-11-07: Kai watch alerts when Kai's later-messages reader stops (#444)
+
+- **Why:** Kai's thread watch (ng-automation #94) reads prospects' later messages hourly, since Prosp's reply webhook fires only once per lead. Ron rolled it out to every client on 2026-11-06 (plan-of-record UPDATE 2026-11-06), with a liveness check as the condition.
+- **Change:** `pingKaiHealth` keeps `threadWatch` from Kai's `/health` (ng-automation #108). `kaiHealth.evaluateThreadWatch` adds two checks to the 15-minute Kai watch:
+  - `thread_watch` ("Later-messages reader stopped"): an enabled watch has not finished a run in 2 h 15 min, or since boot after that long. Needs 2 polls.
+  - `thread_watch_reads` ("Later-messages reader cannot read threads"): over 30% of reads failed on a run of 20 or more. Needs 3 polls.
+  - Both are skipped when the mode is off, when an older Kai sends no status, and when Kai is down.
+- **Tests:** 13 cases in `test/kai-health-watch.test.js`; all 93 test files pass.
