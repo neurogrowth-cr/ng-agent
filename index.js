@@ -17,7 +17,9 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const crypto = require('crypto');
-const cron = require('node-cron');
+// node-cron through a wrapper that forces recoverMissedExecutions on every cron.
+// The default silently dropped 352 runs in 30 days; see lib/cronSchedule.js.
+const cron = require('./lib/cronSchedule').wrapNodeCron(require('node-cron'));
 const { google } = require('googleapis');
 const sharp = require('sharp');
 const OpenAI = require('openai');
