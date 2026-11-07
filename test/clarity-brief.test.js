@@ -133,6 +133,14 @@ check('8b issues verdict', cb.verdictLine({ ok: false, issues: ['gmail_contact u
 const cls = cb.parseClassification('```json\n[{"idx":0,"verdict":"needs_ron","tier":1,"title":"Billing: payment failed","why_ron":"Card on file is yours","action":"Update the card"},{"idx":1,"verdict":"junk","tier":9},{"idx":7,"verdict":"noise"}]\n```', 2);
 check('8c classification parses, defaults bad enums, drops out-of-range idx', [cls.size, cls.get(0).tier, cls.get(1).verdict, cls.get(1).tier], [2, 1, 'noise', 3]);
 check('8d junk classification is null', cb.parseClassification('sure, here you go', 2), null);
+// 2026-11-05: the model answered every candidate but left idx out, and the whole batch vanished.
+const noIdx = cb.parseClassification('[{"verdict":"noise"},{"verdict":"needs_ron","tier":1,"title":"Laura asks about terms"}]', 2);
+check('8d2 an answer without idx that covers the batch in order matches by position', [noIdx.size, noIdx.get(1).verdict, noIdx.get(1).title], [2, 'needs_ron', 'Laura asks about terms']);
+check('8d3 an answer with nothing matchable is junk, not an empty result', cb.parseClassification('[{"verdict":"noise"}]', 2), null);
+check('8d4 partial idx answers do not fall back to position', cb.parseClassification('[{"idx":1,"verdict":"fyi"},{"verdict":"noise"}]', 2).size, 1);
+check('8d5 the prompt requires idx and keeps non needs_ron answers short', /MUST start with "idx"/.test(cb.buildClassifyPrompt([{ idx: 0, source: 's', actor: 'a', title: 't' }])) && /just \{"idx": n, "verdict"/.test(cb.buildClassifyPrompt([])), true);
+check('8d6 a full batch of needs_ron answers fits the token budget', cb.CLASSIFY_BATCH * 150 < cb.CLASSIFY_MAX_TOKENS, true);
+check('8d7 both brief crons recover a missed minute', (fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8').match(/cron\.schedule\('(50 6|15 7) \* \* 1-5', wrapCronJob\('(runClarityBrief|checkClarityBriefPosted)'.*recoverMissedExecutions: true \}\);/g) || []).length, 2);
 const draft = cb.parseDraftJson('{"items":[{"idx":0,"title":"Pay invoice 44","why_ron":"Your card","action":"Pay it"}],"projects":[{"idx":0,"why":"Leaks cost leads"}]}', { nItems: 1, nProjects: 1 });
 check('8e draft parses', [draft.items.get(0).action, draft.projects.get(0).why], ['Pay it', 'Leaks cost leads']);
 check('8f a draft missing an item is rejected', cb.parseDraftJson('{"items":[],"projects":[]}', { nItems: 1, nProjects: 0 }), null);

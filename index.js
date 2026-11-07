@@ -24975,18 +24975,20 @@ async function collectClarityWiki(shownItems, now) {
 }
 
 // Haiku decides needs_ron / team / fyi / noise for everything a collector could
-// not judge itself, 20 per call. A junk answer drops the batch (fail closed:
-// nothing invented reaches the brief) and is counted as an issue.
+// not judge itself, CLASSIFY_BATCH per call. A junk or cut-off answer drops the
+// batch (fail closed: nothing invented reaches the brief) and is counted as an issue.
 async function clarityClassify(cands, correlationId, usage, issues) {
   const ready = cands.filter((c) => !c.needsClassification);
   const need = cands.filter((c) => c.needsClassification);
   const out = [];
-  for (let i = 0; i < need.length; i += 20) {
-    const batch = need.slice(i, i + 20).map((c, idx) => ({ ...c, idx, ageHours: Math.round((Date.now() - new Date(c.createdAt).getTime()) / 3600e3) }));
+  const size = clarityBrief.CLASSIFY_BATCH;
+  for (let i = 0; i < need.length; i += size) {
+    const batch = need.slice(i, i + size).map((c, idx) => ({ ...c, idx, ageHours: Math.round((Date.now() - new Date(c.createdAt).getTime()) / 3600e3) }));
     const t0 = Date.now();
-    const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: 1800, messages: [{ role: 'user', content: clarityBrief.buildClassifyPrompt(batch) }] });
+    const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: clarityBrief.CLASSIFY_MAX_TOKENS, messages: [{ role: 'user', content: clarityBrief.buildClassifyPrompt(batch) }] });
     logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'clarity_classifier');
     usage.push(res);
+    if (res.stop_reason === 'max_tokens') { issues.push(`classifier cut off for ${batch.length} candidates`); continue; }
     const parsed = clarityBrief.parseClassification(res.content.filter((b) => b.type === 'text').map((b) => b.text).join(''), batch.length);
     if (!parsed) { issues.push(`classifier returned junk for ${batch.length} candidates`); continue; }
     for (const c of batch) {
@@ -25186,8 +25188,12 @@ async function handleClarityReaction(event, baseEmoji) {
   return true;
 }
 
-cron.schedule('50 6 * * 1-5', wrapCronJob('runClarityBrief', async (c) => { await runClarityBrief(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
-cron.schedule('15 7 * * 1-5', wrapCronJob('checkClarityBriefPosted', async (c) => { await checkClarityBriefPosted(c); }), { timezone: 'America/Costa_Rica' });
+// recoverMissedExecutions: node-cron checks the clock once a second per task and,
+// by default, drops a minute whose second 0 it stepped over. On 2026-11-06 the
+// 06:50 brief never started while four other 06:50 crons ran. With recovery on,
+// a late tick still fires the missed minute, once (node-cron tracks the last run).
+cron.schedule('50 6 * * 1-5', wrapCronJob('runClarityBrief', async (c) => { await runClarityBrief(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica', recoverMissedExecutions: true });
+cron.schedule('15 7 * * 1-5', wrapCronJob('checkClarityBriefPosted', async (c) => { await checkClarityBriefPosted(c); }), { timezone: 'America/Costa_Rica', recoverMissedExecutions: true });
 // ─── end Clarity Brief ───────────────────────────────────────────────────────
 
 slack.event('reaction_added', async ({ event }) => {
