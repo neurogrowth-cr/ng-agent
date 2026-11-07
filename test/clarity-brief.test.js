@@ -154,6 +154,7 @@ check('9b no mailbox falls back to the first account', cb.gmailThreadUrl('', 'ab
 
 // 10. On-demand trigger (Ron DMs Max)
 check('10a trigger phrases', ['brief now', 'Brief now!', 'clarity brief', 'Clarity brief now', 'brief ahora'].map(cb.isBriefNowCommand), [true, true, true, true, true]);
+check('10a2 the footer Claude adds from Ron\'s account is ignored', ['brief now *Sent using* Claude', 'brief now\n*Sent using* Claude'].map(cb.isBriefNowCommand), [true, true]);
 check('10b sentences about the brief go to the chat model', ['brief', 'why was the brief empty?', 'send the brief now to Gerald', 'brief now please'].map(cb.isBriefNowCommand), [false, false, false, false]);
 check('10c the DM handler runs it only for Ron, outside threads', /userId === RON_SLACK_ID && !dmThreadTs && clarityBrief\.isBriefNowCommand\(message\.text\)/.test(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')), true);
 
