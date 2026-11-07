@@ -60,6 +60,15 @@ taskB.fire('10:00');                       // other task, own guard
 clock += 1; taskA.fire('10:15');           // a second later: a real next run
 assert.deepStrictEqual(runs, [['A', '10:00'], ['B', '10:00'], ['A', '10:15']]);
 
+// 5b. node-cron's own recovery double-fire: the same slot again ~1002 ms later runs once.
+let clock2 = 5_000_000;
+const runs2 = [];
+const t2 = makeSchedule(fake2, () => clock2)('*/5 * * * *', () => { runs2.push(clock2); });
+t2.fire(); clock2 += 1002; t2.fire(); clock2 += 2500; t2.fire();
+clock2 += 5 * 60 * 1000; t2.fire();         // the next real slot, 5 min later
+assert.strictEqual(runs2.length, 2, 'duplicate fire a second later must not run');
+assert.ok(MIN_GAP_MS >= 30 * 1000 && MIN_GAP_MS < 60 * 1000, 'guard must cover the ~1 s duplicate and stay under a minute');
+
 // 6. Against the real node-cron, the scheduler is built with recovery on.
 // CI runs with no npm install, so this part runs where node_modules exists.
 let realCron = null;
