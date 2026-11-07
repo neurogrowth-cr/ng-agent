@@ -295,6 +295,31 @@ check('an auto-reply waiting for its send time is not waiting for review', /stat
 check('an auto-reply waiting for its send time is not backlog', /send_after IS NOT NULL/.test(kai.DIGEST_SQL.backlog), true);
 check('a stand-down during the wait is not auto-send holding back', /detail->>'scheduled'/.test(kai.SQL.autoSend24h), true);
 
+// ── Thread watch liveness (ng-automation lib/thread-watch.js via /health)
+{
+  const H = 3600 * 1000;
+  const tw = (over = {}) => ({ mode: 'on', bootedAt: new Date(T0.getTime() - 10 * H).toISOString(), lastOkAt: new Date(T0.getTime() - 0.5 * H).toISOString(), lastError: null, lastSummary: { candidates: 271, read: 231, unreadable: 23 }, ...over });
+  const ids = (r) => r.filter((x) => x.failing).map((x) => x.id);
+  check('tw1 recent run, 9% unreadable: green', ids(kai.evaluateThreadWatch(tw(), T0)), []);
+  check('tw2 mode off: skipped', kai.evaluateThreadWatch(tw({ mode: 'off' }), T0).every((x) => x.skip), true);
+  check('tw3 older Kai with no threadWatch: skipped', kai.evaluateThreadWatch(undefined, T0).every((x) => x.skip), true);
+  const stale = kai.evaluateThreadWatch(tw({ lastOkAt: new Date(T0.getTime() - 3 * H).toISOString(), lastError: 'db down' }), T0);
+  check('tw4 no finished run in 3 h: failing', ids(stale), ['thread_watch']);
+  check('tw4b reason names the last error', /db down/.test(stale[0].reason), true);
+  check('tw5 just booted, no run yet: green', ids(kai.evaluateThreadWatch(tw({ bootedAt: new Date(T0.getTime() - 20 * 60 * 1000).toISOString(), lastOkAt: null }), T0)), []);
+  check('tw6 booted 3 h ago, never finished: failing', ids(kai.evaluateThreadWatch(tw({ bootedAt: new Date(T0.getTime() - 3 * H).toISOString(), lastOkAt: null }), T0)), ['thread_watch']);
+  check('tw7 over 30% unreadable: failing', ids(kai.evaluateThreadWatch(tw({ lastSummary: { candidates: 100, read: 60, unreadable: 40 } }), T0)), ['thread_watch_reads']);
+  check('tw8 a tiny run never trips the read alarm', ids(kai.evaluateThreadWatch(tw({ lastSummary: { candidates: 5, read: 2, unreadable: 3 } }), T0)), []);
+  const down = kai.evaluateKaiChecks({ health: { ok: false, error: 'x' }, snapshot: HEALTHY, now: T0 });
+  check('tw9 Kai down: thread watch skipped, health alert carries it', down.filter((r) => r.id.startsWith('thread_watch')).every((r) => r.skip), true);
+  const wired = kai.evaluateKaiChecks({ health: { ok: true, threadWatch: tw({ lastOkAt: new Date(T0.getTime() - 3 * H).toISOString() }) }, snapshot: HEALTHY, now: T0 });
+  check('tw10 wired into evaluateKaiChecks', failingIds(wired), ['thread_watch']);
+  let st = {};
+  const p1 = kai.stepKaiWatch(st, wired, T0); st = p1.state;
+  const p2 = kai.stepKaiWatch(st, wired, at(15));
+  check('tw11 alerts on the second stale poll, not the first', [p1.alerts.length, p2.alerts.length, p2.alerts[0] && p2.alerts[0].title], [0, 1, 'Later-messages reader stopped']);
+}
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
 })();
