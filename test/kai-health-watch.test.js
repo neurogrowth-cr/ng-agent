@@ -288,7 +288,7 @@ function digestData({ yesterday, baseline, extra = {} }) {
   check('15d read-only: no writes in any SQL', [...Object.values(kai.SQL), ...Object.values(kai.DIGEST_SQL)].some((s) => /\b(insert|update|delete|drop|alter)\b/i.test(s)), false);
 
   // A prospect's no closed by Kai is the normal path: not a skip, not a missing Slack post.
-check('decline closes are not counted as skipped', /status = 'skipped' AND COALESCE\(status_reason, ''\) <> 'prospect_declined'/.test(kai.DIGEST_SQL.daily), true);
+check('decline closes are not counted as skipped', /status = 'skipped' AND COALESCE\(status_reason, ''\) NOT IN \('prospect_declined'/.test(kai.DIGEST_SQL.daily), true);
 check('a sent decline close is not a divergence', /status_reason, ''\) <> 'decline_close'/.test(kai.DIGEST_SQL.divergence), true);
 check('an auto-reply waiting for its send time is not a divergence', /q\.send_after IS NOT NULL/.test(kai.DIGEST_SQL.divergence), true);
 check('an auto-reply waiting for its send time is not waiting for review', /status = 'drafted' AND NOT \(COALESCE\(kind, 'reply'\) = 'reply' AND send_after IS NOT NULL\)/.test(kai.DIGEST_SQL.daily), true);
@@ -319,6 +319,8 @@ check('a stand-down during the wait is not auto-send holding back', /detail->>'s
   const p2 = kai.stepKaiWatch(st, wired, at(15));
   check('tw11 alerts on the second stale poll, not the first', [p1.alerts.length, p2.alerts.length, p2.alerts[0] && p2.alerts[0].title], [0, 1, 'Later-messages reader stopped']);
 }
+
+check('a pleasantry Kai closed is not counted as held back', /NOT IN \('prospect_declined', 'pleasantry'\)/.test(kai.DIGEST_SQL.daily), true);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
