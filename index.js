@@ -15492,7 +15492,8 @@ cron.schedule('0 18 * * *', wrapCronJob('runStaleLeadDailySweep', async (c) => {
 // a follow-up; the dry-run setter DM was retired 2026-10-04 (hot reply alerts replace it).
 cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (c) => { await runStalledProspectFollowups(c); }), { timezone: 'America/Costa_Rica' });
 
-// Auto strike mover — every 2h, 7 AM–9 PM CR. Advances setter pipeline cards on
+// Auto strike mover: every 2h, 7 AM to 9 PM CR (hours listed: node-cron read the
+// old '7-21/2' as 8, 10, ..., 20; see stepMismatch in lib/cronSchedule.js). Advances setter pipeline cards on
 // real human follow-ups on any channel (WhatsApp, Messenger, Instagram, SMS,
 // email, GHL-logged calls, or an email sent through Max) so nobody has to drag them. Every 2h (not
 // hourly) because a full sweep costs ~1 API call per candidate card and the 20h
@@ -15501,7 +15502,7 @@ cron.schedule('0 11 * * 1-5', wrapCronJob('runStalledProspectFollowups', async (
 // 30 min, not the 10-min default: this one legitimately runs long. Over 147 sweeps
 // it averaged 6.4 min and peaked at 17.4 min, throttled across ~1500 contacts. The
 // default would abandon a perfectly healthy sweep. Every other cron peaks under 80s.
-cron.schedule('0 7-21/2 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }, { timeoutMs: 30 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 7,9,11,13,15,17,19,21 * * *', wrapCronJob('runAutoStrikeMover', async (c) => { await runAutoStrikeMover(c); }, { timeoutMs: 30 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 
 // Daily strike-mover digest to the sales channel — 9:30 PM CR, right after the
 // day's last sweep, so the 24h window covers exactly today's 8 sweeps.
@@ -18796,8 +18797,9 @@ async function runApptDeletionSweep(correlationId) {
 }
 
 // Every 3 hours across the CR working day — deletions are rare, and each run
-// re-probes the full window, so a missed run self-heals on the next.
-cron.schedule('20 7-19/3 * * *', wrapCronJob('runApptDeletionSweep', async (c) => { await runApptDeletionSweep(c); }), { timezone: 'America/Costa_Rica' });
+// re-probes the full window, so a missed run self-heals on the next. Hours listed:
+// node-cron read the old '7-19/3' as 9, 12, 15, 18 (see lib/cronSchedule.js).
+cron.schedule('20 7,10,13,16,19 * * *', wrapCronJob('runApptDeletionSweep', async (c) => { await runApptDeletionSweep(c); }), { timezone: 'America/Costa_Rica' });
 // ─── end GHL APPOINTMENT DELETION SWEEP ─────────────────────────────────────
 
 // ─── MAKE SCENARIO HEALTH ───────────────────────────────────────────────────
@@ -23373,8 +23375,8 @@ const STATIC_CRON_SCHEDULES = {
   runAppointmentStatusSync:     '0 15 * * *',
   runCampaignHealthWbrReminder: '30 15 * * 1',
   runKaiEscalationsDigest:      '30 8 * * 1-5',
-  runApptDeletionSweep:         '20 7-19/3 * * *',
-  runAutoStrikeMover:           '0 7-21/2 * * *',
+  runApptDeletionSweep:         '20 7,10,13,16,19 * * *',
+  runAutoStrikeMover:           '0 7,9,11,13,15,17,19,21 * * *',
   // The audit declares itself, so a run where it dies shows up as stale on the
   // next one that survives. It cannot detect its own total death — nothing
   // in-process can — which is the standing limitation noted in the spec.
