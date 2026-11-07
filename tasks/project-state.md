@@ -1080,3 +1080,7 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Not backfilled:** John Rodvill - Proveexa Cleaning stays "no reason logged" until someone re-drags the card to Blocked and types the reason.
 - **Process note:** #453 was closed by a branch delete chained after a refused merge (branch was behind main); #458 is the same commit. Never chain a branch delete behind anything but a confirmed MERGED state.
 - **Tests:** 3 new cases in `test/blocked-summary.test.js`; all tests pass.
+## 2026-11-07: Strike mover and appointment sweep run at their intended hours ([PR #457](https://github.com/neurogrowth-cr/ng-agent/pull/457))
+- **Why:** node-cron 3.0.3 reads a step as "divisible by the step", not "every step-th value from the range start". Since they shipped, `runAutoStrikeMover` (`0 7-21/2`) ran at 8, 10, ..., 20 CR (7 sweeps a day, while the 21:30 strike digest is built for 8) and `runApptDeletionSweep` (`20 7-19/3`) at 9:20, 12:20, 15:20, 18:20 (4 a day, not 5). Ron chose the intended hours.
+- **Change:** both crons list their hours: `0 7,9,11,13,15,17,19,21 * * *` and `20 7,10,13,16,19 * * *`, in the registrations and in `STATIC_CRON_SCHEDULES`, so the liveness audit's next-fire math matches what runs.
+- **Guard:** `stepMismatch(expr)` in `lib/cronSchedule.js` compares node-cron's reading of a stepped field with standard cron; the wrapper logs an error at registration when they differ (covers dynamic crons from the DB). `test/cron-step-ranges.test.js` fails if any of the 131 expressions in `index.js` differs.
