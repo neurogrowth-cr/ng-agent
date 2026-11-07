@@ -4,6 +4,7 @@ const leadVolume = require('./lib/leadVolume');
 const firstTouchAdLib = require('./lib/firstTouchAd');
 const adAttribution = require('./lib/adAttribution');
 const hotReplies = require('./lib/hotReplies');
+const { blockedSummary } = require('./lib/blockedSummary');
 const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
 const openDealDrafts = require('./lib/openDealDrafts');
@@ -3451,7 +3452,7 @@ async function getClientStatus(clientName = null) {
       // Query by client_dashboards.id first (primary), then merge any results from customer_onboarding.id.
       const { data: actsByDashId } = await portalSupabase
         .from('customer_activities')
-        .select('id, template_id, status, assigned_to, completed_at, notes')
+        .select('id, template_id, status, assigned_to, completed_at, notes, updated_at')
         .eq('customer_id', dash.id);
       activities = actsByDashId || [];
 
@@ -3459,7 +3460,7 @@ async function getClientStatus(clientName = null) {
       if (customerId && customerId !== dash.id) {
         const { data: actsByObId } = await portalSupabase
           .from('customer_activities')
-          .select('id, template_id, status, assigned_to, completed_at, notes')
+          .select('id, template_id, status, assigned_to, completed_at, notes, updated_at')
           .eq('customer_id', customerId);
         if (actsByObId && actsByObId.length > 0) {
           const existingIds = new Set(activities.map(a => a.id));
@@ -3472,7 +3473,7 @@ async function getClientStatus(clientName = null) {
       const blocked = activities.filter(a => a.status === 'blocked').length;
       const phase1  = activities.filter(a => a.status === 'phase_1').length;
       const phase2  = activities.filter(a => a.status === 'phase_2').length;
-      const blockedActs = activities.filter(a => a.status === 'blocked').map(a => templateMap[a.template_id]?.title || 'Unknown activity').join(', ');
+      const blockedActs = blockedSummary(activities); // one line, never the roster (Ron, 2026-11-06)
       const pendingActs = activities
         .filter(a => a.status === 'phase_1' || a.status === 'phase_2')
         .sort((a,b) => (templateMap[a.template_id]?.order_index||99) - (templateMap[b.template_id]?.order_index||99))
@@ -3490,7 +3491,7 @@ async function getClientStatus(clientName = null) {
         `${statusEmoji} ${dash.client_name || dash.email} [${(dash.customer_type || '').replace('flywheel-ai','Flywheel').replace('full-service','Full Service')}]`,
         `${statusLabel} | Day ${daysSince ?? '?'} ${dayAnchor}${anchorDate ? ` (${anchorDate})` : ''}`,
         total > 0 ? `Activities: ${live} live, ${phase1} phase_1 pending, ${phase2} phase_2 pending, ${blocked} blocked` : 'No activities tracked',
-        blockedActs ? `🔴 Blocked on: ${blockedActs}` : '',
+        blockedActs ? `🔴 ${blockedActs}` : '',
         pendingActs && !blockedActs ? `Next up: ${pendingActs}` : '',
         ob?.services_products && clientName ? `Service: ${clipText(ob.services_products, 120)}` : '',
         ob?.ideal_customer    && clientName ? `ICP: ${clipText(ob.ideal_customer, 100)}` : '',
@@ -3687,7 +3688,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       // ── Dual-path activity query: dash.id first, merge onboarding.id if different ──
       const { data: actsByDashId } = await portalSupabase
         .from('customer_activities')
-        .select('template_id, status, notes, completed_at')
+        .select('template_id, status, notes, completed_at, updated_at')
         .eq('customer_id', dash.id);
       let allActs = actsByDashId || [];
 
@@ -3695,7 +3696,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       if (onboarding?.[0] && onboarding[0].id !== dash.id) {
         const { data: actsByObId } = await portalSupabase
           .from('customer_activities')
-          .select('template_id, status, notes, completed_at')
+          .select('template_id, status, notes, completed_at, updated_at')
           .eq('customer_id', onboarding[0].id);
         if (actsByObId?.length) {
           const existingIds = new Set(allActs.map(a => a.template_id + a.status));
@@ -3709,12 +3710,11 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       const anchorSuffix = anchor.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : '';
 
       // ── Blocked activity details ──
-      const blockedActs = allActs.filter(a => a.status === 'blocked');
-      const blockedDetails = blockedActs.map(a => templateMap[a.template_id] || 'Unknown').join(', ');
+      const blockedDetails = blockedSummary(allActs); // one line, never the roster (Ron, 2026-11-06)
 
       if (dash.customer_status === 'blocked') {
         if (dailyMode) continue; // long-standing blocked clients: Monday gap report count, full list on request
-        alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince}${anchorSuffix})${blockedDetails ? ` | Blocked on: ${blockedDetails}` : ''}`);
+        alerts.push(`🔴 BLOCKED — ${dash.client_name || dash.email} (Day ${daysSince}${anchorSuffix})${blockedDetails ? ` | ${blockedDetails}` : ''}`);
       } else if (daysSince >= 14) {
         if (dailyMode && daysSince > 30) {
           const recentActivity = allActs.some(a => a.completed_at && (now - new Date(a.completed_at).getTime()) <= fourteenDaysMs);
@@ -10473,7 +10473,7 @@ async function runFulfillmentStandup(_correlationId) {
 
     const { data: allActivities } = await portalSupabase
       .from('customer_activities')
-      .select('customer_id, template_id, status, assigned_to, completed_at, notes')
+      .select('customer_id, template_id, status, assigned_to, completed_at, notes, updated_at')
       .in('status', ['phase_1', 'phase_2', 'blocked']);
 
     const actsByClient = {};
@@ -10538,9 +10538,10 @@ async function runFulfillmentStandup(_correlationId) {
 
     josueLines.push(...renderDelta('Blocked', dBlocked.new, dBlocked.resolved, dBlocked.unchanged, name => {
       const d = blocked.find(x => x.client_name === name);
-      const acts = d ? (actsByClient[d.id] || []).filter(a => a.status === 'blocked').map(a => tMap[a.template_id] || 'Unknown').join(', ') : '';
+      // One line of signal, never the activity roster (Ron, 2026-11-06).
+      const why = d ? blockedSummary(actsByClient[d.id]) : '';
       const anchor = d ? getDayAnchor(d) : null;
-      return `${name} — Day ${anchor?.daysSince ?? '?'}${anchor?.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : ''}${acts ? ` | blocked on: ${acts}` : ''}`;
+      return `${name} — Day ${anchor?.daysSince ?? '?'}${anchor?.anchorDate ? ` ${anchor.label} (${anchor.anchorDate})` : ''}${why ? ` | ${why}` : ''}`;
     }));
     josueLines.push(...renderDelta('Day 14 TODAY', dH14.new, dH14.resolved, dH14.unchanged, name => {
       const d = hitting14Today.find(x => x.client_name === name);
