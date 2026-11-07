@@ -97,7 +97,7 @@ check('5i  a v2 item line without an owner tag fails', ca.validateReport(untagge
 
 // ── 6. Alerts: owner tag, fleet shape, dedupe keys, metadata, records.
 const alert = ca.formatAlert(FEED.items[1], FEED.adminUrl);
-check('6a  alert carries the owner and tells the team how to react', alert, `🔴 *Client attention* · [client] US Legal - Guido Soto: ${FEED.items[1].reason} → ${FEED.items[1].firstMove} <${FEED.adminUrl}|Open>\nReact ✅ here when it is handled, 💤 to snooze 3 days, or mark it in Campaign health.`);
+check('6a  alert carries the owner and tells the team how to react', alert, `🔴 *LinkedIn disconnected* · [client] US Legal - Guido Soto: ${FEED.items[1].reason} → ${FEED.items[1].firstMove} <${FEED.adminUrl}|Open>\nReact ✅ here when it is handled, 💤 to snooze 3 days, or mark it in Campaign health.`);
 check('2o  report ends with the how-to-act line', lines[lines.length - 1], `[ours] = our team fixes it · [client] = ask the client. When an item is handled, react ✅ on its alert (💤 snoozes 3 days), or mark it in <${FEED.adminUrl}|Campaign health>.`);
 check('6b  alert passes its criteria', ca.validateAlert(alert), { ok: true, problems: [] });
 const fleetAlert = ca.formatAlert(FEED.items[0], FEED.adminUrl);
@@ -126,6 +126,10 @@ for (let k = 0; k < 6; k++) many.items.push({ ...clone(FEED.items[4]), clientId:
 const plan = ca.planAlerts(many, new Set());
 check('6n  alerts per run are capped with an overflow count', [plan.send.length, plan.overflow], [ca.MAX_ALERTS_PER_RUN, many.items.filter((i) => i.level === 'urgent').length - ca.MAX_ALERTS_PER_RUN]);
 check('6o  overflow line', ca.formatAlertOverflow(3, FEED.adminUrl), `🔴 *Client attention* · 3 more urgent items this run: <${FEED.adminUrl}|see the admin page>`);
+const typed = (code) => ca.formatAlert({ ...clone(FEED.items[1]), code }, FEED.adminUrl, { mention: MENTION });
+check('6o7 each uptime alert opens with its type in bold', ['linkedin_disconnected', 'campaign_stalled', 'leads_running_out'].map((c) => typed(c).split(' · ')[0]), ['🔴 *LinkedIn disconnected*', '🔴 *Campaign stalled*', '🔴 *Leads running out*']);
+check('6o8 typed alerts pass their criteria', ['linkedin_disconnected', 'campaign_stalled', 'leads_running_out', 'sending_stopped'].every((c) => ca.validateAlert(typed(c)).ok), true);
+check('6o9 any other code keeps the generic title', typed('sending_stopped').startsWith('🔴 *Client attention* · '), true);
 check('6o2 an alert can close with the @fulfillment mention and still passes', ca.validateAlert(ca.formatAlert(FEED.items[1], FEED.adminUrl, { mention: MENTION })).ok, true);
 check('6o3 the mention ends the alert', ca.formatAlert(FEED.items[1], FEED.adminUrl, { mention: MENTION }).endsWith(`Campaign health. ${MENTION}`), true);
 check('6o4 dry-run keys live apart from live keys', [ca.alertKey(FEED.items[1], { dry: true }), ca.memberKeys(FEED.items[0], { dry: true })[0]], ['attention-dry:c-uslegal:linkedin_disconnected:bb0000000001', 'attention-dry:c-action:sending_stopped:aa0000000001']);
