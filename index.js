@@ -19240,7 +19240,8 @@ async function pingKaiHealth() {
   try {
     const res = await fetch(KAI_HEALTH_URL, { signal: AbortSignal.timeout(10000) });
     const body = await res.json().catch(() => null);
-    if (res.ok && body && body.ok === true) return { ok: true };
+    // threadWatch: Kai's later-messages reader status, judged by kaiHealth.evaluateThreadWatch.
+    if (res.ok && body && body.ok === true) return { ok: true, threadWatch: body.threadWatch || null };
     return { ok: false, error: `HTTP ${res.status}` };
   } catch (err) {
     return { ok: false, error: err.message };
