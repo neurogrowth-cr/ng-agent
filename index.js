@@ -9635,6 +9635,21 @@ slack.message(async ({ message, say }) => {
   if (message.subtype) return;
   if (isRateLimited(userId)) { await dmSay('Slow down a bit — you are sending messages too fast. Give me a moment.'); return; }
 
+  // "brief now" from Ron runs the Clarity Brief on demand, weekends included
+  // (Ron 2026-11-07). force skips the mode and once-a-day guards; the window
+  // still starts at the last posted brief, so nothing is shown twice.
+  if (userId === RON_SLACK_ID && !dmThreadTs && clarityBrief.isBriefNowCommand(message.text)) {
+    if (clarityOnDemandRunning) { await dmSay('The Clarity Brief is already running, it lands here in a minute.'); return; }
+    clarityOnDemandRunning = true;
+    await dmSay('Running the Clarity Brief now. It lands here in about a minute.');
+    (async () => {
+      try { await runClarityBrief(newCorrelationId(), { force: true }); }
+      catch (e) { await dmSay(`⚠️ Clarity Brief failed: ${String((e && e.message) || e).slice(0, 200)}`); }
+      finally { clarityOnDemandRunning = false; }
+    })();
+    return;
+  }
+
   // ── Outcome-card thread replies (deterministic — the card knows its call) ──
   let cardThreadHint = '';
   if (message.thread_ts && message.thread_ts !== message.ts) {
@@ -24680,6 +24695,7 @@ async function claimLeadForSetter({ contactId, locationId, fullName, email, ghlU
 // else. The poster below has RON_SLACK_ID hardcoded and no channel fallback.
 // Mode: CLARITY_BRIEF_MODE=off (default) | live. Kill switch CLARITY_BRIEF_DISABLED=true.
 const clarityBrief = require('./lib/clarityBrief');
+let clarityOnDemandRunning = false;
 const clarityMode = () => String(process.env.CLARITY_BRIEF_MODE || 'off').trim().toLowerCase();
 const clarityDisabled = () => String(process.env.CLARITY_BRIEF_DISABLED || '') === 'true';
 const CLARITY_RON_EMAIL = (process.env.RON_EMAIL || 'ronny.duarte@neurogrowth.io').toLowerCase();

@@ -152,5 +152,10 @@ check('8h prompts carry no em dash', /\u2014/.test(cb.buildClassifyPrompt([{ idx
 check('9a contact link names the mailbox', cb.gmailThreadUrl('contact@example.com', 'abc123'), 'https://mail.google.com/mail/u/contact@example.com/#inbox/abc123');
 check('9b no mailbox falls back to the first account', cb.gmailThreadUrl('', 'abc123'), 'https://mail.google.com/mail/u/0/#inbox/abc123');
 
+// 10. On-demand trigger (Ron DMs Max)
+check('10a trigger phrases', ['brief now', 'Brief now!', 'clarity brief', 'Clarity brief now', 'brief ahora'].map(cb.isBriefNowCommand), [true, true, true, true, true]);
+check('10b sentences about the brief go to the chat model', ['brief', 'why was the brief empty?', 'send the brief now to Gerald', 'brief now please'].map(cb.isBriefNowCommand), [false, false, false, false]);
+check('10c the DM handler runs it only for Ron, outside threads', /userId === RON_SLACK_ID && !dmThreadTs && clarityBrief\.isBriefNowCommand\(message\.text\)/.test(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')), true);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall clarity-brief checks passed');
