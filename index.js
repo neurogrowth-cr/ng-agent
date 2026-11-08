@@ -9614,6 +9614,10 @@ async function buildThreadContext({ channel, threadTs, excludeTs, userId, userTe
 slack.message(async ({ message, say }) => {
   if (message.bot_id) return;
   if (message.channel_type !== 'im') return;
+  // Edits, thread-reply bookkeeping and other system events carry no user. They
+  // used to reach the roster check and DM Ron "not on Max's roster" twice after
+  // every Clarity Brief, whose thread replies update the parent (2026-11-05/07).
+  if (!message.user) return;
   // A DM inside a thread is answered *in that thread*. Top-level DMs stay
   // top-level — replying with a thread_ts there would start a thread nobody
   // asked for.
