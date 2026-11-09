@@ -18408,6 +18408,68 @@ async function handleAgentConsult(req, res) {
   });
 }
 
+// ─── PORTAL REQUESTS (dash Ayuda + Campañas → #ng-marktech-internal) ─────────
+// The dash calls this right after a client saves a help request or a campaign
+// request (dash src/lib/alerts/portal-request-alert.ts). Auth is the shared
+// CLIENT_ATTENTION_FEED_SECRET (the same one Max sends to read the attention
+// feed), so nothing new is configured. mode "live" posts to the channel and
+// tags @fulfillment; anything else goes to Ron's DM as a dry run. Each request
+// id posts once (24 h memory). Rules and text: lib/portalRequest.js.
+const portalRequestLib = require('./lib/portalRequest');
+const PORTAL_REQUEST_CHANNEL = process.env.PORTAL_REQUEST_CHANNEL || OPS_BRIEF_CHANNEL;
+const PORTAL_REQUEST_USERGROUP = String(process.env.FULFILLMENT_USERGROUP_ID || '').trim() || 'S0BH988QW1K';
+const portalRequestSeen = portalRequestLib.createSeen(24 * 60 * 60 * 1000);
+
+function handlePortalRequest(req, res) {
+  const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+  if (!secret) return json(503, { ok: false, error: 'portal requests disabled' });
+  const given = Buffer.from(String(req.headers['x-agent-secret'] || '').trim());
+  const want = Buffer.from(secret);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) {
+    console.warn('Portal request rejected: invalid or missing secret');
+    return json(401, { ok: false, error: 'Unauthorized' });
+  }
+  let body = '';
+  let tooLarge = false;
+  req.on('data', chunk => {
+    body += chunk.toString();
+    if (body.length > 20_000 && !tooLarge) { tooLarge = true; json(413, { ok: false, error: 'payload too large' }); req.destroy(); }
+  });
+  req.on('end', async () => {
+    if (tooLarge) return;
+    let payload;
+    try { payload = JSON.parse(body); } catch { return json(400, { ok: false, error: 'invalid JSON' }); }
+    const checked = portalRequestLib.checkRequest(payload);
+    if (!checked.ok) {
+      console.warn(`[portal-request] refused: ${checked.problem}`);
+      return json(400, { ok: false, error: checked.problem });
+    }
+    const request = checked.request;
+    if (portalRequestSeen.has(request.id)) return json(200, { ok: true, duplicate: true });
+    portalRequestSeen.add(request.id);
+    const live = request.mode === 'live';
+    const text = portalRequestLib.formatRequest(request, { mention: live ? `<!subteam^${PORTAL_REQUEST_USERGROUP}|@fulfillment>` : '' });
+    try {
+      if (live) await slack.client.chat.postMessage({ channel: PORTAL_REQUEST_CHANNEL, text, unfurl_links: false });
+      else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${PORTAL_REQUEST_CHANNEL}, tags @fulfillment]\n${text}`, unfurl_links: false });
+      console.log(`[portal-request] posted ${request.id} (${request.mode})`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: `portalRequest:${request.kind}`, status: 'success' });
+      return json(200, { ok: true, posted: true, mode: request.mode });
+    } catch (err) {
+      portalRequestSeen.delete(request.id);
+      console.error(`[portal-request] post failed for ${request.id}: ${err.message}`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: `portalRequest:${request.kind}`, status: 'error', error_message: err.message });
+      try {
+        await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `⚠️ A client ${request.kind} request from ${request.clientName} did not post to ${PORTAL_REQUEST_CHANNEL}: ${err.message}\nIt is saved in the dash: ${request.adminUrl}` });
+      } catch (dmErr) {
+        console.error('[portal-request] failure DM failed:', dmErr.message);
+      }
+      return json(502, { ok: false, error: 'slack post failed' });
+    }
+  });
+}
+
 // ─── HEALTH CHECK SERVER ──────────────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
@@ -18421,6 +18483,8 @@ const healthServer = http.createServer((req, res) => {
     handleSupabaseWebhook(req, res);
   } else if (req.url === '/agent/consult' && req.method === 'POST') {
     handleAgentConsult(req, res);
+  } else if (req.url === '/webhook/portal-request' && req.method === 'POST') {
+    handlePortalRequest(req, res);
   } else {
     res.writeHead(404); res.end('Not found');
   }
