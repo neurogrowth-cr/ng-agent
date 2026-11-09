@@ -1107,3 +1107,13 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **State at merge:** mode off. Migration 026 not yet applied; AXON #222 waits for it. Heartbeats stay in `revi.engine_heartbeat` and `axon.engine_heartbeat`.
 - **Duplicated contract:** the event shape lives in `lib/agentEvents.js` here and `lib/agent-events.js` in ng-axon. Change both the same day.
 - **Tests:** `test/agent-events.test.js` (routing, collapse, budget, digest, migration enums match the lib); all tests pass.
+
+## 2026-11-08: Monday digest lists clients who leave Kai drafts waiting (#468)
+
+- **Why:** Ron wants an internal check, not a client-facing KPI, on how clients handle the drafts Kai leaves for their approval, so fulfillment can call the slow ones or offer auto-send.
+- **Change:** `lib/kaiHealth.js`. On Mondays only, `readKaiDigest` reads `DIGEST_SQL.approvals` (one read-only query; `approvals` is null on other days), and `formatKaiDigest` adds `CLIENT APPROVALS (WEEKLY, LAST 30 DAYS)`.
+  - Each client line shows drafts waiting and the oldest wait, approved count with the usual time to approve, and drafts expired unsent.
+  - A client is flagged when 3 or more drafts are waiting over 2 days, approvals usually take over a day, or 5 or more drafts expired. Flagged clients are listed worst first, up to 8 lines, with an ISSUES entry and a fulfillment hint.
+  - The query leaves out Kai's own closes (decline close, `prospect_declined`, `pleasantry`), auto-replies waiting for their send time (`send_after`), and drafts answered by hand (`thread_state='answered'`) or marked handled.
+- **On 2026-11-08 data:** 8 of 16 Kai clients are flagged, led by Flor Lizano (0 of 116 approved, 69 expired unsent) and Multiproyectos (approvals usually after 3 days).
+- **Tests:** 10 new checks in `test/kai-health-watch.test.js`; all tests pass. Railway deploy succeeded on `840b57c`.
