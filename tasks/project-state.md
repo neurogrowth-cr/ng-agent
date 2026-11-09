@@ -1062,3 +1062,12 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Why:** ng-automation #115 closes a reply that is only thanks or a reaction as `skipped` + `pleasantry` (Ron, plan-of-record UPDATE 2026-11-07).
 - **Change:** the daily Kai digest's `skipped` count excludes `pleasantry` as well as `prospect_declined` (`lib/kaiHealth.js`, `DIGEST_SQL.daily`).
 - **Tests:** `test/kai-health-watch.test.js`; all 94 test files pass.
+
+## 2026-11-07: Ron runs the Clarity Brief on demand ([PR #451](https://github.com/neurogrowth-cr/ng-agent/pull/451))
+- **Why:** on Saturday Ron asked for a brief. Weekends are off by his own rule (06:50 CR Mon to Fri) and Max had no manual trigger.
+- **What:** Ron DMs Max `brief now`, `brief ahora` or `clarity brief` (exact phrases, top-level DM, Ron only). Max runs `runClarityBrief` with `force: true`, one run at a time, and DMs back a failure. The window still starts at the last posted brief, so Monday's brief starts where an on-demand one ends.
+
+## 2026-11-07: brief now fixes, first on-demand Clarity Brief ([PR #456](https://github.com/neurogrowth-cr/ng-agent/pull/456), [PR #460](https://github.com/neurogrowth-cr/ng-agent/pull/460))
+- **#456:** a `brief now` that Claude sends from Ron's account ends in "*Sent using* Claude", so the exact match missed it and the chat model answered with its own summary. The footer is ignored now.
+- **First on-demand run:** the 16:40 CR run died when #457 deployed mid-run (row 3 started, never posted). The 20:57 CR run posted: all green, sources 7/7, 7 items (5 Gmail, 2 Slack), $0.04. The classifier fix from #446 works on real data.
+- **#460:** every brief was followed by two "not on Max's roster" DMs: the brief's thread replies update the parent, Slack sends those as events with no user, and the DM handler sent them to the roster check. Events without a user now return first.
