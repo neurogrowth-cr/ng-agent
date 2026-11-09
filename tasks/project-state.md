@@ -1117,3 +1117,13 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
   - The query leaves out Kai's own closes (decline close, `prospect_declined`, `pleasantry`), auto-replies waiting for their send time (`send_after`), and drafts answered by hand (`thread_state='answered'`) or marked handled.
 - **On 2026-11-08 data:** 8 of 16 Kai clients are flagged, led by Flor Lizano (0 of 116 approved, 69 expired unsent) and Multiproyectos (approvals usually after 3 days).
 - **Tests:** 10 new checks in `test/kai-health-watch.test.js`; all tests pass. Railway deploy succeeded on `840b57c`.
+
+## 2026-11-09: client help and campaign requests from the dash post to #ng-marktech-internal (#470)
+
+- **Why:** the new onboarding video tells every client to stop using the WhatsApp group and ask in the dash instead (Ayuda for help, Campañas for campaign requests). Until now nothing alerted the team when a client did.
+- **Change:** new `POST /webhook/portal-request` in `index.js`, with rules and text in `lib/portalRequest.js`. The dash calls it right after a client saves a request (dash #433, `src/lib/alerts/portal-request-alert.ts`).
+  - Auth reuses `CLIENT_ATTENTION_FEED_SECRET`, the secret Max already sends to read the dash attention feed. No new env var.
+  - `mode: "live"` posts to `PORTAL_REQUEST_CHANNEL` (default `OPS_BRIEF_CHANNEL`, #ng-marktech-internal) tagging `FULFILLMENT_USERGROUP_ID` (default `S0BH988QW1K`). Any other mode goes to Ron's DM as a dry run. The dash sends live only from Production.
+  - Fails closed on a bad payload, and the admin link must point into `dash.neurogrowth.io/admin`. Each request id posts once (24 h memory). If Slack refuses the post, Ron gets a DM with the admin link.
+- **Verified live 2026-11-09:** one TEST help request and one TEST campaign request from the internal Neurogrowth dashboard produced exactly one post each in #ng-marktech-internal, both tagging @fulfillment. Both tests were then closed in the admin.
+- **Tests:** `test/portal-request.test.js`; all tests pass.
