@@ -28,4 +28,18 @@ assert.strictEqual(blockedSummary(undefined), '');
 // 5. No updated_at at all still reads.
 assert.strictEqual(blockedSummary([{ status: 'blocked' }]), 'blocked: no reason logged in the portal');
 
+// 6. The portal reason (client_dashboards.blocked_reason, dash #430) wins over
+//    activity notes, and blocked_at is the date.
+const dash = { customer_status: 'blocked', blocked_reason: '  Client has not sent  LinkedIn access ', blocked_at: '2026-11-07T14:02:00Z' };
+assert.strictEqual(blockedSummary(noted, dash), 'blocked since 2026-11-07: Client has not sent LinkedIn access');
+assert.strictEqual(blockedSummary(roster, dash), 'blocked since 2026-11-07: Client has not sent LinkedIn access');
+
+// 7. A blocked client with no blocked activity rows still reads (the dash row alone is enough).
+assert.strictEqual(blockedSummary([], dash), 'blocked since 2026-11-07: Client has not sent LinkedIn access');
+assert.strictEqual(blockedSummary([], { customer_status: 'blocked', blocked_reason: null, blocked_at: null }), 'blocked: no reason logged in the portal');
+
+// 8. A dash row that is not blocked changes nothing.
+assert.strictEqual(blockedSummary(roster, { customer_status: 'phase_1', blocked_reason: 'stale', blocked_at: '2026-01-01' }), 'blocked since 2026-11-05: no reason logged in the portal');
+assert.strictEqual(blockedSummary([], { customer_status: 'phase_1' }), '');
+
 console.log('blocked-summary: all tests passed');
