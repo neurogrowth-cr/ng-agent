@@ -1084,3 +1084,12 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **Why:** node-cron 3.0.3 reads a step as "divisible by the step", not "every step-th value from the range start". Since they shipped, `runAutoStrikeMover` (`0 7-21/2`) ran at 8, 10, ..., 20 CR (7 sweeps a day, while the 21:30 strike digest is built for 8) and `runApptDeletionSweep` (`20 7-19/3`) at 9:20, 12:20, 15:20, 18:20 (4 a day, not 5). Ron chose the intended hours.
 - **Change:** both crons list their hours: `0 7,9,11,13,15,17,19,21 * * *` and `20 7,10,13,16,19 * * *`, in the registrations and in `STATIC_CRON_SCHEDULES`, so the liveness audit's next-fire math matches what runs.
 - **Guard:** `stepMismatch(expr)` in `lib/cronSchedule.js` compares node-cron's reading of a stepped field with standard cron; the wrapper logs an error at registration when they differ (covers dynamic crons from the DB). `test/cron-step-ranges.test.js` fails if any of the 131 expressions in `index.js` differs.
+
+## 2026-11-08: Kai intake alert compares Prosp with Kai (#465)
+
+- **Why:** the old `intake` check ("No replies arriving") counted Kai's own `received` rows over 6 hours and fired on quiet afternoons (2026-10-20, 10-23, 10-30, 11-03, each 18:45 to 19:45 CR) while Prosp webhooks kept flowing. Weekday replies bunch at 03:00 to 05:00 CR. Ron (2026-11-08) chose to compare Prosp with Kai.
+- **Change (`lib/kaiHealth.js`):**
+  - `prosp_quiet` ("Prosp stopped sending"): no Prosp webhook event of any kind in dash's `prosp_webhook_logs` for 3 hours, weekdays 10:00 to 19:00 CR. Backtest: the longest weekday gap in 30 days was 1.6 h; 2026-10-27 (almost no events) would have fired.
+  - `kai_intake` ("Replies not reaching Kai"): a reply Prosp reported for a Kai client activated before the reply, with no Kai row for that lead within 30 minutes, in the last 6 hours, at any hour. Names the clients. Backtest: 0 in 14 days (158 of 158).
+  - Both need 2 polls; the `intake` id is gone.
+- **Tests:** `test/kai-health-watch.test.js` (8a to 8i, 2d to 2f, 15a to 15c2); all 96 test files pass.
