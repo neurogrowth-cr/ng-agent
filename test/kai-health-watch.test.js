@@ -295,6 +295,15 @@ function digestData({ yesterday, baseline, extra = {} }) {
 
 // ── 15. The snapshot reader runs every query with the right parameters
 (async () => {
+  {
+    const asked = [];
+    const pgd = { query: async (sql) => { asked.push(sql); return { rows: [{ n: 0 }] }; } };
+    const tue = await kai.readKaiDigest(pgd, new Date('2026-11-10T14:00:00Z'));
+    check('ap9 approvals read only on Mondays (Tuesday: not read)', [asked.includes(kai.DIGEST_SQL.approvals), tue.approvals], [false, null]);
+    asked.length = 0;
+    const mon = await kai.readKaiDigest(pgd, new Date('2026-11-09T14:00:00Z'));
+    check('ap10 Monday: approvals read', asked.includes(kai.DIGEST_SQL.approvals) && Array.isArray(mon.approvals), true);
+  }
   const seen = [];
   const pg = { query: async (sql, params) => { seen.push({ sql, params }); return { rows: [{ n: 0, sent: 0, skipped: 0 }] }; } };
   await kai.readKaiSnapshot(pg, T0);
@@ -338,6 +347,31 @@ check('a stand-down during the wait is not auto-send holding back', /detail->>'s
 }
 
 check('a pleasantry Kai closed is not counted as held back', /NOT IN \('prospect_declined', 'pleasantry'\)/.test(kai.DIGEST_SQL.daily), true);
+
+// ── Weekly client approvals (Mondays): who leaves Kai drafts waiting
+{
+  const rows = [
+    { client_name: 'Flor Lizano Bolaños', drafts: 116, waiting: 38, oldest_hours: 330, approved: 0, median_approve_hours: null, expired: 69 },
+    { client_name: 'Multiproyectos', drafts: 46, waiting: 12, oldest_hours: 330, approved: 29, median_approve_hours: 75.7, expired: 5 },
+    { client_name: 'Mind Lift', drafts: 50, waiting: 1, oldest_hours: 3, approved: 39, median_approve_hours: 1.8, expired: 0 },
+    { client_name: 'Buena Vista', drafts: 13, waiting: 1, oldest_hours: 30, approved: 0, median_approve_hours: null, expired: 0 },
+  ];
+  const slow = kai.slowApprovers(rows);
+  check('ap1 flags drafts waiting over 2 days, slow approvals and expired drafts; worst first', slow.map((r) => r.client), ['FLOR LIZANO BOLAÑOS', 'MULTIPROYECTOS']);
+  check('ap2 a fast approver and a single waiting draft are not flagged', slow.some((r) => /MIND LIFT|BUENA VISTA/.test(r.client)), false);
+  check('ap3 line for a client that never approves', kai.approvalLine(slow[0]), '• FLOR LIZANO BOLAÑOS: 38 waiting, oldest 14 d · 0 of 116 approved · 69 expired unsent');
+  check('ap4 line for a slow approver', kai.approvalLine(slow[1]), '• MULTIPROYECTOS: 12 waiting, oldest 14 d · 29 of 46 approved, usually after 3 d · 5 expired unsent');
+
+  const base = digestData({ yesterday: { received: 28 }, baseline: () => ({ received: 28 }) });
+  const daily = kai.formatKaiDigest(base);
+  check('ap5 no approvals section on other days', daily.includes('CLIENT APPROVALS'), false);
+  const monday = kai.formatKaiDigest({ ...base, approvals: rows });
+  check('ap6 Monday: section, fulfillment hint and an issue', monday.includes('CLIENT APPROVALS (WEEKLY, LAST 30 DAYS)') && monday.includes('→ Fulfillment') && monday.includes('2 clients slow to approve'), true);
+  const clean = kai.formatKaiDigest({ ...base, approvals: [rows[2]] });
+  check('ap7 Monday with nobody slow: one green line, no issue', clean.includes('No client is leaving Kai drafts waiting') && clean.includes('✅ ALL GREEN'), true);
+  check('ap8 approvals SQL is read-only and leaves out Kai closes and waiting auto-replies',
+    !/\b(insert|update|delete)\b/i.test(kai.DIGEST_SQL.approvals) && /'pleasantry'/.test(kai.DIGEST_SQL.approvals) && /send_after IS NULL/.test(kai.DIGEST_SQL.approvals), true);
+}
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
