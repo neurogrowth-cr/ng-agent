@@ -1071,3 +1071,12 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
 - **#456:** a `brief now` that Claude sends from Ron's account ends in "*Sent using* Claude", so the exact match missed it and the chat model answered with its own summary. The footer is ignored now.
 - **First on-demand run:** the 16:40 CR run died when #457 deployed mid-run (row 3 started, never posted). The 20:57 CR run posted: all green, sources 7/7, 7 items (5 Gmail, 2 Slack), $0.04. The classifier fix from #446 works on real data.
 - **#460:** every brief was followed by two "not on Max's roster" DMs: the brief's thread replies update the parent, Slack sends those as events with no user, and the DM handler sent them to the roster check. Events without a user now return first.
+
+## 2026-11-07: Max prints the portal's blocked reason (#458, with dash #430)
+
+- **Why:** #442 cut the blocked line to one line of signal, but the portal had no field saying why a client is blocked, so the line read "no reason logged in the portal".
+- **dash #430 (merged, migration applied 2026-11-07):** `client_dashboards.blocked_reason` (text, 5 to 140 chars) and `blocked_at`. The CRM Kanban asks for the reason when a card is dropped on Blocked and clears both columns when the client leaves Blocked. Shown on the Kanban card and in Campaign health.
+- **Change here:** `blockedSummary(acts, dash)` in `lib/blockedSummary.js`. The portal reason and `blocked_at` win over activity notes, only while `customer_status` is `blocked`. The three `client_dashboards` selects that feed it (ops brief, client-attention alert, client status card) fetch both columns.
+- **Not backfilled:** John Rodvill - Proveexa Cleaning stays "no reason logged" until someone re-drags the card to Blocked and types the reason.
+- **Process note:** #453 was closed by a branch delete chained after a refused merge (branch was behind main); #458 is the same commit. Never chain a branch delete behind anything but a confirmed MERGED state.
+- **Tests:** 3 new cases in `test/blocked-summary.test.js`; all tests pass.
