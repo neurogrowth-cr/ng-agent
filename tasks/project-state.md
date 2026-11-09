@@ -1093,3 +1093,10 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
   - `kai_intake` ("Replies not reaching Kai"): a reply Prosp reported for a Kai client activated before the reply, with no Kai row for that lead within 30 minutes, in the last 6 hours, at any hour. Names the clients. Backtest: 0 in 14 days (158 of 158).
   - Both need 2 polls; the `intake` id is gone.
 - **Tests:** `test/kai-health-watch.test.js` (8a to 8i, 2d to 2f, 15a to 15c2); all 96 test files pass.
+## 2026-11-08: Agent event bus, phase 1 ([PR #463](https://github.com/neurogrowth-cr/ng-agent/pull/463), spec [PR #461](https://github.com/neurogrowth-cr/ng-agent/pull/461), AXON [ng-axon #222](https://github.com/neurogrowth-cr/ng-axon/pull/222))
+- **Why:** Ron wants REVI, AXON and Kai reporting back to Max. Until now Max only pulled from their tables on a timer; a sibling had no way to say "this needs a human" or "this failed". Ron approved phase 1 on 2026-11-08 with the spec's recommendations.
+- **What:** migration `026_agent_events.sql` adds `public.agent_events` (source, kind, severity, audience, subject_key, summary up to 300 chars, payload capped at 4 KB by the database, unique `source + idempotency_key`). `pollAgentEvents` (every 5 min) routes each unconsumed row in plain code, no LLM: red to Ron's DM, warn errors to `#ng-pm-agent` once per subject per 6 h, `needs_human` kept for the morning brief (collector is phase 2), `job_done` stored, handoffs dropped (allowlist empty), 20 per source per CR day. A row waiting over 15 min DMs Ron.
+- **Modes:** `AGENT_EVENTS_MODE` off (default) | shadow (route and stamp, post nothing, 18:00 CR DM to Ron of what live would have done, no post on a quiet day) | live.
+- **State at merge:** mode off. Migration 026 not yet applied; AXON #222 waits for it. Heartbeats stay in `revi.engine_heartbeat` and `axon.engine_heartbeat`.
+- **Duplicated contract:** the event shape lives in `lib/agentEvents.js` here and `lib/agent-events.js` in ng-axon. Change both the same day.
+- **Tests:** `test/agent-events.test.js` (routing, collapse, budget, digest, migration enums match the lib); all tests pass.
