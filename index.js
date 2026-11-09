@@ -19325,6 +19325,99 @@ cron.schedule('*/15 * * * *', wrapCronJob('checkKaiHealth', async () => { await 
 cron.schedule('0 8 * * 1-5', wrapCronJob('runKaiHealthDigest', async () => { await runKaiHealthDigest(); }), { timezone: 'America/Costa_Rica' });
 console.log('Registered static crons: Kai health watch (*/15 * * * *) + Kai daily digest (0 8 * * 1-5 CR)');
 
+// ─── AGENT EVENT BUS (phase 1, 2026-11-08) ──────────────────────────────────
+// Spec: tasks/specs/agent-event-bus.md. REVI, AXON and Kai insert rows into
+// agent_events (migration 026); this polls the unconsumed ones, routes each in
+// plain code (lib/agentEvents.js, no LLM) and stamps consumed_at.
+// AGENT_EVENTS_MODE: off (default, nothing runs) | shadow (route and stamp, post
+// nothing, one evening DM to Ron listing what live would have done) | live
+// (red to Ron's DM, errors to #ng-pm-agent, needs_human kept for the morning
+// brief collector, which is phase 2). Sibling rows are data: no route reaches a
+// mutating tool.
+const agentEvents = require('./lib/agentEvents');
+const AGENT_EVENTS_CHANNEL = process.env.AGENT_EVENTS_CHANNEL || AGENT_CHANNEL;
+const AGENT_EVENTS_STALE_REALERT_MS = 6 * 60 * 60 * 1000;
+let agentEventsStaleAlertAt = 0;
+
+async function loadAgentEventsContext(now) {
+  const sixAgo = new Date(now.getTime() - agentEvents.ERROR_COLLAPSE_MS).toISOString();
+  // CR midnight (UTC-6, no DST) for the daily budget.
+  const crMidnight = new Date(`${agentEvents.crDay(now)}T06:00:00Z`).toISOString();
+  const since = sixAgo < crMidnight ? sixAgo : crMidnight;
+  const { data, error } = await supabase.from('agent_events')
+    .select('source, kind, subject_key, route, consumed_at')
+    .gte('consumed_at', since).in('route', ['dm_ron', 'post_error', 'clarity', 'collapsed']).limit(1000);
+  if (error) throw new Error(`agent_events context read: ${error.message}`);
+  const recentErrorPosts = new Map();
+  const usedToday = new Map();
+  for (const r of data || []) {
+    const at = new Date(r.consumed_at).getTime();
+    if (r.route === 'post_error' && r.consumed_at >= sixAgo) {
+      const k = agentEvents.collapseKey(r);
+      recentErrorPosts.set(k, Math.max(recentErrorPosts.get(k) || 0, at));
+    }
+    if (r.consumed_at >= crMidnight) usedToday.set(r.source, (usedToday.get(r.source) || 0) + 1);
+  }
+  return { recentErrorPosts, usedToday };
+}
+
+async function pollAgentEvents() {
+  const mode = agentEvents.eventsMode();
+  if (mode === 'off') return;
+  const now = new Date();
+  const { data: rows, error } = await supabase.from('agent_events')
+    .select('id, created_at, source, kind, severity, audience, subject_key, summary, payload, correlation_id')
+    .is('consumed_at', null).order('created_at', { ascending: true }).limit(50);
+  if (error) throw new Error(`agent_events read: ${error.message}`);
+  if (rows && rows.length) {
+    const ctx = await loadAgentEventsContext(now);
+    for (const d of agentEvents.planBatch(rows, { ...ctx, now })) {
+      if (mode === 'live') {
+        try {
+          if (d.route === 'dm_ron') await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: agentEvents.formatLive(d.evt) });
+          else if (d.route === 'post_error') await postToSlack(AGENT_EVENTS_CHANNEL, agentEvents.formatLive(d.evt));
+        } catch (err) {
+          // Left unconsumed: the next poll retries, and the stale check below
+          // speaks up if it keeps failing.
+          console.error(`[agent-events] ${d.route} for event ${d.id} failed: ${err.message}`);
+          continue;
+        }
+      }
+      const { error: uErr } = await supabase.from('agent_events')
+        .update({ consumed_at: new Date().toISOString(), route: d.route, route_mode: mode })
+        .eq('id', d.id).is('consumed_at', null);
+      if (uErr) console.error(`[agent-events] stamp ${d.id} failed: ${uErr.message}`);
+      logActivity({ event_type: 'agent_event', event_source: 'cron', action: 'agent_event_routed', status: 'ok',
+        output: { id: d.id, source: d.evt.source, kind: d.evt.kind, route: d.route, mode }, correlation_id: d.evt.correlation_id || null });
+    }
+  }
+  // Rows nobody stamped mean the poller is failing quietly.
+  const { data: oldest } = await supabase.from('agent_events').select('created_at')
+    .is('consumed_at', null).order('created_at', { ascending: true }).limit(1);
+  const staleMin = agentEvents.staleBacklog(oldest && oldest[0] && oldest[0].created_at, new Date());
+  if (staleMin && Date.now() - agentEventsStaleAlertAt > AGENT_EVENTS_STALE_REALERT_MS) {
+    agentEventsStaleAlertAt = Date.now();
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID,
+      text: `⚠️ *Agent events are piling up*: the oldest unconsumed row is ${staleMin} min old. Max's poller is reading but not stamping. Check Railway logs for [agent-events]. Kill switch: AGENT_EVENTS_MODE=off.` }).catch(() => {});
+  }
+}
+
+async function runAgentEventsShadowDigest() {
+  if (agentEvents.eventsMode() !== 'shadow') return;
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const { data, error } = await supabase.from('agent_events')
+    .select('source, kind, summary, route').eq('route_mode', 'shadow').gte('consumed_at', since)
+    .order('consumed_at', { ascending: true }).limit(500);
+  if (error) throw new Error(`agent_events digest read: ${error.message}`);
+  const text = agentEvents.formatShadowDigest(data || [], { day: agentEvents.crDay(new Date()) });
+  if (!text) return; // quiet day, no post
+  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text });
+}
+
+cron.schedule('*/5 * * * *', wrapCronJob('pollAgentEvents', async () => { await pollAgentEvents(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('0 18 * * *', wrapCronJob('runAgentEventsShadowDigest', async () => { await runAgentEventsShadowDigest(); }), { timezone: 'America/Costa_Rica' });
+console.log(`Registered static crons: agent events poll (*/5 * * * *) + shadow digest (0 18 * * * CR), mode ${agentEvents.eventsMode()}`);
+
 // Kai escalations digest (2026-11-03). Recipe: ~/automations/ops/recipes/kai-escalations-digest.md
 // The queue Kai hands to humans had no owner: 365 escalations and 118 drafts
 // sat unsent on 2026-11-03 and no Slack message existed for the escalated
@@ -23372,6 +23465,8 @@ const STATIC_CRON_SCHEDULES = {
   checkMakeScenarioHealth:      '*/10 * * * *',
   checkAxonHealth:              '*/10 * * * *',
   checkKaiHealth:              '*/15 * * * *',
+  pollAgentEvents:             '*/5 * * * *',
+  runAgentEventsShadowDigest:  '0 18 * * *',
   runClientAttentionAlerts:     '*/30 7-19 * * 1-5',
   runReelsWeekly:               '0 8 * * 1',
   runReelsDailyBrief:           '40 7 * * *',
