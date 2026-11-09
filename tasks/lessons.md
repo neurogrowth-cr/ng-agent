@@ -532,3 +532,12 @@ missing. That second data point is the only reason the real cause was found.
 
 ## 2026-11-03: anything that must fire at a fixed hour belongs on Railway, not in a Claude scheduled task on the Mac
 - Brainstorming Ron's Clarity Brief (spec PR #416), the first recommendation was a Claude scheduled task on this Mac because it reaches connectors with zero code. Ron asked what time the Mac had to be on. The honest answer killed the idea: the `scheduled-tasks` runner fires only while the Mac is awake with the app open, and that same day the daily 09:09 task ran at 17:35. **Pattern:** a Mac-side scheduled task is for one-off checks and anything whose lateness costs nothing; a recipe with a deadline (a morning brief, a digest, a watchdog) goes to Max on Railway or another always-on runner, even when that means a PR per source. Say the Mac dependency out loud in the first proposal instead of listing it as a footnote.
+
+## 2026-11-08: check the stated root cause against the code before fixing it (dash #432)
+- The incident brief said the dash sequence sync set `customer_id` only on insert. The code recomputed the owner on every run; the real gap was the catch-up runs skipping once a sync had saved that day. Fixing the stated cause would have changed nothing. **Pattern:** read the code path a brief blames before building on it, and say so in the summary when the brief was wrong.
+
+## 2026-11-08: SQL applied by hand to production is a migration owed the same day
+- Two triggers and three functions went into the portal database as plain SQL during the incident. Until dash #432 the schema history did not match production, and the only copy of the SQL was a patch file nobody could find a day later. **Pattern:** after a hand-applied fix, read the live definitions back (`pg_get_functiondef`, `pg_get_triggerdef`), commit them as an idempotent migration (`create or replace`, `drop trigger if exists`), and record it in the migration history.
+
+## 2026-11-08: a "runs once a day, skip if already done" job turns late data into a next-day bug
+- The sequence sync was correct on every run, but its catch-up runs stopped when the day's sync had saved, so anything the team saved after 06:30 waited until tomorrow. **Pattern:** when a job joins two things people enter at different times (a campaign in Prosp, a handler in the portal), the job must rerun after either side changes, or the write itself must do the join (a trigger). A daily skip is only safe when the inputs cannot change during the day.
