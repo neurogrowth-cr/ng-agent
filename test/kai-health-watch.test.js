@@ -21,7 +21,7 @@ const T0 = new Date('2026-09-23T16:00:00Z');
 const at = (m) => new Date(T0.getTime() + m * MIN);
 
 const HEALTHY = {
-  errors: [], stuck: { n: 0, oldest: null }, received: 12, threadCheckFails: [],
+  errors: [], stuck: { n: 0, oldest: null }, prospEvents: true, missedReplies: [], threadCheckFails: [],
   autoSend: { sent: 4, skipped: 0 }, doubleSends: [],
 };
 const USAGE_LIMIT_ROW = {
@@ -47,7 +47,9 @@ check('1e  anything else', kai.classifyKaiError({ event: 'error', error: 'Cannot
 check('2a  Tue 10:00 CR is inside', kai.isIntakeWindow(T0), true);
 check('2b  Tue 21:00 CR is outside', kai.isIntakeWindow(new Date('2026-09-24T03:00:00Z')), false);
 check('2c  Sat 10:00 CR is outside', kai.isIntakeWindow(new Date('2026-09-26T16:00:00Z')), false);
-check('2d  Mon 08:00 CR is inside', kai.isIntakeWindow(new Date('2026-09-28T14:00:00Z')), true);
+check('2d  Mon 08:00 CR is outside (campaigns warm up; 10:00 to 19:00)', kai.isIntakeWindow(new Date('2026-09-28T14:00:00Z')), false);
+check('2e  Mon 18:30 CR is inside', kai.isIntakeWindow(new Date('2026-09-29T00:30:00Z')), true);
+check('2f  Tue 19:30 CR is outside (the old false alarms fired 18:45 to 19:45)', kai.isIntakeWindow(new Date('2026-09-24T01:30:00Z')), false);
 
 // ── 3. A healthy poll is silent
 {
@@ -119,18 +121,32 @@ check('2d  Mon 08:00 CR is inside', kai.isIntakeWindow(new Date('2026-09-28T14:0
   check('7e  Slack alert still open', Boolean(s['errors:slack'] && s['errors:slack'].alerted), true);
 }
 
-// ── 8. Intake silence: only during business hours, needs 2 polls
+// ── 8. Prosp silence: only weekdays 10:00 to 19:00, needs 2 polls
 {
-  const quiet = { ...HEALTHY, received: 0 };
+  const quiet = { ...HEALTHY, prospEvents: false };
   let r = poll({}, { snapshot: quiet });
   check('8a  1st quiet poll silent', r.alerts.length, 0);
   r = poll(r.state, { snapshot: quiet, now: at(15) });
-  check('8b  2nd quiet poll alerts', r.alerts.map((a) => a.id), ['intake']);
+  check('8b  2nd quiet poll alerts', r.alerts.map((a) => a.id), ['prosp_quiet']);
   const night = new Date('2026-09-24T04:00:00Z'); // 22:00 CR
   const n1 = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: quiet, now: night });
-  check('8c  not evaluated at night', n1.find((x) => x.id === 'intake').skip, true);
+  check('8c  not evaluated at night', n1.find((x) => x.id === 'prosp_quiet').skip, true);
   const kept = kai.stepKaiWatch(r.state, n1, night);
   check('8d  night skip neither recovers nor re-alerts', [kept.alerts.length, kept.recoveries.length], [0, 0]);
+}
+
+// ── 8b. Replies Prosp reported that never reached Kai (any hour), needs 2 polls
+{
+  const lost = { ...HEALTHY, missedReplies: [{ client_name: ' Emmis Capital ', n: 2, oldest: '2026-09-23T14:00:00Z' }] };
+  let r = poll({}, { snapshot: lost });
+  check('8e  1st poll with lost replies silent', r.alerts.length, 0);
+  r = poll(r.state, { snapshot: lost, now: at(15) });
+  check('8f  2nd poll alerts and names the client', [r.alerts.map((a) => a.id), /EMMIS CAPITAL 2/.test(r.alerts[0].reason)], [['kai_intake'], true]);
+  const night = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: lost, now: new Date('2026-09-24T04:00:00Z') });
+  check('8g  judged at night too (a lost reply is lost at any hour)', night.find((x) => x.id === 'kai_intake').failing, true);
+  check('8h  a quiet afternoon with nothing lost is green', failingIds(kai.evaluateKaiChecks({ health: { ok: true }, snapshot: HEALTHY, now: new Date('2026-11-04T01:30:00Z') })), []);
+  const rec = poll(r.state, { snapshot: HEALTHY, now: at(30) });
+  check('8i  recovers once nothing is lost', rec.recoveries.map((x) => x.id), ['kai_intake']);
 }
 
 // ── 9. Auto-send held back too often (thread-check ordering broke)
@@ -282,9 +298,10 @@ function digestData({ yesterday, baseline, extra = {} }) {
   const seen = [];
   const pg = { query: async (sql, params) => { seen.push({ sql, params }); return { rows: [{ n: 0, sent: 0, skipped: 0 }] }; } };
   await kai.readKaiSnapshot(pg, T0);
-  check('15a six queries', seen.length, 6);
+  check('15a seven queries', seen.length, 7);
   check('15b every query gets the poll time', seen.every((q) => q.params[0] === T0.toISOString()), true);
-  check('15c intake window passed as hours', seen.find((q) => q.sql === kai.SQL.received).params[1], kai.INTAKE_WINDOW_HOURS);
+  check('15c Prosp quiet window passed as hours', seen.find((q) => q.sql === kai.SQL.prospEvents).params[1], kai.PROSP_QUIET_HOURS);
+  check('15c2 lost-reply lookback passed as hours', seen.find((q) => q.sql === kai.SQL.missedReplies).params[1], kai.KAI_INTAKE_LOOKBACK_HOURS);
   check('15d read-only: no writes in any SQL', [...Object.values(kai.SQL), ...Object.values(kai.DIGEST_SQL)].some((s) => /\b(insert|update|delete|drop|alter)\b/i.test(s)), false);
 
   // A prospect's no closed by Kai is the normal path: not a skip, not a missing Slack post.
