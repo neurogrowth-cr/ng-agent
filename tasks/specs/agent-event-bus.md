@@ -1,6 +1,6 @@
 # Spec: Agent event bus (siblings report to Max)
 
-**Owner:** Ron   **Status:** PROPOSAL, nothing built. Needs Ron's go on section 2 and the decisions in section 9.
+**Owner:** Ron   **Status:** phase 1 approved by Ron 2026-11-08 ("Build phase 1", taking the section 9 recommendations). Built in ng-agent (migration 026, `lib/agentEvents.js`) and ng-axon (`lib/agent-events.js`), mode `off` until the migration is applied and Ron sets `AGENT_EVENTS_MODE=shadow`.
 **Written:** 2026-11-08   **Checked against:** ng-agent `origin/main` at `52cd9e8` (#460), the wiki (`systems/supabase-max.md`, `repos/ng-axon.md`, `repos/ng-automation-KAI.md`, `repos/ng-revi.md`, `decisions/log.md`) and the strategy repo (`docs/NORTH_STAR.md`, `docs/context/ng-agent.md`).
 **Not read this session:** the ng-revi, ng-axon and ng-automation code. Facts about them come from the wiki pages above and must be rechecked in each repo before its phase starts.
 
@@ -63,7 +63,7 @@ Access: RLS on, anon select and insert, update for Max's bookkeeping columns, no
 
 ### 5.3 Max reads by polling, not by webhook
 
-One cron, every minute, through `lib/cronSchedule.js`: read up to 50 rows where `consumed_at is null`, oldest first, route each, stamp `consumed_at`. A database webhook would lose every event fired while Max is mid-deploy. A poll loses nothing and needs no new production configuration. One minute of delay does not matter for any event listed here.
+One cron, every 5 minutes, through `lib/cronSchedule.js` (built at 5, not 1: every cron run writes two `agent_activity` rows, and a one-minute poll would add 2,880 a day for events that are never minute-urgent): read up to 50 rows where `consumed_at is null`, oldest first, route each, stamp `consumed_at`. A database webhook would lose every event fired while Max is mid-deploy. A poll loses nothing and needs no new production configuration. Five minutes of delay does not matter for any event listed here.
 
 ### 5.4 Routing is plain code, zero tokens
 
@@ -71,8 +71,8 @@ New `lib/agentEvents.js`, pure and tested, same split as `lib/kaiHealth.js` (log
 
 | Kind | What Max does |
 |---|---|
-| `needs_human` | Becomes a Clarity Brief candidate (new collector). `red` also DMs Ron at once. |
-| `error` | Posts to `#ng-pm-agent`, collapsed by `source` + `subject_key`, at most one post per key per 6 h. |
+| `needs_human` | Becomes a Clarity Brief candidate (route `clarity`; the collector is phase 2). `red` DMs Ron at once. |
+| `error` | Posts to `#ng-pm-agent`, collapsed by `source` + `subject_key`, at most one post per key per 6 h. `red` DMs Ron instead. |
 | `job_done` | No post. Stored so reports and the cost report can read it. |
 | `handoff` | Runs a named handler from an allowlist in code. Unknown names are logged and dropped. |
 
@@ -119,7 +119,7 @@ Each phase is its own PR. Phase 1 is roughly one migration, one lib file with te
 - A sibling stops emitting: in `live`, Max's weekly check counts events per source for the last 7 days and names any source at zero that was above zero the week before.
 - Events pile up unconsumed: the poller alerts when the oldest unconsumed row is older than 15 minutes.
 
-## 9. Decisions for Ron
+## 9. Decisions (Ron took all four recommendations on 2026-11-08)
 
 1. **Build now or park?** See section 2. Recommendation: phase 1 only, in shadow, because it is small and reversible. Phases 3 and 4 wait until phase 2 has shown one event that changed what Ron did that morning.
 2. **Which two AXON events prove it?** Candidates: a Document Factory run finished or was rejected; a launch QA check failed. Recommendation: launch QA failed (`needs_human`) and factory run failed (`error`), because both are things a person must act on and both sit only in AXON's channel today.
