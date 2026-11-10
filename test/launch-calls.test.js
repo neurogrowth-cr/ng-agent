@@ -38,7 +38,7 @@ s = lc.launchCallsStatus({ startedAt: LAUNCH, now: at(1), appointments: [
   { calendarId: ACTIVATION, startMs: at(30), status: 'confirmed' },
 ] });
 check('3a cancelled delivery, 1:1 at day 20, activation calendar: both missing', s.missing, ['delivery', 'review']);
-check('3b flag names both', lc.launchCallsFlag(s), ' 📞 not booked: official delivery call, 1:1 review at one month');
+check('3b flag names both', lc.launchCallsFlag(s), ' 📞 not booked: launch call, 30-day call');
 s = lc.launchCallsStatus({ startedAt: LAUNCH, now: at(1), appointments: [{ calendarId: DELIVERY, startMs: at(-3), status: 'showed' }] });
 check('3c delivery held 3 days before launch counts; review missing', s.missing, ['review']);
 s = lc.launchCallsStatus({ startedAt: LAUNCH, now: at(1), appointments: [{ calendarId: 'NEW-1ON1', startMs: at(29), status: 'confirmed' }], extraReview: ['NEW-1ON1'] });

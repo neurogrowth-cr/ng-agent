@@ -60,6 +60,9 @@ check('quick sync by calendar id',
 check('quick sync by name',      reason({ sourceRaw: 'LinkedIn Flywheel Quick Sync' }) !== null);
 check('quick sync, no space',    reason({ sourceRaw: 'LinkedIn Flywheel QuickSync' }) !== null);
 check('official delivery by id', reason({ calendarIds: ['VTdxE8vEJ26U509wazNL'] }) !== null);
+check('session 1:1 Gerald by id', reason({ calendarIds: ['WQPvlvNFh9Lp9Tb1OVez'] }) !== null);
+check('session 1:1 Valeria by id', reason({ calendarIds: ['usjXU48iZdCDVL5gLR9D'] }) !== null);
+check('session 1:1 by name (no attribution)', reason({ sourceRaw: 'LinkedIn Flywheel - Session 1:1  Gerald' }) !== null);
 // The live calendar name has a leading space — trimming is not assumed anywhere.
 check('official delivery by name (leading space, as stored in GHL)',
   reason({ sourceRaw: ' LinkedIn Flywheel Official Delivery' }) !== null);

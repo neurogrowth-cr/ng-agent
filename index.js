@@ -15684,6 +15684,8 @@ const CLIENT_CALL_CALENDAR_IDS = new Set([
   'H9q2eNZMsr0APPCrinWC', // LinkedIn Flywheel - Client 1:1 with Josue
   'rRh3CZnC4DlF3Fo1HqXq', // LinkedIn Flywheel - Client 1:1 with Ron
   'VTdxE8vEJ26U509wazNL', // LinkedIn Flywheel Official Delivery
+  'WQPvlvNFh9Lp9Tb1OVez', // LinkedIn Flywheel - Session 1:1 Gerald (found 2026-11-09, #472)
+  'usjXU48iZdCDVL5gLR9D', // LinkedIn Flywheel - Session 1:1 Valeria (found 2026-11-09, #472)
   // Env override so a new client calendar can be covered without a deploy.
   ...String(process.env.CLIENT_CALL_CALENDAR_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
 ]);
