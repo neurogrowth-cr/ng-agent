@@ -6607,9 +6607,9 @@ async function runProactiveDMs(_correlationId) {
       console.log(`Proactive DM sent to client_success: ${stuckPhase0.length} Phase 0 client(s) stuck ≥7 days`);
     }
 
-    // ── DM client success: clients hitting Day 20 in Phase 3 (stabilization) ──
+    // ── DM client success: clients hitting Day 30 in Phase 3 (stabilization) ──
     // Uses stabilization_started_at as the Day 1 anchor.
-    // Day 20 = time to reach out, schedule the 1:1 progress check, coordinate with client.
+    // Day 30 = the 1:1 review at one month (Ron, 2026-11-09; was day 20).
     const { data: phase3Clients } = await portalSupabase
       .from('client_dashboards')
       .select('id, client_name, stabilization_started_at')
@@ -6617,32 +6617,32 @@ async function runProactiveDMs(_correlationId) {
       .eq('customer_status', 'phase_3')
       .not('stabilization_started_at', 'is', null);
 
-    const hitting20InStabilization = (phase3Clients || []).filter(d => {
+    const hittingReviewInStabilization = (phase3Clients || []).filter(d => {
       const daysInStabilization = Math.floor((now - new Date(d.stabilization_started_at).getTime()) / (1000 * 60 * 60 * 24));
-      return daysInStabilization === 20;
+      return daysInStabilization === launchCalls.REVIEW_DAY;
     });
 
-    const approaching20InStabilization = (phase3Clients || []).filter(d => {
+    const approachingReviewInStabilization = (phase3Clients || []).filter(d => {
       const daysInStabilization = Math.floor((now - new Date(d.stabilization_started_at).getTime()) / (1000 * 60 * 60 * 24));
-      return daysInStabilization === 18; // 2-day heads up before Day 20
+      return daysInStabilization === launchCalls.REVIEW_DUE_SOON_DAY; // 2-day heads up
     });
 
-    if (hitting20InStabilization.length > 0) {
-      const names = hitting20InStabilization.map(d => d.client_name).join(', ');
-      const msg = `Day 20 in stabilization today for: ${names}. This is the checkpoint — time to reach out to the client, schedule the 1:1 progress check, and confirm how the campaign is performing. Can you get that call on the calendar and flag anything that needs Ron's attention?`;
+    if (hittingReviewInStabilization.length > 0) {
+      const names = hittingReviewInStabilization.map(d => d.client_name).join(', ');
+      const msg = `Day 30 in stabilization today for: ${names}. The 1:1 review at one month is due: confirm the call is on the calendar and flag anything that needs Ron's attention.`;
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to client_success: ${hitting20InStabilization.length} client(s) at Day 20 stabilization`);
+      console.log(`Proactive DM sent to client_success: ${hittingReviewInStabilization.length} client(s) at Day 30 stabilization`);
     }
 
-    if (approaching20InStabilization.length > 0) {
-      const names = approaching20InStabilization.map(d => d.client_name).join(', ');
-      const msg = `Heads up — these clients hit Day 20 in stabilization in 2 days: ${names}. Start preparing the 1:1 progress check outreach so it's ready to go on Day 20.`;
+    if (approachingReviewInStabilization.length > 0) {
+      const names = approachingReviewInStabilization.map(d => d.client_name).join(', ');
+      const msg = `Heads up: these clients reach Day 30 in stabilization in 2 days: ${names}. Prepare the 1:1 review at one month.`;
       for (const id of slackIdsByRole('client_success')) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
-      console.log(`Proactive DM sent to client_success: ${approaching20InStabilization.length} client(s) approaching Day 20 stabilization`);
+      console.log(`Proactive DM sent to client_success: ${approachingReviewInStabilization.length} client(s) approaching Day 30 stabilization`);
     }
 
     console.log('Proactive team DMs complete.');
@@ -10474,6 +10474,57 @@ async function runSalesCallPrep(_correlationId) {
 // ─── FULFILLMENT MORNING STANDUP ──────────────────────────────────────────────
 // Fires 9:00 AM CR Mon–Fri. DMs each fulfillment team member with their
 // specific priorities for the day — no meeting needed.
+// ─── LAUNCH CALLS (Ron, 2026-11-09) ───────────────────────────────────────
+// For every Phase 3 client in stabilization days 0 to 30, read the client's
+// GHL appointments (exact email match only: a fuzzy match could read someone
+// else's calendar) and name the launch call that is not booked. Read-only.
+// Kill switch: LAUNCH_CALLS_CHECK=off. Extra calendar ids without a deploy:
+// LAUNCH_DELIVERY_CALENDAR_IDS, LAUNCH_REVIEW_CALENDAR_IDS (comma lists).
+const launchCalls = require('./lib/launchCalls');
+const envIds = (k) => String(process.env[k] || '').split(',').map(x => x.trim()).filter(Boolean);
+
+// Throws on a read error so a failed read never reads as "not booked".
+async function ghlAppointmentsByEmail(email) {
+  const headers = { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' };
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&email=${encodeURIComponent(email)}`,
+    { headers }, { label: 'GET /contacts/search/duplicate' });
+  if (!res.ok) throw new Error(`contact search -> ${res.status}`);
+  const data = await res.json();
+  const contact = data.contact || (data.contacts || [])[0];
+  if (!contact || !contact.id) return null;
+  const ar = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contact.id}/appointments`,
+    { headers }, { label: 'GET /contacts/:id/appointments' });
+  if (!ar.ok) throw new Error(`appointments -> ${ar.status}`);
+  const ad = await ar.json();
+  return (ad.events || []).filter(e => e && !e.deleted)
+    .map(e => ({ calendarId: e.calendarId, startMs: parseGhlApptTime(e.startTime), status: e.appointmentStatus || e.status || '' }));
+}
+
+async function launchCallsStandupLines(phase3Clients, now = Date.now()) {
+  if (String(process.env.LAUNCH_CALLS_CHECK || '').toLowerCase() === 'off') return [];
+  const lines = [];
+  for (const d of phase3Clients || []) {
+    const day = launchCalls.stabilizationDay(d.stabilization_started_at, now);
+    if (day == null || day < 0 || day > launchCalls.CHECK_UNTIL_DAY) continue;
+    let status = null, readFailed = false, noContact = false;
+    if (!d.email) noContact = true;
+    else {
+      try {
+        const appts = await ghlAppointmentsByEmail(d.email);
+        if (appts == null) noContact = true;
+        else status = launchCalls.launchCallsStatus({ startedAt: d.stabilization_started_at, appointments: appts, now,
+          extraDelivery: envIds('LAUNCH_DELIVERY_CALENDAR_IDS'), extraReview: envIds('LAUNCH_REVIEW_CALENDAR_IDS') });
+      } catch (err) {
+        readFailed = true;
+        console.warn(`Launch calls: GHL read failed for ${d.client_name}: ${err.message}`);
+      }
+    }
+    const flag = launchCalls.launchCallsFlag(status, { readFailed, noContact });
+    if (flag) lines.push(`• ${d.client_name}, Day ${day}:${flag}`);
+  }
+  return lines;
+}
+
 async function runFulfillmentStandup(_correlationId) {
   console.log('Running fulfillment morning standup DMs...');
   try {
@@ -10738,11 +10789,23 @@ async function runFulfillmentStandup(_correlationId) {
         if (!d) return name;
         const anchor  = d.stabilization_started_at ? new Date(d.stabilization_started_at) : new Date(d.created_at);
         const stabDay = Math.floor((now - anchor.getTime()) / (1000 * 60 * 60 * 24));
-        const flag    = stabDay >= 20 ? ' 🔴 1:1 overdue — schedule now' : stabDay >= 18 ? ' 📅 1:1 due in ~2 days' : '';
-        return `${name} — Stabilization Day ${stabDay}${flag}`;
+        // The 1:1 review is at one month after launch (Ron, 2026-11-09; was day 20).
+        return `${name}, Stabilization Day ${stabDay}${launchCalls.reviewFlag(stabDay)}`;
       }));
     } else {
       taniaLines.push(`📈 *Phase 3:* No clients in stabilization.\n`);
+    }
+
+    // Launch calls: the official delivery call and the 1:1 review at one month
+    // must be on the GHL calendar from launch (Ron, 2026-11-09). Listed every
+    // day while one is missing, outside the delta, because a collapsed
+    // "unchanged" line would hide it.
+    try {
+      const callLines = await launchCallsStandupLines(phase3Clients, now);
+      if (callLines.length) taniaLines.push(`📞 *Launch calls not on the calendar (${callLines.length}):*`, ...callLines, '');
+    } catch (err) {
+      console.error('Launch calls check failed:', err.message);
+      taniaLines.push('⚠️ *Launch calls:* check failed today, see the logs.', '');
     }
 
     // Blocked delta
