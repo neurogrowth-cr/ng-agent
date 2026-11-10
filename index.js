@@ -87,7 +87,10 @@ function sanitizeModelInput(value) {
 
 // ICM model tiers — the only place model ids may appear (env-overridable, no redeploy to switch)
 const MODEL_AGENT = process.env.NG_AGENT_MODEL || 'claude-sonnet-4-6';
-const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-4-5-20251001';
+// Haiku 5.5 since 2026-11-09: $0.10/$0.50 vs Haiku 4.5's $1/$5. It rejects
+// temperature/top_p/top_k and assistant prefill, and thinks by default, so every
+// MODEL_LIGHT call keeps THINKING_OFF (accepted at the default effort, medium).
+const MODEL_LIGHT = process.env.NG_AGENT_MODEL_LIGHT || 'claude-haiku-5-5';
 // Pinned off on EVERY Claude call. Sonnet 4.6 runs thinking-off when `thinking` is
 // omitted; Sonnet 5 runs ADAPTIVE thinking on the same request, and thinking tokens
 // count against max_tokens. The Sonnet 5 shadow (PR #234, 2026-09-30 to 10-05) lost
@@ -15041,6 +15044,9 @@ const ICM_MODEL_RATES = [
   // Sonnet 5 is cheaper than 4.6: $2/$10, 1h cache write 2x, read 0.1x (verified 2026-09-16)
   { prefix: 'claude-sonnet-5',   in: 2, out: 10, write: 4, read: 0.2 },
   { prefix: 'claude-haiku-4-5',  in: 1, out: 5,  write: 2, read: 0.1 },
+  // Haiku 5.5: $0.10/$0.50 for prompts up to 100K tokens (every Max/Kai/REVI
+  // classifier prompt is far below that); 1h write 2x, read 0.1x
+  { prefix: 'claude-haiku-5-5',  in: 0.1, out: 0.5, write: 0.2, read: 0.01 },
 ];
 function icmRates(model) {
   const m = String(model || '').toLowerCase();
