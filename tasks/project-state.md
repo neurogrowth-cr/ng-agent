@@ -1150,3 +1150,13 @@ Josué's 1:1 calendar `H9q2eNZMsr0APPCrinWC` no longer exists (400); Gerald's an
 session calendars are new and are not in `CLIENT_CALL_CALENDAR_IDS` (the lead-intake filter),
 so a client booking one could still be posted as a sales lead (not fixed here). Quick Sync does
 not count as either launch call. First real standup with the block: the next weekday 09:00 CR.
+
+## 2026-11-09: session 1:1 calendars of Gerald and Valeria count as client calls (#474)
+
+Gerald's (`WQPvlvNFh9Lp9Tb1OVez`) and Valeria's (`usjXU48iZdCDVL5gLR9D`) session 1:1 calendars,
+live in GHL since 2026-11-05, joined `CLIENT_CALL_CALENDAR_IDS`, so a client booking one is no
+longer a candidate sales lead (before, only the `1:1` name regex stood in the way). Checked the
+same day: their 6 bookings (4 contacts) created no `lead_posts` row; the rows those contacts
+have date from June and July, when they were leads. The #472 standup labels now read "launch
+call" and "30-day call" (Ron: activation, launch and 30-day are the three launch-cycle calls;
+activation is already watched elsewhere in Max).
