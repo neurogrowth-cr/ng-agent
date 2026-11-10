@@ -28,6 +28,7 @@ const near = (a, b) => Math.abs(a - b) < 1e-9;
 // ── 1. Prefix matching. Dated ids must resolve; unknown models must never
 // price at $0 (that would silently hide spend from the report).
 check('1a  dated haiku id resolves to haiku rates', icmRates('claude-haiku-4-5-20251001').in, 1);
+check('1a2 haiku 5.5 prices at its own rates, not haiku 4.5 or the sonnet fallback', icmRates('claude-haiku-5-5').in, 0.1);
 check('1b  sonnet-4-6 exact', icmRates('claude-sonnet-4-6').out, 15);
 check('1c  sonnet-5 (AXON) resolves to its own row, not 4.6', icmRates('claude-sonnet-5').prefix, 'claude-sonnet-5');
 // Sonnet 5 is $2 in / $10 out, 1h cache write 2x ($4), cache read 0.1x ($0.2).
@@ -37,7 +38,7 @@ check('1f  sonnet-5 rates are $2/$10/$4/$0.2', (({ in: i, out, write, read }) =>
 check('1g  sonnet-4-6 rates unchanged at $3/$15/$6/$0.3', (({ in: i, out, write, read }) => ({ in: i, out, write, read }))(icmRates('claude-sonnet-4-6')),
   { in: 3, out: 15, write: 6, read: 0.3 });
 check('1h  every row keeps write = 2x input and read = 0.1x input',
-  ['claude-sonnet-4-6', 'claude-sonnet-5', 'claude-haiku-4-5'].every((m) => { const r = icmRates(m); return near(r.write, r.in * 2) && near(r.read, r.in * 0.1); }), true);
+  ['claude-sonnet-4-6', 'claude-sonnet-5', 'claude-haiku-4-5', 'claude-haiku-5-5'].every((m) => { const r = icmRates(m); return near(r.write, r.in * 2) && near(r.read, r.in * 0.1); }), true);
 check('1d  unknown model falls back to sonnet rates, not $0', icmRates('claude-opus-9').in, 3);
 check('1e  null model does not throw', icmRates(null).in, 3);
 
