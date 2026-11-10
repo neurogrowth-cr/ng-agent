@@ -1184,3 +1184,15 @@ arrival although the guardian is closed 20:00 to 08:00 CR. Both surfaced in the 
 none missed, yellow 1 to 4, red more than 4. `cardLagMinutes` counts from 08:00 CR for messages
 that came in before opening; the 18:00 digest median uses it too. 5 new checks in
 `test/pipeline-guardian.test.js`.
+
+## 2026-11-10: Kai watch tells a Prosp firewall block from failed client reads (#479)
+
+Max kept posting `KAI PROBLEM: LATER-MESSAGES READER CANNOT READ THREADS` (09:15 and 14:45 CR on
+2026-11-10, 70% and 64%) after ng-automation #124 staggered Kai's readers. Kai's logs showed the
+thread watch cut short by Prosp's IP firewall at 12 to 15 reads a minute with no other Kai reader
+running and AXON idle: Railway's outbound address is shared with other customers, so the traffic is
+usually not ours. `lib/kaiHealth.js`: leads a block left unread (`blockedStopped` on Kai /health,
+ng-automation #128) no longer count toward the `thread_watch_reads` share; new check
+`thread_watch_blocked` ("Later-messages reader blocked by Prosp") goes red after 3 cut runs in a row
+(`blockedRunsInARow`) and names the Railway static outbound IP as the lever. Older Kai without the
+fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
