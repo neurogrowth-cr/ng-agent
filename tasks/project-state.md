@@ -1127,3 +1127,26 @@ projected ~$6-7 with discipline protocol + batch tier (ng-axon PRs #36-#37).
   - Fails closed on a bad payload, and the admin link must point into `dash.neurogrowth.io/admin`. Each request id posts once (24 h memory). If Slack refuses the post, Ron gets a DM with the admin link.
 - **Verified live 2026-11-09:** one TEST help request and one TEST campaign request from the internal Neurogrowth dashboard produced exactly one post each in #ng-marktech-internal, both tagging @fulfillment. Both tests were then closed in the admin.
 - **Tests:** `test/portal-request.test.js`; all tests pass.
+
+## 2026-11-09: launch calls booked check in the fulfillment standup; 1:1 review at one month (#472)
+
+Ron, 2026-11-09 (strategy plan-of-record UPDATE 2026-11-09, roi-rm-okr-reporting #111): the
+1:1 review after launch moves from day 20 to one month (stabilization day 30), and Max checks
+that the two launch calls of the Fulfilment SOP are on the GHL calendar. The 09:00 fulfillment
+standup now lists, for every Phase 3 client in stabilization days 0 to 30, the call that is not
+booked: the official delivery call (Official Delivery calendar `VTdxE8vEJ26U509wazNL`, days -14
+to 21 from launch) and the 1:1 review (Client 1:1 with Ron `rRh3CZnC4DlF3Fo1HqXq`, Session 1:1
+Gerald `WQPvlvNFh9Lp9Tb1OVez`, Session 1:1 Valeria `usjXU48iZdCDVL5gLR9D`, days 25 to 40). The
+block shows every day while a call is missing, outside the delta. The GHL contact is found by
+exact email only (`contacts/search/duplicate`); a failed read or a missing contact is named as
+such. Launch is `client_dashboards.stabilization_started_at`. The 1:1 reminders on the
+stabilization line moved from 18/20 to 28/30 (also in the disabled `runProactiveDMs`). Rules in
+`lib/launchCalls.js`, tests in `test/launch-calls.test.js`. Kill switch `LAUNCH_CALLS_CHECK=off`;
+extra calendar ids `LAUNCH_DELIVERY_CALENDAR_IDS`, `LAUNCH_REVIEW_CALENDAR_IDS`.
+
+Dry read against production before the merge: 15 Phase 3 clients, 7 in days 0 to 30, none with
+both calls booked, 3 with no GHL contact under their dashboard email. GHL calendars read live:
+Josué's 1:1 calendar `H9q2eNZMsr0APPCrinWC` no longer exists (400); Gerald's and Valeria's
+session calendars are new and are not in `CLIENT_CALL_CALENDAR_IDS` (the lead-intake filter),
+so a client booking one could still be posted as a sales lead (not fixed here). Quick Sync does
+not count as either launch call. First real standup with the block: the next weekday 09:00 CR.
