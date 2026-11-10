@@ -23066,7 +23066,7 @@ async function guardianStats(now) {
   const rejections = decided.length - approvals;
   const cards7 = all.filter((r) => r.kind !== 'stop');
   const expired7 = cards7.filter((r) => r.status === 'expired').length;
-  const minutes = today.filter((r) => r.kind === 'reply' && r.lead_message_at).map((r) => (Date.parse(r.created_at) - Date.parse(r.lead_message_at)) / 60000);
+  const minutes = today.filter((r) => r.kind === 'reply' && r.lead_message_at).map((r) => guardian.cardLagMinutes(Date.parse(r.lead_message_at), Date.parse(r.created_at)));
   return {
     dayStartIso,
     leadsRead: 0,
@@ -23129,7 +23129,7 @@ async function runGuardianWatchdog(correlationId) {
   // Sends the activity log saw that no sent row with an approver explains.
   const sentWithoutApproval = Math.max(stats.sentWithoutApproval, (sentRows || []).length - stats.sent);
   const m = {
-    daysActive, runsToday: (okRuns || []).length, capStreak, cardsToday: stats.cardsToday, isWeekday: dow >= 1 && dow <= 5, inboundToday,
+    daysActive, runsToday: (okRuns || []).length, expectedRuns: guardian.expectedRuns(now), capStreak, cardsToday: stats.cardsToday, isWeekday: dow >= 1 && dow <= 5, inboundToday,
     approvals: stats.approvals, rejections: stats.rejections, medianMinutes: stats.medianMinutes, expiredShare: stats.expiredShare,
     sentInShadowOrOff: stats.sentInShadowOrOff + (guardianMode() !== 'draft' ? (sentRows || []).length : 0),
     sentWithoutApproval, divergence: stats.divergence, maxDraftsPerRun: GUARDIAN_MAX_DRAFTS_PER_RUN,

@@ -227,6 +227,12 @@ check('expired 20% yellow, 30% red', [levels({ ...warm, expiredShare: 0.2 }).exp
 check('warmup keeps the gated rows green', levels({ ...warm, daysActive: 2, runsToday: 3, cardsToday: 0 }).runs, 'green');
 check('zero tolerance ignores warmup', [levels({ ...warm, daysActive: 0, sentInShadowOrOff: 1 }).sent_in_shadow, levels({ ...warm, daysActive: 0, sentWithoutApproval: 1 }).sent_without_approval], ['red', 'red']);
 check('divergence 1 yellow, 2 red', [levels({ ...warm, divergence: 1 }).divergence, levels({ ...warm, divergence: 2 }).divergence], ['yellow', 'red']);
+const crAt = (hhmm) => Date.parse(`2026-11-10T${hhmm}:00-06:00`);
+check('runs due: none before 08:10, 1 at 08:10, 32 at 16:05 (the 16:00 run may still be going), 52 at night', [pg.expectedRuns(crAt('07:30')), pg.expectedRuns(crAt('08:10')), pg.expectedRuns(crAt('16:05')), pg.expectedRuns(crAt('23:00'))], [0, 1, 32, 52]);
+check('mid-day runs on schedule are green, not red', levels({ ...warm, runsToday: 33, expectedRuns: 33 }).runs, 'green');
+check('mid-day runs: 2 missed yellow, 5 missed red', [levels({ ...warm, runsToday: 31, expectedRuns: 33 }).runs, levels({ ...warm, runsToday: 28, expectedRuns: 33 }).runs], ['yellow', 'red']);
+check('overnight message lag counts from 08:00', Math.round(pg.cardLagMinutes(crAt('22:00') - 24 * 3600000, crAt('08:07'))), 7);
+check('daytime message lag is the plain gap', Math.round(pg.cardLagMinutes(crAt('10:00'), crAt('10:12'))), 12);
 check('median helper', [pg.median([5, 1, 3]), pg.median([1, 2, 3, 4]), pg.median([])], [3, 2.5, null]);
 
 // ── prompts and parsing ──
