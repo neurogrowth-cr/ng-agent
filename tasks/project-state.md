@@ -1160,3 +1160,16 @@ same day: their 6 bookings (4 contacts) created no `lead_posts` row; the rows th
 have date from June and July, when they were leads. The #472 standup labels now read "launch
 call" and "30-day call" (Ron: activation, launch and 30-day are the three launch-cycle calls;
 activation is already watched elsewhere in Max).
+
+## 2026-11-09: light model on Haiku 5.5 (#476)
+
+`MODEL_LIGHT` default moved from `claude-haiku-4-5-20251001` to `claude-haiku-5-5` ($0.10/$0.50
+per MTok vs $1/$5). Every light call already pinned `THINKING_OFF` and sent no temperature or
+prefill, so no call site changed. The ICM cost report got a Haiku 5.5 rate row (unknown models
+price at the Sonnet fallback). Same switch shipped for Kai (ng-automation #122, plus the
+`automation_global_settings.classifier_model` row) and REVI (ng-revi #117). Why: the Anthropic
+"cache hit rate is low" email (2026-11-06) led to a spend audit: about $117/month across the
+fleet, factory $62 and already 98% cached, so caching had little left to give and the Haiku swap
+(about $5/month) was the low-risk lever. Sonnet 4.6 to 5.5 was not done: Sonnet 5.5 rejects
+`THINKING_OFF` and `temperature`, and needs a new shadow week. Rollback: env
+`NG_AGENT_MODEL_LIGHT=claude-haiku-4-5-20251001`. Deploy `12b01fdb` SUCCESS 2026-11-10 01:50 UTC.
