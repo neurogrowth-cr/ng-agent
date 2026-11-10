@@ -344,6 +344,15 @@ check('a stand-down during the wait is not auto-send holding back', /detail->>'s
   const p1 = kai.stepKaiWatch(st, wired, T0); st = p1.state;
   const p2 = kai.stepKaiWatch(st, wired, at(15));
   check('tw11 alerts on the second stale poll, not the first', [p1.alerts.length, p2.alerts.length, p2.alerts[0] && p2.alerts[0].title], [0, 1, 'Later-messages reader stopped']);
+  // Firewall-cut runs (Kai /health blockedStopped + blockedRunsInARow, ng-automation 2026-11-10)
+  const cutRun = { candidates: 253, read: 77, unreadable: 176, blockedStopped: 176 };
+  check('tw12 one firewall-cut run: no read alarm, no block alarm', ids(kai.evaluateThreadWatch(tw({ lastSummary: cutRun, blockedRunsInARow: 1 }), T0)), []);
+  check('tw13 cut run with real client failures still trips the read alarm', ids(kai.evaluateThreadWatch(tw({ lastSummary: { candidates: 253, read: 50, unreadable: 103, blockedStopped: 70 }, blockedRunsInARow: 1 }), T0)), ['thread_watch_reads']);
+  const streak3 = kai.evaluateThreadWatch(tw({ lastSummary: cutRun, blockedRunsInARow: 3 }), T0);
+  check('tw14 three cut runs in a row: block alarm only', ids(streak3), ['thread_watch_blocked']);
+  check('tw15 block alarm names the streak and the static IP lever', /3 hourly runs in a row/.test(streak3.find((r) => r.id === 'thread_watch_blocked').reason) && /static outbound IP/.test(streak3.find((r) => r.id === 'thread_watch_blocked').reason), true);
+  check('tw16 older Kai without the new fields: unchanged behaviour', ids(kai.evaluateThreadWatch(tw({ lastSummary: { candidates: 100, read: 60, unreadable: 40 } }), T0)), ['thread_watch_reads']);
+  check('tw17 Kai down: block check skipped too', kai.evaluateKaiChecks({ health: { ok: false, error: 'x' }, snapshot: HEALTHY, now: T0 }).some((r) => r.id === 'thread_watch_blocked' && r.skip), true);
 }
 
 check('a pleasantry Kai closed is not counted as held back', /NOT IN \('prospect_declined', 'pleasantry'\)/.test(kai.DIGEST_SQL.daily), true);
