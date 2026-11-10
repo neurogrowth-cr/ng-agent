@@ -1173,3 +1173,14 @@ fleet, factory $62 and already 98% cached, so caching had little left to give an
 (about $5/month) was the low-risk lever. Sonnet 4.6 to 5.5 was not done: Sonnet 5.5 rejects
 `THINKING_OFF` and `temperature`, and needs a new shadow week. Rollback: env
 `NG_AGENT_MODEL_LIGHT=claude-haiku-4-5-20251001`. Deploy `12b01fdb` SUCCESS 2026-11-10 01:50 UTC.
+
+## 2026-11-10: Guardián watchdog judges runs due so far and lag from 08:00 (#478)
+
+The hourly `runGuardianWatchdog` compared runs-so-far with the full-day target (52, red below 48),
+so it read red every day until 20:00, and the lead-to-card median counted overnight messages from
+arrival although the guardian is closed 20:00 to 08:00 CR. Both surfaced in the Clarity Brief as
+"runs low, message-to-card lag 266 min" while Guardián was healthy (36 of 36 runs that day, 52 of
+52 on the weekend, 11 min median). Now `expectedRuns(now)` (10 min grace) sets the target: green
+none missed, yellow 1 to 4, red more than 4. `cardLagMinutes` counts from 08:00 CR for messages
+that came in before opening; the 18:00 digest median uses it too. 5 new checks in
+`test/pipeline-guardian.test.js`.
