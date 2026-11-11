@@ -17408,7 +17408,16 @@ const STRIKE_TEMPLATE_MARKERS = [
   'entiendo que el tiempo escasea',                    // variacion_st2_st3
   'pasaba a darle un seguimiento y preguntarle',       // 2nd_follow_up
   'pasaba a darle un ultimo seguimiento',              // last_follow_up_attempt
+  // Backlog situation pool (Ron, 2026-11-10/11), approved by Meta 2026-11-11.
+  'me gustaría entender si usted sigue estando interesado', // react_s1_sin_respuesta
+  'quedamos a medias la última vez',                   // react_s1_respondio_poco
+  'me quedé pensando en lo que me contó de su negocio', // react_s1_conto_negocio
+  'la última vez me preguntó por la inversión',        // react_s1_pregunto_precio
+  'sé que estas cosas se quedan para después',         // react_s2_calificar
+  'tengo espacio esta semana con José',                // react_s2_llamada
 ].map(strikeNormalizeText);
+// Strike 1 of the backlog campaign, any situation (health check of each run).
+const BACKLOG_STRIKE1_MARKERS = [0, 5, 6, 7, 8].map((i) => STRIKE_TEMPLATE_MARKERS[i]);
 // template_strike3_y_lost closes the case, so it lands on Strike 3 from any stage.
 const STRIKE_CLOSING_MARKER = strikeNormalizeText('Voy a cerrar su caso por ahora');
 function strikeIsClosingTemplate(body) {
@@ -23212,13 +23221,37 @@ function backlogReactMode() {
 async function backlogReactFirstSend(contactId, sinceMs) {
   const convoId = await ghlFindConversationId(contactId);
   if (!convoId) return null;
-  const marker = STRIKE_TEMPLATE_MARKERS[0]; // template_nuevo
   for (const m of await ghlGetConversationMessages(convoId)) {
     if (m.direction !== 'outbound' || m.messageType !== 'TYPE_WHATSAPP') continue;
     const at = Date.parse(m.dateAdded || m.createdAt || 0) || 0;
-    if (at >= sinceMs - 60 * 1000 && strikeNormalizeText(m.body).includes(marker)) return { at, status: m.status || null };
+    const body = strikeNormalizeText(m.body);
+    if (at >= sinceMs - 60 * 1000 && BACKLOG_STRIKE1_MARKERS.some((mk) => body.includes(mk))) return { at, status: m.status || null };
   }
   return null;
+}
+
+// Reads the whole thread and returns one of backlogReact.SITUATIONS, or null when
+// it cannot tell (the lead is then left for the next run, never tagged blind).
+async function backlogReactSituation(contactId, correlationId) {
+  const convoId = await ghlFindConversationId(contactId);
+  if (!convoId) return 'sin_respuesta';
+  const messages = await ghlGetConversationMessages(convoId);
+  const opts = { isAutomatedBody: strikeIsAutomatedBody };
+  const rule = backlogReact.ruleSituation(messages, opts);
+  if (rule) return rule;
+  const t0 = Date.now();
+  const res = await anthropic.messages.create({ model: MODEL_LIGHT, thinking: THINKING_OFF, max_tokens: 20, messages: [{ role: 'user', content: backlogReact.buildSituationPrompt(messages, opts) }] });
+  logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'backlog_react_situation');
+  return backlogReact.parseSituation(res.content.filter((b) => b.type === 'text').map((b) => b.text).join(''));
+}
+
+async function ghlSetContactField(contactId, fieldId, value) {
+  const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: [{ id: fieldId, field_value: value }] }),
+  }, { label: `PUT /contacts/${contactId} (field)` });
+  if (!res.ok) throw new Error(`contact field PUT ${contactId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
 async function runBacklogReactivation(correlationId) {
@@ -23253,26 +23286,51 @@ async function runBacklogReactivation(correlationId) {
     await upsertKnowledge('process', BACKLOG_REACT_PAUSE_KEY, JSON.stringify({ reason: paused, at: now }), 'backlog_react');
   }
 
+  const cards = [];
+  for (const stageId of Object.values(backlogReact.CONFIG.stages)) cards.push(...await ghlSearchOppsByStage(stageId));
+
+  // Struck out (Ron, 2026-11-10): the workflow tags reactivacion-cerrada 7 days
+  // after the closing template with no reply. Move the card to the Lost STAGE
+  // only. Never the status: status Lost fires "Outcome: Generic Lost" and the
+  // Outcome Webhook, and the dash then invents an appointment for a lead who
+  // never booked.
+  const struckOut = cards.filter((o) => String(o.status || 'open') === 'open'
+    && (o.contact?.tags || []).map((x) => String(x).toLowerCase()).includes(backlogReact.CONFIG.closedTag));
+  let closed = 0;
+  if (mode === 'live') {
+    for (const o of struckOut) {
+      try { await ghlMoveOpportunityStage(o.id, backlogReact.CONFIG.lostStageId); closed++; }
+      catch (err) { console.error(`backlog-react: Lost move failed ${o.id}:`, err.message); }
+    }
+  }
+
   let picked = [], eligible = 0, skips = {};
   if (!paused) {
     const clientEmails = await loadActiveClientEmails();
     if (!clientEmails) throw new Error('client list unavailable (portal client_dashboards)');
-    const cards = [];
-    for (const stageId of Object.values(backlogReact.CONFIG.stages)) cards.push(...await ghlSearchOppsByStage(stageId));
     const limit = Math.max(0, Number(process.env.BACKLOG_REACT_DAILY || 100));
     ({ picked, eligible, skips } = backlogReact.selectBacklog(cards, { now, limit, clientEmails, personalTag: PERSONAL_CONTACT_TAG }));
   }
+  // Read each thread and pick the situation; write it before the tag, because
+  // the tag starts the workflow and the workflow branches on the field.
+  const situations = {};
   const tagged = [], tagFailed = [];
-  if (mode === 'live') {
-    for (const o of picked) {
-      try { await ghlAddContactTag(o.contactId, backlogReact.CONFIG.enrolTag); tagged.push(o.contactId); }
-      catch (err) { tagFailed.push(o.contactId); console.error(`backlog-react: tag failed ${o.contactId}:`, err.message); }
-      await new Promise((r) => setTimeout(r, 150));
-    }
+  for (const o of picked) {
+    let situation = null;
+    try { situation = await backlogReactSituation(o.contactId, correlationId); }
+    catch (err) { console.error(`backlog-react: situation failed ${o.contactId}:`, err.message); }
+    situations[situation || 'sin_clasificar'] = (situations[situation || 'sin_clasificar'] || 0) + 1;
+    if (mode !== 'live' || !situation) continue;
+    try {
+      await ghlSetContactField(o.contactId, backlogReact.CONFIG.situationFieldId, situation);
+      await ghlAddContactTag(o.contactId, backlogReact.CONFIG.enrolTag);
+      tagged.push(o.contactId);
+    } catch (err) { tagFailed.push(o.contactId); console.error(`backlog-react: enrol failed ${o.contactId}:`, err.message); }
+    await new Promise((r) => setTimeout(r, 150));
   }
-  const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length : picked.length, eligible, health, paused });
+  const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length : picked.length, eligible, health, paused, situations, closed: mode === 'live' ? closed : struckOut.length });
   log('backlog_react_run', paused || health.level === 'red' || tagFailed.length ? 'warning' : 'ok',
-    { mode, tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, health: { ...health }, paused });
+    { mode, tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, situations, struck_out: struckOut.length, moved_to_lost: closed, health: { ...health }, paused });
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: mode === 'dry_run' ? `[DRY RUN] ${line}` : line })
     .catch((e) => console.error('backlog-react: DM failed:', e.message));
 }
