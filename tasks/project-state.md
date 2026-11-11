@@ -1196,3 +1196,7 @@ ng-automation #128) no longer count toward the `thread_watch_reads` share; new c
 `thread_watch_blocked` ("Later-messages reader blocked by Prosp") goes red after 3 cut runs in a row
 (`blockedRunsInARow`) and names the Railway static outbound IP as the lever. Older Kai without the
 fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
+
+## 2026-11-10: Kai escalations report weekly in the fulfillment channel ([PR #482](https://github.com/neurogrowth-cr/ng-agent/pull/482))
+- **Why (Ron):** a daily DM to Valeria added noise to everything else she does; the team should see it once a week and intervene from the channel.
+- **What:** `runKaiEscalationsDigest` runs Monday 08:30 CR (`30 8 * * 1`, also in `STATIC_CRON_SCHEDULES`) and posts to `OPS_CHANNEL` (#ng-fullfillment-ops). Header "semana del ...", plus last week's totals from `agent_knowledge` `intel/kai-escalations-weekly-state`. Same filters (over 48 h, still needs a person). A post that does not land throws, so the run is recorded as an error. `KAI_ESCALATION_DIGEST_TO` accepts a channel or user id. First run Monday 2026-11-16.
