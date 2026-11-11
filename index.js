@@ -4,6 +4,7 @@ const leadVolume = require('./lib/leadVolume');
 const firstTouchAdLib = require('./lib/firstTouchAd');
 const adAttribution = require('./lib/adAttribution');
 const hotReplies = require('./lib/hotReplies');
+const { excludeDemo, isDemoRecord, notDemoDashboard, DEMO_PROMPT_NOTE } = require('./lib/demoClient');
 const { blockedSummary } = require('./lib/blockedSummary');
 const replyClaims = require('./lib/replyClaims');
 const sequenceReplies = require('./lib/sequenceReplies');
@@ -345,7 +346,8 @@ const SYSTEM_PROMPT_DATA_MAP = `
 PORTAL DATA MAP — where portal data actually lives (query via query_portal_db):
 
 KEY TABLES
-- client_dashboards — one row per client. id (uuid — joins to customer_activities.customer_id), client_name, email, customer_status (phase_0|phase_1|phase_2|phase_3|live|blocked), customer_type, is_active, created_at, stabilization_started_at, linkedin_handler.
+- client_dashboards: one row per client. id (uuid, joins to customer_activities.customer_id), client_name, email, customer_status (phase_0|phase_1|phase_2|phase_3|live|blocked), customer_type, is_active, is_demo, created_at, stabilization_started_at, linkedin_handler.
+- DEMO CLIENT: ${DEMO_PROMPT_NOTE}
 - customer_activities — per-client checklist items. customer_id → client_dashboards.id (a few legacy rows point at customer_onboarding.id — check both), template_id → customer_activity_templates.id, status, assigned_to, notes, completed_at (timestamptz — the REAL calendar date the activity was completed).
 - customer_activity_templates — id, title, order_index, category. Titles like "Activation Call Completed" are ROW VALUES here, not column names.
 - customer_onboarding — intake form: email, first_name, last_name, company, service_tier, payment_status, onboarding_completed_at.
@@ -3418,6 +3420,7 @@ async function getClientStatus(clientName = null) {
         .from('client_dashboards')
         .select('id, client_name, email, customer_status, customer_type, is_active, created_at, stabilization_started_at, linkedin_handler, blocked_reason, blocked_at')
         .eq('is_active', true)
+        .eq('is_demo', false)
         .order('customer_status', { ascending: true })
         .range(dashFrom, dashFrom + PAGE_SIZE - 1);
       if (clientName) {
@@ -3520,15 +3523,38 @@ async function getClientStatus(clientName = null) {
 // The view exposes a derived phase0_step:
 //   1_awaiting_signup, 2_awaiting_terms, 3_awaiting_form,
 //   4_awaiting_activation_call, 5_ready_for_handoff
+// The demo client's dashboard ids and emails, for readers that cannot filter
+// on is_demo directly (v_phase0_fulfillment, activity-wide reads). Throws when
+// unreadable, so a caller never reports the demo by accident.
+async function loadDemoClients() {
+  const { data, error } = await portalSupabase.from('client_dashboards').select('id, email').eq('is_demo', true);
+  if (error) throw new Error(`demo client read: ${error.message}`);
+  return {
+    ids: new Set((data || []).map(d => d.id)),
+    emails: new Set((data || []).map(d => String(d.email || '').toLowerCase().trim()).filter(Boolean)),
+  };
+}
+
+// Drops the demo client's rows: by email (v_phase0_fulfillment) or by
+// customer_id (customer_activities read across every client).
+async function withoutDemoClients(rows, by = 'email') {
+  if (!rows) return rows;
+  const demo = await loadDemoClients();
+  return by === 'customer_id'
+    ? rows.filter(r => !demo.ids.has(r.customer_id))
+    : rows.filter(r => !demo.emails.has(String(r.email || '').toLowerCase().trim()));
+}
+
 async function getPhase0Clients() {
   try {
-    const { data, error } = await portalSupabase
+    const { data: rawData, error } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('id, email, first_name, last_name, company, status, phase0_step, days_in_phase0, terms_accepted_at, onboarding_completed_at, booking_calendar_url, dashboard_created, created_at')
       .order('phase0_step', { ascending: true })
       .order('created_at', { ascending: true });
     if (error) throw error;
-    if (!data || !data.length) return 'Phase 0 — no clients currently in pre-portal onboarding.';
+    const data = await withoutDemoClients(rawData || []);
+    if (!data.length) return 'Phase 0: no clients currently in pre-portal onboarding.';
 
     const stepLabel = {
       '1_awaiting_signup':          '🟠 Awaiting portal signup',
@@ -3672,6 +3698,7 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       .from('client_dashboards')
       .select('id, client_name, email, customer_status, customer_type, created_at, blocked_reason, blocked_at')
       .eq('is_active', true)
+      .eq('is_demo', false)
       .in('customer_status', ['blocked', 'phase_1', 'phase_2'])
       .order('created_at', { ascending: true });
     if (error) throw error;
@@ -3731,10 +3758,11 @@ async function getPortalAlerts({ mode = 'full' } = {}) {
       }
     }
     // ── Phase 0 alerts — pre-portal clients stuck or ready for handoff ──────────
-    const { data: phase0 } = await portalSupabase
+    const { data: rawPhase0 } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('id, email, first_name, last_name, company, phase0_step, days_in_phase0')
       .order('days_in_phase0', { ascending: false });
+    const phase0 = await withoutDemoClients(rawPhase0);
 
     const phase0Alerts = [];
     for (const r of (phase0 || [])) {
@@ -5083,12 +5111,13 @@ async function createSlackReminder(target, message, postAt) {
 async function runWeeklyPortalTrends(_correlationId) {
   console.log('Running weekly portal trend analysis...');
   try {
-    const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true);
+    const { data: dashboards } = await excludeDemo(portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true));
     const { data: templates }  = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
     const tMap = {};
     (templates || []).forEach(t => { tMap[t.id] = t.title; });
-    const { data: allActs } = await portalSupabase.from('customer_activities').select('customer_id, template_id, status, assigned_to, completed_at');
-    if (!dashboards || !allActs) return;
+    const { data: rawActs } = await portalSupabase.from('customer_activities').select('customer_id, template_id, status, assigned_to, completed_at');
+    if (!dashboards || !rawActs) return;
+    const allActs = await withoutDemoClients(rawActs, 'customer_id');
     const activationFor = await loadActivationDates();
 
     const phaseCounts = dashboards.reduce((acc, d) => { acc[d.customer_status] = (acc[d.customer_status]||0)+1; return acc; }, {});
@@ -5460,7 +5489,7 @@ function formatFridayDelta({ todayLabel, firstRun, delta, owners }) {
 async function runMondayGapDetection(correlationId) {
   console.log('Running Monday gap detection...');
   try {
-    const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true).in('customer_status', ['phase_1','phase_2','blocked']);
+    const { data: dashboards } = await excludeDemo(portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type, created_at').eq('is_active', true)).in('customer_status', ['phase_1','phase_2','blocked']);
     if (!dashboards || !dashboards.length) { console.log('No at-risk clients detected.'); return; }
     const { data: templates } = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
     const tMap = {};
@@ -5515,11 +5544,12 @@ async function runMondayGapDetection(correlationId) {
       }
     }
     // ── Phase 0 gaps: stuck ≥7 days ───────────────────────────────────────────
-    const { data: phase0Gaps } = await portalSupabase
+    const { data: rawPhase0Gaps } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
       .gte('days_in_phase0', 7)
       .order('days_in_phase0', { ascending: false });
+    const phase0Gaps = await withoutDemoClients(rawPhase0Gaps);
     const stepLabels = {
       '1_awaiting_signup': 'awaiting portal signup', '2_awaiting_terms': 'awaiting T&C',
       '3_awaiting_form': 'awaiting onboarding form', '4_awaiting_activation_call': 'awaiting activation call',
@@ -5703,7 +5733,8 @@ async function gatherFridayDeliveryData() {
   const { data: dashboards, error: dErr } = await portalSupabase
     .from('client_dashboards')
     .select('id, client_name, email, customer_status, created_at, stabilization_started_at')
-    .eq('is_active', true);
+    .eq('is_active', true)
+    .eq('is_demo', false);
   if (dErr) throw new Error(`client_dashboards read: ${dErr.message}`);
   const { data: templates, error: tErr } = await portalSupabase.from('customer_activity_templates').select('id, title');
   if (tErr) throw new Error(`activity templates read: ${tErr.message}`);
@@ -6255,12 +6286,13 @@ async function runNightlyLearning(correlationId) {
     } catch (e) { console.error('Nightly learning — calendar fetch error:', e.message); }
 
     try {
-      const { data: dashboards } = await portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type').eq('is_active', true);
+      const { data: dashboards } = await excludeDemo(portalSupabase.from('client_dashboards').select('id, client_name, email, customer_status, customer_type').eq('is_active', true));
       const { data: templates }  = await portalSupabase.from('customer_activity_templates').select('id, title, order_index');
       const tMap = {};
       (templates || []).forEach(t => { tMap[t.id] = t.title; });
       const today = new Date(); today.setHours(0,0,0,0);
-      const { data: recentActs } = await portalSupabase.from('customer_activities').select('customer_id, template_id, status, assigned_to, completed_at, notes').or(`status.eq.blocked,completed_at.gte.${today.toISOString()}`);
+      const { data: rawRecentActs } = await portalSupabase.from('customer_activities').select('customer_id, template_id, status, assigned_to, completed_at, notes').or(`status.eq.blocked,completed_at.gte.${today.toISOString()}`);
+      const recentActs = await withoutDemoClients(rawRecentActs, 'customer_id');
       if (dashboards && recentActs) {
         const clientMap = {};
         dashboards.forEach(d => { clientMap[d.id] = d; });
@@ -6447,6 +6479,7 @@ async function runProactiveDMs(_correlationId) {
       .from('client_dashboards')
       .select('id, client_name, email, customer_status, customer_type, created_at')
       .eq('is_active', true)
+      .eq('is_demo', false)
       .in('customer_status', ['phase_1', 'phase_2', 'phase_3', 'blocked']);
 
     if (!dashboards || !dashboards.length) {
@@ -6582,11 +6615,12 @@ async function runProactiveDMs(_correlationId) {
     }
 
     // ── DM client success: Phase 0 clients stuck ≥7 days in same step ─────────
-    const { data: stuckPhase0 } = await portalSupabase
+    const { data: rawStuckPhase0 } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
       .gte('days_in_phase0', 7)
       .order('days_in_phase0', { ascending: false });
+    const stuckPhase0 = await withoutDemoClients(rawStuckPhase0);
 
     if (stuckPhase0 && stuckPhase0.length > 0) {
       const stepLabels = {
@@ -6617,6 +6651,7 @@ async function runProactiveDMs(_correlationId) {
       .from('client_dashboards')
       .select('id, client_name, stabilization_started_at')
       .eq('is_active', true)
+      .eq('is_demo', false)
       .eq('customer_status', 'phase_3')
       .not('stabilization_started_at', 'is', null);
 
@@ -7015,6 +7050,7 @@ async function _scrapePhase0ToPhase1Conv7d() {
     .from('client_dashboards')
     .select('id')
     .gte('created_at', sevenDaysAgo)
+    .eq('is_demo', false)
     .in('customer_status', ['phase_1','phase_2','phase_3','live']);
   if (pErr) throw new Error(pErr.message);
   // Denominator: total active clients created in last 7 days (any status including phase_0)
@@ -7022,7 +7058,8 @@ async function _scrapePhase0ToPhase1Conv7d() {
     .from('client_dashboards')
     .select('id')
     .gte('created_at', sevenDaysAgo)
-    .eq('is_active', true);
+    .eq('is_active', true)
+    .eq('is_demo', false);
   if (tErr) throw new Error(tErr.message);
   const denom = total?.length || 0;
   if (denom === 0) return null;
@@ -7036,6 +7073,7 @@ async function _scrapePhaseCycleP50(targetStatus) {
     .from('client_dashboards')
     .select('id, email, created_at, customer_status')
     .eq('is_active', true)
+    .eq('is_demo', false)
     .eq('customer_status', targetStatus);
   if (error) throw new Error(error.message);
   if (!dashboards || !dashboards.length) return null;
@@ -7071,6 +7109,7 @@ async function _scrapeDay7AtRiskCount() {
     .from('client_dashboards')
     .select('id, email, created_at, customer_status')
     .eq('is_active', true)
+    .eq('is_demo', false)
     .in('customer_status', ['phase_1', 'phase_2']);
   if (error) throw new Error(error.message);
   if (!dashboards) return 0;
@@ -8104,8 +8143,10 @@ async function _scrapeDaysToLaunchAvg() {
   if (lErr) throw new Error(lErr.message);
   if (!launches || !launches.length) return null;
   const { data: dashboards, error: dErr } = await portalSupabase
-    .from('client_dashboards').select('id, email, created_at, customer_status');
+    .from('client_dashboards').select('id, email, created_at, customer_status, is_demo');
   if (dErr) throw new Error(dErr.message);
+  // The demo client never counts; a launch row with no dashboard keeps today's behavior.
+  const demoIds = new Set((dashboards || []).filter(isDemoRecord).map(d => d.id));
   const dashById = Object.fromEntries((dashboards || []).map(d => [d.id, d]));
   const activationFor = await loadActivationDates();
   // Latest launch-step completion per client = the launch date.
@@ -8115,6 +8156,7 @@ async function _scrapeDaysToLaunchAvg() {
   }
   const days = [];
   for (const [customerId, launchedAt] of Object.entries(launchByClient)) {
+    if (demoIds.has(customerId)) continue;
     const activation = activationFor(dashById[customerId]);
     if (!activation) continue;
     const d = (Date.parse(launchedAt) - Date.parse(activation)) / 86400000;
@@ -8138,7 +8180,8 @@ async function _scrapePendingActivations() {
   const { data: dashboards, error: dErr } = await portalSupabase
     .from('client_dashboards')
     .select('id, email, created_at, customer_status')
-    .eq('is_active', true);
+    .eq('is_active', true)
+    .eq('is_demo', false);
   if (dErr) throw new Error(dErr.message);
   const activationFor = await loadActivationDates();
   const cutoff = Date.now() - 7 * 86400000;
@@ -8423,7 +8466,7 @@ const ALL_TOOLS = [
           { name: 'search_portal_schema', description: "Find portal tables by plain-English keywords. Searches both table and column names (e.g. 'email linkedin client' returns every table that has a matching column, grouped by table). ALWAYS use this first when Ron asks for a field in natural language — do NOT guess table names.", input_schema: { type: 'object', properties: { keywords: { type: 'string', description: 'Space-separated keywords drawn from what Ron asked for.' } }, required: ['keywords'] } },
           { name: 'list_portal_tables',   description: 'List every table and view in the portal Supabase database. Use when Ron explicitly asks what tables exist, or as a fallback if search_portal_schema returns nothing.', input_schema: { type: 'object', properties: {} } },
           { name: 'describe_portal_table',description: 'Show full column list for a specific portal table. Call after search_portal_schema has narrowed things down and you need the complete column set before querying.', input_schema: { type: 'object', properties: { tableName: { type: 'string' } }, required: ['tableName'] } },
-          { name: 'query_portal_db',      description: 'Run a read-only SQL query (SELECT or WITH only) against the portal Supabase database. Use for ad-hoc lookups the pre-built tools do not cover — e.g. pulling emails or LinkedIn handles from arbitrary tables. Results capped at 500 rows. For standard onboarding/phase status prefer get_client_status / get_phase0_clients.', input_schema: { type: 'object', properties: { sql: { type: 'string', description: 'A single SELECT or WITH statement. No semicolons, no writes.' } }, required: ['sql'] } },
+          { name: 'query_portal_db',      description: `Run a read-only SQL query (SELECT or WITH only) against the portal Supabase database. Use for ad-hoc lookups the pre-built tools do not cover, e.g. pulling emails or LinkedIn handles from arbitrary tables. Results capped at 500 rows. For standard onboarding/phase status prefer get_client_status / get_phase0_clients. ${DEMO_PROMPT_NOTE}`, input_schema: { type: 'object', properties: { sql: { type: 'string', description: 'A single SELECT or WITH statement. No semicolons, no writes.' } }, required: ['sql'] } },
           { name: 'get_phase0_clients',   description: 'ALWAYS use this tool for Phase 0 (pre-portal onboarding) status — flywheel-ai clients who signed up but have not gone live yet. Covers: portal signup, T&C acceptance, onboarding form, activation call booking, handoff to Phase 1. Use in every fulfillment report to show the Phase 0 pipeline before get_client_status covers Phase 1+.',                                                                                                       input_schema: { type: 'object', properties: {} } },
           { name: 'create_slack_reminder',description: 'Schedule a one-off reminder message in Slack at a specific time. Use for "remind me/someone at X" requests. For recurring reminders use create_scheduled_task instead. Target can be a channel name (#ng-sales-goats) or a user ID (U… for a DM). Compute postAt as an ISO 8601 string in the user\'s timezone (default America/Costa_Rica) based on their natural-language time; must be in the future and within 120 days.',                     input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Channel name like #ng-sales-goats, or a Slack user ID like U08ABBFNGUW for a DM.' }, message: { type: 'string', description: 'The reminder text Max will post at the scheduled time.' }, postAt: { type: 'string', description: 'ISO 8601 datetime with timezone offset, e.g. 2026-04-24T15:00:00-06:00.' } }, required: ['target','message','postAt'] } },
           { name: 'add_calendar_attendees',description: 'Add guests to an existing Google Calendar event and send them invite emails. Use for "add X to the meeting", "forward the invite to Y", or "invite them to tomorrow\'s huddle". Workflow: call get_calendar_events first to find the event ID by summary/date, then call this tool with that ID and the list of attendee emails. Google sends update emails automatically.',                                                                                                                input_schema: { type: 'object', properties: { eventId: { type: 'string', description: 'Google Calendar event ID (returned in square brackets by get_calendar_events).' }, attendees: { type: 'array', items: { type: 'string' }, description: 'Array of email addresses to add as guests.' } }, required: ['eventId','attendees'] } },
@@ -10538,7 +10581,8 @@ async function runFulfillmentStandup(_correlationId) {
     const { data: dashboards } = await portalSupabase
       .from('client_dashboards')
       .select('id, client_name, email, customer_status, customer_type, created_at, stabilization_started_at, linkedin_handler, blocked_reason, blocked_at')
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .eq('is_demo', false);
 
     const { data: templates } = await portalSupabase
       .from('customer_activity_templates')
@@ -10556,10 +10600,11 @@ async function runFulfillmentStandup(_correlationId) {
       (actsByClient[a.customer_id] = actsByClient[a.customer_id] || []).push(a);
     });
 
-    const { data: phase0 } = await portalSupabase
+    const { data: rawPhase0 } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
       .order('days_in_phase0', { ascending: false });
+    const phase0 = await withoutDemoClients(rawPhase0);
 
     // Day anchors: the status-filtered allActivities fetch above excludes completed
     // rows, so fetch completed activities separately (one batched query) to find
@@ -10733,11 +10778,12 @@ async function runFulfillmentStandup(_correlationId) {
     const taniaSnap = await getYesterdayStandupSnapshot('tania');
     const taniaLines = [`Here's your ${today} client success brief:\n`];
 
-    const { data: phase0All } = await portalSupabase
+    const { data: rawPhase0All } = await portalSupabase
       .from('v_phase0_fulfillment')
       .select('email, first_name, last_name, company, phase0_step, days_in_phase0')
       .order('phase0_step', { ascending: true })
       .order('days_in_phase0', { ascending: false });
+    const phase0All = await withoutDemoClients(rawPhase0All);
 
     const p0StepLabels = {
       '1_awaiting_signup':          'awaiting portal signup',
@@ -18298,6 +18344,10 @@ async function getInnerCircleHuddleEvent() {
 // ─── SUPABASE WEBHOOK HANDLER ────────────────────────────────────────────────
 async function handlePhase3Transition(record) {
   const { email, client_name } = record;
+  if (isDemoRecord(record)) {
+    console.log('Phase 3 transition webhook: demo client, skipping.');
+    return;
+  }
   if (!email) {
     console.warn('Phase 3 transition webhook: no email on record, skipping.');
     return;
@@ -18322,7 +18372,7 @@ async function runPhase3Reconciliation(_correlationId) {
   try {
     // 1. Get all active phase_3 clients from portal
     const { rows } = await portalPg.query(
-      `SELECT client_name, email FROM client_dashboards WHERE customer_status = 'phase_3' AND is_active = true AND email IS NOT NULL`
+      `SELECT client_name, email FROM client_dashboards d WHERE d.customer_status = 'phase_3' AND d.is_active = true AND d.email IS NOT NULL AND ${notDemoDashboard('d')}`
     );
     if (!rows.length) { console.log('Phase 3 reconciliation: no active phase_3 clients.'); return; }
 
@@ -18382,7 +18432,7 @@ async function handleSupabaseWebhook(req, res) {
         if (table === 'client_dashboards' && type === 'UPDATE') {
           const wasPhase3 = old_record?.customer_status === 'phase_3';
           const isPhase3  = record?.customer_status === 'phase_3';
-          if (!wasPhase3 && isPhase3) await handlePhase3Transition(record);
+          if (!wasPhase3 && isPhase3 && !isDemoRecord(record)) await handlePhase3Transition(record);
         }
       } catch (parseErr) {
         console.error('Supabase webhook parse error:', parseErr.message);
@@ -23595,7 +23645,7 @@ async function checkGmailAlertQuality(correlationId, nowMs = Date.now()) {
   let missing = [];
   const { data: clients, error: clientErr } = await portalSupabase
     .from('client_dashboards')
-    .select('client_name, email, created_at')
+    .select('client_name, email, created_at, is_demo')
     .gte('created_at', new Date(since).toISOString())
     .lte('created_at', new Date(now - GMAIL_ALERT_GRACE_MS).toISOString())
     .limit(100);
@@ -23608,7 +23658,7 @@ async function checkGmailAlertQuality(correlationId, nowMs = Date.now()) {
     // silently turned a fail-closed path into a false-alarm generator.
     skipped.push(`client_dashboards divergence (<#${GMAIL_NEW_CLIENT_CHANNEL_ID}> unreadable)`);
   } else {
-    missing = (clients || []).filter(c => !cardExistsFor(c, seenCards))
+    missing = (clients || []).filter(c => !isDemoRecord(c) && !cardExistsFor(c, seenCards))
       .filter(c => !gmailAlertAlerted.has(`missing:${c.email}`));
     for (const c of missing) gmailAlertAlerted.add(`missing:${c.email}`);
   }
