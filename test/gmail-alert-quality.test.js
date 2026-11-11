@@ -62,7 +62,7 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
     }),
   };
   const factory = new Function(
-    'slack', 'portalSupabase', 'postMakeHealthAlert', 'logActivity', 'RON_SLACK_ID', 'console',
+    'slack', 'portalSupabase', 'postMakeHealthAlert', 'logActivity', 'RON_SLACK_ID', 'console', 'isDemoRecord',
     `${block}; return { checkGmailAlertQuality, evaluateAlertCard, cardExistsFor, shouldReportSkipOnly, isAlertCard };`
   );
   const api = factory(
@@ -71,6 +71,7 @@ function build({ history = {}, clients = [], clientErr = null, historyErr = {} }
     (e) => { logged.push(e); },
     'U05HXGX18H3',
     { log: () => {}, warn: () => {}, error: () => {} },
+    require('../lib/demoClient').isDemoRecord,
   );
   return { ...api, posted, logged };
 }
