@@ -74,6 +74,18 @@ check('4a capped at 10 client lines plus a remainder line', (capped.match(/^• 
 check('5a bad timestamp is null', daysAgo('not a date', now) === null && daysAgo(null, now) === null);
 check('5b future timestamp clamps to 0', daysAgo(new Date(now.getTime() + 3600e3).toISOString(), now) === 0);
 
+// ── 5b. Weekly report in the channel (Ron, 2026-11-10) ──────────────────────
+const weekly = formatKaiEscalationsDigest(s, { weekly: true, previous: { staleEscalated: 60, staleDrafted: 1 } });
+check('5c weekly header says the week', /^`KAI: ESCALADOS SIN ATENDER \(semana del /.test(weekly), weekly.split('\n')[0]);
+check('5d last week totals ride along', /Semana pasada: 60 escalados y 1 borrador\./.test(weekly), weekly);
+check('5e no previous week, no line', !/Semana pasada/.test(formatKaiEscalationsDigest(s, { weekly: true })));
+check('5f a broken previous state prints nothing', !/Semana pasada|NaN|undefined/.test(formatKaiEscalationsDigest(s, { weekly: true, previous: { staleEscalated: 'x' } })));
+const SRC = require('fs').readFileSync(require('path').join(__dirname, '..', 'index.js'), 'utf8');
+check('5g weekly on Monday 08:30 CR', /cron\.schedule\('30 8 \* \* 1', wrapCronJob\('runKaiEscalationsDigest'/.test(SRC) && /runKaiEscalationsDigest: +'30 8 \* \* 1',/.test(SRC));
+const fn = SRC.slice(SRC.indexOf('async function runKaiEscalationsDigest('), SRC.indexOf("cron.schedule('30 8 * * 1', wrapCronJob('runKaiEscalationsDigest'"));
+check('5i a post that did not land is an error, not a sent report', /if \(!posted \|\| posted\.ok === false\) throw/.test(fn));
+check('5h it posts to the fulfillment channel, not a DM to a person', /\|\| OPS_CHANNEL;/.test(fn) && !/slackIdsByRole\('fulfillment'\)/.test(fn) && !/U09Q3BXJ18B/.test(fn));
+
 // ── 6. A no and an answered thread are never in the count (Ron, 2026-11-04) ──
 for (const [name, sql] of Object.entries(SQL)) {
   check(`6a ${name} leaves out a prospect's no`, /classified_intent, ''\) <> 'unsubscribe'/.test(sql));

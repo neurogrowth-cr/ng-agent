@@ -19553,20 +19553,20 @@ cron.schedule('*/5 * * * *', wrapCronJob('pollAgentEvents', async () => { await 
 cron.schedule('0 18 * * *', wrapCronJob('runAgentEventsShadowDigest', async () => { await runAgentEventsShadowDigest(); }), { timezone: 'America/Costa_Rica' });
 console.log(`Registered static crons: agent events poll (*/5 * * * *) + shadow digest (0 18 * * * CR), mode ${agentEvents.eventsMode()}`);
 
-// Kai escalations digest (2026-11-03). Recipe: ~/automations/ops/recipes/kai-escalations-digest.md
-// The queue Kai hands to humans had no owner: 365 escalations and 118 drafts
-// sat unsent on 2026-11-03 and no Slack message existed for the escalated
-// rows. One weekday DM at 08:30 CR to the fulfillment role (Valeria), per
-// client, only when something has waited over 48 h. Pure logic and SQL in
-// lib/kaiEscalations.js (read-only on portalPg). Kill switch
-// KAI_ESCALATION_DIGEST=off; KAI_ESCALATION_DIGEST_TO=U... reroutes it;
-// KAI_ESCALATION_SINCE moves the cutoff for the per-client list.
+// Kai escalations report. Recipe: ~/automations/ops/recipes/kai-escalations-digest.md
+// The queue Kai hands to humans had no owner (365 escalations and 118 drafts
+// unsent on 2026-11-03). Since 2026-11-10 (Ron): one report a week, Monday
+// 08:30 CR, in the fulfillment channel, not a daily DM to Valeria, so the team
+// intervenes from there without adding to one person's inbox. Per client, only
+// what has waited over 48 h and still needs a person; last week's totals ride
+// along. Pure logic and SQL in lib/kaiEscalations.js (read-only on portalPg).
+// Kill switch KAI_ESCALATION_DIGEST=off; KAI_ESCALATION_DIGEST_TO reroutes it
+// (a channel id or a user id); KAI_ESCALATION_SINCE moves the cutoff.
 const kaiEscalations = require('./lib/kaiEscalations');
-const KAI_ESCALATION_DIGEST_FALLBACK = 'U09Q3BXJ18B'; // Valeria, only if the roster carries no fulfillment member
-async function runKaiEscalationsDigest() {
+const KAI_ESCALATION_STATE_KEY = 'kai-escalations-weekly-state';
+async function runKaiEscalationsDigest(correlationId) {
   if (String(process.env.KAI_ESCALATION_DIGEST || '') === 'off') return;
-  const override = String(process.env.KAI_ESCALATION_DIGEST_TO || '').trim();
-  const targets = override ? [override] : (slackIdsByRole('fulfillment').length ? slackIdsByRole('fulfillment') : [KAI_ESCALATION_DIGEST_FALLBACK]);
+  const target = String(process.env.KAI_ESCALATION_DIGEST_TO || '').trim() || OPS_CHANNEL;
   if (!portalPg) {
     console.warn('[kai-escalations] PORTAL_READONLY_DATABASE_URL is not set; digest skipped');
     logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'error', output: { error: 'portalPg not configured' } });
@@ -19574,16 +19574,32 @@ async function runKaiEscalationsDigest() {
   }
   const data = await kaiEscalations.readKaiEscalations(portalPg, new Date(), { since: process.env.KAI_ESCALATION_SINCE || undefined });
   const summary = kaiEscalations.summarizeKaiEscalations(data);
-  const text = kaiEscalations.formatKaiEscalationsDigest(summary);
+  let previous = null;
+  try {
+    const { data: stateRow } = await supabase
+      .from('agent_knowledge').select('value')
+      .eq('category', 'intel').eq('key', KAI_ESCALATION_STATE_KEY).limit(1);
+    if (stateRow?.[0]?.value) previous = JSON.parse(stateRow[0].value);
+  } catch (err) { console.warn('[kai-escalations] last week state unreadable:', err.message); }
+  const text = kaiEscalations.formatKaiEscalationsDigest(summary, { weekly: true, previous });
+  const state = JSON.stringify({ ...summary.totals, at: new Date().toISOString() });
   if (!text) {
+    await upsertKnowledge('intel', KAI_ESCALATION_STATE_KEY, state, 'kai-escalations').catch(() => {});
     logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'ok', output: { posted: false, ...summary.totals, legacy: summary.legacy.n } });
     return;
   }
-  for (const id of targets) await slack.client.chat.postMessage({ channel: id, text });
+  // A raw Slack id posts directly; a #name goes through the channel lookup. That
+  // helper swallows errors, so a missing post is thrown here and the cron run is
+  // recorded as an error, never as a report that went out.
+  const posted = /^[CDGU][A-Z0-9]{6,}$/.test(target)
+    ? await slack.client.chat.postMessage({ channel: target, text })
+    : await executeChannelPost(target, text, null, correlationId);
+  if (!posted || posted.ok === false) throw new Error(`kai escalations report not posted to ${target}`);
+  await upsertKnowledge('intel', KAI_ESCALATION_STATE_KEY, state, 'kai-escalations').catch((err) => console.warn('[kai-escalations] state not saved:', err.message));
   logActivity({ event_type: 'report', event_source: 'cron', action: 'runKaiEscalationsDigest', status: 'ok',
-    output: { posted: true, targets: targets.length, clients: summary.clients.length, ...summary.totals, legacy: summary.legacy.n } });
+    output: { posted: true, target, clients: summary.clients.length, ...summary.totals, legacy: summary.legacy.n } });
 }
-cron.schedule('30 8 * * 1-5', wrapCronJob('runKaiEscalationsDigest', async () => { await runKaiEscalationsDigest(); }), { timezone: 'America/Costa_Rica' });
+cron.schedule('30 8 * * 1', wrapCronJob('runKaiEscalationsDigest', async (c) => { await runKaiEscalationsDigest(c); }), { timezone: 'America/Costa_Rica' });
 
 // ─── CLIENT ATTENTION (fulfillment) ─────────────────────────────────────────
 // Mon + Thu report and urgent alerts in #ng-fullfillment-ops (Ron, 2026-09-23).
@@ -23608,7 +23624,7 @@ const STATIC_CRON_SCHEDULES = {
   runReelsMonthlyReport:        '0 8 1 * *',
   runAppointmentStatusSync:     '0 15 * * *',
   runCampaignHealthWbrReminder: '30 15 * * 1',
-  runKaiEscalationsDigest:      '30 8 * * 1-5',
+  runKaiEscalationsDigest:      '30 8 * * 1',
   runApptDeletionSweep:         '20 7,10,13,16,19 * * *',
   runAutoStrikeMover:           '0 7,9,11,13,15,17,19,21 * * *',
   // The audit declares itself, so a run where it dies shows up as stale on the
