@@ -83,5 +83,25 @@ check('all four stages are in scope', [S.INITIAL_CONTACT, S.STRIKE_1, S.STRIKE_2
   check('no em dash in any line', /—/.test(green + pausedLine), false);
 }
 
+// Situation pool (Ron, 2026-11-10): the thread decides the message.
+{
+  const msg = (direction, body, i, type = 'TYPE_WHATSAPP') => ({ direction, body, messageType: type, dateAdded: new Date(NOW - (100 - i) * 3600e3).toISOString() });
+  const auto = (b) => /gracias por comunicarte/i.test(b);
+  check('no reply from the lead is sin_respuesta', br.ruleSituation([msg('outbound', 'Hola', 1)]), 'sin_respuesta');
+  check('only a business auto-reply is still sin_respuesta', br.ruleSituation([msg('outbound', 'Hola', 1), msg('inbound', 'Gracias por comunicarte con Ferretería Ana', 2)], { isAutomatedBody: auto }), 'sin_respuesta');
+  check('a price question is pregunto_precio', br.ruleSituation([msg('inbound', 'Info', 1), msg('outbound', 'Claro', 2), msg('inbound', 'Y cuánto cuesta?', 3)]), 'pregunto_precio');
+  check('anything else goes to the model', br.ruleSituation([msg('inbound', 'Tengo una agencia de seguros en Heredia', 1)]), null);
+  check('activity rows never count as the lead', br.ruleSituation([{ direction: 'inbound', body: 'Opportunity created', messageType: 'TYPE_ACTIVITY_OPPORTUNITY', dateAdded: new Date().toISOString() }]), 'sin_respuesta');
+  check('model answer parsed', br.parseSituation('conto_negocio'), 'conto_negocio');
+  check('model answer with noise parsed', br.parseSituation(' Etiqueta: respondio_poco.'), 'respondio_poco');
+  check('unknown model answer is null, never a guess', br.parseSituation('no sé'), null);
+  const prompt = br.buildSituationPrompt([msg('outbound', 'Hola, a qué se dedica?', 1), msg('inbound', 'Vendo seguros', 2)]);
+  check('prompt carries the thread with roles', /NOSOTROS: Hola, a qué se dedica\?\nPROSPECTO: Vendo seguros/.test(prompt), true);
+  check('prompt has no em dash', /—/.test(prompt), false);
+  const dry = br.verdictLine({ mode: 'dry_run', picked: 100, eligible: 1583, health: { level: 'green', checked: 0 }, paused: null, situations: { sin_respuesta: 25, respondio_poco: 19, conto_negocio: 20, pregunto_precio: 36 }, closed: 3 });
+  check('dry run says what it would do, not what it did', /se etiquetarían 100 hoy, 1483 pendientes\. Situación: sin_respuesta 25, respondio_poco 19, conto_negocio 20, pregunto_precio 36\. Se moverían a Lost: 3\./.test(dry), true);
+  check('live run says what it did', /100 etiquetados hoy/.test(br.verdictLine({ mode: 'live', picked: 100, eligible: 200, health: { level: 'green', checked: 0 }, paused: null })), true);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');

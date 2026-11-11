@@ -265,6 +265,22 @@ check('a real setter reply that merely quotes part of the template still counts'
     evaluateStrikeMove(opp(S.IC, OLD), [tpl(NUEVO, 'workflow'), wa('inbound', '2026-11-10T14:30:00.000Z')], T).skip, 'lead_spoke_last');
 }
 
+// Backlog situation pool (2026-11-11): the new templates move the card too.
+{
+  const T = Date.parse('2026-11-12T15:00:00.000Z');
+  const tpl = (body) => ({ messageType: 'TYPE_WHATSAPP', direction: 'outbound', source: 'workflow', dateAdded: '2026-11-12T14:00:00.000Z', body });
+  const OLD = '2026-08-01T12:00:00.000Z';
+  for (const body of [
+    'Hola Ana, me gustaría entender si usted sigue estando interesado en adquirir clientes por LinkedIn sin pagar anuncios?',
+    'Hola Ana, quedamos a medias la última vez. Para saber si le puedo ayudar necesito entender algo',
+    'Hola Ana, me quedé pensando en lo que me contó de su negocio. Sigue buscando conseguir clientes',
+    'Hola Ana, la última vez me preguntó por la inversión. Depende del nivel de acompañamiento',
+    'Hola Ana, sé que estas cosas se quedan para después. No todos los negocios califican',
+    'Hola Ana, tengo espacio esta semana con José, nuestro director de operaciones',
+  ]) check(`pool template moves the card: ${body.slice(10, 40)}`, evaluateStrikeMove(opp(S.IC, OLD), [tpl(body)], T).move, S.S1);
+  check('pool closing template lands on Strike 3', evaluateStrikeMove(opp(S.S1, OLD), [tpl('Hola Ana, voy a cerrar su caso por ahora. Esto funciona cuando')], T).move, S.S3);
+}
+
 let failed = 0;
 for (const c of cases) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}`);
