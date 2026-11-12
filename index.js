@@ -25378,8 +25378,15 @@ async function clarityClassify(cands, correlationId, usage, issues) {
     logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'clarity_classifier');
     usage.push(res);
     if (res.stop_reason === 'max_tokens') { issues.push(`classifier cut off for ${batch.length} candidates`); continue; }
-    const parsed = clarityBrief.parseClassification(res.content.filter((b) => b.type === 'text').map((b) => b.text).join(''), batch.length);
-    if (!parsed) { issues.push(`classifier returned junk for ${batch.length} candidates`); continue; }
+    const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    const parsed = clarityBrief.parseClassification(text, batch.length);
+    if (!parsed) {
+      // The reply stays in Railway logs only (Ron-only sources), so the next junk batch has a cause.
+      console.warn(`[clarity] classifier junk (stop ${res.stop_reason}, ${text.length} chars): ${JSON.stringify(text.slice(0, 300))} ... ${JSON.stringify(text.slice(-150))}`);
+      issues.push(`classifier returned junk for ${batch.length} candidates`);
+      continue;
+    }
+    if (parsed.size < batch.length) issues.push(`classifier answered ${parsed.size} of ${batch.length} candidates`);
     for (const c of batch) {
       const v = parsed.get(c.idx);
       if (!v || v.verdict !== 'needs_ron') continue;

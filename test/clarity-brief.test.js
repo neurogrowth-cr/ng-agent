@@ -136,6 +136,12 @@ check('8d junk classification is null', cb.parseClassification('sure, here you g
 // 2026-11-05: the model answered every candidate but left idx out, and the whole batch vanished.
 const noIdx = cb.parseClassification('[{"verdict":"noise"},{"verdict":"needs_ron","tier":1,"title":"Laura asks about terms"}]', 2);
 check('8d2 an answer without idx that covers the batch in order matches by position', [noIdx.size, noIdx.get(1).verdict, noIdx.get(1).title], [2, 'needs_ron', 'Laura asks about terms']);
+// 2026-11-11: a real batch came back as junk; one broken object or a stray bracket must not cost the other nine.
+const salvaged = cb.parseClassification('[{"idx":0,"verdict":"needs_ron","tier":1,"title":"Pay the card"},{"idx":1,"verdict":"noise" "oops"},{"idx":2,"verdict":"fyi"}]', 3);
+check('8d2b one malformed object costs only itself', [salvaged.size, salvaged.get(0).verdict, salvaged.get(2).verdict, salvaged.has(1)], [2, 'needs_ron', 'fyi', false]);
+const trailing = cb.parseClassification('[{"idx":0,"verdict":"team"},{"idx":1,"verdict":"needs_ron","tier":2,"title":"Approve PR"}]\nNote: item [1] needs Ron.', 2);
+check('8d2c a bracket in trailing text does not sink the array', [trailing.size, trailing.get(1).title], [2, 'Approve PR']);
+check('8d2d prose with no objects is still junk', cb.parseClassification('I could not classify these [sorry].', 2), null);
 check('8d3 an answer with nothing matchable is junk, not an empty result', cb.parseClassification('[{"verdict":"noise"}]', 2), null);
 check('8d4 partial idx answers do not fall back to position', cb.parseClassification('[{"idx":1,"verdict":"fyi"},{"verdict":"noise"}]', 2).size, 1);
 check('8d5 the prompt requires idx and keeps non needs_ron answers short', /MUST start with "idx"/.test(cb.buildClassifyPrompt([{ idx: 0, source: 's', actor: 'a', title: 't' }])) && /just \{"idx": n, "verdict"/.test(cb.buildClassifyPrompt([])), true);
