@@ -280,5 +280,16 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('a clarify never counts toward the day cap', pg.countsTowardDayCap('clarify'), false);
 }
 
+// Voice rules (Ron, 2026-11-10): no opening ¿ or ¡, only the closing sign.
+{
+  check('parseDraft strips opening marks from the draft', pg.parseDraft('{"draft":"¿A qué se dedica su negocio? ¿Y a quién le vende?","reason_es":"x"}').draft, 'A qué se dedica su negocio? Y a quién le vende?');
+  check('validator flags an opening question mark', pg.validateDraft('¿A qué se dedica su negocio?').problems.includes('opening question mark'), true);
+  check('a closing question mark alone is fine', pg.validateDraft('A qué se dedica su negocio?').ok, true);
+  const p = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Ana', intentLabel: 'pregunta', stageName: 'New Lead', faq: '', channel: 'instagram' });
+  check('drafter prompt states the opening-mark rule', /nunca ponga ¿ ni ¡ al inicio/.test(p.system), true);
+  check('drafter prompt carries the qualification order', /a qué se dedica, a quién le vende, en qué rango cobra por cliente, cómo le llegan clientes hoy, quién decide/.test(p.system), true);
+  check('drafter prompt has no em dash', /—/.test(p.system), false);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
