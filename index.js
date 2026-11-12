@@ -19445,7 +19445,8 @@ async function pingKaiHealth() {
     const res = await fetch(KAI_HEALTH_URL, { signal: AbortSignal.timeout(10000) });
     const body = await res.json().catch(() => null);
     // threadWatch: Kai's later-messages reader status, judged by kaiHealth.evaluateThreadWatch.
-    if (res.ok && body && body.ok === true) return { ok: true, threadWatch: body.threadWatch || null };
+    // webhookHold: replies Kai could not store and is holding in memory, judged by kaiHealth.evaluateKaiHold.
+    if (res.ok && body && body.ok === true) return { ok: true, threadWatch: body.threadWatch || null, webhookHold: body.webhookHold || null };
     return { ok: false, error: `HTTP ${res.status}` };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -19460,10 +19461,60 @@ async function postKaiWatch(text) {
   }
 }
 
+// Prosp events the dash parked because the portal database would not take
+// them (prosp_webhook_spool, migration 027, Max's own Supabase). Read apart
+// from the portal snapshot: a portal outage is exactly when this matters.
+// Returns null when the read fails, so the check is skipped, never blind.
+async function readProspSpool() {
+  try {
+    const { data, error } = await supabase.from('prosp_webhook_spool')
+      .select('received_at, workspace_id, target')
+      .is('stored_at', null)
+      .order('received_at', { ascending: true })
+      .limit(kaiHealth.SPOOL_READ_LIMIT);
+    if (error) throw new Error(error.message);
+    return { rows: data || [] };
+  } catch (err) {
+    console.warn('[kai-health] prosp_webhook_spool read failed:', err.message);
+    return null;
+  }
+}
+
+// Per-workspace Prosp silence (kaiHealth.stepWorkspaceQuiet). KAI_WORKSPACE_QUIET:
+// digest (default: logged and listed in the daily digest, no alert), alert, off.
+// Its portal reads have their own try/catch so a slow log table never blinds
+// the rest of the watch.
+let kaiSpoolHolding = false;
+let kaiWorkspaceQuietState = {};
+let kaiWorkspaceQuietRecent = [];
+const kaiWorkspaceBaselineCache = {};
+
+async function checkProspWorkspaceQuiet(now, spoolPending) {
+  const mode = kaiHealth.workspaceQuietMode(process.env.KAI_WORKSPACE_QUIET);
+  if (mode === 'off' || !portalPg) return;
+  let data;
+  try { data = await kaiHealth.readWorkspaceQuiet(portalPg, now, kaiWorkspaceBaselineCache); }
+  catch (err) { console.warn('[kai-health] workspace quiet read failed:', err.message); return; }
+  const { state, started, ended } = kaiHealth.stepWorkspaceQuiet(kaiWorkspaceQuietState, data, now, { spoolPending });
+  kaiWorkspaceQuietState = state;
+  const dayAgo = now.getTime() - 24 * 60 * 60 * 1000;
+  kaiWorkspaceQuietRecent = [...kaiWorkspaceQuietRecent, ...ended].filter((e) => Date.parse(e.endedAt) > dayAgo);
+  for (const e of started) {
+    const alert = kaiHealth.formatWorkspaceQuietAlert(e);
+    console.warn(`[kai-health] ${alert.id} (${mode}): ${alert.reason}`);
+    if (mode === 'alert') await postKaiWatch(kaiHealth.formatKaiAlert(alert, RON_SLACK_ID));
+  }
+  for (const e of ended) {
+    console.log(`[kai-health] prosp_workspace_quiet:${e.workspaceId} sending again (${mode})`);
+    if (mode === 'alert') await postKaiWatch(kaiHealth.formatWorkspaceQuietRecovery(e));
+  }
+}
+
 async function checkKaiHealth() {
   if (String(process.env.KAI_HEALTH_WATCH || '') === 'off') return;
   const now = new Date();
   const health = await pingKaiHealth();
+  const spool = await readProspSpool();
 
   let snapshot = null;
   let snapshotError = null;
@@ -19473,7 +19524,7 @@ async function checkKaiHealth() {
     catch (err) { snapshotError = err.message; }
   }
 
-  const results = kaiHealth.evaluateKaiChecks({ health, snapshot, snapshotError, now });
+  const results = kaiHealth.evaluateKaiChecks({ health, snapshot, snapshotError, now, spool });
   const { state, alerts, recoveries } = kaiHealth.stepKaiWatch(kaiWatchState, results, now, { blind: !snapshot });
   kaiWatchState = state;
 
@@ -19482,6 +19533,14 @@ async function checkKaiHealth() {
   }
   for (const a of alerts) await postKaiWatch(kaiHealth.formatKaiAlert(a, RON_SLACK_ID));
   for (const r of recoveries) await postKaiWatch(kaiHealth.formatKaiRecovery(r));
+
+  if (spool) {
+    const notice = kaiHealth.spoolNotice(kaiSpoolHolding, spool.rows, now);
+    kaiSpoolHolding = notice.holding;
+    if (notice.message) await postKaiWatch(notice.message);
+  }
+  // An unreadable spool counts as holding: parked events must not read as a silent workspace.
+  await checkProspWorkspaceQuiet(now, spool ? spool.rows.length : 1);
 }
 
 async function runKaiHealthDigest() {
@@ -19499,7 +19558,13 @@ async function runKaiHealthDigest() {
     return;
   }
   const openAlerts = Object.entries(kaiWatchState).filter(([, s]) => s.alerted).map(([id]) => id);
-  await postKaiWatch(kaiHealth.formatKaiDigest(data, openAlerts));
+  const quietMode = kaiHealth.workspaceQuietMode(process.env.KAI_WORKSPACE_QUIET);
+  const workspaceQuiet = {
+    mode: quietMode,
+    open: Object.values(kaiWorkspaceQuietState).filter((e) => e.open),
+    recent: kaiWorkspaceQuietRecent,
+  };
+  await postKaiWatch(kaiHealth.formatKaiDigest(data, openAlerts, { workspaceQuiet }));
 }
 
 cron.schedule('*/15 * * * *', wrapCronJob('checkKaiHealth', async () => { await checkKaiHealth(); }), { timezone: 'America/Costa_Rica' });

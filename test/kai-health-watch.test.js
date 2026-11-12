@@ -382,6 +382,150 @@ check('a pleasantry Kai closed is not counted as held back', /NOT IN \('prospect
     !/\b(insert|update|delete)\b/i.test(kai.DIGEST_SQL.approvals) && /'pleasantry'/.test(kai.DIGEST_SQL.approvals) && /send_after IS NULL/.test(kai.DIGEST_SQL.approvals), true);
 }
 
+// ── Prosp webhook watch (2026-11-12): Kai hold, dash spool, per-workspace silence
+{
+  const ago = (min) => new Date(T0.getTime() - min * MIN).toISOString();
+  const ids = (r) => (r.failing ? [r.id] : []);
+
+  // Kai hold
+  check('wh1 older Kai with no webhookHold: skipped', kai.evaluateKaiHold(undefined, T0).skip, true);
+  check('wh2 nothing held: fine', ids(kai.evaluateKaiHold({ held: 0, oldestHeldAt: null }, T0)), []);
+  check('wh3 held 10 minutes: fine (the retry usually clears it)', ids(kai.evaluateKaiHold({ held: 2, oldestHeldAt: ago(10) }, T0)), []);
+  const hold = kai.evaluateKaiHold({ held: 2, oldestHeldAt: ago(45) }, T0);
+  check('wh4 held 45 minutes: failing', ids(hold), ['kai_hold']);
+  check('wh5 the text warns about a restart', /2 replies in memory/.test(hold.reason) && /lost if Kai restarts/.test(hold.reason), true);
+  const holdWired = kai.evaluateKaiChecks({ health: { ok: true, webhookHold: { held: 1, oldestHeldAt: ago(60) } }, snapshot: HEALTHY, now: T0 });
+  check('wh6 wired into evaluateKaiChecks', failingIds(holdWired), ['kai_hold']);
+  const holdDown = kai.evaluateKaiChecks({ health: { ok: false, error: 'HTTP 502' }, snapshot: HEALTHY, now: T0 });
+  check('wh7 Kai down: hold skipped, health alert carries it', holdDown.find((r) => r.id === 'kai_hold').skip, true);
+
+  // Dash spool
+  check('sp1 empty spool: fine', ids(kai.evaluateSpool([], T0)), []);
+  check('sp2 an event parked 10 minutes ago: fine', ids(kai.evaluateSpool([{ received_at: ago(10) }], T0)), []);
+  const spoolLate = kai.evaluateSpool([{ received_at: ago(50) }, { received_at: ago(40) }, { received_at: ago(5) }], T0);
+  check('sp3 events waiting over 30 minutes: failing', ids(spoolLate), ['spool_waiting']);
+  check('sp4 counts only the late ones and names the replay job', /^2 Prosp events have been waiting/.test(spoolLate.reason) && /prosp-spool-drain/.test(spoolLate.reason), true);
+  const spoolWired = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: HEALTHY, now: T0, spool: { rows: [{ received_at: ago(90) }] } });
+  check('sp5 wired into evaluateKaiChecks', failingIds(spoolWired), ['spool_waiting']);
+  const spoolBlind = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: null, snapshotError: 'timeout', now: T0, spool: { rows: [{ received_at: ago(90) }] } });
+  check('sp6 still judged while the portal is unreadable', failingIds(spoolBlind), ['spool_waiting', 'watcher_read']);
+  const spoolUnread = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: HEALTHY, now: T0, spool: null });
+  check('sp7 spool unreadable: skipped, nothing else blinded', spoolUnread.find((r) => r.id === 'spool_waiting').skip && failingIds(spoolUnread).length === 0, true);
+  check('sp8 without a spool argument (older caller): skipped', kai.evaluateKaiChecks({ health: { ok: true }, snapshot: HEALTHY, now: T0 }).find((r) => r.id === 'spool_waiting').skip, true);
+
+  // Spool notice
+  check('sn1 one fresh event: no notice', kai.spoolNotice(false, [{ received_at: ago(2) }], T0), { holding: false, message: null });
+  const n5 = kai.spoolNotice(false, Array.from({ length: 5 }, () => ({ received_at: ago(1) })), T0);
+  check('sn2 five events: one notice, no mention', n5.holding && /5 held so far, nothing lost/.test(n5.message) && !/<@/.test(n5.message), true);
+  check('sn3 one event older than 10 minutes: notice', kai.spoolNotice(false, [{ received_at: ago(12) }], T0).holding, true);
+  check('sn4 still holding: silent', kai.spoolNotice(true, [{ received_at: ago(20) }], T0), { holding: true, message: null });
+  const nEnd = kai.spoolNotice(true, [], T0);
+  check('sn5 spool empty again: one recovery line', !nEnd.holding && /storing Prosp events again/.test(nEnd.message), true);
+
+  // prosp_quiet names the fix
+  const quietAll = kai.evaluateKaiChecks({ health: { ok: true }, snapshot: { ...HEALTHY, prospEvents: false }, now: T0 });
+  check('pq1 the global check names the fix', /Settings, Webhooks/.test(quietAll.find((r) => r.id === 'prosp_quiet').reason), true);
+
+  // Per-workspace silence. Made-up workspace and campaign ids.
+  check('wq1 mode defaults to digest', [kai.workspaceQuietMode(undefined), kai.workspaceQuietMode('alert'), kai.workspaceQuietMode('OFF'), kai.workspaceQuietMode('nonsense')], ['digest', 'alert', 'off', 'digest']);
+  let monday = new Date(Date.UTC(2026, 8, 21, 14, 37));
+  while (monday.getUTCDay() !== 1) monday = new Date(monday.getTime() + 24 * 60 * MIN);
+  const wins = kai.baselineWindows(monday);
+  check('wq2 five baseline windows, none on a weekend', [wins.length, wins.every((w) => ![0, 6].includes(w.to.getUTCDay()))], [5, true]);
+  check('wq3 Monday looks back to Friday, on the clock hour, 3 hours wide',
+    [(kai.utcHourStart(monday).getTime() - wins[0].to.getTime()) / (60 * MIN), wins[0].to.getUTCMinutes(), (wins[0].to - wins[0].from) / (60 * MIN)], [72, 0, 3]);
+
+  const WS = 'ws-quiet-1';
+  const day = (n, ws = WS, campaigns = ['camp-1']) => [{ workspace_id: ws, n, campaigns }];
+  const regular = [day(40), day(35), day(50), day(0), day(22)];
+  check('wq4 regular (4 of 5 days) and quiet: candidate', kai.quietCandidates({ current: [], baseline: regular }).map((c) => [c.workspaceId, c.activeDays, c.usual]), [[WS, 4, 35]]);
+  check('wq5 3 of 5 days is not regular', kai.quietCandidates({ current: [], baseline: [day(40), day(35), day(50), day(0), day(3)] }), []);
+  check('wq6 still sending: not a candidate', kai.quietCandidates({ current: [{ workspace_id: WS, recent: 4, earlier: 30 }], baseline: regular }), []);
+
+  const W0 = new Date(monday.getTime());
+  const wat = (m) => new Date(W0.getTime() + m * MIN);
+  const fresh = (t) => new Date(t.getTime() - 20 * MIN).toISOString();
+  const stopped = (t, extra = {}) => ({
+    current: [{ workspace_id: WS, recent: 0, earlier: 60, last_at: new Date(t.getTime() - 200 * MIN).toISOString() }],
+    baseline: regular,
+    telemetry: [{ prosp_campaign_id: 'camp-1', is_active: true, status_checked_at: fresh(t) }],
+    telemetryNewest: fresh(t),
+    names: [{ workspace_id: WS, is_shared: false, clients: ['Acme Example'], only_demo: false }],
+    ...extra,
+  });
+  let q = kai.stepWorkspaceQuiet({}, stopped(W0), W0);
+  check('wq7 first quiet poll: nothing yet', [q.started.length, q.state[WS].open], [0, false]);
+  q = kai.stepWorkspaceQuiet(q.state, stopped(wat(15)), wat(15));
+  check('wq8 second poll, was sending earlier today, Prosp says active: flagged', q.started.map((e) => [e.workspaceId, e.tier, e.campaign, e.label]), [[WS, 'stopped', 'active', 'ACME EXAMPLE']]);
+  const alert = kai.formatWorkspaceQuietAlert(q.started[0]);
+  check('wq9 the alert carries the link and the fix',
+    alert.id === `prosp_workspace_quiet:${WS}` && alert.reason.includes(`https://prosp.ai/settings?workspace=${WS}&tab=Webhooks`)
+      && /switch every Error row back on \(Test Webhook, then Update\)/.test(alert.reason) && /real click/.test(alert.reason) && /events of the gap are gone/.test(alert.reason), true);
+  check('wq10 no em dash in the alert', alert.reason.includes('—'), false);
+  let q2 = kai.stepWorkspaceQuiet(q.state, stopped(wat(30)), wat(30));
+  q2 = kai.stepWorkspaceQuiet(q2.state, stopped(wat(60 * 8)), wat(60 * 8));
+  check('wq11 one alert per silence, however long', [q2.started.length, q2.ended.length, q2.state[WS].open], [0, 0, true]);
+  const night = kai.stepWorkspaceQuiet(q2.state, { current: [], baseline: [day(0), day(0), day(0), day(0), day(0)], telemetry: [], telemetryNewest: null, names: [] }, wat(60 * 10));
+  check('wq12 stays open outside its usual hours', [night.ended.length, night.state[WS].open], [0, true]);
+  const back = kai.stepWorkspaceQuiet(night.state, { ...stopped(wat(60 * 11)), current: [{ workspace_id: WS, recent: 3, earlier: 0 }] }, wat(60 * 11));
+  check('wq13 sends again: one recovery, state cleared', [back.ended.map((e) => e.workspaceId), Object.keys(back.state)], [[WS], []]);
+  check('wq14 recovery line', /ACME EXAMPLE is sending Prosp events again/.test(kai.formatWorkspaceQuietRecovery(back.ended[0])), true);
+
+  const paused = (t) => stopped(t, { telemetry: [{ prosp_campaign_id: 'camp-1', is_active: false, status_checked_at: fresh(t) }] });
+  let p = kai.stepWorkspaceQuiet({}, paused(W0), W0);
+  p = kai.stepWorkspaceQuiet(p.state, paused(wat(15)), wat(15));
+  check('wq15 Prosp says the campaign is off: not flagged', [p.started.length, p.state[WS].open], [0, false]);
+  const staleTel = (t) => stopped(t, { telemetry: [{ prosp_campaign_id: 'camp-1', is_active: true, status_checked_at: new Date(t.getTime() - 300 * MIN).toISOString() }], telemetryNewest: new Date(t.getTime() - 300 * MIN).toISOString() });
+  let st = kai.stepWorkspaceQuiet({}, staleTel(W0), W0);
+  st = kai.stepWorkspaceQuiet(st.state, staleTel(wat(15)), wat(15));
+  check('wq16 telemetry stale everywhere: flagged, and the text says it could not check', [st.started.map((e) => e.campaign), /could not check whether its campaigns are still running/.test(kai.formatWorkspaceQuietAlert(st.started[0]).reason)], [['unknown'], true]);
+
+  const late = (t) => stopped(t, { current: [] });
+  let l = kai.stepWorkspaceQuiet({}, late(W0), W0);
+  l = kai.stepWorkspaceQuiet(l.state, late(wat(15)), wat(15));
+  l = kai.stepWorkspaceQuiet(l.state, late(wat(60)), wat(60));
+  check('wq17 nothing earlier today: a late start waits', [l.started.length, l.state[WS].hours], [0, 2]);
+  l = kai.stepWorkspaceQuiet(l.state, late(wat(120)), wat(120));
+  check('wq18 quiet three clock hours in a row: flagged as not started', l.started.map((e) => [e.tier, e.since]), [['not_started', null]]);
+  check('wq19 its text gives a duration, not a time', /for over 9 hours/.test(kai.formatWorkspaceQuietAlert(l.started[0]).reason), true);
+  let gap = kai.stepWorkspaceQuiet({}, late(W0), W0);
+  gap = kai.stepWorkspaceQuiet(gap.state, late(wat(120)), wat(120));
+  check('wq20 a skipped hour restarts the count', gap.state[WS].hours, 1);
+
+  let saturday = new Date(W0.getTime());
+  while (saturday.getUTCDay() !== 6) saturday = new Date(saturday.getTime() + 24 * 60 * MIN);
+  check('wq21 weekend: not judged', kai.stepWorkspaceQuiet({}, stopped(saturday), saturday).skipped, true);
+  const parked = kai.stepWorkspaceQuiet({}, stopped(W0), W0, { spoolPending: 3 });
+  check('wq22 events parked in the spool: not judged', [parked.skipped, Object.keys(parked.state).length], [true, 0]);
+  let demo = kai.stepWorkspaceQuiet({}, stopped(W0, { names: [{ workspace_id: WS, is_shared: false, clients: null, only_demo: true }] }), W0);
+  demo = kai.stepWorkspaceQuiet(demo.state, stopped(wat(15), { names: [{ workspace_id: WS, is_shared: false, clients: null, only_demo: true }] }), wat(15));
+  check('wq23 the demo workspace is never flagged', demo.started.length, 0);
+  let shared = kai.stepWorkspaceQuiet({}, stopped(W0, { names: [{ workspace_id: WS, is_shared: true, clients: ['Acme Example'], only_demo: false }] }), W0);
+  shared = kai.stepWorkspaceQuiet(shared.state, stopped(wat(15), { names: [{ workspace_id: WS, is_shared: true, clients: ['Acme Example'], only_demo: false }] }), wat(15));
+  check('wq24 a shared workspace is named as the agency one', shared.started[0].label, 'The shared agency workspace');
+  let unmapped = kai.stepWorkspaceQuiet({}, stopped(W0, { names: [] }), W0);
+  unmapped = kai.stepWorkspaceQuiet(unmapped.state, stopped(wat(15), { names: [] }), wat(15));
+  check('wq25 no client on record: named by its id', unmapped.started[0].label, `Prosp workspace ${WS}`);
+
+  // Digest section
+  check('wq26 off: no section', kai.workspaceQuietDigestLines({ mode: 'off', open: [q.started[0]] }), []);
+  const dl = kai.workspaceQuietDigestLines({ mode: 'digest', open: [q.started[0]], recent: [back.ended[0]] });
+  check('wq27 digest mode: trial header, the open one with its link, the recovered one', [dl[1], dl.length, dl[2].includes('tab=Webhooks'), /sending again at/.test(dl[3])], ['`PROSP WEBHOOKS (TRIAL, NO ALERTS YET)`', 4, true, true]);
+  check('wq28 nothing quiet: one green line', kai.workspaceQuietDigestLines({ mode: 'alert' }).slice(1), ['`PROSP WEBHOOKS`', '• No workspace went quiet in its usual hours. ✅']);
+  check('wq29 the workspace reads are short created_at ranges, imports left out',
+    [kai.SQL.workspaceNow, kai.SQL.workspaceBaseline].every((s) => /created_at > \$1::timestamptz AND created_at <= \$[23]::timestamptz/.test(s) && /NOT IN \('Contact Added', 'LinkedIn Contact Extracted'\)/.test(s) && !/\b(insert|update|delete)\b/i.test(s)), true);
+  check('wq30 client names leave the demo out', /is_demo/.test(kai.SQL.workspaceNames), true);
+
+  const steady = (i) => ({ received: 25 + (i % 5) * 4, escalated: 2 + (i % 3) });
+  const dd = digestData({ yesterday: { received: 28, escalated: 3, sent: 4, drafted: 16 }, baseline: steady });
+  const withQuiet = kai.formatKaiDigest(dd, [], { workspaceQuiet: { mode: 'digest', open: [q.started[0]], recent: [] } });
+  check('wq31 a quiet workspace is an issue in the daily digest', withQuiet.includes('1 Prosp workspace gone quiet') && withQuiet.includes('`PROSP WEBHOOKS (TRIAL, NO ALERTS YET)`') && withQuiet.includes('ACME EXAMPLE: no Prosp event since'), true);
+  const noQuiet = kai.formatKaiDigest(dd, [], { workspaceQuiet: { mode: 'digest', open: [], recent: [] } });
+  check('wq32 none quiet: still ALL GREEN, with the section', noQuiet.includes('✅ ALL GREEN') && noQuiet.includes('No workspace went quiet in its usual hours'), true);
+  check('wq33 digest without the extras is unchanged (no section)', kai.formatKaiDigest(dd).includes('PROSP WEBHOOKS'), false);
+  check('wq34 no em dash in the digest section', withQuiet.includes('\u2014'), false);
+}
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
   console.log('\nall kai health watch checks passed');
 })();
