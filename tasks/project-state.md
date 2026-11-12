@@ -1233,3 +1233,7 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **What:** `lib/axonHealth.js` classifies each poll as `ok`, `down` (read worked, beat stale or missing) or `blind` (read failed or threw). `blind` posts "🟠 Max cannot read AXON's heartbeat ... AXON may be running fine. Do not redeploy AXON. Check status.supabase.com". Each kind has its own 3-poll streak, 6h re-alert and matching recovery line; a blind poll neither counts nor resets the down streak. `errorOneLine` turns a Cloudflare 522 HTML page into one line. Test `test/axon-health-watch.test.js`.
 - **REVI:** its heartbeat read already falls back silently on a failed read (no "poller is down" on a read error), so unchanged.
 - No migrations, no env vars. Kill switch still `AXON_HEALTH_WATCH=off`.
+
+## 2026-11-11: Clarity Brief, first week and classifier salvage ([PR #492](https://github.com/neurogrowth-cr/ng-agent/pull/492))
+- **First week:** Mon 11-09 to Wed 11-11 each posted at 06:50 CR with 7/7 sources; cost fell from $0.04 to $0.02 once the light model moved to Haiku 5.5 (#476). Ron reacted only to the Saturday on-demand brief (2 ✅, 4 ❌); weekday items expired unreacted.
+- **Junk batch (11-11):** a batch of 10 real candidates came back unparseable and was dropped; six synthetic probes on Haiku 5.5 parsed every time. Now each flat object is parsed on its own when the array fails, a short answer is reported as `classifier answered N of M`, and a junk reply's head and tail go to Railway logs (not Slack) so the next one has a cause.
