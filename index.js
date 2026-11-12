@@ -4445,11 +4445,16 @@ function classifyUnheldAppt(appt, outcomeRow, latestStartByProspect) {
 // self-serve duplicate (deleted) sat 30 min after the setter's real call, so
 // the real call read as superseded. It vanished from both boards and the closer
 // was never asked for its outcome.
+// A row with no start time (dash `opp:` carriers for won deals with no call)
+// is not a call either: String(null) is 'null', which sorts above every date,
+// so it used to win and make the superseded check compare against NaN.
 function latestStartFromRows(rows, latest = {}) {
   for (const r of (rows || [])) {
     if (!r?.prospect_id || isAppointmentDeleted(r)) continue;
+    const t = r.scheduled_start ? Date.parse(r.scheduled_start) : NaN;
+    if (!Number.isFinite(t)) continue;
     const cur = latest[r.prospect_id];
-    if (!cur || String(r.scheduled_start) > cur) latest[r.prospect_id] = String(r.scheduled_start);
+    if (!cur || t > Date.parse(cur)) latest[r.prospect_id] = String(r.scheduled_start);
   }
   return latest;
 }

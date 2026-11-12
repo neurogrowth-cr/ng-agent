@@ -161,6 +161,22 @@ const appt = (o = {}) => ({
   check('the real call counts once and is pending', stats['Sebastian S']?.calls_booked === 1 && stats['Sebastian S'].pending === 1, stats);
 }
 
+// 5b. A row with no start time (dash `opp:` carrier) never becomes the latest
+//     start, so it cannot hide a later real call or a rebook (2026-11-12).
+{
+  const rows = [
+    { prospect_id: 'pO', scheduled_start: null, qualification_snapshot: {} },
+    { prospect_id: 'pO', scheduled_start: '2026-10-01 15:00:00+00', qualification_snapshot: {} },
+    { prospect_id: 'pO', scheduled_start: '2026-10-03 15:00:00+00', qualification_snapshot: {} },
+    { prospect_id: 'pN', scheduled_start: null, qualification_snapshot: {} },
+  ];
+  const latest = latestStartFromRows(rows);
+  check('null start is ignored, the real rebook is the latest', latest.pO === '2026-10-03 15:00:00+00', latest);
+  check('a prospect with only a null-start row has no latest', !('pN' in latest), latest);
+  const first = appt({ id: 'o-first', prospect_id: 'pO', scheduled_start: '2026-10-01 15:00:00+00', qualification_snapshot: { ghl: { cancelled: true } } });
+  check('the earlier booking is superseded by the rebook', classifyUnheldAppt(first, null, latest) === 'skip', latest);
+}
+
 // 6. HEADLINE (Ron, 2026-10-11, script audit decision 4): held calls with a
 //    complete triage ficha lead the board; bookings, show rate and AQC follow.
 {
