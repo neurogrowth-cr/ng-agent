@@ -1227,3 +1227,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Guardian:** `GUARDIAN_MODE=draft` since 2026-11-11 ~23:20 CR (boot log confirmed). Cards go to Sebastián; nothing reaches a lead without his ✅.
 - **Backlog campaign LIVE (Ron's yes, 2026-11-11 23:18 CR):** `BACKLOG_REACT_MODE=live`, boot log confirmed; first 100 tagged Thu 2026-11-12 09:30 CR, 100 a weekday after that (1,520 eligible on 11-11).
 - **Sebastián briefed** by Max DM the same night: guardian cards (✅ send, ❌ discard, thread reply sends his text, signals need his judgment), backlog strikes are automatic and a reply reaches him as a card, departed setters' leads alert #ng-sales-goats and become his when he answers.
+
+## 2026-11-12: AXON watch tells a database outage apart from AXON down ([PR #494](https://github.com/neurogrowth-cr/ng-agent/pull/494), merged `26c12cb`)
+- **Why:** 2026-11-12 01:17 to 03:40 UTC the shared Supabase project `zbuqpdwjpxgsetduhjeo` stopped answering. Max's `checkAxonHealth` failed to read `axon.engine_heartbeat` and posted "AXON looks DOWN ... redeploy it" while AXON was alive (its own cron posted 10 minutes later).
+- **What:** `lib/axonHealth.js` classifies each poll as `ok`, `down` (read worked, beat stale or missing) or `blind` (read failed or threw). `blind` posts "🟠 Max cannot read AXON's heartbeat ... AXON may be running fine. Do not redeploy AXON. Check status.supabase.com". Each kind has its own 3-poll streak, 6h re-alert and matching recovery line; a blind poll neither counts nor resets the down streak. `errorOneLine` turns a Cloudflare 522 HTML page into one line. Test `test/axon-health-watch.test.js`.
+- **REVI:** its heartbeat read already falls back silently on a failed read (no "poller is down" on a read error), so unchanged.
+- No migrations, no env vars. Kill switch still `AXON_HEALTH_WATCH=off`.
