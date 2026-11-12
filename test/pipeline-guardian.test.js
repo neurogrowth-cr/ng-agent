@@ -105,6 +105,13 @@ check('row 3: objection_budget → signal', dec({ intent: 'objection_budget' }).
 check('row 3: objection_timing → signal', dec({ intent: 'objection_timing' }).kind, 'signal');
 check('row 3: competitor_mention → signal', dec({ intent: 'competitor_mention' }).kind, 'signal');
 check('row 4: hot verdict → signal', kindStep(dec({ intent: 'interested', verdict: 'hot' })), ['signal', 'signal', 'hot', 'whatsapp']);
+check('hot question the FAQ answers → reply draft, not a blank signal', kindStep(dec({ intent: 'question', verdict: 'hot', signals: { faqCovered: true } })).slice(0, 3), ['reply', 'reply', 'question']);
+check('hot wants_info the FAQ answers → reply draft', dec({ intent: 'wants_info', verdict: 'hot', signals: { faqCovered: true } }).kind, 'reply');
+check('hot question outside the FAQ is still a signal', dec({ intent: 'question', verdict: 'hot', signals: { faqCovered: false } }).reason, 'hot');
+check('hot interest that is not a question is still a signal', dec({ intent: 'interested', verdict: 'hot', signals: { faqCovered: true } }).reason, 'hot');
+check('noise (business auto-reply, thanks) → no card', kindStep(dec({ intent: 'objection_relevance', verdict: 'noise' })).slice(0, 3), ['skip', 'reply', 'noise']);
+check('a call request beats noise', dec({ analysis: callAsk, intent: 'interested', verdict: 'noise' }).reason, 'call_request');
+check('a stop beats noise', dec({ intent: 'unsubscribe', verdict: 'noise' }).kind, 'stop');
 for (const i of ['unsubscribe', 'angry', 'already_client']) check(`row 5: ${i} → stop, Ron not paged`, kindStep(dec({ intent: i })).concat([dec({ intent: i }).ron]), ['stop', 'stop', i, 'whatsapp', false]);
 for (const i of ['legal_risk', 'sensitive']) check(`row 5: ${i} → stop and DM Ron`, [dec({ intent: i }).kind, dec({ intent: i }).ron], ['stop', true]);
 check('stop beats a call request', dec({ analysis: callAsk, intent: 'angry' }).kind, 'stop');

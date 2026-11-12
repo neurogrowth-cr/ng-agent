@@ -122,6 +122,8 @@ const SETTERS = { 'wdjte1temxfr0lpi5rgv': 'U_SEB' };
 check('5a a setter-owned chat DMs the setter', hr.routeOwner('Wdjte1temxfR0lpi5RGV', SETTERS), { kind: 'setter', slackId: 'U_SEB' });
 check('5b unassigned goes to the channel', hr.routeOwner('', SETTERS), { kind: 'unassigned' });
 check('5c a closer-owned chat is not a setter\'s', hr.routeOwner('closerId', SETTERS), { kind: 'other' });
+check('5d a departed setter\'s card routes as unassigned', hr.routeOwner('ZcmdIz2EEraPd80W2zop', SETTERS, new Set(['zcmdiz2eerapd80w2zop'])), { kind: 'unassigned' });
+check('5e an active setter is unaffected by the departed list', hr.routeOwner('Wdjte1temxfR0lpi5RGV', SETTERS, new Set(['zcmdiz2eerapd80w2zop'])), { kind: 'setter', slackId: 'U_SEB' });
 
 // ── 6. Formatting ───────────────────────────────────────────────────────────
 const card = hr.formatPokeCard('poke1', { contactName: 'Lead', channel: 'TYPE_WHATSAPP', quote: 'Cual es el costo', reason_es: 'Pregunta el precio', link: 'https://x', anchorAt: NOW - 20 * MIN }, { now: NOW });
