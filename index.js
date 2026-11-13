@@ -19734,6 +19734,37 @@ async function runKaiEscalationsDigest(correlationId) {
 }
 cron.schedule('30 8 * * 1', wrapCronJob('runKaiEscalationsDigest', async (c) => { await runKaiEscalationsDigest(c); }), { timezone: 'America/Costa_Rica' });
 
+// ─── LICENCIA UNIFICADA ROSTER (fulfillment) ────────────────────────────────
+// Ron, 2026-11-13: Mon and Thu 08:00 CR in #ng-fullfillment-ops, the clients
+// on a license SKU and which of them have no Kai working yet. Recipe:
+// ~/automations/ops/recipes/license-roster.md. Read-only on portalPg; pure
+// logic in lib/licenseRoster.js. Always posts (the list on the day, even with
+// no change). Zero licenses or a broken post contract is a failed read: no
+// channel post, Ron gets a DM, the cron run is recorded as an error.
+// Kill switch LICENSE_ROSTER_REPORT=off; LICENSE_ROSTER_REPORT_TO reroutes it
+// (a channel id or a user id).
+const licenseRoster = require('./lib/licenseRoster');
+async function runLicenseRosterReport(correlationId) {
+  if (String(process.env.LICENSE_ROSTER_REPORT || '') === 'off') return;
+  const target = String(process.env.LICENSE_ROSTER_REPORT_TO || '').trim() || OPS_CHANNEL;
+  if (!portalPg) throw new Error('PORTAL_READONLY_DATABASE_URL is not set; license roster skipped');
+  const summary = licenseRoster.summarizeLicenseRoster(await licenseRoster.readLicenseRoster(portalPg, new Date()));
+  const text = licenseRoster.formatLicenseRoster(summary);
+  const problems = text ? licenseRoster.checkLicenseRoster(text, summary) : ['no live license rows (a broken read, not an empty roster)'];
+  if (problems.length) {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID,
+      text: `⚠️ License roster NOT posted to ${target}: ${problems.join('; ')}. Nothing went to the channel.` }).catch(() => {});
+    throw new Error(`license roster contract failed: ${problems.join('; ')}`);
+  }
+  const posted = /^[CDGU][A-Z0-9]{6,}$/.test(target)
+    ? await slack.client.chat.postMessage({ channel: target, text })
+    : await executeChannelPost(target, text, null, correlationId);
+  if (!posted || posted.ok === false) throw new Error(`license roster not posted to ${target}`);
+  logActivity({ event_type: 'report', event_source: 'cron', action: 'runLicenseRosterReport', status: 'ok',
+    output: { posted: true, target, ...summary.totals } });
+}
+cron.schedule('0 8 * * 1,4', wrapCronJob('runLicenseRosterReport', async (c) => { await runLicenseRosterReport(c); }), { timezone: 'America/Costa_Rica' });
+
 // ─── CLIENT ATTENTION (fulfillment) ─────────────────────────────────────────
 // Mon + Thu report and urgent alerts in #ng-fullfillment-ops (Ron, 2026-09-23).
 // Slack posting RETIRED 2026-10-14; the crons are unscheduled (see below).
@@ -24009,6 +24040,7 @@ const STATIC_CRON_SCHEDULES = {
   runAppointmentStatusSync:     '0 15 * * *',
   runCampaignHealthWbrReminder: '30 15 * * 1',
   runKaiEscalationsDigest:      '30 8 * * 1',
+  runLicenseRosterReport:       '0 8 * * 1,4',
   runApptDeletionSweep:         '20 7,10,13,16,19 * * *',
   runAutoStrikeMover:           '0 7,9,11,13,15,17,19,21 * * *',
   // The audit declares itself, so a run where it dies shows up as stale on the
