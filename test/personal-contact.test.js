@@ -36,7 +36,9 @@ check('tag name is overridable from env', build('amigo')(['Amigo']), true);
 
 // Every lead_posts read outside the intake webhook's own dedup lookups must
 // carry the personal_excluded_at filter within its query chain.
-const DEDUP_OK = new Set(['handleGHLWebhook', 'handleGHLClaimWebhook']);
+// healLeadPostsFromSlack asks "does this card have a row at all": a personal
+// row is still a row, and filtering it out would write the row a second time.
+const DEDUP_OK = new Set(['handleGHLWebhook', 'handleGHLClaimWebhook', 'healLeadPostsFromSlack']);
 const lines = SRC.split('\n');
 let currentFn = '';
 const missing = [];
