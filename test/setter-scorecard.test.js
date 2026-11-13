@@ -28,10 +28,11 @@ const sla = sc.signalSla([
   sig('2026-11-13T11:00:00', null),                    // never answered: late
   sig('2026-11-13T21:30:00', '2026-11-14T08:05:00'),   // overnight: clock starts 08:00, on time
   sig('2026-11-14T11:50:00', null),                    // still inside its 15 min: not judged
+  sig('2026-11-13T15:00:00', null, { answered_at: new Date(CR('2026-11-13T15:07:00')).toISOString() }), // answered in GHL, no ✅: on time
   sig('2026-11-13T10:00:00', '2026-11-13T10:01:00', { mode: 'shadow' }), // shadow: Ron's, ignored
   { kind: 'reply', mode: 'draft', status: 'sent', created_at: new Date(CR('2026-11-13T10:00:00')).toISOString() },
 ], now);
-check('SLA counts on-time and judged cards', sla.onTime === 2 && sla.judged === 4, JSON.stringify(sla));
+check('SLA counts on-time and judged cards', sla.onTime === 3 && sla.judged === 5, JSON.stringify(sla));
 check('overnight card clock starts at 08:00', sc.slaClockStart(CR('2026-11-13T21:30:00')) === CR('2026-11-14T08:00:00'));
 check('early card clock starts at 08:00 same day', sc.slaClockStart(CR('2026-11-13T06:10:00')) === CR('2026-11-13T08:00:00'));
 
@@ -43,8 +44,10 @@ const d = sc.draftStats([
   { kind: 'reply', mode: 'draft', status: 'rejected' },
   { kind: 'reply', mode: 'shadow', status: 'sent' },
   { kind: 'signal', mode: 'draft', status: 'handled' },
-]);
-check('draft counts', d.asIs === 1 && d.edited === 1 && d.expired === 1 && d.rejected === 1, JSON.stringify(d));
+  { kind: 'reply', mode: 'draft', status: 'drafted', created_at: '2026-11-13T14:00:00.000Z', window_closes_at: '2026-11-14T13:00:00.000Z' }, // window closed: expired
+  { kind: 'strike', mode: 'draft', status: 'drafted', created_at: new Date(now - 3600000).toISOString() },                                 // an hour old: waiting
+], now);
+check('draft counts', d.asIs === 1 && d.edited === 1 && d.expired === 2 && d.rejected === 1 && d.waiting === 1, JSON.stringify(d));
 
 // 5. The text: no em dashes, no opening question/exclamation marks, no dollars.
 const text = sc.formatScorecard({

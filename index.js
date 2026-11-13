@@ -23545,12 +23545,16 @@ async function setterScorecardBacklog(monthStartIso) {
         .select('contact_id, kind, created_at').in('contact_id', chunk).in('kind', ['reply', 'signal']).gte('created_at', monthStartIso);
       if (aErr) throw new Error(`guardian_actions: ${aErr.message}`);
       for (const a of acts || []) if (Date.parse(a.created_at) > taggedAt.get(a.contact_id)) replied.add(a.contact_id);
+      const { data: prospects, error: prErr } = await portalSupabase.from('revops_prospects')
+        .select('id, ghl_contact_id').in('ghl_contact_id', chunk);
+      if (prErr) throw new Error(`prospects: ${prErr.message}`);
+      const cidByProspect = new Map((prospects || []).map((p) => [p.id, p.ghl_contact_id]));
+      if (!cidByProspect.size) continue;
       const { data: appts, error: pErr } = await portalSupabase.from('revops_appointments')
-        .select('scheduled_start, prospect:prospect_id!inner ( ghl_contact_id )')
-        .in('prospect.ghl_contact_id', chunk).gte('scheduled_start', monthStartIso);
+        .select('prospect_id, scheduled_start').in('prospect_id', [...cidByProspect.keys()]).gte('scheduled_start', monthStartIso);
       if (pErr) throw new Error(`appointments: ${pErr.message}`);
       for (const a of appts || []) {
-        const cid = a.prospect?.ghl_contact_id;
+        const cid = cidByProspect.get(a.prospect_id);
         if (cid && Date.parse(a.scheduled_start) > taggedAt.get(cid)) booked.add(cid);
       }
     }
@@ -23576,9 +23580,19 @@ async function buildSetterScorecard(now = Date.now()) {
   ];
   // A failed read prints "No se pudo leer hoy" for its section, never a 0.
   const { data: rows, error } = await supabase.from('guardian_actions')
-    .select('kind, status, mode, edited, created_at, approved_at')
+    .select('kind, status, mode, edited, created_at, approved_at, conversation_id, window_closes_at')
     .gte('created_at', monthStartIso).limit(10000);
   if (error) console.error('Setter scorecard: guardian_actions read failed:', error.message);
+  // Signal cards he answered straight in GHL or on the phone: nothing closes
+  // the card then, so read the thread for the first team answer after it.
+  // One GHL read per open signal card (a few dozen a month at most).
+  for (const r of error ? [] : rows || []) {
+    if (r.kind !== 'signal' || r.mode !== 'draft' || r.status === 'handled' || !r.conversation_id) continue;
+    try {
+      const at = hotReplies.firstAnswerAfter(await ghlGetConversationMessages(r.conversation_id), Date.parse(r.created_at), strikeIsAutomatedBody);
+      if (at) r.answered_at = new Date(at).toISOString();
+    } catch (err) { console.warn(`Setter scorecard: thread read failed ${r.conversation_id}: ${err.message}`); }
+  }
   const backlog = await setterScorecardBacklog(monthStartIso);
   const mtd = mtdRes.stats[SCORECARD_SETTER_NAME] || empty();
   return {
@@ -23587,7 +23601,7 @@ async function buildSetterScorecard(now = Date.now()) {
       week: weekRes.stats[SCORECARD_SETTER_NAME] || empty(),
       prevWeek: prevRes.stats[SCORECARD_SETTER_NAME] || empty(),
       sla: error ? null : setterScorecard.signalSla(rows, now),
-      drafts: error ? null : setterScorecard.draftStats(rows),
+      drafts: error ? null : setterScorecard.draftStats(rows, now),
       backlog,
     }),
     mtd, backlog, degraded: Boolean(error) || !backlog,
