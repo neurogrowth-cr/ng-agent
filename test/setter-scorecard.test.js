@@ -62,7 +62,8 @@ check('no em dash', !text.includes('—'));
 check('no opening marks', !/[¿¡]/.test(text));
 check('no dollar amounts', !text.includes('$'));
 const gated = sc.formatScorecard({ now, mtd: { held_with_ficha: 16, attended: 5, no_shows: 5 }, week: {}, prevWeek: {}, sla: null, drafts: null, backlog: null });
-check('show rate under 60% says no bonus', gated.includes('❌ sin bono por ahora') && gated.includes('No se pudo leer hoy'), gated);
+check('show rate under 60% says no bonus', gated.includes('❌ sin bono por ahora'), gated);
+check('unreadable sections say so, never 0', (gated.match(/No se pudo leer hoy/g) || []).length === 3, gated);
 
 // 6. index.js: soleSetter credits every call, unclaimed self-bookings included.
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');

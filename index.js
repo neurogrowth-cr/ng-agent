@@ -23574,10 +23574,11 @@ async function buildSetterScorecard(now = Date.now()) {
     await getSetterStatsWithCalls(weekAgoIso, nowIso, { ...sole, ficha: false }),
     await getSetterStatsWithCalls(twoWeeksIso, weekAgoIso, { ...sole, ficha: false }),
   ];
+  // A failed read prints "No se pudo leer hoy" for its section, never a 0.
   const { data: rows, error } = await supabase.from('guardian_actions')
     .select('kind, status, mode, edited, created_at, approved_at')
     .gte('created_at', monthStartIso).limit(10000);
-  if (error) throw new Error(`guardian_actions read: ${error.message}`);
+  if (error) console.error('Setter scorecard: guardian_actions read failed:', error.message);
   const backlog = await setterScorecardBacklog(monthStartIso);
   const mtd = mtdRes.stats[SCORECARD_SETTER_NAME] || empty();
   return {
@@ -23585,18 +23586,18 @@ async function buildSetterScorecard(now = Date.now()) {
       now, mtd,
       week: weekRes.stats[SCORECARD_SETTER_NAME] || empty(),
       prevWeek: prevRes.stats[SCORECARD_SETTER_NAME] || empty(),
-      sla: setterScorecard.signalSla(rows, now),
-      drafts: setterScorecard.draftStats(rows),
+      sla: error ? null : setterScorecard.signalSla(rows, now),
+      drafts: error ? null : setterScorecard.draftStats(rows),
       backlog,
     }),
-    mtd, backlog,
+    mtd, backlog, degraded: Boolean(error) || !backlog,
   };
 }
 
 async function runSetterScorecard(correlationId) {
-  const { text, mtd, backlog } = await buildSetterScorecard();
+  const { text, mtd, backlog, degraded } = await buildSetterScorecard();
   await slack.client.chat.postMessage({ channel: SALES_CHANNEL, text });
-  await logActivity({ event_type: 'report', event_source: 'cron', action: 'runSetterScorecard', status: backlog ? 'ok' : 'degraded',
+  await logActivity({ event_type: 'report', event_source: 'cron', action: 'runSetterScorecard', status: degraded ? 'degraded' : 'ok',
     output: { aqc: mtd.held_with_ficha || 0, attended: mtd.attended || 0, backlog }, correlation_id: correlationId });
 }
 
