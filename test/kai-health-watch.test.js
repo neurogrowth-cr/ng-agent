@@ -314,6 +314,7 @@ function digestData({ yesterday, baseline, extra = {} }) {
   check('15d read-only: no writes in any SQL', [...Object.values(kai.SQL), ...Object.values(kai.DIGEST_SQL)].some((s) => /\b(insert|update|delete|drop|alter)\b/i.test(s)), false);
 
   // A prospect's no closed by Kai is the normal path: not a skip, not a missing Slack post.
+check('a reply put back by hand after an outage is not a lost reply', [/l\.metadata->>'recovered' IS NULL/.test(kai.SQL.missedReplies), /l\.event_data->'eventData'->>'recoveredFrom' IS NULL/.test(kai.SQL.missedReplies)], [true, true]);
 check('decline closes are not counted as skipped', /status = 'skipped' AND COALESCE\(status_reason, ''\) NOT IN \('prospect_declined'/.test(kai.DIGEST_SQL.daily), true);
 check('a sent decline close is not a divergence', /status_reason, ''\) <> 'decline_close'/.test(kai.DIGEST_SQL.divergence), true);
 check('an auto-reply waiting for its send time is not a divergence', /q\.send_after IS NOT NULL/.test(kai.DIGEST_SQL.divergence), true);

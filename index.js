@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { logActivity, newCorrelationId } = require('./lib/activityLog');
 const leadVolume = require('./lib/leadVolume');
+const leadPostHeal = require('./lib/leadPostHeal');
 const firstTouchAdLib = require('./lib/firstTouchAd');
 const adAttribution = require('./lib/adAttribution');
 const hotReplies = require('./lib/hotReplies');
@@ -16346,13 +16347,17 @@ async function handleGHLWebhook(req, res) {
           text: channelNote,
           metadata: contactId ? {
             event_type: 'ghl_lead',
-            event_payload: { contact_id: contactId, location_id: locationId, full_name: fullName, email: email || null, correlation_id: ghlCorr },
+            // source, channel, phone_last10 and name_prefix3 ride along so the
+            // lead_posts row can be rebuilt from the card when the write below
+            // fails (healLeadPostsFromSlack).
+            event_payload: { contact_id: contactId, location_id: locationId, full_name: fullName, email: email || null, correlation_id: ghlCorr, source: source || null, channel: leadChannelKey || null, phone_last10: phoneLast10 || null, name_prefix3: namePrefix3 || null },
           } : undefined,
         });
         logActivity({ event_type: 'slack_message', event_source: 'slack', action: 'outbound', channel_id: LEAD_CHANNEL_ID, output: { text: channelNote.slice(0, 2000) }, correlation_id: ghlCorr });
 
         // Persist contact_id → message_ts mapping so /webhook/ghl-claim can mirror
-        // GHL-direct claims back to this Slack post. Non-fatal on insert failure.
+        // GHL-direct claims back to this Slack post. Non-fatal on insert failure:
+        // the hourly heal rebuilds a row lost here from the card.
         if (contactId && leadPost?.ts) {
           try {
             const { error: lpErr } = await supabase.from('lead_posts').upsert({
@@ -21066,6 +21071,41 @@ console.log('Registered static cron: GHL workflow drift check (45 7 * * *)');
 // lib/leadVolume.js; this owns the I/O.
 //
 // Spec: ~/automations/ops/recipes/lead-volume-watchdog.md
+// A card posted while the database was down has no lead_posts row: the write
+// in handleGHLWebhook failed and nothing retried it (2026-11-12, two cards in
+// a two-hour freeze; one was then reported as "card but NO Slack lead post").
+// The card's Slack metadata is the durable copy, so read the lead channel and
+// write the rows that are missing. Pure logic in lib/leadPostHeal.js. Returns
+// the contact ids restored; throws on a failed read or write.
+async function healLeadPostsFromSlack(sinceMs, { now = Date.now() } = {}) {
+  const messages = [];
+  let cursor;
+  for (let page = 0; page < 10; page++) {
+    const res = await slack.client.conversations.history({
+      channel: LEAD_CHANNEL_ID, oldest: String(sinceMs / 1000), limit: 200, include_all_metadata: true, ...(cursor ? { cursor } : {}),
+    });
+    messages.push(...(res.messages || []));
+    cursor = res.response_metadata && res.response_metadata.next_cursor;
+    if (!cursor) break;
+  }
+  const ids = [...new Set(leadPostHeal.leadCards(messages).map(m => String(m.metadata.event_payload.contact_id)))];
+  if (!ids.length) return [];
+  const have = new Set();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await supabase.from('lead_posts').select('contact_id').in('contact_id', ids.slice(i, i + 100));
+    if (error) throw new Error(`lead_posts read failed: ${error.message}`);
+    for (const r of data || []) have.add(r.contact_id);
+  }
+  const rows = leadPostHeal.missingRows(messages, have, { channelId: LEAD_CHANNEL_ID, now });
+  if (!rows.length) return [];
+  // ignoreDuplicates: a row the webhook wrote in the meantime is the better one.
+  const { error } = await supabase.from('lead_posts').upsert(rows, { onConflict: 'contact_id', ignoreDuplicates: true });
+  if (error) throw new Error(`lead_posts heal write failed: ${error.message}`);
+  console.log(`lead_posts heal: restored ${rows.length} row(s) from the lead cards: ${rows.map(r => r.contact_id).join(', ')}`);
+  logActivity({ event_type: 'audit', event_source: 'cron', action: 'lead_posts_heal', status: 'ok', output: { restored: rows.map(r => ({ contact_id: r.contact_id, slack_message_ts: r.slack_message_ts })) } });
+  return rows.map(r => r.contact_id);
+}
+
 async function fetchLeadVolumeRows(sinceIso) {
   const rows = [];
   // Paged: PostgREST caps a response at 1000 rows, and a short page read as
@@ -21085,6 +21125,10 @@ async function fetchLeadVolumeRows(sinceIso) {
 }
 
 async function runLeadVolumeWatchdog(correlationId, { now = Date.now() } = {}) {
+  // Hourly, every channel: a card that lost its row gets it back before the
+  // count. Not fatal; if the database is down the read below says so.
+  try { await healLeadPostsFromSlack(now - 48 * 60 * 60 * 1000, { now }); }
+  catch (err) { console.warn(`Lead volume watchdog: lead_posts heal failed: ${err.message}`); }
   let rows;
   try {
     // 14 days: a 7-day baseline before the silence plus up to 7 days of silence.
@@ -21434,7 +21478,7 @@ async function runSocialIntakeGapCheck(now, stats) {
   if (!suspects.length) return;
   const alreadyAlerted = await hotReadKnowledge(suspects.map(c => `social-intake-gap:${c.contactId}`));
 
-  const found = [];
+  let found = [];
   for (const c of suspects) {
     const key = `social-intake-gap:${c.contactId}`;
     if (alreadyAlerted.has(key) || _hotSentGuard.has(key)) continue;
@@ -21472,6 +21516,14 @@ async function runSocialIntakeGapCheck(now, stats) {
       continue;
     }
     found.push({ key, code: v.code, contactId: c.contactId, conversationId: c.id, contactName: c.contactName || c.fullName || c.contactId, channel: c.lastMessageType, firstInboundAt, link: ghlContactLink(c.contactId) });
+  }
+  // "Card but no Slack post" is read off lead_posts. A card whose row write
+  // failed is in Slack all the same: rebuild its row and drop it from the alert.
+  if (found.some(f => f.code === 'no_post')) {
+    try {
+      const healed = new Set(await healLeadPostsFromSlack(since - hotReplies.MERGED_POST_WINDOW.beforeMs, { now }));
+      found = found.filter(f => !(f.code === 'no_post' && healed.has(f.contactId)));
+    } catch (err) { stats.reportErrors++; console.warn(`hot-reply: lead_posts heal failed: ${err.message}`); }
   }
   if (!found.length) return;
 
