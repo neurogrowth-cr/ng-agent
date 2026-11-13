@@ -1889,7 +1889,15 @@ function trimToLeadAnchor(text, taskName) {
   return text.slice(i).trim();
 }
 
+// Replaced by the static Setter Scorecard (Ron, 2026-11-12: one setter, no
+// ranking). Skipped here so the old row can never double-post, active or not.
+const RETIRED_DYNAMIC_TASKS = new Set(['Setter Leaderboard']);
+
 function registerDynamicCron(task) {
+  if (RETIRED_DYNAMIC_TASKS.has(task.name)) {
+    console.log(`Dynamic task "${task.name}" not registered: replaced by a static cron`);
+    return;
+  }
   try {
     if (activeDynamicCrons[task.id]) { activeDynamicCrons[task.id].stop(); }
     const job = cron.schedule(task.cron_expression, async () => {
@@ -4735,6 +4743,8 @@ function _newSetterSlot() {
     held_with_ficha: 0,
     ficha_incomplete: 0, // held, a ficha was pasted, at least one claro is blank
     ficha_unchecked: 0,  // held, but no GHL contact id or the notes read failed
+    won: 0,              // held calls the closer logged as won
+    won_with_ficha: 0,   // won among held_with_ficha (AQC close rate, Setter Scorecard)
   };
 }
 
@@ -4769,7 +4779,9 @@ async function fetchSetterClaimsSince(sinceIso) {
 //   latestStartByProspect  see classifyUnheldAppt (reschedules and deletions)
 // Returns { stats, ownedCalls }. ownedCalls is one entry per attributed call so
 // every enrichment (REVI lead quality) credits the SAME owner as the stats do.
-function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, nowMs, latestStartByProspect = {}) {
+// opts.soleSetter (Setter Scorecard, Ron 2026-11-12): one setter left, and an
+// AQC counts for him whoever booked it, so every call is credited to that name.
+function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, nowMs, latestStartByProspect = {}, opts = {}) {
   const result = {};
 
   // OWNERSHIP MAP: who CLAIMED each prospect in #ng-sales-goats (✋ flow →
@@ -4798,7 +4810,7 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
     if (unheld === 'skip') continue;
     const prospectEmail = (a.prospect?.email || '').toLowerCase().trim();
     const claimOwner = prospectEmail ? claimOwnerByEmail[prospectEmail] : null;
-    const owner = claimOwner || (a.setter_id ? resolveSalesMember(a.setter_id) : null);
+    const owner = opts.soleSetter || claimOwner || (a.setter_id ? resolveSalesMember(a.setter_id) : null);
     if (!owner) continue;
 
     if (!result[owner]) result[owner] = _newSetterSlot();
@@ -4828,9 +4840,12 @@ function tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso,
     }
     // Same reschedule-leftover guard as getCloserWeeklyStats: no outcome can
     // describe a call that hasn't happened yet.
-    const c = classifyOutcome(new Date(a.scheduled_start).getTime() > nowMs ? null : outcomesById[a.id]);
-    ownedCalls.push({ owner, email: prospectEmail || null, cancelled, held: c.showed, ghlContactId });
+    const outcomeRow = new Date(a.scheduled_start).getTime() > nowMs ? null : outcomesById[a.id];
+    const c = classifyOutcome(outcomeRow);
+    const won = c.showed && (outcomeRow?.outcome || '').toLowerCase().trim() === 'won';
+    ownedCalls.push({ owner, email: prospectEmail || null, cancelled, held: c.showed, won, ghlContactId });
     if (c.showed)            slot.attended += 1;
+    if (won)                 slot.won      += 1;
     if (c.noShow)            slot.no_shows += 1;
     if (c.pending)           slot.pending  += 1;
     if (c.qualifiedAttended) slot.aqc      += 1;
@@ -4886,14 +4901,16 @@ async function addFichaStats(stats, ownedCalls) {
   for (const c of held) {
     const slot = stats[c.owner];
     const status = c.ghlContactId ? statusByContact[c.ghlContactId] : 'unchecked';
-    if (status === 'complete')        slot.held_with_ficha  += 1;
+    if (status === 'complete')        { slot.held_with_ficha += 1; if (c.won) slot.won_with_ficha += 1; }
     else if (status === 'incomplete') slot.ficha_incomplete += 1;
     else if (status === 'unchecked')  slot.ficha_unchecked  += 1;
   }
   return stats;
 }
 
-async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
+// opts.soleSetter credits every call to one name (see tallySetterStats);
+// opts.ficha === false skips the GHL notes reads for windows that do not show it.
+async function getSetterStatsWithCalls(weekStartIso, weekEndIso, opts = {}) {
   // Flywheel appointments in range + their outcomes
   const { data: apptsRaw, error: apptErr } = await portalSupabase
     .from('revops_appointments')
@@ -4917,8 +4934,8 @@ async function getSetterStatsWithCalls(weekStartIso, weekEndIso) {
 
   const lookbackIso = new Date(new Date(weekStartIso).getTime() - 45 * 24 * 60 * 60 * 1000).toISOString();
   const claims = await fetchSetterClaimsSince(lookbackIso);
-  const tally = tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now(), latestStartByProspect);
-  await addFichaStats(tally.stats, tally.ownedCalls);
+  const tally = tallySetterStats(appts, outcomesById, claims, weekStartIso, weekEndIso, Date.now(), latestStartByProspect, opts);
+  if (opts.ficha !== false) await addFichaStats(tally.stats, tally.ownedCalls);
   return tally;
 }
 
@@ -23495,6 +23512,111 @@ async function runBacklogReactivation(correlationId) {
 
 cron.schedule('30 9 * * 1-5', wrapCronJob('runBacklogReactivation', async (c) => { await runBacklogReactivation(c); }, { timeoutMs: 15 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
 console.log(`Registered static cron: backlog reactivation (30 9 * * 1-5) mode=${backlogReactMode()}`);
+
+// ─── SETTER SCORECARD (Tue + Sat 07:00 CR, #ng-sales-goats) ────────────────────
+// Ron, 2026-11-12: one setter left, so the board compares Sebastián with his pay
+// targets and his own last week, not with other setters. Replaces the dynamic
+// "Setter Leaderboard" task (see RETIRED_DYNAMIC_TASKS). Deterministic: no model.
+// Formatting and pay rules live in lib/setterScorecard.js.
+const setterScorecard = require('./lib/setterScorecard');
+const SCORECARD_SETTER_NAME = 'Sebastian S'; // roster name used by setter stats
+
+// Backlog campaign this month: who Max tagged, who answered after the tag, who
+// booked after it. Null when a read fails, so the board says so instead of a 0.
+async function setterScorecardBacklog(monthStartIso) {
+  try {
+    const { data: runs, error } = await portalSupabase.from('agent_activity')
+      .select('output, created_at').eq('event_type', 'backlog_react').eq('action', 'backlog_react_run')
+      .gte('created_at', monthStartIso).limit(200);
+    if (error) throw new Error(`backlog runs: ${error.message}`);
+    const taggedAt = new Map();
+    let struckOut = 0;
+    for (const r of runs || []) {
+      if (r.output?.mode !== 'live') continue;
+      struckOut += Number(r.output?.moved_to_lost) || 0;
+      const at = Date.parse(r.created_at);
+      for (const id of r.output?.tagged || []) if (!taggedAt.has(id)) taggedAt.set(id, at);
+    }
+    const ids = [...taggedAt.keys()];
+    const replied = new Set(), booked = new Set();
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      const { data: acts, error: aErr } = await supabase.from('guardian_actions')
+        .select('contact_id, kind, created_at').in('contact_id', chunk).in('kind', ['reply', 'signal']).gte('created_at', monthStartIso);
+      if (aErr) throw new Error(`guardian_actions: ${aErr.message}`);
+      for (const a of acts || []) if (Date.parse(a.created_at) > taggedAt.get(a.contact_id)) replied.add(a.contact_id);
+      const { data: prospects, error: prErr } = await portalSupabase.from('revops_prospects')
+        .select('id, ghl_contact_id').in('ghl_contact_id', chunk);
+      if (prErr) throw new Error(`prospects: ${prErr.message}`);
+      const cidByProspect = new Map((prospects || []).map((p) => [p.id, p.ghl_contact_id]));
+      if (!cidByProspect.size) continue;
+      const { data: appts, error: pErr } = await portalSupabase.from('revops_appointments')
+        .select('prospect_id, scheduled_start').in('prospect_id', [...cidByProspect.keys()]).gte('scheduled_start', monthStartIso);
+      if (pErr) throw new Error(`appointments: ${pErr.message}`);
+      for (const a of appts || []) {
+        const cid = cidByProspect.get(a.prospect_id);
+        if (cid && Date.parse(a.scheduled_start) > taggedAt.get(cid)) booked.add(cid);
+      }
+    }
+    return { tagged: ids.length, replied: replied.size, booked: booked.size, struckOut };
+  } catch (err) {
+    console.error('Setter scorecard: backlog read failed:', err.message);
+    return null;
+  }
+}
+
+async function buildSetterScorecard(now = Date.now()) {
+  const todayCR = new Date(now - 6 * 3600 * 1000).toISOString().slice(0, 10);
+  const monthStartIso = new Date(`${todayCR.slice(0, 8)}01T06:00:00.000Z`).toISOString(); // CR midnight on the 1st
+  const nowIso = new Date(now).toISOString();
+  const weekAgoIso = new Date(now - 7 * 86400000).toISOString();
+  const twoWeeksIso = new Date(now - 14 * 86400000).toISOString();
+  const sole = { soleSetter: SCORECARD_SETTER_NAME };
+  const empty = () => ({ leads_claimed: 0, calls_booked: 0, attended: 0, no_shows: 0 });
+  const [mtdRes, weekRes, prevRes] = [
+    await getSetterStatsWithCalls(monthStartIso, nowIso, sole),
+    await getSetterStatsWithCalls(weekAgoIso, nowIso, { ...sole, ficha: false }),
+    await getSetterStatsWithCalls(twoWeeksIso, weekAgoIso, { ...sole, ficha: false }),
+  ];
+  // A failed read prints "No se pudo leer hoy" for its section, never a 0.
+  const { data: rows, error } = await supabase.from('guardian_actions')
+    .select('kind, status, mode, edited, created_at, approved_at, conversation_id, window_closes_at')
+    .gte('created_at', monthStartIso).limit(10000);
+  if (error) console.error('Setter scorecard: guardian_actions read failed:', error.message);
+  // Signal cards he answered straight in GHL or on the phone: nothing closes
+  // the card then, so read the thread for the first team answer after it.
+  // One GHL read per open signal card (a few dozen a month at most).
+  for (const r of error ? [] : rows || []) {
+    if (r.kind !== 'signal' || r.mode !== 'draft' || r.status === 'handled' || !r.conversation_id) continue;
+    try {
+      const at = hotReplies.firstAnswerAfter(await ghlGetConversationMessages(r.conversation_id), Date.parse(r.created_at), strikeIsAutomatedBody);
+      if (at) r.answered_at = new Date(at).toISOString();
+    } catch (err) { console.warn(`Setter scorecard: thread read failed ${r.conversation_id}: ${err.message}`); }
+  }
+  const backlog = await setterScorecardBacklog(monthStartIso);
+  const mtd = mtdRes.stats[SCORECARD_SETTER_NAME] || empty();
+  return {
+    text: setterScorecard.formatScorecard({
+      now, mtd,
+      week: weekRes.stats[SCORECARD_SETTER_NAME] || empty(),
+      prevWeek: prevRes.stats[SCORECARD_SETTER_NAME] || empty(),
+      sla: error ? null : setterScorecard.signalSla(rows, now),
+      drafts: error ? null : setterScorecard.draftStats(rows, now),
+      backlog,
+    }),
+    mtd, backlog, degraded: Boolean(error) || !backlog,
+  };
+}
+
+async function runSetterScorecard(correlationId) {
+  const { text, mtd, backlog, degraded } = await buildSetterScorecard();
+  await slack.client.chat.postMessage({ channel: SALES_CHANNEL, text });
+  await logActivity({ event_type: 'report', event_source: 'cron', action: 'runSetterScorecard', status: degraded ? 'degraded' : 'ok',
+    output: { aqc: mtd.held_with_ficha || 0, attended: mtd.attended || 0, backlog }, correlation_id: correlationId });
+}
+
+cron.schedule('0 7 * * 2,6', wrapCronJob('runSetterScorecard', async (c) => { await runSetterScorecard(c); }, { timeoutMs: 10 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: setter scorecard (0 7 * * 2,6)');
 // ─── end pipeline guardian ──────────────────────────────────────────────────
 
 // ─── GMAIL FAN-OUT ALERT QUALITY ────────────────────────────────────────────
@@ -23879,6 +24001,7 @@ const STATIC_CRON_SCHEDULES = {
   runIgGuideCheck:              '*/5 * * * *',
   runGuardianCheck:             '*/15 8-20 * * *',
   runGuardianDigest:            '0 18 * * 1-6',
+  runSetterScorecard:           '0 7 * * 2,6',
   runGuardianWatchdog:          '5 * * * *',
   runBacklogReactivation:       '30 9 * * 1-5',
   runStalledProspectFollowups:  '0 11 * * 1-5',
