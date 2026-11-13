@@ -44,10 +44,11 @@ const d = sc.draftStats([
   { kind: 'reply', mode: 'draft', status: 'rejected' },
   { kind: 'reply', mode: 'shadow', status: 'sent' },
   { kind: 'signal', mode: 'draft', status: 'handled' },
+  { kind: 'reply', mode: 'draft', status: 'handled' },                                                                                     // answered from the phone
   { kind: 'reply', mode: 'draft', status: 'drafted', created_at: '2026-11-13T14:00:00.000Z', window_closes_at: '2026-11-14T13:00:00.000Z' }, // window closed: expired
   { kind: 'strike', mode: 'draft', status: 'drafted', created_at: new Date(now - 3600000).toISOString() },                                 // an hour old: waiting
 ], now);
-check('draft counts', d.asIs === 1 && d.edited === 1 && d.expired === 2 && d.rejected === 1 && d.waiting === 1, JSON.stringify(d));
+check('draft counts', d.asIs === 1 && d.edited === 1 && d.expired === 2 && d.rejected === 1 && d.waiting === 1 && d.direct === 1, JSON.stringify(d));
 
 // 5. The text: no em dashes, no opening question/exclamation marks, no dollars.
 const text = sc.formatScorecard({

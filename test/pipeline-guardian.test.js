@@ -292,5 +292,24 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('drafter prompt has no em dash', /—/.test(p.system), false);
 }
 
+// Open cards get closed (2026-11-12): phone/GHL answer, deadline, shadow.
+{
+  const H = 3600 * 1000, now = Date.parse('2026-11-13T18:00:00Z');
+  const row = (o) => ({ status: 'drafted', kind: 'reply', mode: 'draft', created_at: '2026-11-13T14:00:00Z', window_closes_at: '2026-11-14T13:00:00Z', ...o });
+  const ans = Date.parse('2026-11-13T14:05:00Z');
+  check('draft answered from the phone is handled', pg.closeDecision(row(), now, ans).status, 'handled');
+  check('handled keeps the answer time', pg.closeDecision(row(), now, ans).approvedAt, ans);
+  check('an answer before the card does not count', pg.closeDecision(row(), now, Date.parse('2026-11-13T13:00:00Z')), null);
+  check('open draft inside its window stays open', pg.closeDecision(row(), now, null), null);
+  check('draft past its Meta window expires', pg.closeDecision(row({ window_closes_at: '2026-11-13T17:00:00Z' }), now, null).status, 'expired');
+  check('email strike (no window) expires after 24 h', pg.closeDecision(row({ kind: 'strike', window_closes_at: null, created_at: '2026-11-12T17:00:00Z' }), now, null).status, 'expired');
+  check('signal stays open under 72 h', pg.closeDecision(row({ kind: 'signal', status: 'signal', window_closes_at: null, created_at: '2026-11-12T17:00:00Z' }), now, null), null);
+  check('signal answered is handled', pg.closeDecision(row({ kind: 'signal', status: 'signal', window_closes_at: null }), now, ans).status, 'handled');
+  check('signal closes after 72 h', pg.closeDecision(row({ kind: 'signal', status: 'signal', window_closes_at: null, created_at: new Date(now - 73 * H).toISOString() }), now, null).status, 'expired');
+  check('shadow card past deadline is skipped, never expired', pg.closeDecision(row({ mode: 'shadow', window_closes_at: '2026-11-13T17:00:00Z' }), now, null).status, 'skipped');
+  check('shadow card answered is not credited', pg.closeDecision(row({ mode: 'shadow' }), now, ans), null);
+  check('a sent card is never touched', pg.closeDecision(row({ status: 'sent' }), now, ans), null);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');

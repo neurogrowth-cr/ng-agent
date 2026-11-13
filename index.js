@@ -22927,8 +22927,54 @@ async function runGuardianCheck(correlationId) {
   }
 }
 
+// Closes open cards before the run reads them (lib closeDecision): answered from
+// the phone or GHL -> handled, past the deadline -> expired (shadow: skipped).
+// Only draft-mode cards need the thread; a failed or capped read leaves the card
+// for the next run instead of guessing. Messages Max AI sent never count as
+// Sebastián's answer. The card gets ✅ or ⏳ so Slack matches the table.
+const GUARDIAN_CLOSE_MAX_READS = 40;
+async function guardianCloseOpenCards(now, stats) {
+  const { data: open, error } = await supabase.from('guardian_actions')
+    .select('id, kind, status, mode, conversation_id, created_at, window_closes_at, slack_channel_id, slack_message_ts')
+    .in('status', ['drafted', 'signal']).order('created_at', { ascending: true }).limit(500);
+  if (error) throw new Error(`guardian_actions open read: ${error.message}`);
+  stats.closed = { handled: 0, expired: 0, skipped: 0 };
+  const threads = new Map();
+  let reads = 0;
+  const maxId = IG_GUIDE_MAX_GHL_USER_ID.toLowerCase();
+  for (const r of open || []) {
+    let answeredAt = null;
+    if (r.mode === 'draft') {
+      if (!r.conversation_id) continue;
+      if (!threads.has(r.conversation_id)) {
+        if (reads >= GUARDIAN_CLOSE_MAX_READS) continue;
+        reads++;
+        try {
+          const msgs = await ghlGetConversationMessages(r.conversation_id);
+          threads.set(r.conversation_id, msgs.filter((m) => String(m.userId || '').toLowerCase() !== maxId));
+        } catch (err) { threads.set(r.conversation_id, null); console.warn(`guardian close: thread read failed ${r.conversation_id}: ${err.message}`); }
+      }
+      const msgs = threads.get(r.conversation_id);
+      if (!msgs) continue;
+      answeredAt = hotReplies.firstAnswerAfter(msgs, Date.parse(r.created_at), strikeIsAutomatedBody);
+    }
+    const d = guardian.closeDecision(r, now, answeredAt);
+    if (!d) continue;
+    const patch = { status: d.status, last_error: d.reason, updated_at: new Date(now).toISOString() };
+    if (d.status === 'handled') { patch.approved_by = 'ghl_reply'; patch.approved_at = new Date(d.approvedAt).toISOString(); }
+    // Conditional on the status read: a ✅ that lands first wins.
+    const { data: upd, error: uErr } = await supabase.from('guardian_actions').update(patch).eq('id', r.id).eq('status', r.status).select('id');
+    if (uErr || !upd || !upd.length) continue;
+    stats.closed[d.status]++;
+    if (r.mode === 'draft' && r.slack_channel_id && r.slack_message_ts) {
+      await guardianReact(r.slack_channel_id, r.slack_message_ts, d.status === 'handled' ? 'white_check_mark' : 'hourglass').catch(() => {});
+    }
+  }
+}
+
 async function guardianRun(now, mode, stats, correlationId) {
   const skip = (r) => { stats.skips[r] = (stats.skips[r] || 0) + 1; };
+  await guardianCloseOpenCards(now, stats);
   // Clients write to the same WhatsApp number. Without the client list a client
   // could get a strike, so the run holds and counts as a failure (fail closed).
   const clientEmails = await loadActiveClientEmails();
