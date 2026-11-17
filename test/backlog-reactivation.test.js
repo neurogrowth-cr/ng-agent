@@ -103,5 +103,14 @@ check('all four stages are in scope', [S.INITIAL_CONTACT, S.STRIKE_1, S.STRIKE_2
   check('live run says what it did', /100 etiquetados hoy/.test(br.verdictLine({ mode: 'live', picked: 100, eligible: 200, health: { level: 'green', checked: 0 }, paused: null })), true);
 }
 
+// Health is measured from the TAG time (2026-11-17): the run row is logged when
+// the run ends, after the workflow already sent strike 1, so the log time read
+// every strike 1 as missing and paused the campaign on 2026-11-16.
+{
+  const SRC = require('fs').readFileSync(require('path').join(__dirname, '..', 'index.js'), 'utf8');
+  check('run row records started_at', /backlog_react_run'[\s\S]{0,200}started_at: new Date\(now\)\.toISOString\(\)/.test(SRC), true);
+  check('health reads started_at, falls back a run timeout before the log', /r\.output\?\.started_at \? Date\.parse\(r\.output\.started_at\) : Date\.parse\(r\.created_at\) - BACKLOG_REACT_RUN_TIMEOUT_MS/.test(SRC), true);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');
