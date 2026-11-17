@@ -23506,6 +23506,7 @@ async function ghlSetContactField(contactId, fieldId, value) {
   if (!res.ok) throw new Error(`contact field PUT ${contactId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
+const BACKLOG_REACT_RUN_TIMEOUT_MS = 15 * 60 * 1000;
 async function runBacklogReactivation(correlationId) {
   const mode = backlogReactMode();
   if (mode === 'off') return;
@@ -23520,7 +23521,12 @@ async function runBacklogReactivation(correlationId) {
   const enrolled = [];
   for (const r of runs || []) {
     if (r.output?.mode !== 'live') continue;
-    const at = Date.parse(r.created_at);
+    // The tag time, not the log time: the row is written when the run ENDS,
+    // minutes after the first tag, and the workflow sends strike 1 the moment a
+    // contact is tagged. Measuring from the log time read every strike 1 as
+    // missing and paused the campaign on 2026-11-16 (164 of 200 "missing"; all
+    // 50 sampled had it). Older rows carry no started_at: back off the run timeout.
+    const at = r.output?.started_at ? Date.parse(r.output.started_at) : Date.parse(r.created_at) - BACKLOG_REACT_RUN_TIMEOUT_MS;
     for (const id of r.output?.tagged || []) enrolled.push({ contactId: id, at });
   }
   const sends = new Map();
@@ -23582,12 +23588,12 @@ async function runBacklogReactivation(correlationId) {
   }
   const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length : picked.length, eligible, health, paused, situations, closed: mode === 'live' ? closed : struckOut.length });
   log('backlog_react_run', paused || health.level === 'red' || tagFailed.length ? 'warning' : 'ok',
-    { mode, tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, situations, struck_out: struckOut.length, moved_to_lost: closed, health: { ...health }, paused });
+    { mode, started_at: new Date(now).toISOString(), tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, situations, struck_out: struckOut.length, moved_to_lost: closed, health: { ...health }, paused });
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: mode === 'dry_run' ? `[DRY RUN] ${line}` : line })
     .catch((e) => console.error('backlog-react: DM failed:', e.message));
 }
 
-cron.schedule('30 9 * * 1-5', wrapCronJob('runBacklogReactivation', async (c) => { await runBacklogReactivation(c); }, { timeoutMs: 15 * 60 * 1000 }), { timezone: 'America/Costa_Rica' });
+cron.schedule('30 9 * * 1-5', wrapCronJob('runBacklogReactivation', async (c) => { await runBacklogReactivation(c); }, { timeoutMs: BACKLOG_REACT_RUN_TIMEOUT_MS }), { timezone: 'America/Costa_Rica' });
 console.log(`Registered static cron: backlog reactivation (30 9 * * 1-5) mode=${backlogReactMode()}`);
 
 // ─── SETTER SCORECARD (Tue + Sat 07:00 CR, #ng-sales-goats) ────────────────────
