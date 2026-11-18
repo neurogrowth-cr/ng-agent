@@ -1311,3 +1311,7 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Guardian watchdog `expectedRuns`:** the 10-minute grace was taken off the date, so the 00:05 CR read landed on 23:55 of the day before and asked the new day for all 52 runs (false red three nights running). The grace now comes off today's clock.
 - **Verified live:** the first heal (2026-11-13 02:05 UTC) restored the three missing rows (two from the freeze, one from 2026-11-11); their `channel` is null because those cards predate the new metadata. No `kai_intake`, social intake gap or runs false alarm since; guardian 00:05 reads 0 due on 11-13 to 11-15.
 - Tests: `test/lead-post-heal.test.js` (8 checks) plus one check each in the Kai watch and guardian tests; `test/personal-contact.test.js` exempts the heal's row-exists lookup. No migration, no env var.
+
+## 2026-11-17: backlog campaign un-paused (Ron's go)
+- `backlog-react:paused` removed from agent_knowledge at Ron's go on 2026-11-17 ~20:20 CR (it was the false alarm fixed in #507). The flag is read fresh each run, so the 2026-11-18 09:30 run tags the next 100.
+- Max DMed Sebastián the restart and the new card behavior from #513 (follow-ups auto-send after 2 h, light reply cards, 15 min / 1 h nudges).
