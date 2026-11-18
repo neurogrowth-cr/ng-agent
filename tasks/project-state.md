@@ -1289,3 +1289,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 
 - **What:** migration `028_infra_health_samples.sql`, applied 2026-11-18 with the owner's OK. The dash infra-health check (every 5 minutes) saves one reading per database for the history charts on dash Admin > Infrastructure. Each database's reading goes to the OTHER project first, so this table mostly holds the PORTAL's readings; that way a portal outage is still recorded.
 - **Max never reads or writes it.** No `index.js` change. The dash writes with `INFRA_HEALTH_MAX_SERVICE_KEY`. Rows older than 13 months are deleted by the dash once a day.
+
+## 2026-11-17: Valeria's DM for clients still not on NeuroGrowth's Prosp (#511, dash #523)
+
+- **What:** `POST /webhook/agency-move-overdue` (rules in `lib/agencyMoveOverdue.js`, test `test/agency-move-overdue.test.js`). The dash's daily `prosp-key-check` (13:00 UTC) sends the ROLEX and PATEK clients still not on NeuroGrowth's Prosp 3+ days after their held activation call; Max DMs that list to Valeria in Spanish, since she hosts the activation calls and connects the LinkedIn (Ron, 2026-11-17; strategy #132, #134).
+- **Auth and modes:** same `x-agent-secret` = `CLIENT_ATTENTION_FEED_SECRET` as `/webhook/portal-request`, nothing new to configure. `mode: "live"` DMs `U09Q3BXJ18B` (override `AGENCY_MOVE_DM_USER`); anything else goes to Ron's DM as a dry run. One DM per day and mode (24 h memory, lost on restart).
+- **Not verified live yet:** the first real DM is the next daily run with an overdue client.
