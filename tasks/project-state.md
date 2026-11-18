@@ -1284,3 +1284,8 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Campaign so far (2026-11-17):** 200 contacted (11-12, 11-13), 20 replied, 3 booked a call (setter scorecard numbers).
 - **Guardian first week (2026-11-12 to 11-17, draft mode):** 138 cards; Sebastián answered from his phone or GHL on 65 (closed by #503), approved 2 drafts in Slack, 52 expired unanswered (17 replies to leads who wrote, 24 strikes, 12 signals at 72 h). Median card to his answer about 2 h. Watchdog red all week on expired share (34%). Guardian run errors were all the 2026-11-12 Supabase outage.
 - **Setter ficha:** none of the 13 held calls this month has a `FICHA DE TRIAGE` note on the GHL contact (only REVI and Max notes), so AQC is 0 on the scorecard.
+
+## 2026-11-18: `infra_health_samples` table in Max's project (#509, dash #517)
+
+- **What:** migration `028_infra_health_samples.sql`, applied 2026-11-18 with the owner's OK. The dash infra-health check (every 5 minutes) saves one reading per database for the history charts on dash Admin > Infrastructure. Each database's reading goes to the OTHER project first, so this table mostly holds the PORTAL's readings; that way a portal outage is still recorded.
+- **Max never reads or writes it.** No `index.js` change. The dash writes with `INFRA_HEALTH_MAX_SERVICE_KEY`. Rows older than 13 months are deleted by the dash once a day.
