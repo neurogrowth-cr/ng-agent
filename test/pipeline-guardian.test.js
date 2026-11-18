@@ -168,10 +168,13 @@ const RL = replyCard.split('\n');
 check('reply card header', RL[0], '🛡️ Guardián · Mariana Solís · WhatsApp · interesado');
 check('reply card lead line', RL[1], 'Lead (hace 30 min): "Vendo consultoría a empresas, me interesa"');
 check('reply card stage and step', RL[2], 'Etapa: Initial Contact · Paso: respuesta');
-check('reply card draft label then draft', [RL[3], RL[4]], ['Borrador:', 'Con gusto. Para orientarlo mejor, cuánto cobra por cliente, más o menos?']);
-check('reply card expiry is the Meta window in CR time', RL[5], 'Vence: 09:30 CR (ventana de Meta cierra 09:30)');
-check('reply card controls', RL[6], '✅ enviar · ❌ descartar · responda en este hilo para enviar su texto');
-check('reply card link', RL[7], `🔗 ${LINK}`);
+// Light reply card (Ron, 2026-11-17): no draft in the card, it goes in the thread.
+check('reply card says where to answer', RL[3], pg.LIGHT_REPLY_LINE);
+check('reply card carries no draft', replyCard.includes('Con gusto. Para orientarlo'), false);
+check('reply card expiry is the Meta window in CR time', RL[4], 'Vence: 09:30 CR (ventana de Meta cierra 09:30)');
+check('reply card controls', RL[5], '✅ envía la sugerencia del hilo · ❌ descartar · Max le recuerda a los 15 min y a la hora');
+check('reply card link', RL[6], `🔗 ${LINK}`);
+check('thread carries the draft', pg.replyDraftThread({ draft: 'Con gusto. Qué vende?', problems: [] }).endsWith('\nCon gusto. Qué vende?'), true);
 check('reply card passes validateCard', pg.validateCard(replyCard), { ok: true, problems: [] });
 
 const signalCard = pg.formatCard({
@@ -197,9 +200,10 @@ check('strike card intent reads silencio', strikeCard.split('\n')[0].endsWith('�
 check('strike card passes validateCard', pg.validateCard(strikeCard).ok, true);
 
 const invalidCard = pg.formatCard({ kind: 'reply', step: 'reply', contactName: 'X', channel: 'whatsapp', intent: 'interested', leadQuote: 'hola', leadAt: NOW - MIN, stageName: 'New Lead', draft: 'tú', problems: ['uses tú'], closesAt: NOW + H, contactLink: LINK }, { now: NOW });
-check('invalid draft card shows the mark and still validates', [invalidCard.includes(`Borrador: ${pg.INVALID_DRAFT_MARK} (uses tú)`), pg.validateCard(invalidCard).ok], [true, true]);
+check('invalid draft: the thread shows the mark, the card still validates', [pg.replyDraftThread({ draft: 'tú', problems: ['uses tú'] }).includes(`${pg.INVALID_DRAFT_MARK} (uses tú)`), pg.validateCard(invalidCard).ok], [true, true]);
 check('validateCard red on a missing link', pg.validateCard(replyCard.replace(`🔗 ${LINK}`, '')).problems, ['missing GHL link']);
-check('validateCard red on an empty draft', pg.validateCard(replyCard.replace(RL[4], '')).problems.includes('empty draft'), true);
+check('validateCard red on an empty draft', pg.validateCard(strikeCard.replace('Le escribo por correo porque por WhatsApp no nos cruzamos.\n\nLe sirve si vemos su caso en una llamada corta esta semana?', '')).problems.includes('empty draft'), true);
+check('strike card says it goes out on its own', strikeCard.includes(pg.AUTO_STRIKE_LINE), true);
 check('validateCard red on a signal without Agendar', pg.validateCard(signalCard.replace(SL[6], 'Agendar: ')).problems.includes('signal without Agendar'), true);
 check('validateCard red on a placeholder', pg.validateCard(replyCard.replace('Mariana Solís', 'undefined')).problems.includes('placeholder'), true);
 
@@ -220,7 +224,7 @@ check('a quiet day with nothing waiting is no post', pg.formatDigest([], { now: 
 check('no em dash anywhere in the digest', /\u2014/.test(digest), false);
 
 // ── watchdog (4b) ──
-const warm = { daysActive: 7, runsToday: 52, capStreak: 0, cardsToday: 12, isWeekday: true, inboundToday: 9, approvals: 8, rejections: 1, medianMinutes: 10, expiredShare: 0.05, sentInShadowOrOff: 0, sentWithoutApproval: 0, divergence: 0, maxDraftsPerRun: 8 };
+const warm = { daysActive: 7, runsToday: 52, capStreak: 0, cardsToday: 12, isWeekday: true, inboundToday: 9, approvals: 8, rejections: 1, medianMinutes: 10, unansweredShare: 0.05, sentInShadowOrOff: 0, sentWithoutApproval: 0, divergence: 0, maxDraftsPerRun: 8 };
 const levels = (m) => Object.fromEntries(pg.evaluateWatchdog(m).map((r) => [r.metric, r.level]));
 check('all green', Object.values(levels(warm)).every((l) => l === 'green'), true);
 check('runs 50 yellow, 47 red', [levels({ ...warm, runsToday: 50 }).runs, levels({ ...warm, runsToday: 47 }).runs], ['yellow', 'red']);
@@ -230,7 +234,7 @@ check('zero cards on a weekday with no inbound is fine', levels({ ...warm, cards
 check('61 cards red, 45 yellow', [levels({ ...warm, cardsToday: 61 }).cards, levels({ ...warm, cardsToday: 45 }).cards], ['red', 'yellow']);
 check('approval 60% yellow, 40% red', [levels({ ...warm, approvals: 6, rejections: 4 }).approval, levels({ ...warm, approvals: 4, rejections: 6 }).approval], ['yellow', 'red']);
 check('median 20 yellow, 31 red', [levels({ ...warm, medianMinutes: 20 }).median, levels({ ...warm, medianMinutes: 31 }).median], ['yellow', 'red']);
-check('expired 20% yellow, 30% red', [levels({ ...warm, expiredShare: 0.2 }).expired, levels({ ...warm, expiredShare: 0.3 }).expired], ['yellow', 'red']);
+check('unanswered 20% yellow, 30% red', [levels({ ...warm, unansweredShare: 0.2 }).unanswered, levels({ ...warm, unansweredShare: 0.3 }).unanswered], ['yellow', 'red']);
 check('warmup keeps the gated rows green', levels({ ...warm, daysActive: 2, runsToday: 3, cardsToday: 0 }).runs, 'green');
 check('zero tolerance ignores warmup', [levels({ ...warm, daysActive: 0, sentInShadowOrOff: 1 }).sent_in_shadow, levels({ ...warm, daysActive: 0, sentWithoutApproval: 1 }).sent_without_approval], ['red', 'red']);
 check('divergence 1 yellow, 2 red', [levels({ ...warm, divergence: 1 }).divergence, levels({ ...warm, divergence: 2 }).divergence], ['yellow', 'red']);
@@ -309,6 +313,39 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('shadow card past deadline is skipped, never expired', pg.closeDecision(row({ mode: 'shadow', window_closes_at: '2026-11-13T17:00:00Z' }), now, null).status, 'skipped');
   check('shadow card answered is not credited', pg.closeDecision(row({ mode: 'shadow' }), now, ans), null);
   check('a sent card is never touched', pg.closeDecision(row({ status: 'sent' }), now, ans), null);
+}
+
+// Auto strikes, nudges, unanswered share (Ron, 2026-11-17).
+{
+  const H = 3600 * 1000, M = 60 * 1000, now = Date.parse('2026-11-18T16:00:00Z');
+  const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, created_at: new Date(now - 2 * H - M).toISOString(), window_closes_at: null, ...o });
+  check('untouched strike after 2 h is due', pg.autoSendDue(s(), now), true);
+  check('strike under 2 h is not due', pg.autoSendDue(s({ created_at: new Date(now - 90 * M).toISOString() }), now), false);
+  check('a reply never auto-sends', pg.autoSendDue(s({ kind: 'reply' }), now), false);
+  check('a signal never auto-sends', pg.autoSendDue(s({ kind: 'signal', status: 'signal' }), now), false);
+  check('an invalid strike never auto-sends', pg.autoSendDue(s({ problems: 'uses tú' }), now), false);
+  check('shadow strike never auto-sends', pg.autoSendDue(s({ mode: 'shadow' }), now), false);
+  check('window closing in 5 min: no auto-send', pg.autoSendDue(s({ window_closes_at: new Date(now + 5 * M).toISOString() }), now), false);
+  check('window open 3 h: auto-send', pg.autoSendDue(s({ window_closes_at: new Date(now + 3 * H).toISOString() }), now), true);
+  const r = (ageMin, o) => ({ kind: 'reply', status: 'drafted', mode: 'draft', contact_name: 'Ana', created_at: new Date(now - ageMin * M).toISOString(), ...o });
+  check('nudge at 15 min', pg.nudgeDue(r(16), now), 15);
+  check('no nudge at 10 min', pg.nudgeDue(r(10), now), null);
+  check('no second nudge at 31 min', pg.nudgeDue(r(31), now), null);
+  check('nudge at 1 h', pg.nudgeDue(r(62), now), 60);
+  check('signal cards are nudged too', pg.nudgeDue(r(16, { kind: 'signal', status: 'signal' }), now), 15);
+  check('strikes are not nudged', pg.nudgeDue(r(16, { kind: 'strike' }), now), null);
+  check('nudge text', pg.nudgeText({ contact_name: 'Ana' }, 60), '⏰ Ana sigue esperando respuesta (1 h desde la tarjeta). Contéstele desde su teléfono o GHL.');
+  const u = (o) => ({ kind: 'reply', mode: 'draft', created_at: new Date(now - 5 * H).toISOString(), ...o });
+  const rows = [
+    u({ status: 'handled', approved_at: new Date(now - 4.5 * H).toISOString() }),   // 30 min: on time
+    u({ status: 'handled', approved_at: new Date(now - 2 * H).toISOString() }),     // 3 h: late
+    u({ status: 'expired' }),                                                      // never: late
+    u({ status: 'sent', sent_at: new Date(now - 4.9 * H).toISOString() }),         // on time
+    u({ status: 'drafted', created_at: new Date(now - 30 * M).toISOString() }),    // too young: not judged
+    u({ status: 'rejected' }),                                                     // he chose: not judged
+    u({ kind: 'strike', status: 'expired' }),                                      // strikes: not judged
+  ];
+  check('unanswered share counts leads who wrote and waited over 2 h', pg.unansweredShare(rows, now), 0.5);
 }
 
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
