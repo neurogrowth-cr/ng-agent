@@ -18630,6 +18630,64 @@ function handlePortalRequest(req, res) {
   });
 }
 
+// ─── AGENCY PROSP WAITING (dash prosp-key-check → Valeria's DM) ──────────────
+// The dash's daily key check calls this when ROLEX or PATEK clients are still
+// not on NeuroGrowth's Prosp 3+ days after their held activation call. Valeria
+// hosts the activation calls and connects the client's LinkedIn there (Ron,
+// 2026-11-17), so the list goes to her DM. Same auth as portal requests
+// (CLIENT_ATTENTION_FEED_SECRET). mode "live" DMs Valeria; anything else goes
+// to Ron's DM as a dry run. One DM per day. Rules and text:
+// lib/agencyMoveOverdue.js.
+const agencyMoveLib = require('./lib/agencyMoveOverdue');
+const AGENCY_MOVE_DM_USER = String(process.env.AGENCY_MOVE_DM_USER || '').trim() || 'U09Q3BXJ18B';
+const agencyMoveSeen = portalRequestLib.createSeen(24 * 60 * 60 * 1000);
+
+function handleAgencyMoveOverdue(req, res) {
+  const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
+  if (!secret) return json(503, { ok: false, error: 'agency move alerts disabled' });
+  const given = Buffer.from(String(req.headers['x-agent-secret'] || '').trim());
+  const want = Buffer.from(secret);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) {
+    console.warn('Agency move alert rejected: invalid or missing secret');
+    return json(401, { ok: false, error: 'Unauthorized' });
+  }
+  let body = '';
+  let tooLarge = false;
+  req.on('data', chunk => {
+    body += chunk.toString();
+    if (body.length > 20_000 && !tooLarge) { tooLarge = true; json(413, { ok: false, error: 'payload too large' }); req.destroy(); }
+  });
+  req.on('end', async () => {
+    if (tooLarge) return;
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { return json(400, { ok: false, error: 'invalid JSON' }); }
+    const checked = agencyMoveLib.checkPayload(parsed);
+    if (!checked.ok) {
+      console.warn(`[agency-move-overdue] refused: ${checked.problem}`);
+      return json(400, { ok: false, error: checked.problem });
+    }
+    const p = checked.payload;
+    const id = `${p.day}:${p.mode}`;
+    if (agencyMoveSeen.has(id)) return json(200, { ok: true, duplicate: true });
+    agencyMoveSeen.add(id);
+    const live = p.mode === 'live';
+    const text = agencyMoveLib.formatDm(p);
+    try {
+      if (live) await slack.client.chat.postMessage({ channel: AGENCY_MOVE_DM_USER, text, unfurl_links: false });
+      else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → DM ${AGENCY_MOVE_DM_USER}]\n${text}`, unfurl_links: false });
+      console.log(`[agency-move-overdue] sent ${p.clients.length} clients (${p.mode})`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: 'agencyMoveOverdue', status: 'success' });
+      return json(200, { ok: true, posted: true, mode: p.mode });
+    } catch (err) {
+      agencyMoveSeen.delete(id);
+      console.error(`[agency-move-overdue] DM failed: ${err.message}`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: 'agencyMoveOverdue', status: 'error', error_message: err.message });
+      return json(502, { ok: false, error: 'slack post failed' });
+    }
+  });
+}
+
 // ─── HEALTH CHECK SERVER ──────────────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
@@ -18645,6 +18703,8 @@ const healthServer = http.createServer((req, res) => {
     handleAgentConsult(req, res);
   } else if (req.url === '/webhook/portal-request' && req.method === 'POST') {
     handlePortalRequest(req, res);
+  } else if (req.url === '/webhook/agency-move-overdue' && req.method === 'POST') {
+    handleAgencyMoveOverdue(req, res);
   } else {
     res.writeHead(404); res.end('Not found');
   }
