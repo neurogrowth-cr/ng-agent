@@ -23024,12 +23024,18 @@ async function runGuardianCheck(correlationId) {
 // for the next run instead of guessing. Messages Max AI sent never count as
 // Sebastián's answer. The card gets ✅ or ⏳ so Slack matches the table.
 const GUARDIAN_CLOSE_MAX_READS = 40;
+// Kill switch for the 2 h auto-send of strikes: GUARDIAN_AUTO_STRIKES=off.
+const GUARDIAN_AUTO_STRIKES = String(process.env.GUARDIAN_AUTO_STRIKES || 'on').toLowerCase() !== 'off';
+const GUARDIAN_AUTO_ACTOR = 'auto_2h';
 async function guardianCloseOpenCards(now, stats) {
   const { data: open, error } = await supabase.from('guardian_actions')
-    .select('id, kind, status, mode, conversation_id, created_at, window_closes_at, slack_channel_id, slack_message_ts')
+    .select('id, kind, status, mode, conversation_id, contact_name, problems, created_at, window_closes_at, slack_channel_id, slack_message_ts')
     .in('status', ['drafted', 'signal']).order('created_at', { ascending: true }).limit(500);
   if (error) throw new Error(`guardian_actions open read: ${error.message}`);
   stats.closed = { handled: 0, expired: 0, skipped: 0 };
+  stats.autoStrikes = 0;
+  stats.nudges = 0;
+  let autoToday = null; // read once, only when a strike is due
   const threads = new Map();
   let reads = 0;
   const maxId = IG_GUIDE_MAX_GHL_USER_ID.toLowerCase();
@@ -23050,7 +23056,34 @@ async function guardianCloseOpenCards(now, stats) {
       answeredAt = hotReplies.firstAnswerAfter(msgs, Date.parse(r.created_at), strikeIsAutomatedBody);
     }
     const d = guardian.closeDecision(r, now, answeredAt);
-    if (!d) continue;
+    if (!d) {
+      if (answeredAt || !r.slack_channel_id || !r.slack_message_ts) continue;
+      // Untouched strike after 2 h goes out on its own (Ron, 2026-11-17). Same
+      // path as a ✅: approve, claim, live-thread check, send.
+      if (GUARDIAN_AUTO_STRIKES && guardian.autoSendDue(r, now) && stats.autoStrikes < guardian.CONFIG.autoStrikesPerRun) {
+        if (autoToday === null) {
+          const { count, error: cErr } = await supabase.from('guardian_actions').select('id', { count: 'exact', head: true })
+            .eq('approved_by', GUARDIAN_AUTO_ACTOR).eq('day', guardian.crDay(now));
+          autoToday = cErr ? Infinity : (count || 0);
+        }
+        if (autoToday >= guardian.CONFIG.autoStrikesPerDay) continue;
+        const nowIso = new Date(now).toISOString();
+        const { data: appr } = await supabase.from('guardian_actions').update({ status: 'approved', approved_by: GUARDIAN_AUTO_ACTOR, approved_at: nowIso, updated_at: nowIso })
+          .eq('id', r.id).eq('status', 'drafted').select('id');
+        if (!appr || !appr.length) continue;
+        autoToday++;
+        stats.autoStrikes++;
+        await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, '2 h sin tocar: Max la envía.').catch(() => {});
+        await guardianSendApproved(r.id, { channel: r.slack_channel_id, ts: r.slack_message_ts, actor: GUARDIAN_AUTO_ACTOR });
+        continue;
+      }
+      const mark = guardian.nudgeDue(r, now);
+      if (mark) {
+        await slack.client.chat.postMessage({ channel: r.slack_channel_id, thread_ts: r.slack_message_ts, reply_broadcast: true, text: guardian.nudgeText(r, mark) })
+          .then(() => { stats.nudges++; }).catch((e) => console.warn(`guardian nudge failed ${r.id}: ${e.message}`));
+      }
+      continue;
+    }
     const patch = { status: d.status, last_error: d.reason, updated_at: new Date(now).toISOString() };
     if (d.status === 'handled') { patch.approved_by = 'ghl_reply'; patch.approved_at = new Date(d.approvedAt).toISOString(); }
     // Conditional on the status read: a ✅ that lands first wins.
@@ -23170,6 +23203,13 @@ async function guardianRun(now, mode, stats, correlationId) {
         ? await slack.client.chat.postMessage({ channel: GUARDIAN_SETTER_SLACK_ID, text: cardText, metadata: { event_type: GUARDIAN_EVENT, event_payload: { action_id: actionId } } })
         : await guardianPostShadowCard(cardText);
       await supabase.from('guardian_actions').update({ slack_channel_id: posted.channel, slack_message_ts: posted.ts, updated_at: new Date().toISOString() }).eq('id', actionId);
+      // Light reply card: Max's draft goes in the thread. ✅ still sends row.draft;
+      // a reply in the thread by Sebastián or Ron is sent instead (pickSendText
+      // ignores Max's own message).
+      if (action.kind === 'reply') {
+        await guardianThreadReply(posted.channel, posted.ts, guardian.replyDraftThread({ draft: d.draft, problems: d.problems }))
+          .catch((e) => console.warn(`[guardian] draft thread failed ${actionId}: ${e.message}`));
+      }
       if (guardian.countsTowardDayCap(action.step)) cardsToday++;
       const out = { action_id: actionId, contact_id: c.contactId, step: action.step, channel: row.channel, intent: row.intent, reason: action.reason, mode, problems: d.problems };
       if (action.kind === 'signal') {
@@ -23398,7 +23438,8 @@ async function guardianStats(now) {
   if (error) throw new Error(`guardian_actions read: ${error.message}`);
   const all = rows || [];
   const today = all.filter((r) => r.created_at >= dayStartIso);
-  const decided = all.filter((r) => ['approved', 'sending', 'sent', 'send_failed', 'handled', 'rejected'].includes(r.status));
+  // Auto-sent strikes are Max's call, not an approval by Sebastián.
+  const decided = all.filter((r) => ['approved', 'sending', 'sent', 'send_failed', 'handled', 'rejected'].includes(r.status) && r.approved_by !== GUARDIAN_AUTO_ACTOR);
   const approvals = decided.filter((r) => r.status !== 'rejected').length;
   const rejections = decided.length - approvals;
   const cards7 = all.filter((r) => r.kind !== 'stop');
@@ -23416,6 +23457,8 @@ async function guardianStats(now) {
     approvals, rejections,
     approvalRate: decided.length ? approvals / decided.length : null,
     expiredShare: cards7.length ? expired7 / cards7.length : null,
+    unansweredShare: guardian.unansweredShare(all, now),
+    autoStrikesToday: today.filter((r) => r.approved_by === GUARDIAN_AUTO_ACTOR && r.status === 'sent').length,
     sentInShadowOrOff: all.filter((r) => r.status === 'sent' && r.mode !== 'draft').length,
     sentWithoutApproval: all.filter((r) => r.status === 'sent' && !r.approved_by).length,
     divergence: all.filter((r) => ['approved', 'sending'].includes(r.status) && now - Date.parse(r.updated_at || r.approved_at || r.created_at) > 10 * 60 * 1000).length,
@@ -23467,7 +23510,7 @@ async function runGuardianWatchdog(correlationId) {
   const sentWithoutApproval = Math.max(stats.sentWithoutApproval, (sentRows || []).length - stats.sent);
   const m = {
     daysActive, runsToday: (okRuns || []).length, expectedRuns: guardian.expectedRuns(now), capStreak, cardsToday: stats.cardsToday, isWeekday: dow >= 1 && dow <= 5, inboundToday,
-    approvals: stats.approvals, rejections: stats.rejections, medianMinutes: stats.medianMinutes, expiredShare: stats.expiredShare,
+    approvals: stats.approvals, rejections: stats.rejections, medianMinutes: stats.medianMinutes, unansweredShare: stats.unansweredShare,
     sentInShadowOrOff: stats.sentInShadowOrOff + (guardianMode() !== 'draft' ? (sentRows || []).length : 0),
     sentWithoutApproval, divergence: stats.divergence, maxDraftsPerRun: GUARDIAN_MAX_DRAFTS_PER_RUN,
   };
@@ -23723,7 +23766,7 @@ async function buildSetterScorecard(now = Date.now()) {
   ];
   // A failed read prints "No se pudo leer hoy" for its section, never a 0.
   const { data: rows, error } = await supabase.from('guardian_actions')
-    .select('kind, status, mode, edited, created_at, approved_at, conversation_id, window_closes_at')
+    .select('kind, status, mode, edited, approved_by, created_at, approved_at, conversation_id, window_closes_at')
     .gte('created_at', monthStartIso).limit(10000);
   if (error) console.error('Setter scorecard: guardian_actions read failed:', error.message);
   // Signal cards he answered straight in GHL or on the phone: nothing closes
