@@ -1315,3 +1315,11 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 ## 2026-11-17: backlog campaign un-paused (Ron's go)
 - `backlog-react:paused` removed from agent_knowledge at Ron's go on 2026-11-17 ~20:20 CR (it was the false alarm fixed in #507). The flag is read fresh each run, so the 2026-11-18 09:30 run tags the next 100.
 - Max DMed Sebastián the restart and the new card behavior from #513 (follow-ups auto-send after 2 h, light reply cards, 15 min / 1 h nudges).
+
+## 2026-11-18: Guardian wait metric counts open hours and each lead message once ([PR #517](https://github.com/neurogrowth-cr/ng-agent/pull/517))
+- **Why:** the watchdog's `unanswered` metric (leads who wrote and waited over 2 h, 7 days) read 70% on 2026-11-17. Read against the cards: mostly real, but inflated by a 24/7 clock, by the email re-card of the same lead message (when the WhatsApp window closes) counting twice, and by a lead's own WhatsApp Business greeting becoming a reply card.
+- **Open hours (Ron, 2026-11-18, "Monday to Monday"):** `openMsBetween` counts 08:00 to 20:00 CR, every day of the week. A 19:50 message answered at 08:15 waited 25 min.
+- **One count per lead message:** `unansweredShare` groups cards by `contact_id` + `lead_message_at`; the clock starts at the first card and stops at the first answer. The stats read now selects `contact_id`.
+- **Greetings:** `isBusinessAutoReply` (one waiting message, auto-reply wording, within 2 min of our message or saying it is automatic) makes `decideAction` skip with reason `auto_reply`.
+- **Effect on the same 7 days:** 71% before, 61% after. The rest is real: about 6 in 10 leads wait over 2 open hours, and 15 of 23 `wants_info` leads waited over 2 h; most replies come from the backlog campaign (100 a day) landing on one setter. Not changed: a lead marked No Fit still counts as unanswered (the one case seen came 26 h after the message, late either way).
+- Same day, not code: Ron's Prosp card was declined on 2026-11-17 (Relay 05:47 CR), Prosp stopped the agency workspace's campaigns 05:53 to 10:46 CR, Kai's `payment_failed` alerts on four agency clients told the client to fix it. All campaigns active again by 2026-11-18. Alert wording fix not built yet.
