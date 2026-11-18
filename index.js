@@ -23433,7 +23433,7 @@ async function guardianStats(now) {
   const dayStartIso = new Date(Date.parse(`${guardian.crDay(now)}T00:00:00-06:00`)).toISOString();
   const weekAgoIso = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
   const { data: rows, error } = await supabase.from('guardian_actions')
-    .select('id, kind, status, mode, approved_by, lead_message_at, created_at, approved_at, sent_at, updated_at, window_closes_at')
+    .select('id, contact_id, kind, status, mode, approved_by, lead_message_at, created_at, approved_at, sent_at, updated_at, window_closes_at')
     .gte('created_at', weekAgoIso).limit(5000);
   if (error) throw new Error(`guardian_actions read: ${error.message}`);
   const all = rows || [];

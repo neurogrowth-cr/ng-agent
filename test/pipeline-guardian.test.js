@@ -335,17 +335,48 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('signal cards are nudged too', pg.nudgeDue(r(16, { kind: 'signal', status: 'signal' }), now), 15);
   check('strikes are not nudged', pg.nudgeDue(r(16, { kind: 'strike' }), now), null);
   check('nudge text', pg.nudgeText({ contact_name: 'Ana' }, 60), '⏰ Ana sigue esperando respuesta (1 h desde la tarjeta). Contéstele desde su teléfono o GHL.');
-  const u = (o) => ({ kind: 'reply', mode: 'draft', created_at: new Date(now - 5 * H).toISOString(), ...o });
+  // Daytime clock for the share: 16:00 CR, cards made at 11:00 CR.
+  const day = Date.parse('2026-11-18T22:00:00Z');
+  const u = (o) => ({ kind: 'reply', mode: 'draft', created_at: new Date(day - 5 * H).toISOString(), ...o });
   const rows = [
-    u({ status: 'handled', approved_at: new Date(now - 4.5 * H).toISOString() }),   // 30 min: on time
-    u({ status: 'handled', approved_at: new Date(now - 2 * H).toISOString() }),     // 3 h: late
+    u({ status: 'handled', approved_at: new Date(day - 4.5 * H).toISOString() }),   // 30 min: on time
+    u({ status: 'handled', approved_at: new Date(day - 2 * H).toISOString() }),     // 3 h: late
     u({ status: 'expired' }),                                                      // never: late
-    u({ status: 'sent', sent_at: new Date(now - 4.9 * H).toISOString() }),         // on time
-    u({ status: 'drafted', created_at: new Date(now - 30 * M).toISOString() }),    // too young: not judged
+    u({ status: 'sent', sent_at: new Date(day - 4.9 * H).toISOString() }),         // on time
+    u({ status: 'drafted', created_at: new Date(day - 30 * M).toISOString() }),    // too young: not judged
     u({ status: 'rejected' }),                                                     // he chose: not judged
     u({ kind: 'strike', status: 'expired' }),                                      // strikes: not judged
   ];
-  check('unanswered share counts leads who wrote and waited over 2 h', pg.unansweredShare(rows, now), 0.5);
+  check('unanswered share counts leads who wrote and waited over 2 h', pg.unansweredShare(rows, day), 0.5);
+
+  // Open hours, 08:00 to 20:00 CR every day (Ron, 2026-11-18).
+  const cr = (iso) => Date.parse(`${iso}-06:00`);
+  check('open hours: 19:50 to 08:15 next day is 25 min', pg.openMsBetween(cr('2026-11-17T19:50:00'), cr('2026-11-18T08:15:00')) / M, 25);
+  check('open hours: 10:00 to 13:00 is 3 h', pg.openMsBetween(cr('2026-11-18T10:00:00'), cr('2026-11-18T13:00:00')) / H, 3);
+  check('open hours: Sunday counts like any day', pg.openMsBetween(cr('2026-11-15T09:00:00'), cr('2026-11-15T12:00:00')) / H, 3);
+  check('open hours: overnight only is 0', pg.openMsBetween(cr('2026-11-17T21:00:00'), cr('2026-11-18T07:00:00')), 0);
+  check('open hours: two days', pg.openMsBetween(cr('2026-11-16T19:00:00'), cr('2026-11-18T09:00:00')) / H, 1 + 12 + 1);
+  const evening = { kind: 'reply', mode: 'draft', contact_id: 'c1', lead_message_at: new Date(cr('2026-11-17T19:45:00')).toISOString(), created_at: new Date(cr('2026-11-17T19:50:00')).toISOString() };
+  check('a 19:50 card answered 08:15 is on time', pg.unansweredShare([{ ...evening, status: 'handled', approved_at: new Date(cr('2026-11-18T08:15:00')).toISOString() }], cr('2026-11-18T12:00:00')), 0);
+  check('a 19:50 card still open at 09:00 is not judged yet', pg.unansweredShare([{ ...evening, status: 'drafted' }], cr('2026-11-18T09:00:00')), null);
+  check('a 19:50 card still open at 10:30 is late', pg.unansweredShare([{ ...evening, status: 'drafted' }], cr('2026-11-18T10:30:00')), 1);
+  // One lead message, two cards (WhatsApp, then email 24 h later): counted once.
+  const wa = { kind: 'reply', mode: 'draft', contact_id: 'c2', lead_message_at: new Date(cr('2026-11-13T09:35:00')).toISOString(), created_at: new Date(cr('2026-11-13T09:45:00')).toISOString(), status: 'expired' };
+  const mail = { ...wa, created_at: new Date(cr('2026-11-14T09:45:00')).toISOString(), status: 'handled', approved_at: new Date(cr('2026-11-14T10:00:00')).toISOString() };
+  const other = { kind: 'reply', mode: 'draft', contact_id: 'c3', lead_message_at: new Date(cr('2026-11-14T09:00:00')).toISOString(), created_at: new Date(cr('2026-11-14T09:10:00')).toISOString(), status: 'handled', approved_at: new Date(cr('2026-11-14T09:20:00')).toISOString() };
+  check('the email re-card of the same message counts once (and late, from the first card)', pg.unansweredShare([wa, mail, other], cr('2026-11-14T18:00:00')), 0.5);
+
+  // The lead's own WhatsApp Business greeting is not a reply (2026-11-12).
+  const t0 = cr('2026-11-12T09:34:56');
+  const ours = { direction: 'outbound', dateAdded: new Date(t0).toISOString(), body: 'Hola, sigue buscando clientes?' };
+  const greet = (body, gapMs, extra = {}) => ({ waitingCount: 1, quote: body, anchorAt: t0 + gapMs, tail: [ours, { direction: 'inbound', dateAdded: new Date(t0 + gapMs).toISOString(), body }], ...extra });
+  check('greeting 8 s after our message is an auto-reply', pg.isBusinessAutoReply(greet('Gracias por comunicarte con Gonzalo, ¿Cómo podemos ayudarte?', 8000)), true);
+  check('same words 20 min later are a person', pg.isBusinessAutoReply(greet('Gracias por comunicarte, me interesa', 20 * M)), false);
+  check('"mensaje automático" counts at any gap', pg.isBusinessAutoReply(greet('Este es un mensaje automático, le responderemos pronto', 3 * H)), true);
+  check('a fast real reply is not an auto-reply', pg.isBusinessAutoReply(greet('Hola buenos dias', 60 * 1000)), false);
+  check('auto-reply plus a real message still gets a card', pg.isBusinessAutoReply(greet('Gracias por comunicarte con Gonzalo / Sí me interesa', 8000, { waitingCount: 2 })), false);
+  const base = { analysis: { ...greet('Gracias por comunicarte con Gonzalo, ¿Cómo podemos ayudarte?', 8000), newestAt: t0 + 8000, channel: 'TYPE_WHATSAPP' }, intent: 'unclear', verdict: 'normal', thread: {}, contact: {}, now: t0 + H };
+  check('decideAction skips the auto-reply', pg.decideAction(base).reason, 'auto_reply');
 }
 
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
