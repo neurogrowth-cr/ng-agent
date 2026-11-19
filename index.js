@@ -11163,7 +11163,11 @@ const GHL_TERMINAL_STAGE_IDS = new Set(
 // with status open at the default value, GHL's "Opportunity Won" workflow
 // never fired and Meta never got the Purchase (reported by Ron on two real wins).
 // A card already in the target stage still gets its status and value fixed.
-// Other outcomes only move the stage, as before. Pure, no I/O.
+// Lost and No Fit also set status lost (Ron, 2026-11-18): only the stage moved
+// before, so those cards read "open" in GHL reports and automations. Closers'
+// own No Fit moves already carry status lost, and dash reads the workflow's
+// outcome label, not this status, so No Fit stays No Fit in the portal.
+// Follow-up and no-show only move the stage. Pure, no I/O.
 // Returns { body } to PUT, or { already, label }, or { error } / { terminal }.
 function outcomeOppUpdate(opp, outcome, revenue) {
   const target = outcomeStageFor(opp.pipelineId, outcome);
@@ -11178,6 +11182,7 @@ function outcomeOppUpdate(opp, outcome, revenue) {
     const value = Number(revenue);
     if (Number.isFinite(value) && value > 0 && Number(opp.monetaryValue) !== value) body.monetaryValue = value;
   }
+  if ((outcome === 'lost' || outcome === 'disqualified') && opp.status !== 'lost') body.status = 'lost';
   if (!Object.keys(body).length) return { already: true, label: target.label };
   return { body, label: target.label };
 }

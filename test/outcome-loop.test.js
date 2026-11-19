@@ -125,9 +125,25 @@ check('an unknown pipeline never guesses a stage id', g.outcomeStageFor('not-a-p
     { status: 'won' });
   check('already won at the right value: nothing to write',
     g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: CLOSED, status: 'won', monetaryValue: 5000 }, 'won', 5000).already, true);
-  check('non-won outcomes move the stage only (no status, no value)',
+  check('lost moves the stage and sets status lost, never the value',
     g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: OPEN_DEAL, status: 'open', monetaryValue: 2900 }, 'lost', 5000).body,
-    { pipelineId: APPT, pipelineStageId: LOST });
+    { pipelineId: APPT, pipelineStageId: LOST, status: 'lost' });
+  check('No Fit moves to No Fit and sets status lost',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: OPEN_DEAL, status: 'open' }, 'disqualified', null).body,
+    { pipelineId: APPT, pipelineStageId: g.outcomeStageFor(APPT, 'disqualified').id, status: 'lost' });
+  check('already in Lost but still open: only the status is fixed',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: LOST, status: 'open' }, 'lost', null).body,
+    { status: 'lost' });
+  check('already in Lost with status lost: nothing to write',
+    g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: LOST, status: 'lost' }, 'lost', null).already, true);
+  check('VSL No Fit sets status lost on the shared Lost / No Fit stage',
+    g.outcomeOppUpdate({ pipelineId: VSL, pipelineStageId: g.outcomeStageFor(VSL, 'follow_up').id, status: 'open' }, 'disqualified', null).body,
+    { pipelineId: VSL, pipelineStageId: g.outcomeStageFor(VSL, 'lost').id, status: 'lost' });
+  check('follow-up and no-show move the stage only (no status)',
+    [g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: OPEN_DEAL, status: 'open' }, 'no_show', null).body,
+     g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: g.outcomeStageFor(APPT, 'no_show').id, status: 'open' }, 'follow_up', null).body],
+    [{ pipelineId: APPT, pipelineStageId: g.outcomeStageFor(APPT, 'no_show').id },
+     { pipelineId: APPT, pipelineStageId: OPEN_DEAL }]);
   check('a card closed out in another closed stage is never reopened',
     g.outcomeOppUpdate({ pipelineId: APPT, pipelineStageId: LOST, status: 'lost' }, 'won', 5000).terminal, true);
   check('VSL won uses the VSL stage',
