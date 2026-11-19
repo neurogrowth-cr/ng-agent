@@ -1344,3 +1344,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Media:** voice notes, images and files go to Sebastián as a signal at once (`reason = media`), no draft.
 - **Auto replies:** built and OFF. `GUARDIAN_AUTO_REPLIES=on` makes Max send `wants_info` / `unclear` drafts after 15 min (actor `auto_15m`, 40 a day); waiting on Ron's blind-test review.
 - **Blind test (12 real messages, before merge):** strongest on first replies to new leads; weaker mid-conversation (re-asked a known fact once, misread slang once); one personal chat was treated as a lead.
+
+## 2026-11-19: monthly API budget raised to $150
+- **Env on ng-pm-MAX:** `MONTHLY_API_BUDGET_USD=150` (was 70), set 2026-11-19 on Ron's go. Applies to the daily AI SPEND post and the 09:00 budget alert.
+- **Why:** since #435 the AXON factory spend shows on its real day, and November read $89.20 of $70 (127%) on 11-18, on pace for about $144. Each factory run costs $4.50 to $5.
+- **November alerts:** the 100% alert already fired this month (dedupe key `api-budget-alert:2026-11` holds 1), so no new threshold alert fires before December even at 85% of $150. The daily post shows the new percentage from tomorrow.
+- **Not changed:** the Anthropic Console spend limit, the hard cap that returns errors, is separate and only Ron can raise it.
