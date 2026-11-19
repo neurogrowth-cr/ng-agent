@@ -11181,6 +11181,15 @@ function outcomeOppUpdate(opp, outcome, revenue) {
   if (!Object.keys(body).length) return { already: true, label: target.label };
   return { body, label: target.label };
 }
+// One sentence on what happened to the GHL card. The portal row is written
+// either way, so a failed move must be said out loud: until 2026-11-18 the
+// typed log_call_outcome reply never mentioned GHL, and a card that did not
+// move looked exactly like one that did. Pure, no I/O.
+function stageMoveNote(move) {
+  if (!move) return '';
+  if (move.ok) return move.already ? ` GHL card was already in ${move.label}.` : ` GHL card moved to ${move.label}.`;
+  return ` WARNING: logged in the portal, but the GHL card did NOT move (${move.message || 'unknown error'}). Move it by hand.`;
+}
 // The distinct actions a closer can be offered on this pipeline. On VSL,
 // lost and disqualified collapse to one button because they are one stage.
 // no_show is included: it is the one attendance answer Max cannot derive, and
@@ -12003,13 +12012,15 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
     let opportunityId = null;
     let ghlContactId = null;
     let ghlAppointmentId = null;
+    let prospectEmail = null;
     const { rows: prow } = await client.query(
-      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id, a.ghl_appointment_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id, p.email, a.ghl_appointment_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
       [appointmentId]
     );
     if (prow.length) {
       opportunityId = prow[0].ghl_opportunity_id || null;
       ghlContactId = prow[0].ghl_contact_id || null;
+      prospectEmail = prow[0].email || null;
       ghlAppointmentId = prow[0].ghl_appointment_id || null;
       const next = nextProspectStatusForOutcome(outcome, prow[0].status);
       if (next) {
@@ -12027,6 +12038,11 @@ async function logOutcomeToPortal({ appointmentId, outcome, source, notes, close
     // dash only populates ghl_opportunity_id on ~half of prospects (58 of 111
     // post-cutover on 2026-08-18 — Aura Bonilla's Open-Deal ✅ hit this), but
     // nearly all carry ghl_contact_id, and GHL can find the opp from that.
+    // A few carry neither (a lost logged 2026-09-21 whose card never moved),
+    // so the prospect email finds the contact as a last resort.
+    if (!opportunityId && !ghlContactId && prospectEmail) {
+      ghlContactId = await ghlFindContactByEmail(prospectEmail);
+    }
     if (!opportunityId && ghlContactId) {
       opportunityId = await ghlFindSalesOpportunityByContact(ghlContactId);
     }
@@ -12129,7 +12145,7 @@ async function logCallOutcomeTool({ prospect, date, outcome, revenue, note }) {
     if (result.reason === 'not_configured') return 'Outcome write path not configured (PORTAL_WRITER_DATABASE_URL missing on ng-pm-MAX). Log it in GHL instead and tell Ron.';
     return `Write failed: ${result.message || result.reason}`;
   }
-  return `Logged ${outcome}${revenue ? ` ($${revenue})` : ''} for ${target.full_name} (${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call).${result.statusChange ? ` Prospect status: ${result.statusChange}.` : ''} Scorecard + portal reflect it immediately.`;
+  return `Logged ${outcome}${revenue ? ` ($${revenue})` : ''} for ${target.full_name} (${formatICTime(target.scheduled_start, { month: 'short', day: 'numeric' })} call).${result.statusChange ? ` Prospect status: ${result.statusChange}.` : ''}${stageMoveNote(result.stageMove)} Scorecard + portal reflect it immediately.`;
 }
 
 // Paso 1 by hand: set attendance on the GHL appointment itself. Only reached
@@ -12630,13 +12646,15 @@ async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, c
     let statusChange = null;
     let opportunityId = null;
     let ghlContactId = null;
+    let prospectEmail = null;
     const { rows: prow } = await client.query(
-      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
+      `SELECT p.id, p.status, p.ghl_opportunity_id, p.ghl_contact_id, p.email FROM revops_prospects p JOIN revops_appointments a ON a.prospect_id = p.id WHERE a.id = $1`,
       [appointmentId]
     );
     if (prow.length) {
       opportunityId = prow[0].ghl_opportunity_id || null;
       ghlContactId = prow[0].ghl_contact_id || null;
+      prospectEmail = prow[0].email || null;
       const next = nextProspectStatusForOutcome(outcome, prow[0].status);
       if (next) {
         await client.query('UPDATE revops_prospects SET status = $1, updated_at = now() WHERE id = $2', [next, prow[0].id]);
@@ -12650,6 +12668,9 @@ async function promoteOpenDealOutcome({ appointmentId, outcome, source, notes, c
     // hiccup must never roll back a promotion. No attendance write here — it
     // was already set when follow_up was first logged.
     let stageMove = null;
+    if (!opportunityId && !ghlContactId && prospectEmail) {
+      ghlContactId = await ghlFindContactByEmail(prospectEmail);
+    }
     if (!opportunityId && ghlContactId) {
       opportunityId = await ghlFindSalesOpportunityByContact(ghlContactId);
     }
