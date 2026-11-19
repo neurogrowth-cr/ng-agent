@@ -14,7 +14,7 @@ const block = SRC.slice(
   SRC.indexOf('const OUTCOME_STATUS_RANK'),
   SRC.indexOf('// Writes one outcome row + the matching prospect-status promotion'),
 );
-const g = new Function(`${block}; return { outcomeOppUpdate, nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS, OUTCOME_EMOJI, EMOJI_TO_OUTCOME };`)();
+const g = new Function(`${block}; return { outcomeOppUpdate, stageMoveNote, nextProspectStatusForOutcome, computeOutcomeProposal, parseReviSignals, outcomeStageFor, outcomeActionsFor, resolveAppointmentStatus, appointmentStatusForOutcome, buildOutcomeCardText, buildReviProspectNote, parseOutcomeReply, nearestAppointmentToCall, matchRecordingToCall, VALID_LOGGABLE_OUTCOMES, OUTCOME_MATCH_PAD_MS, OUTCOME_EMOJI, EMOJI_TO_OUTCOME };`)();
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -319,6 +319,16 @@ check('a valid row still wins when a junk row sits closer',
   g.nearestAppointmentToCall([{ ghl_appointment_id: 'opp:junk', scheduled_start: new Date(CT).toISOString() }, appts[1]], CT), 'near');
 check('exactly 36h is inside the window',
   g.nearestAppointmentToCall([{ ghl_appointment_id: 'edge', scheduled_start: new Date(CT + g.OUTCOME_MATCH_PAD_MS).toISOString() }], CT), 'edge');
+
+console.log('\nstageMoveNote — the typed log reply always says what happened to the GHL card');
+check('moved card names the stage', g.stageMoveNote({ ok: true, label: 'Lost' }), ' GHL card moved to Lost.');
+check('card already there says so', g.stageMoveNote({ ok: true, already: true, label: 'Open Deal' }), ' GHL card was already in Open Deal.');
+check('failed move is a loud warning, never silent',
+  g.stageMoveNote({ ok: false, message: 'no GHL opportunity found for the prospect' }),
+  ' WARNING: logged in the portal, but the GHL card did NOT move (no GHL opportunity found for the prospect). Move it by hand.');
+check('closed card is reported as not moved',
+  g.stageMoveNote({ ok: false, terminal: true, message: 'opportunity already in a closed stage (Lost)' }).startsWith(' WARNING'), true);
+check('no move attempted adds nothing', g.stageMoveNote(null), '');
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nAll outcome-loop tests passed.');
