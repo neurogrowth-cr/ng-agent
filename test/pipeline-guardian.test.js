@@ -154,7 +154,9 @@ check('4 paragraphs fail', v('Uno.\n\nDos.\n\nTres.\n\nCuatro.').problems.includ
 check('over 700 chars fails', v('a'.repeat(701)).problems[0].startsWith('too long'), true);
 check('empty fails', v('').ok, false);
 check('guarantee fails', v('Le garantizo resultados en un mes.').problems.includes('banned word "garantizo"'), true);
-check('exclamation fails', v('Hola! qué vende?').problems.includes('exclamation mark'), true);
+check('one closing exclamation is fine', v('Hola Marco, todo bien! A qué se dedica su negocio?').ok, true);
+check('opening exclamation fails', v('¡Hola! qué vende?').problems.includes('opening exclamation mark'), true);
+check('two exclamations fail', v('Hola! Excelente! Qué vende?').problems.includes('more than one exclamation mark'), true);
 
 // ── card round trip (3.2, 4a) ──
 const LINK = 'https://app.gohighlevel.com/v2/location/LOC/contacts/detail/ct1';
@@ -250,7 +252,7 @@ check('median helper', [pg.median([5, 1, 3]), pg.median([1, 2, 3, 4]), pg.median
 // ── prompts and parsing ──
 const prompt = pg.buildDraftPrompt({ action: { kind: 'strike', step: 'strike_5', askContact: true }, thread: 'NOSOTROS: hola', contactName: 'Ana', intentLabel: 'silencio', stageName: 'Strike 3', channel: 'whatsapp' });
 check('system prompt carries usted, the playbook and both links', [prompt.system.includes('siempre de usted'), prompt.system.includes('PLAYBOOK'), prompt.system.includes(pg.APPROVED_URLS.booking), prompt.system.includes(pg.APPROVED_URLS.guide)], [true, true, true, true]);
-check('user prompt names the step and the move-off-channel ask', [prompt.user.includes('Strike 5 de 5'), prompt.user.includes('termine pidiendo su WhatsApp o su correo')], [true, true]);
+check('user prompt names the step and the move-off-channel ask', [prompt.user.includes('Strike 5 de 5'), prompt.user.includes('pídale su WhatsApp para confirmarle la hora')], [true, true]);
 check('no em dash in the prompts', /\u2014/.test(prompt.system + prompt.user), false);
 check('draft parse with text around', pg.parseDraft('Aquí va:\n{"draft":"Hola, a quién le vende?","reason_es":"falta el cliente"}'), { ok: true, draft: 'Hola, a quién le vende?', reason_es: 'falta el cliente' });
 check('broken draft JSON never throws', pg.parseDraft('nope').ok, false);
@@ -292,7 +294,7 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('a closing question mark alone is fine', pg.validateDraft('A qué se dedica su negocio?').ok, true);
   const p = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Ana', intentLabel: 'pregunta', stageName: 'New Lead', faq: '', channel: 'instagram' });
   check('drafter prompt states the opening-mark rule', /nunca ponga ¿ ni ¡ al inicio/.test(p.system), true);
-  check('drafter prompt carries the qualification order', /a qué se dedica, a quién le vende, en qué rango cobra por cliente, cómo le llegan clientes hoy, quién decide/.test(p.system), true);
+  check('drafter prompt carries the qualification order', /su negocio es de coaching o servicios/.test(p.system) && /perfil de su cliente ideal/.test(p.system), true);
   check('drafter prompt has no em dash', /—/.test(p.system), false);
 }
 
@@ -377,6 +379,49 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('auto-reply plus a real message still gets a card', pg.isBusinessAutoReply(greet('Gracias por comunicarte con Gonzalo / Sí me interesa', 8000, { waitingCount: 2 })), false);
   const base = { analysis: { ...greet('Gracias por comunicarte con Gonzalo, ¿Cómo podemos ayudarte?', 8000), newestAt: t0 + 8000, channel: 'TYPE_WHATSAPP' }, intent: 'unclear', verdict: 'normal', thread: {}, contact: {}, now: t0 + H };
   check('decideAction skips the auto-reply', pg.decideAction(base).reason, 'auto_reply');
+}
+
+// Human voice, media, calendar, auto replies (Ron, 2026-11-18).
+{
+  const H = 3600 * 1000, M = 60 * 1000;
+  const v2 = (t, channel) => pg.validateDraft(t, { channel });
+  check('template phrase is flagged', v2('Gracias por escribir. Qué vende?', 'whatsapp').problems.some((p) => p.startsWith('sounds like a template')), true);
+  check('long chat message is flagged', v2('Hola Marco. ' + 'Ayudamos a negocios a conseguir reuniones con quien decide. '.repeat(6) + 'Qué vende?', 'whatsapp').problems.some((p) => p.startsWith('too long for chat')), true);
+  check('the qualification list may run longer', v2('Excelente! Para entender mejor su situación y ayudarle de la mejor forma posible, me podría compartir esta información:\n• nicho del servicio\n• el servicio que usted vende\n• precio por venta del servicio\n• perfil de su cliente ideal\nCon esta información puedo revisar su caso y ver si realmente le podemos ayudar con nuestro método.', 'whatsapp').ok, true);
+  check('email may run longer than chat', v2('Hola Marco. ' + 'Le escribo por correo porque por WhatsApp no nos cruzamos. '.repeat(5) + 'Qué vende?', 'email').problems.some((p) => p.startsWith('too long for chat')), false);
+  const p = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Ana', intentLabel: 'quiere información', stageName: 'New Lead', faq: '', channel: 'whatsapp', slots: ['mañana jueves a las 10:00 am', 'el viernes a las 3:00 pm'] });
+  check('slots reach the drafter', p.user.includes('mañana jueves a las 10:00 am · el viernes a las 3:00 pm'), true);
+  check('drafter is told never to ask WhatsApp on WhatsApp', /Nunca pida WhatsApp ni correo si el prospecto ya escribe por WhatsApp/.test(p.system), true);
+  check('no em dash in the new prompt', /\u2014/.test(p.system + p.user), false);
+  // Media goes straight to Sebastián.
+  const now = Date.parse('2026-11-19T16:00:00Z');
+  const media = { anchorAt: now - 5 * M, newestAt: now - 30 * 1000, channel: 'TYPE_WHATSAPP', quote: '', lastAnswerAt: now - H,
+    tail: [{ direction: 'outbound', dateAdded: new Date(now - H).toISOString(), body: 'Hola' }, { direction: 'inbound', dateAdded: new Date(now - 30 * 1000).toISOString(), body: '', attachments: ['https://x/audio.ogg'], messageType: 'TYPE_WHATSAPP' }] };
+  const dm = pg.decideAction({ analysis: media, intent: 'unclear', verdict: 'normal', thread: { channel: 'whatsapp' }, now });
+  check('a voice note is a signal at once, even while settling', [dm.kind, dm.reason], ['signal', 'media']);
+  const text = { ...media, tail: [media.tail[0], { ...media.tail[1], body: 'Hola, info?', attachments: [] }] };
+  check('text is not media', pg.waitingHasMedia(text), false);
+  // Calendar.
+  const nowCal = Date.parse('2026-11-18T21:00:00Z'); // Wed 15:00 CR
+  const slotsByDay = { '2026-11-19': { slots: ['2026-11-19T10:00:00-06:00', '2026-11-19T15:00:00-06:00'] }, '2026-11-20': { slots: ['2026-11-20T10:00:00-06:00', '2026-11-20T15:00:00-06:00'] }, traceId: 'x' };
+  const two = pg.pickTwoSlots(slotsByDay, nowCal);
+  check('two slots: first free, then another day in the other half', two.map((ms) => pg.slotLabel(ms, nowCal)), ['mañana jueves a las 10:00 am', 'el viernes a las 3:00 pm']);
+  check('a slot under 3 h out is skipped', pg.pickTwoSlots({ '2026-11-18': { slots: ['2026-11-18T16:00:00-06:00'] } }, nowCal), []);
+  check('first name only', [pg.firstName('Marco-vinicio Pérez'), pg.firstName('TATI'), pg.firstName('')], ['Marco', 'Tati', '']);
+  const greetedThread = [{ direction: 'outbound', messageType: 'TYPE_WHATSAPP', body: 'Hola Cinthia, me quedé pensando en lo que me contó', dateAdded: new Date(now - 2 * 24 * H).toISOString() }];
+  check('a greeting from us in 14 days counts as greeted', pg.alreadyGreeted(greetedThread, now), true);
+  check('an old greeting does not', pg.alreadyGreeted([{ ...greetedThread[0], dateAdded: new Date(now - 20 * 24 * H).toISOString() }], now), false);
+  check('exclamation on cómo le va is flagged', pg.validateDraft('Hola Marco, cómo le va! Qué vende?').problems.includes('exclamation on a question'), true);
+  const pg2 = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Marco-vinicio Pérez', intentLabel: 'x', stageName: '', faq: '', channel: 'whatsapp', greeted: true });
+  check('greeted lead: told not to greet, first name given', [pg2.user.includes('NO vuelva a saludar'), pg2.user.includes('llámelo solo "Marco"')], [true, true]);
+  // Auto replies (built, off by default).
+  const r = (o) => ({ kind: 'reply', status: 'drafted', mode: 'draft', intent: 'wants_info', problems: null, created_at: new Date(now - 16 * M).toISOString(), window_closes_at: new Date(now + 20 * H).toISOString(), ...o });
+  check('wants_info after 15 min is due', pg.autoReplyDue(r(), now), true);
+  check('unclear after 15 min is due', pg.autoReplyDue(r({ intent: 'unclear' }), now), true);
+  check('under 15 min is not due', pg.autoReplyDue(r({ created_at: new Date(now - 10 * M).toISOString() }), now), false);
+  check('a question (hot) is never auto', pg.autoReplyDue(r({ intent: 'question' }), now), false);
+  check('an invalid draft is never auto', pg.autoReplyDue(r({ problems: 'uses tú' }), now), false);
+  check('a signal is never auto', pg.autoReplyDue(r({ kind: 'signal', status: 'signal' }), now), false);
 }
 
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
