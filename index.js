@@ -22916,11 +22916,32 @@ async function guardianClassify(convo, analysis, correlationId) {
 
 // The reply, strike, or signal suggestion: one reprompt on a broken or invalid
 // draft; a second failure reaches the setter as ⚠️ BORRADOR INVÁLIDO (4a).
+// Two real free times from the booking calendar for the drafter (Ron,
+// 2026-11-18). Cached 10 min; a failed read gives no times, and the drafter
+// then asks morning or afternoon instead of inventing one.
+const GUARDIAN_BOOKING_CALENDAR_ID = process.env.GUARDIAN_BOOKING_CALENDAR_ID || 'fYQJCzbk4hvV0brpJqoE'; // LinkedIn Flywheel - Appointment
+let _guardianSlotCache = { at: 0, labels: [] };
+async function guardianFreeSlotLabels(now = Date.now()) {
+  if (now - _guardianSlotCache.at < 10 * 60 * 1000) return _guardianSlotCache.labels;
+  let labels = [];
+  try {
+    const res = await ghlFetch(`https://services.leadconnectorhq.com/calendars/${GUARDIAN_BOOKING_CALENDAR_ID}/free-slots?startDate=${now}&endDate=${now + 4 * 24 * 3600 * 1000}&timezone=America/Costa_Rica`, {
+      headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-04-15' },
+    }, { label: 'guardian free slots' });
+    if (res.ok) labels = guardian.pickTwoSlots(await res.json(), now).map((ms) => guardian.slotLabel(ms, now));
+    else console.warn(`[guardian] free slots → ${res.status}`);
+  } catch (err) { console.warn(`[guardian] free slots failed: ${err.message}`); }
+  _guardianSlotCache = { at: now, labels };
+  return labels;
+}
+
 async function guardianDraft({ action, messages, convo, cls, stageName }, correlationId) {
+  const slots = action.kind === 'signal' ? [] : await guardianFreeSlotLabels();
   const { system, user } = guardian.buildDraftPrompt({
     action, thread: guardian.threadForPrompt(messages), contactName: convo.contactName || convo.fullName || '',
     intentLabel: cls ? (guardian.INTENT_LABEL[cls.intent] || cls.intent) : guardian.INTENT_LABEL.silence,
-    stageName, faq: GUARDIAN_FAQ, channel: action.channel, bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL,
+    stageName, faq: GUARDIAN_FAQ, channel: action.channel, bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL, slots,
+    greeted: guardian.alreadyGreeted(messages),
   });
   let feedback = '';
   let last = { draft: '', problems: ['drafter returned nothing'], reason_es: '' };
@@ -22942,7 +22963,7 @@ async function guardianDraft({ action, messages, convo, cls, stageName }, correl
     }
     const parsed = guardian.parseDraft((res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(''));
     if (!parsed.ok) { last = { draft: '', problems: [parsed.error], reason_es: '' }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
-    const v = guardian.validateDraft(parsed.draft, { allowedUrls: [IG_GUIDE_BOOKING_URL, IG_GUIDE_URL] });
+    const v = guardian.validateDraft(parsed.draft, { allowedUrls: [IG_GUIDE_BOOKING_URL, IG_GUIDE_URL], channel: action.channel });
     last = { draft: parsed.draft, problems: v.problems, reason_es: parsed.reason_es };
     if (v.ok) return last;
     feedback = `\n\nSu borrador anterior rompió estas reglas: ${v.problems.join('; ')}. Corríjalo.`;
@@ -23053,15 +23074,22 @@ const GUARDIAN_CLOSE_MAX_READS = 40;
 // Kill switch for the 2 h auto-send of strikes: GUARDIAN_AUTO_STRIKES=off.
 const GUARDIAN_AUTO_STRIKES = String(process.env.GUARDIAN_AUTO_STRIKES || 'on').toLowerCase() !== 'off';
 const GUARDIAN_AUTO_ACTOR = 'auto_2h';
+// Simple replies (asked for info, unclear) Max sends himself after 15 min.
+// OFF until Ron approves the blind test: GUARDIAN_AUTO_REPLIES=on.
+const GUARDIAN_AUTO_REPLIES = String(process.env.GUARDIAN_AUTO_REPLIES || 'off').toLowerCase() === 'on';
+const GUARDIAN_AUTO_REPLY_ACTOR = 'auto_15m';
+const GUARDIAN_AUTO_ACTORS = new Set([GUARDIAN_AUTO_ACTOR, GUARDIAN_AUTO_REPLY_ACTOR]);
 async function guardianCloseOpenCards(now, stats) {
   const { data: open, error } = await supabase.from('guardian_actions')
-    .select('id, kind, status, mode, conversation_id, contact_name, problems, created_at, window_closes_at, slack_channel_id, slack_message_ts')
+    .select('id, kind, status, mode, intent, conversation_id, contact_name, problems, created_at, window_closes_at, slack_channel_id, slack_message_ts')
     .in('status', ['drafted', 'signal']).order('created_at', { ascending: true }).limit(500);
   if (error) throw new Error(`guardian_actions open read: ${error.message}`);
   stats.closed = { handled: 0, expired: 0, skipped: 0 };
   stats.autoStrikes = 0;
+  stats.autoReplies = 0;
   stats.nudges = 0;
   let autoToday = null; // read once, only when a strike is due
+  let autoRepliesToday = null;
   const threads = new Map();
   let reads = 0;
   const maxId = IG_GUIDE_MAX_GHL_USER_ID.toLowerCase();
@@ -23084,6 +23112,27 @@ async function guardianCloseOpenCards(now, stats) {
     const d = guardian.closeDecision(r, now, answeredAt);
     if (!d) {
       if (answeredAt || !r.slack_channel_id || !r.slack_message_ts) continue;
+      // Simple reply Sebastián did not take in 15 min (Ron, 2026-11-18; off by
+      // default). Same ✅ path: claim, Meta window, live-thread check.
+      if (GUARDIAN_AUTO_REPLIES && guardian.autoReplyDue(r, now) && stats.autoReplies < guardian.CONFIG.autoStrikesPerRun) {
+        if (autoRepliesToday === null) {
+          const { count, error: cErr } = await supabase.from('guardian_actions').select('id', { count: 'exact', head: true })
+            .eq('approved_by', GUARDIAN_AUTO_REPLY_ACTOR).eq('day', guardian.crDay(now));
+          autoRepliesToday = cErr ? Infinity : (count || 0);
+        }
+        if (autoRepliesToday < guardian.CONFIG.autoRepliesPerDay) {
+          const nowIso = new Date(now).toISOString();
+          const { data: appr } = await supabase.from('guardian_actions').update({ status: 'approved', approved_by: GUARDIAN_AUTO_REPLY_ACTOR, approved_at: nowIso, updated_at: nowIso })
+            .eq('id', r.id).eq('status', 'drafted').select('id');
+          if (appr && appr.length) {
+            autoRepliesToday++;
+            stats.autoReplies++;
+            await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, '15 min sin respuesta: Max contestó con la sugerencia del hilo.').catch(() => {});
+            await guardianSendApproved(r.id, { channel: r.slack_channel_id, ts: r.slack_message_ts, actor: GUARDIAN_AUTO_REPLY_ACTOR });
+            continue;
+          }
+        }
+      }
       // Untouched strike after 2 h goes out on its own (Ron, 2026-11-17). Same
       // path as a ✅: approve, claim, live-thread check, send.
       if (GUARDIAN_AUTO_STRIKES && guardian.autoSendDue(r, now) && stats.autoStrikes < guardian.CONFIG.autoStrikesPerRun) {
@@ -23187,9 +23236,12 @@ async function guardianRun(now, mode, stats, correlationId) {
       const needsDraft = action.kind === 'reply' || action.kind === 'strike' || (action.kind === 'signal' && ['outside_faq', 'objection'].includes(action.reason));
       if (needsDraft) d = await guardianDraft({ action, messages, convo: c, cls, stageName }, correlationId);
       else if (action.kind === 'signal') {
-        d.draft = action.reason === 'call_request'
-          ? 'El prospecto pide hablar: confirme el día y la hora y mande el enlace para agendar.'
-          : (cls && (cls.summary_es || cls.reason_es)) || 'Respuesta caliente: tómela usted.';
+        const free = action.reason === 'call_request' ? await guardianFreeSlotLabels() : [];
+        d.draft = action.reason === 'media'
+          ? 'Le mandó un audio, una foto o un archivo: Max no puede verlo. Ábralo y contéstele usted.'
+          : action.reason === 'call_request'
+            ? `El prospecto pide hablar: confirme el día y la hora y agéndelo.${free.length ? ` Libres en la agenda: ${free.join(' · ')} (hora Costa Rica).` : ''}`
+            : (cls && (cls.summary_es || cls.reason_es)) || 'Respuesta caliente: tómela usted.';
       }
       const row = {
         contact_id: c.contactId, conversation_id: c.id, opportunity_id: card.id, contact_name: c.contactName || c.fullName || null,
@@ -23465,7 +23517,7 @@ async function guardianStats(now) {
   const all = rows || [];
   const today = all.filter((r) => r.created_at >= dayStartIso);
   // Auto-sent strikes are Max's call, not an approval by Sebastián.
-  const decided = all.filter((r) => ['approved', 'sending', 'sent', 'send_failed', 'handled', 'rejected'].includes(r.status) && r.approved_by !== GUARDIAN_AUTO_ACTOR);
+  const decided = all.filter((r) => ['approved', 'sending', 'sent', 'send_failed', 'handled', 'rejected'].includes(r.status) && !GUARDIAN_AUTO_ACTORS.has(r.approved_by));
   const approvals = decided.filter((r) => r.status !== 'rejected').length;
   const rejections = decided.length - approvals;
   const cards7 = all.filter((r) => r.kind !== 'stop');
@@ -23485,6 +23537,7 @@ async function guardianStats(now) {
     expiredShare: cards7.length ? expired7 / cards7.length : null,
     unansweredShare: guardian.unansweredShare(all, now),
     autoStrikesToday: today.filter((r) => r.approved_by === GUARDIAN_AUTO_ACTOR && r.status === 'sent').length,
+    autoRepliesToday: today.filter((r) => r.approved_by === GUARDIAN_AUTO_REPLY_ACTOR && r.status === 'sent').length,
     sentInShadowOrOff: all.filter((r) => r.status === 'sent' && r.mode !== 'draft').length,
     sentWithoutApproval: all.filter((r) => r.status === 'sent' && !r.approved_by).length,
     divergence: all.filter((r) => ['approved', 'sending'].includes(r.status) && now - Date.parse(r.updated_at || r.approved_at || r.created_at) > 10 * 60 * 1000).length,
