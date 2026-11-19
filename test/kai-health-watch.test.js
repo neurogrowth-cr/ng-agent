@@ -218,6 +218,59 @@ check('2f  Tue 19:30 CR is outside (the old false alarms fired 18:45 to 19:45)',
   check('10s blind poll skips the thread checks', ['thread_check', 'thread_check_account', 'thread_check_key'].every((id) => blind.find((b) => b.id === id)?.skip), true);
 }
 
+// ── 10y. NeuroGrowth's own Prosp payment (2026-11-17: the agency card was
+// declined 05:47 CR, Kai failed on four agency clients 08:06 to 10:38, the
+// charge went through 10:46 and an agency client sent at 10:47; Max blamed each
+// client and kept paging until 19:30).
+{
+  const PAY = '500 {"message":"payment_failed"}';
+  const fail = (ws, m, extra = {}) => ({ workspace_id: ws, client_name: ws, created_at: at(-m).toISOString(), error_class: 'payment_failed', error: PAY, last_ok_at: null, key_last_ok_at: null, agency_key: true, ...extra });
+  const four = [fail('Agency Uno ', 50), fail('Agency Dos', 30), fail('Agency Tres', 20), fail('Agency Cuatro', 5), fail('Agency Cuatro', 4)];
+
+  const r1 = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: four } });
+  check('ab1 four agency clients unpaid: one NeuroGrowth alert, no client alert', [failingIds(r1.results), r1.alerts.map((a) => a.id)], [['prosp_billing_agency'], ['prosp_billing_agency']]);
+  const text = kai.formatKaiAlert(r1.alerts[0], 'U1');
+  check('ab2 says it is our payment and names Ron', /NEUROGROWTH PROSP PAYMENT FAILED/.test(text) && /NeuroGrowth's own Prosp payment failed/.test(text) && /every agency client/.test(text) && /Ron: pay Prosp/.test(text), true);
+  check('ab3 never tells the client to act', /client has to fix/.test(text), false);
+  check('ab4 lists each client once, counts tries', /Seen on 4 clients so far: AGENCY UNO, AGENCY DOS, AGENCY TRES, AGENCY CUATRO \(5 tries/.test(text), true);
+  check('ab5 no em dash', text.includes(String.fromCharCode(0x2014)), false);
+
+  // The charge goes through and one agency client sends 2 minutes ago: all clear, at once.
+  const paid = four.map((r) => ({ ...r, key_last_ok_at: at(-2).toISOString() }));
+  paid[0].last_ok_at = null; // Agency Uno itself has read nothing since
+  const r2 = poll(r1.state, { snapshot: { ...HEALTHY, threadCheckFails: paid }, now: at(15) });
+  check('ab6 one agency client recovering clears all of them', [failingIds(r2.results), r2.recoveries.map((x) => x.id)], [[], ['prosp_billing_agency']]);
+  check('ab7 recovery says to check the campaigns', /stopped campaigns are active again/.test(kai.formatKaiRecovery(r2.recoveries[0])), true);
+
+  // A good read on the key BEFORE the failures does not clear them.
+  const before = four.map((r) => ({ ...r, key_last_ok_at: at(-60).toISOString() }));
+  check('ab8 an older good read on the key does not clear it', failingIds(poll({}, { snapshot: { ...HEALTHY, threadCheckFails: before } }).results), ['prosp_billing_agency']);
+  // A failure after the key's last good read stays open.
+  const again = [...paid, fail('Agency Dos', 1, { key_last_ok_at: at(-2).toISOString() })];
+  check('ab9 a failure after the recovery stays open', failingIds(poll({}, { snapshot: { ...HEALTHY, threadCheckFails: again } }).results), ['prosp_billing_agency']);
+
+  // A legacy client on its own key keeps the client wording.
+  const own = fail('Legacy Own Key', 10, { agency_key: false });
+  const ro1 = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: [own] } });
+  const ro2 = poll(ro1.state, { snapshot: { ...HEALTHY, threadCheckFails: [own] }, now: at(15) });
+  check('ab10 own-key payment_failed: client alert, not ours', [failingIds(ro1.results), ro2.alerts.map((a) => a.id)], [['thread_check_account'], ['thread_check_account']]);
+  check('ab11 own-key wording names the client and tells them to act', /LEGACY OWN KEY: Prosp billing problem/.test(ro2.alerts[0].reason) && /client has to fix this in Prosp/.test(ro2.alerts[0].reason), true);
+  // Another workspace on the client's own key reading again clears it too (one bill).
+  check('ab12 own key: a good read on the same key clears it', failingIds(poll({}, { snapshot: { ...HEALTHY, threadCheckFails: [{ ...own, key_last_ok_at: at(-1).toISOString() }] } }).results), []);
+  // The key-wide rule is for payments only: an expired login stays per workspace.
+  const login = fail('Agency Dos', 10, { error_class: 'login_expired', key_last_ok_at: at(-1).toISOString() });
+  check('ab13 an expired login is not cleared by another client on the key', failingIds(poll({}, { snapshot: { ...HEALTHY, threadCheckFails: [login] } }).results), ['thread_check_account']);
+
+  // Mixed: agency clients unpaid and a legacy client unpaid on its own key.
+  const rm = poll({}, { snapshot: { ...HEALTHY, threadCheckFails: [...four, own] } });
+  check('ab14 mixed: both alerts, each with its own owner', failingIds(rm.results), ['prosp_billing_agency', 'thread_check_account']);
+  const acct = rm.results.find((x) => x.id === 'thread_check_account').reason;
+  check('ab15 mixed: the client alert names only the own-key client', /LEGACY OWN KEY/.test(acct) && !/AGENCY/.test(acct), true);
+
+  check('ab16 blind poll skips the billing check', kai.evaluateKaiChecks({ health: { ok: true }, snapshot: null, snapshotError: 'x', now: T0 }).find((b) => b.id === 'prosp_billing_agency')?.skip, true);
+  check('ab17 the SQL compares keys and never returns one', /AS agency_key/.test(kai.SQL.threadCheck) && /AS key_last_ok_at/.test(kai.SQL.threadCheck) && !/prosp_api_key\s+AS\s+(?!k\b)/i.test(kai.SQL.threadCheck) && !/w\.prosp_api_key\s*,/.test(kai.SQL.threadCheck), true);
+}
+
 // ── 11. Stuck replies need 2 polls
 {
   const stuck = { ...HEALTHY, stuck: { n: 2, oldest: '2026-09-23T15:30:00Z' } };
