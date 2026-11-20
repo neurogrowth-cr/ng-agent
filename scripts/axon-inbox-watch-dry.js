@@ -19,6 +19,15 @@ function arg(name) {
 }
 
 (async () => {
+  // An argument this script does not know must stop it: a simulated clock that
+  // is silently ignored reads as "everything is fine".
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i += 2) {
+    if (!['--plus-min', '--at'].includes(args[i]) || args[i + 1] == null) {
+      console.error(`Argumento no reconocido: ${args[i]}. Use --plus-min <minutos> o --at <fecha ISO>.`);
+      process.exit(2);
+    }
+  }
   const plus = arg('--plus-min');
   const at = arg('--at');
   const now = at ? new Date(at).getTime() : Date.now() + (plus ? Number(plus) * 60 * 1000 : 0);
