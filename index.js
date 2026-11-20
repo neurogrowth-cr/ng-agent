@@ -19378,6 +19378,59 @@ async function checkAxonHealth() {
   }
 }
 
+// Inbox watch liveness (same 10-min poll). AXON's `inbox_watch` cron stamps
+// axon.engine_heartbeat (id 'cron:inbox_watch') after each run that read the
+// inbox (ng-axon #373). No completed run for 75 minutes inside 06:00 to 20:59
+// Costa Rica posts once, in Spanish, to AXON's channel and to Ron; a newer run
+// posts the recovery. Rule, text and state live in lib/axonHealth.js. The
+// alert and the recovery are also rows in agent_activity (axon_inbox_watch),
+// read back on the first poll after a boot so a redeploy does not repeat an
+// alert. Recipe: automations/ops/recipes/inbox-watch.md ("Watched by").
+// Kill switch: AXON_INBOX_WATCH_CHECK=off.
+let axonInboxWatchState = null; // restored on the first poll
+
+async function restoreAxonInboxWatchState() {
+  try {
+    const { data, error } = await portalSupabase.from('agent_activity')
+      .select('action, metadata, created_at')
+      .eq('event_type', 'axon_inbox_watch')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) throw new Error(error.message);
+    return axonHealthLib.restoreInboxWatchState(data);
+  } catch (err) {
+    // Fail toward telling: with no memory, an outage in progress is said again.
+    console.warn(`[axon-inbox-watch] could not read the last alert, starting clean: ${axonHealthLib.errorOneLine(err)}`);
+    return axonHealthLib.newInboxWatchState();
+  }
+}
+
+async function checkAxonInboxWatch() {
+  if (String(process.env.AXON_INBOX_WATCH_CHECK || '') === 'off') return;
+  if (!axonInboxWatchState) axonInboxWatchState = await restoreAxonInboxWatchState();
+
+  let result;
+  try {
+    const { data, error } = await axonSupabase
+      .from('engine_heartbeat').select('beat_at').eq('id', axonHealthLib.INBOX_WATCH_BEAT_ID).limit(1);
+    result = axonHealthLib.classifyInboxWatch({ data, error });
+  } catch (err) {
+    result = axonHealthLib.classifyInboxWatch({ thrown: err });
+  }
+  if (result.kind === 'blind') { console.warn(`[axon-inbox-watch] ${result.reason}`); return; }
+
+  const { state, posts, event } = axonHealthLib.stepInboxWatch(axonInboxWatchState, result);
+  axonInboxWatchState = state;
+  if (event) {
+    console.warn(`[axon-inbox-watch] ${event.action}: last completed run ${event.beat_key}`);
+    logActivity({ event_type: 'axon_inbox_watch', event_source: 'cron', action: event.action, status: 'ok', metadata: { beat_key: event.beat_key } });
+  }
+  for (const text of posts) {
+    await slack.client.chat.postMessage({ channel: AXON_OPS_CHANNEL, text }).catch((e) => console.error('[axon-inbox-watch] channel post failed:', e.message));
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text }).catch((e) => console.error('[axon-inbox-watch] Ron DM failed:', e.message));
+  }
+}
+
 async function checkMakeScenarioHealth(correlationId) {
   if (!MAKE_API_TOKEN) return;
 
@@ -19561,8 +19614,12 @@ if (MAKE_API_TOKEN) {
 // AXON's heartbeat lives in Supabase, not Make, so this watch must not depend on
 // MAKE_API_TOKEN. It used to sit inside the block above and would have stopped
 // silently if that token were ever unset.
-cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => { await checkAxonHealth(); }), { timezone: 'America/Costa_Rica' });
-console.log('Registered static cron: AXON heartbeat watch (*/10 * * * *)');
+// The same poll also checks that AXON's inbox watch cron still runs. Each
+// check runs even when the other one throws.
+cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => {
+  try { await checkAxonHealth(); } finally { await checkAxonInboxWatch(); }
+}), { timezone: 'America/Costa_Rica' });
+console.log('Registered static cron: AXON heartbeat watch + inbox watch liveness (*/10 * * * *)');
 
 // ─── KAI HEALTH WATCH ────────────────────────────────────────────────────────
 // Kai (ng-automation, the LinkedIn reply agent) had no watcher at all until
