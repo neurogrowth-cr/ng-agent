@@ -23138,8 +23138,10 @@ async function runGuardianCheck(correlationId) {
 // for the next run instead of guessing. Messages Max AI sent never count as
 // Sebastián's answer. The card gets ✅ or ⏳ so Slack matches the table.
 const GUARDIAN_CLOSE_MAX_READS = 40;
-// Kill switch for the 2 h auto-send of strikes: GUARDIAN_AUTO_STRIKES=off.
+// Kill switch for the 1 h auto-send of strikes: GUARDIAN_AUTO_STRIKES=off.
 const GUARDIAN_AUTO_STRIKES = String(process.env.GUARDIAN_AUTO_STRIKES || 'on').toLowerCase() !== 'off';
+// Actor id kept as 'auto_2h' after the wait went to 1 h (2026-11-20): it is
+// stored in approved_by and counts the daily cap, so renaming it splits history.
 const GUARDIAN_AUTO_ACTOR = 'auto_2h';
 // Simple replies (asked for info, unclear) Max sends himself after 15 min.
 // OFF until Ron approves the blind test: GUARDIAN_AUTO_REPLIES=on.
@@ -23200,7 +23202,7 @@ async function guardianCloseOpenCards(now, stats) {
           }
         }
       }
-      // Untouched strike after 2 h goes out on its own (Ron, 2026-11-17). Same
+      // Untouched strike after 1 h goes out on its own (Ron, 2026-11-17; 1 h since 11-20). Same
       // path as a ✅: approve, claim, live-thread check, send.
       if (GUARDIAN_AUTO_STRIKES && guardian.autoSendDue(r, now) && stats.autoStrikes < guardian.CONFIG.autoStrikesPerRun) {
         if (autoToday === null) {
@@ -23215,7 +23217,7 @@ async function guardianCloseOpenCards(now, stats) {
         if (!appr || !appr.length) continue;
         autoToday++;
         stats.autoStrikes++;
-        await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, '2 h sin tocar: Max la envía.').catch(() => {});
+        await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, '1 h sin tocar: Max la envía.').catch(() => {});
         await guardianSendApproved(r.id, { channel: r.slack_channel_id, ts: r.slack_message_ts, actor: GUARDIAN_AUTO_ACTOR });
         continue;
       }
