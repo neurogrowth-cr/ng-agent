@@ -1367,3 +1367,8 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Stays with Sebastián:** conversations he already carries, hot replies, objections, price, call requests, media, and any draft Max doubts.
 - **First live window:** guardian opens 08:00 CR on 2026-11-20. Watch guardian_run `autoReplies`, `reviewed`, `doubts`.
 - **Undo:** `GUARDIAN_AUTO_REPLIES=off` (or delete the variable) and redeploy.
+
+## 2026-11-20: license roster lists Prosp + KAI (#530)
+- **Why:** the dash added a fifth license, Prosp + KAI (`kai_prosp`, $140/mo, dash #583, strategy #148). The roster reads a fixed list of codes, so a client on it would not have shown.
+- **What:** `kai_prosp` joins `LICENSE_RUNG_CODES` and `KAI_INCLUDED` in `lib/licenseRoster.js`. Kai is paid on this plan, so a client with Kai off is flagged first with the warning, like the $200 license. No change to `index.js`, the query, the schedule or the post format.
+- **Not verified:** no client holds the plan yet. The first real line appears on the first roster after a sale (Mon and Thu 08:00 CR).
