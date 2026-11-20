@@ -254,13 +254,13 @@ const prompt = pg.buildDraftPrompt({ action: { kind: 'strike', step: 'strike_5',
 check('system prompt carries usted, the playbook and both links', [prompt.system.includes('siempre de usted'), prompt.system.includes('PLAYBOOK'), prompt.system.includes(pg.APPROVED_URLS.booking), prompt.system.includes(pg.APPROVED_URLS.guide)], [true, true, true, true]);
 check('user prompt names the step and the move-off-channel ask', [prompt.user.includes('Strike 5 de 5'), prompt.user.includes('pídale su WhatsApp para confirmarle la hora')], [true, true]);
 check('no em dash in the prompts', /\u2014/.test(prompt.system + prompt.user), false);
-check('draft parse with text around', pg.parseDraft('Aquí va:\n{"draft":"Hola, a quién le vende?","reason_es":"falta el cliente"}'), { ok: true, draft: 'Hola, a quién le vende?', reason_es: 'falta el cliente' });
+check('draft parse with text around', pg.parseDraft('Aquí va:\n{"draft":"Hola, a quién le vende?","reason_es":"falta el cliente"}'), { ok: true, draft: 'Hola, a quién le vende?', reason_es: 'falta el cliente', known_es: '' });
 check('broken draft JSON never throws', pg.parseDraft('nope').ok, false);
 const cls = pg.parseClassification('{"verdict":"hot","intent":"question","call_request":false,"faq_covered":true,"reason_es":"pregunta cómo funciona","summary_es":"quiere saber el proceso","ficha":{"empresa":"Vega SA","vende_a":null,"dolor":"","urgencia":"null"}}');
 check('classification parses intent, flags and ficha', [cls.verdict, cls.intent, cls.faqCovered, cls.ficha], ['hot', 'question', true, { empresa: 'Vega SA', vende_a: null, dolor: null, urgencia: null }]);
 check('unknown intent becomes unclear, bad JSON is normal/unclear', [pg.parseClassification('{"intent":"foo","verdict":"hot"}').intent, pg.parseClassification('x').verdict], ['unclear', 'normal']);
 check('classifier prompt lists every intent class', pg.INTENT_CLASSES.every((i) => pg.buildClassifierPrompt({ contactName: 'A', tail: [] }).includes(i)), true);
-check('thread for prompt labels the workflow send as automatic', pg.threadForPrompt(realThread).startsWith('NOSOTROS (automático): Hola, gracias'), true);
+check('thread for prompt labels the workflow send as automatic', /^\[\d\d\/\d\d\] NOSOTROS \(automático\): Hola, gracias/.test(pg.threadForPrompt(realThread)), true);
 
 // ── send text ──
 check('no thread reply sends the draft', pg.pickSendText({ draft: 'Hola', threadReplies: [{ user: 'B', text: 'x', ts: '1' }], approverIds: ['SETTER'] }), { text: 'Hola', edited: false });
@@ -320,7 +320,7 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
 // Auto strikes, nudges, unanswered share (Ron, 2026-11-17).
 {
   const H = 3600 * 1000, M = 60 * 1000, now = Date.parse('2026-11-18T16:00:00Z');
-  const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, created_at: new Date(now - 2 * H - M).toISOString(), window_closes_at: null, ...o });
+  const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'revisado', created_at: new Date(now - 2 * H - M).toISOString(), window_closes_at: null, ...o });
   check('untouched strike after 2 h is due', pg.autoSendDue(s(), now), true);
   check('strike under 2 h is not due', pg.autoSendDue(s({ created_at: new Date(now - 90 * M).toISOString() }), now), false);
   check('a reply never auto-sends', pg.autoSendDue(s({ kind: 'reply' }), now), false);
@@ -415,13 +415,53 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   const pg2 = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Marco-vinicio Pérez', intentLabel: 'x', stageName: '', faq: '', channel: 'whatsapp', greeted: true });
   check('greeted lead: told not to greet, first name given', [pg2.user.includes('NO vuelva a saludar'), pg2.user.includes('llámelo solo "Marco"')], [true, true]);
   // Auto replies (built, off by default).
-  const r = (o) => ({ kind: 'reply', status: 'drafted', mode: 'draft', intent: 'wants_info', problems: null, created_at: new Date(now - 16 * M).toISOString(), window_closes_at: new Date(now + 20 * H).toISOString(), ...o });
+  const r = (o) => ({ kind: 'reply', status: 'drafted', mode: 'draft', intent: 'wants_info', problems: null, last_error: 'revisado:primera', created_at: new Date(now - 16 * M).toISOString(), window_closes_at: new Date(now + 20 * H).toISOString(), ...o });
   check('wants_info after 15 min is due', pg.autoReplyDue(r(), now), true);
   check('unclear after 15 min is due', pg.autoReplyDue(r({ intent: 'unclear' }), now), true);
   check('under 15 min is not due', pg.autoReplyDue(r({ created_at: new Date(now - 10 * M).toISOString() }), now), false);
   check('a question (hot) is never auto', pg.autoReplyDue(r({ intent: 'question' }), now), false);
   check('an invalid draft is never auto', pg.autoReplyDue(r({ problems: 'uses tú' }), now), false);
   check('a signal is never auto', pg.autoReplyDue(r({ kind: 'signal', status: 'signal' }), now), false);
+  // Second read and first reply only (Ron, 2026-11-19).
+  check('mid-conversation reply (revisado, not primera) is never auto', pg.autoReplyDue(r({ last_error: 'revisado' }), now), false);
+  check('a reply Max doubts is never auto', pg.autoReplyDue(r({ last_error: 'duda: pregunta algo que ya contestó' }), now), false);
+  check('a reply drafted before the second read is never auto', pg.autoReplyDue(r({ last_error: null }), now), false);
+  check('a strike Max doubts never auto-sends', pg.autoSendDue({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'duda: no sigue', created_at: new Date(now - 3 * H).toISOString() }, now), false);
+  check('a strike drafted before the second read never auto-sends', pg.autoSendDue({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: null, created_at: new Date(now - 3 * H).toISOString() }, now), false);
+}
+
+// Second read: parsing, marks, first reply, full thread.
+{
+  const ok = pg.parseReview('Listo:\n{"ya_sabemos":"servicios, vende a pymes","repite":false,"malinterpreta":false,"palabra_rara":false,"contexto":false,"confianza":"alta","nota_es":""}');
+  check('clean review passes', [ok.parsed, ok.pass, ok.note_es, ok.known_es], [true, true, '', 'servicios, vende a pymes']);
+  const rep = pg.parseReview('{"repite":true,"confianza":"alta","nota_es":"ya dijo que sus clientes son empresas"}');
+  check('a repeated question fails with the note', [rep.pass, rep.repeats, rep.note_es], [false, true, 'ya dijo que sus clientes son empresas']);
+  check('odd word without note gets a default note', pg.parseReview('{"palabra_rara":true,"confianza":"alta"}').note_es, 'hay una palabra rara sin resolver');
+  check('medium confidence is a doubt', pg.parseReview('{"confianza":"media"}').pass, false);
+  check('missing confidence is low, a doubt', pg.parseReview('{"repite":false}').confidence, 'baja');
+  check('broken review JSON is a doubt, never throws', [pg.parseReview('nope').pass, pg.parseReview('nope').note_es], [false, 'no se pudo revisar']);
+  check('marks', [pg.reviewMark({ pass: true }, { firstReply: true }), pg.reviewMark({ pass: true }), pg.reviewMark({ pass: false, note_es: 'x' })], ['revisado:primera', 'revisado', 'duda: x']);
+  check('reviewPassed / reviewDoubt', [pg.reviewPassed({ last_error: 'revisado:primera' }), pg.reviewPassed({ last_error: 'duda: x' }), pg.reviewDoubt({ last_error: 'duda: x' }), pg.reviewDoubt({ last_error: 'revisado' })], [true, false, 'x', null]);
+  const t0 = Date.parse('2026-11-01T15:00:00Z');
+  const msg = (i, direction, body, o = {}) => ({ id: `m${i}`, messageType: 'TYPE_WHATSAPP', direction, body, dateAdded: new Date(t0 + i * 60000).toISOString(), ...o });
+  check('lead who only got the workflow welcome: first reply', pg.isFirstReply([msg(1, 'outbound', 'Bienvenido', { source: 'workflow' }), msg(2, 'inbound', 'Buenas, más info')]), true);
+  check('Sebastián already wrote: not a first reply', pg.isFirstReply([msg(1, 'inbound', 'hola'), msg(2, 'outbound', 'Hola Ana, cómo le va?', { source: 'app' }), msg(3, 'inbound', 'bien')]), false);
+  check('template body counts as automated', pg.isFirstReply([msg(1, 'outbound', 'TEMPLATE', { source: 'app' }), msg(2, 'inbound', 'sí')], { isAutomatedBody: (b) => b === 'TEMPLATE' }), true);
+  const long = [];
+  for (let i = 0; i < 40; i++) long.push(msg(i, i % 2 ? 'outbound' : 'inbound', i === 0 ? 'Mis clientes son empresas de logística' : `mensaje ${i}`, { source: 'app' }));
+  check('the drafter now sees the first message of a 40-message chat', pg.threadForPrompt(long).includes('Mis clientes son empresas de logística'), true);
+  const rp = pg.buildReviewPrompt({ thread: 'PROSPECTO: Ok te abuso', draft: 'No hay ningún abuso!', contactName: 'Alejandra', channel: 'whatsapp' });
+  check('review prompt carries thread, draft and the four questions', [rp.user.includes('Ok te abuso'), rp.user.includes('No hay ningún abuso!'), ['repite', 'malinterpreta', 'palabra_rara', 'contexto'].every((k) => rp.system.includes(k))], [true, true, true]);
+  check('no em dash in the review prompt', /\u2014/.test(rp.system + rp.user), false);
+  check('drafter prompt asks for ya_sabemos and reads typos by meaning', (() => { const d = pg.buildDraftPrompt({ action: { step: 'reply' }, thread: '', contactName: 'Ana', channel: 'whatsapp' }); return [d.system.includes('"ya_sabemos"'), d.system.includes('te abuso')]; })(), [true, true]);
+  // Reminder and thread carry the suggestion (Ron, 2026-11-19).
+  const nudge = pg.nudgeText({ kind: 'reply', contact_name: 'Ana', draft: 'Hola Ana, cómo le va?', last_error: 'revisado:primera' }, 15);
+  check('reminder carries the suggestion and the one-tap send', [nudge.includes('Sugerencia de Max: Hola Ana, cómo le va?'), nudge.includes('✅ en la tarjeta la envía')], [true, true]);
+  check('reminder warns when Max doubts', pg.nudgeText({ kind: 'reply', contact_name: 'Ana', draft: 'x', last_error: 'duda: no sigue' }, 60).includes('⚠️ Max no está seguro: no sigue'), true);
+  check('signal reminder stays short', pg.nudgeText({ kind: 'signal', contact_name: 'Ana', draft: 'x' }, 15).includes('Sugerencia'), false);
+  check('a hand-written message without Hola still counts as greeted', pg.alreadyGreeted([msg(1, 'outbound', 'Como vamos brother?', { source: 'app' })], t0 + 3600e3), true);
+  check('a workflow send without Hola does not', pg.alreadyGreeted([msg(1, 'outbound', 'Bienvenido al canal', { source: 'workflow' })], t0 + 3600e3), false);
+  check('thread shows the doubt', pg.replyDraftThread({ draft: 'Hola', problems: [], doubt: 'pregunta algo que ya contestó' }).includes('⚠️ Max no está seguro: pregunta algo que ya contestó'), true);
 }
 
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }

@@ -16711,6 +16711,36 @@ async function ghlGetConversationMessages(conversationId) {
   return msgs;
 }
 
+// The whole chat, oldest first, up to `max` messages (the guardian drafter and
+// its second read; Ron, 2026-11-19). Pages back with lastMessageId; a failed
+// later page keeps what was read, a failed first page throws like the 20-message read.
+async function ghlGetFullConversationMessages(conversationId, max = 80) {
+  const all = [];
+  let cursor = null;
+  for (let page = 0; page < 5 && all.length < max; page++) {
+    const url = `https://services.leadconnectorhq.com/conversations/${conversationId}/messages?limit=100${cursor ? `&lastMessageId=${encodeURIComponent(cursor)}` : ''}`;
+    let data;
+    try {
+      const res = await ghlFetch(url, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' } });
+      if (!res.ok) throw new Error(`GHL messages fetch ${res.status}`);
+      data = await res.json();
+    } catch (err) {
+      if (!page) throw err;
+      console.warn(`[ghl] full thread page ${page + 1} failed ${conversationId}: ${err.message}`);
+      break;
+    }
+    const box = data.messages && !Array.isArray(data.messages) ? data.messages : { messages: data.messages || [] };
+    const msgs = box.messages || [];
+    all.push(...msgs);
+    if (!box.nextPage || !box.lastMessageId || !msgs.length || box.lastMessageId === cursor) break;
+    cursor = box.lastMessageId;
+  }
+  const seen = new Set();
+  const unique = all.filter((m) => { const k = m && m.id; if (!k) return true; if (seen.has(k)) return false; seen.add(k); return true; });
+  unique.sort((a, b) => new Date(a.dateAdded || a.createdAt || 0) - new Date(b.dateAdded || b.createdAt || 0));
+  return unique.slice(-max);
+}
+
 // ── GHL native MCP operation router ──────────────────────────────────────────
 // GHL ships an official MCP server. It is NOT a deeper level of access: it routes
 // to the same v2 REST API, with the same Private Integration Token and the same
@@ -22935,7 +22965,44 @@ async function guardianFreeSlotLabels(now = Date.now()) {
   return labels;
 }
 
+// Second read (Ron, 2026-11-19): a separate call re-reads the whole chat and
+// the draft. Never throws: a failed review is a doubt, so nothing goes out alone.
+async function guardianReview({ thread, draft, contactName, channel }, correlationId) {
+  const { system, user } = guardian.buildReviewPrompt({ thread, draft, contactName, channel });
+  try {
+    const t0 = Date.now();
+    const res = await anthropic.messages.create({
+      model: MODEL_AGENT, max_tokens: 500, thinking: THINKING_OFF,
+      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: user }],
+    });
+    logLlmFromAnthropicResponse(res, Date.now() - t0, correlationId, 'guardian_reviewer');
+    return guardian.parseReview((res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(''));
+  } catch (err) {
+    console.warn(`[guardian] review failed: ${err.message}`);
+    return { parsed: false, pass: false, note_es: 'no se pudo revisar', known_es: '' };
+  }
+}
+
+// Draft, then the second read for anything that can be sent (reply, strike).
+// A failed read gets one redraft with the reviewer's note; a second doubt keeps
+// the draft for Sebastián, marked, and it never goes out on its own.
 async function guardianDraft({ action, messages, convo, cls, stageName }, correlationId) {
+  const first = await guardianDraftOnce({ action, messages, convo, cls, stageName }, correlationId, '');
+  if (action.kind === 'signal' || !first.draft || first.problems.length) return first;
+  const thread = guardian.threadForPrompt(messages);
+  const contactName = convo.contactName || convo.fullName || '';
+  const firstReply = action.kind === 'reply' && guardian.isFirstReply(messages, { isAutomatedBody: strikeIsAutomatedBody });
+  let review = await guardianReview({ thread, draft: first.draft, contactName, channel: action.channel }, correlationId);
+  if (review.pass) return { ...first, doubt: null, mark: guardian.reviewMark(review, { firstReply }), reviews: 1 };
+  const note = `\n\nUn revisor leyó toda la conversación y encontró este problema en su borrador: ${review.note_es}.${review.known_es ? ` Lo que el prospecto ya dijo: ${review.known_es}.` : ''} Escriba un borrador nuevo que lo corrija.`;
+  const second = await guardianDraftOnce({ action, messages, convo, cls, stageName }, correlationId, note);
+  if (!second.draft || second.problems.length) return { ...first, doubt: review.note_es, mark: guardian.reviewMark(review), reviews: 1 };
+  review = await guardianReview({ thread, draft: second.draft, contactName, channel: action.channel }, correlationId);
+  return { ...second, doubt: review.pass ? null : review.note_es, mark: guardian.reviewMark(review, { firstReply }), reviews: 2 };
+}
+
+async function guardianDraftOnce({ action, messages, convo, cls, stageName }, correlationId, extraFeedback) {
   const slots = action.kind === 'signal' ? [] : await guardianFreeSlotLabels();
   const { system, user } = guardian.buildDraftPrompt({
     action, thread: guardian.threadForPrompt(messages), contactName: convo.contactName || convo.fullName || '',
@@ -22943,14 +23010,14 @@ async function guardianDraft({ action, messages, convo, cls, stageName }, correl
     stageName, faq: GUARDIAN_FAQ, channel: action.channel, bookingUrl: IG_GUIDE_BOOKING_URL, guideUrl: IG_GUIDE_URL, slots,
     greeted: guardian.alreadyGreeted(messages),
   });
-  let feedback = '';
+  let feedback = extraFeedback || '';
   let last = { draft: '', problems: ['drafter returned nothing'], reason_es: '' };
   for (let attempt = 0; attempt < 2; attempt++) {
     let res;
     try {
       const t0 = Date.now();
       res = await anthropic.messages.create({
-        model: MODEL_AGENT, max_tokens: 700, thinking: THINKING_OFF,
+        model: MODEL_AGENT, max_tokens: 900, thinking: THINKING_OFF,
         system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: user + feedback }],
       });
@@ -22962,11 +23029,11 @@ async function guardianDraft({ action, messages, convo, cls, stageName }, correl
       continue;
     }
     const parsed = guardian.parseDraft((res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(''));
-    if (!parsed.ok) { last = { draft: '', problems: [parsed.error], reason_es: '' }; feedback = `\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
+    if (!parsed.ok) { last = { draft: '', problems: [parsed.error], reason_es: '' }; feedback = `${extraFeedback || ''}\n\nSu respuesta anterior no era JSON válido (${parsed.error}). Responda solo el objeto JSON.`; continue; }
     const v = guardian.validateDraft(parsed.draft, { allowedUrls: [IG_GUIDE_BOOKING_URL, IG_GUIDE_URL], channel: action.channel });
-    last = { draft: parsed.draft, problems: v.problems, reason_es: parsed.reason_es };
+    last = { draft: parsed.draft, problems: v.problems, reason_es: parsed.reason_es, known_es: parsed.known_es };
     if (v.ok) return last;
-    feedback = `\n\nSu borrador anterior rompió estas reglas: ${v.problems.join('; ')}. Corríjalo.`;
+    feedback = `${extraFeedback || ''}\n\nSu borrador anterior rompió estas reglas: ${v.problems.join('; ')}. Corríjalo.`;
   }
   return last;
 }
@@ -23015,7 +23082,7 @@ function guardianConvoFromCard(card, conversationId) {
 async function guardianMessages(convo) {
   const cached = _guardianThreadCache.get(convo.id);
   if (cached && convo.lastMessageDate && cached.lastMessageDate === convo.lastMessageDate) return cached.messages;
-  const messages = await ghlGetConversationMessages(convo.id);
+  const messages = await ghlGetFullConversationMessages(convo.id, guardian.THREAD_MAX_MESSAGES);
   if (convo.lastMessageDate) _guardianThreadCache.set(convo.id, { lastMessageDate: convo.lastMessageDate, messages });
   return messages;
 }
@@ -23081,7 +23148,7 @@ const GUARDIAN_AUTO_REPLY_ACTOR = 'auto_15m';
 const GUARDIAN_AUTO_ACTORS = new Set([GUARDIAN_AUTO_ACTOR, GUARDIAN_AUTO_REPLY_ACTOR]);
 async function guardianCloseOpenCards(now, stats) {
   const { data: open, error } = await supabase.from('guardian_actions')
-    .select('id, kind, status, mode, intent, conversation_id, contact_name, problems, created_at, window_closes_at, slack_channel_id, slack_message_ts')
+    .select('id, kind, status, mode, intent, conversation_id, contact_name, draft, problems, last_error, created_at, window_closes_at, slack_channel_id, slack_message_ts')
     .in('status', ['drafted', 'signal']).order('created_at', { ascending: true }).limit(500);
   if (error) throw new Error(`guardian_actions open read: ${error.message}`);
   stats.closed = { handled: 0, expired: 0, skipped: 0 };
@@ -23252,8 +23319,11 @@ async function guardianRun(now, mode, stats, correlationId) {
         lead_message_at: analysis ? new Date(analysis.newestAt).toISOString() : (thread.lastInboundAt ? new Date(thread.lastInboundAt).toISOString() : null),
         our_last_message_at: thread.lastOutboundAt ? new Date(thread.lastOutboundAt).toISOString() : null,
         window_closes_at: action.closesAt ? new Date(action.closesAt).toISOString() : null,
+        // Second-read marker while the card is open: revisado[:primera] or duda: ...
+        last_error: d.mark || null,
         correlation_id: correlationId,
       };
+      if (d.reviews) { stats.reviewed = (stats.reviewed || 0) + 1; if (d.doubt) stats.doubts = (stats.doubts || 0) + 1; if (d.reviews > 1) stats.redrafts = (stats.redrafts || 0) + 1; }
       // Claim the (conversation, step, day) slot first: two overlapping runs must not DM twice.
       const { data: ins, error: insErr } = await supabase.from('guardian_actions')
         .upsert(row, { onConflict: 'conversation_id,step,day', ignoreDuplicates: true }).select('id');
@@ -23272,7 +23342,7 @@ async function guardianRun(now, mode, stats, correlationId) {
       }
       const cardText = guardian.formatCard({
         kind: action.kind, step: action.step, contactName: row.contact_name, channel: row.channel, intent: row.intent,
-        leadQuote, leadAt: analysis ? analysis.newestAt : thread.lastInboundAt, stageName, draft: d.draft, problems: d.problems,
+        leadQuote, leadAt: analysis ? analysis.newestAt : thread.lastInboundAt, stageName, draft: d.draft, problems: d.problems, doubt: d.doubt || null,
         closesAt: action.closesAt || null, ficha: cls && cls.ficha, contactLink, bookingUrl: IG_GUIDE_BOOKING_URL,
       }, { now });
       const contract = guardian.validateCard(cardText);
@@ -23285,7 +23355,7 @@ async function guardianRun(now, mode, stats, correlationId) {
       // a reply in the thread by Sebastián or Ron is sent instead (pickSendText
       // ignores Max's own message).
       if (action.kind === 'reply') {
-        await guardianThreadReply(posted.channel, posted.ts, guardian.replyDraftThread({ draft: d.draft, problems: d.problems }))
+        await guardianThreadReply(posted.channel, posted.ts, guardian.replyDraftThread({ draft: d.draft, problems: d.problems, doubt: d.doubt || null }))
           .catch((e) => console.warn(`[guardian] draft thread failed ${actionId}: ${e.message}`));
       }
       if (guardian.countsTowardDayCap(action.step)) cardsToday++;
