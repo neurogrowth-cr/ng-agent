@@ -8,7 +8,7 @@
 //   • every client appears exactly once, in one of the two sections;
 //   • names and prices come from the row (catalog_rungs), never from code;
 //   • no 'undefined', 'null', 'NaN' or em dash ever reaches Slack.
-const { SQL, summarizeLicenseRoster, formatLicenseRoster, checkLicenseRoster, kaiStatus } = require('../lib/licenseRoster');
+const { SQL, LICENSE_RUNG_CODES, summarizeLicenseRoster, formatLicenseRoster, checkLicenseRoster, kaiStatus } = require('../lib/licenseRoster');
 
 let failures = 0;
 function check(label, ok, detail = '') {
@@ -21,6 +21,7 @@ const d = (daysAhead) => new Date(now.getTime() + daysAhead * 24 * 3600 * 1000).
 const LU = { rung_code: 'licencia_unificada', rung_name: 'Licencia Unificada', price_amount: '140.00' };
 const KLU = { rung_code: 'kai_licencia_unificada', rung_name: 'KAI + Licencia Unificada', price_amount: '200.00' };
 const SN = { rung_code: 'sales_nav', rung_name: 'Sales Navigator', price_amount: '100.00' };
+const KP = { rung_code: 'kai_prosp', rung_name: 'Prosp + KAI', price_amount: '140.00' };
 const ws = (over = {}) => ({ workspace_id: 'w', kai_switch: true, paused: false, auto_send: false, ...over });
 
 const rows = [
@@ -42,6 +43,8 @@ const rows = [
   { client_name: 'Kathy Arguedas - Estratega Patrimonial - DIY ', ...SN, status: 'active', source: 'self_serve', workspace_id: null, kai_switch: null, paused: null, auto_send: null },
   // Missing name and catalog row never render as undefined.
   { client_name: null, rung_code: 'kai_sales_nav', rung_name: null, price_amount: null, status: 'active', source: 'self_serve', workspace_id: null },
+  // Prosp + KAI (dash #583): Kai is paid, so the client is in the roster and reads as a Kai plan.
+  { client_name: 'Cliente Prosp Kai', ...KP, status: 'active', source: 'self_serve', ...ws() },
 ];
 
 // ── 1. Kai reading ───────────────────────────────────────────────────────────
@@ -53,10 +56,13 @@ check('1e $140 trial closed = NOT active, says when', (() => { const k = kaiStat
 check('1f paused by client = NOT active', (() => { const k = kaiStatus(rows[6], now); return !k.on && /el cliente lo pausó/.test(k.note); })());
 check('1g sales_nav = no Kai in plan', kaiStatus(rows[7], now).note === 'su plan no incluye Kai');
 check('1h kai_sales_nav without workspace = not configured', /no está configurado/.test(kaiStatus(rows[8], now).note));
+check('1i kai_prosp is read from the portal', LICENSE_RUNG_CODES.includes('kai_prosp'), LICENSE_RUNG_CODES.join(', '));
+check('1j kai_prosp + switch on = active', kaiStatus(rows[9], now).on === true, JSON.stringify(kaiStatus(rows[9], now)));
+check('1k kai_prosp + switch off = pays Kai, not active', (() => { const k = kaiStatus({ ...rows[9], kai_switch: false }, now); return !k.on && k.paysKai && /paga Kai pero Kai está apagado/.test(k.note); })());
 
 // ── 2. Summary ───────────────────────────────────────────────────────────────
 const s = summarizeLicenseRoster({ now, rows });
-check('2a totals', s.totals.clients === 9 && s.totals.on === 3 && s.totals.off === 6, JSON.stringify(s.totals));
+check('2a totals', s.totals.clients === 10 && s.totals.on === 4 && s.totals.off === 6, JSON.stringify(s.totals));
 check('2b paid-Kai-off listed first', s.off[0].paysKai && s.off[1].paysKai && !s.off[2].paysKai, s.off.map((c) => c.client_name).join(' > '));
 check('2c ending trial leads the active list', s.on[0].client_name === 'AURA BONILLA - CACAO LEGAL', s.on.map((c) => c.client_name).join(' > '));
 check('2d sales_nav last', s.off[s.off.length - 1].client_name.startsWith('KATHY'), s.off.map((c) => c.client_name).join(' > '));
@@ -65,7 +71,8 @@ check('2d sales_nav last', s.off[s.off.length - 1].client_name.startsWith('KATHY
 const text = formatLicenseRoster(s);
 console.log('\n' + text + '\n');
 check('3a header', /^`LICENCIA UNIFICADA: LISTA AL DÍA \(lunes, 16 de noviembre\)`/.test(text), text.split('\n')[0]);
-check('3b totals line', /9 clientes con licencia · 3 con Kai activo · 6 sin Kai activo/.test(text));
+check('3b totals line', /10 clientes con licencia · 4 con Kai activo · 6 sin Kai activo/.test(text));
+check('3i Prosp + KAI line', /• CLIENTE PROSP KAI · Prosp \+ KAI \$140 · con aprobación/.test(text), text);
 check('3c price from the row', /• SELVA DESIGN & ARCHITECTURE - ESTEBAN OSSENBACH · KAI \+ Licencia Unificada \$200 · ⚠️ paga Kai pero Kai está apagado/.test(text), text);
 check('3d trial line', /• AURA BONILLA - CACAO LEGAL · Licencia Unificada \$140 · prueba gratis hasta el 22 nov ⏰ · con aprobación/.test(text), text);
 check('3e past due flagged', /GABRIELA HERNANDEZ .* · pago atrasado/.test(text));
