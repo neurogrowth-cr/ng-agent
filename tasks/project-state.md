@@ -1378,3 +1378,12 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - Untouched strike cards now go out on their own after 1 h (was 2 h). Ron's call after the data: since 11-17, 15 strikes sent, Sebastián edited 0 and stopped 0, and approved his within 1 to 7 min. Before auto sending, 26 expired unsent.
 - `CONFIG.autoStrikeAfterMs` in lib/pipelineGuardian.js; card line and thread note say 1 h. Actor id stays `auto_2h` (stored in approved_by, counts the 30/day cap).
 - Kill switch unchanged: `GUARDIAN_AUTO_STRIKES=off`.
+
+## 2026-11-20: Max says when AXON's inbox watch cron stops running (#534)
+
+- AXON's `inbox_watch` cron (`12,42 6-20 * * *` CR) went live today with nothing outside AXON checking that it runs. AXON's own alert only sees a run that fails; a cron that never fires was silent and the dash sweep hides it.
+- AXON stamps `axon.engine_heartbeat` id `cron:inbox_watch` after each run that read the inbox (ng-axon #373). The `checkAxonHealth` cron (every 10 min) now also runs `checkAxonInboxWatch`: no completed run for 75 minutes inside 06:00 to 20:59 CR posts one alert in Spanish to #ng-fulfillment-axon and to Ron, once per outage (keyed by the last completed run), and one line when a newer run appears. The clock starts at 06:00 each day, so the night never counts. No streak, no 6h repeat. A failed read decides nothing.
+- Rule, text and state in `lib/axonHealth.js`; 45 checks in `test/axon-inbox-watch.test.js`. The id and the cron's hours are duplicated from ng-axon; change both the same day.
+- The alert and the recovery are rows in `agent_activity` (`axon_inbox_watch`, `metadata.beat_key`), read back on the first poll after a boot so a redeploy in the middle of an outage does not repeat it.
+- Kill switch `AXON_INBOX_WATCH_CHECK=off`. By hand: `node scripts/axon-inbox-watch-dry.js --plus-min 120` prints what Max would post against the real row and posts nothing.
+- Verified: deploy success 21:15 UTC, boot line "AXON heartbeat watch + inbox watch liveness"; AXON's first stamped run 21:12:51 UTC reads `ok`; the dry run with the clock moved 120 minutes printed the alert, 03:00 printed nothing. Not verified: the alert posted for real in production.
