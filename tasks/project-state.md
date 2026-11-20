@@ -1360,3 +1360,10 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Greeting:** any hand-written message from us in the last 14 days counts as greeted.
 - **Stats:** guardian_run gains `reviewed`, `doubts`, `redrafts`.
 - **Blind test (14 real chats, nothing sent):** 11 pass, 3 flagged to Sebastián (unanswered re-asks). Next: Ron decides on `GUARDIAN_AUTO_REPLIES=on` (first replies only).
+
+## 2026-11-19: guardian auto replies ON (env)
+- **Env on ng-pm-MAX:** `GUARDIAN_AUTO_REPLIES=on`, set 2026-11-19 22:45 CR on Ron's go ("Yes, turn on now"), after the #527 blind test.
+- **What it does:** a reply card that is a first reply (nobody on our side wrote by hand yet), intent `wants_info` or `unclear`, passed the second read (`last_error = revisado:primera`), and is untouched 15 min after the card goes out as `approved_by = auto_15m`. Cap 40 a day, 5 a run. Same send path as a ✅ (claim, Meta window, live-thread check).
+- **Stays with Sebastián:** conversations he already carries, hot replies, objections, price, call requests, media, and any draft Max doubts.
+- **First live window:** guardian opens 08:00 CR on 2026-11-20. Watch guardian_run `autoReplies`, `reviewed`, `doubts`.
+- **Undo:** `GUARDIAN_AUTO_REPLIES=off` (or delete the variable) and redeploy.
