@@ -1350,3 +1350,13 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Why:** since #435 the AXON factory spend shows on its real day, and November read $89.20 of $70 (127%) on 11-18, on pace for about $144. Each factory run costs $4.50 to $5.
 - **November alerts:** the 100% alert already fired this month (dedupe key `api-budget-alert:2026-11` holds 1), so no new threshold alert fires before December even at 85% of $150. The daily post shows the new percentage from tomorrow.
 - **Not changed:** the Anthropic Console spend limit, the hard cap that returns errors, is separate and only Ron can raise it.
+
+## 2026-11-19: guardian reads the whole chat, second read before anything sends (#527)
+- **Why:** Ron, after the blind test: "this cannot happen". Max asked Gabriel what he had already answered and read "te abuso" (te aviso) literally. The drafter saw only the last 12 messages.
+- **Whole chat:** `ghlGetFullConversationMessages` pages GHL (limit 100, `lastMessageId`) up to 80 messages, dated lines. The drafter writes `ya_sabemos` before the draft and reads typos by meaning. A step whose answer is known is skipped; mid-conversation it answers the last thing said first.
+- **Second read:** `guardianReview` (MODEL_AGENT) checks reply and strike drafts: repeated question, misread, odd word, lost context, confidence. Doubt → one redraft with the note → still doubt → card shows "⚠️ Max no está seguro: ..." and never sends on its own.
+- **Marker:** `guardian_actions.last_error` while the card is open: `revisado`, `revisado:primera` (first reply, nobody wrote by hand yet) or `duda: ...`. No migration. Auto replies (still OFF) need `revisado:primera`; 2 h auto strikes need `revisado`. Cards drafted before #527 never auto-send.
+- **Reminders:** 15 and 60 min reminders on reply cards carry Max's suggestion; ✅ on the card sends it.
+- **Greeting:** any hand-written message from us in the last 14 days counts as greeted.
+- **Stats:** guardian_run gains `reviewed`, `doubts`, `redrafts`.
+- **Blind test (14 real chats, nothing sent):** 11 pass, 3 flagged to Sebastián (unanswered re-asks). Next: Ron decides on `GUARDIAN_AUTO_REPLIES=on` (first replies only).
