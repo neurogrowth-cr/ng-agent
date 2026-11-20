@@ -320,9 +320,11 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
 // Auto strikes, nudges, unanswered share (Ron, 2026-11-17).
 {
   const H = 3600 * 1000, M = 60 * 1000, now = Date.parse('2026-11-18T16:00:00Z');
-  const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'revisado', created_at: new Date(now - 2 * H - M).toISOString(), window_closes_at: null, ...o });
-  check('untouched strike after 2 h is due', pg.autoSendDue(s(), now), true);
-  check('strike under 2 h is not due', pg.autoSendDue(s({ created_at: new Date(now - 90 * M).toISOString() }), now), false);
+  const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'revisado', created_at: new Date(now - 1 * H - M).toISOString(), window_closes_at: null, ...o });
+  check('untouched strike after 1 h is due', pg.autoSendDue(s(), now), true);
+  check('strike under 1 h is not due', pg.autoSendDue(s({ created_at: new Date(now - 50 * M).toISOString() }), now), false);
+  check('auto strike wait is 1 h (Ron, 2026-11-20)', pg.CONFIG.autoStrikeAfterMs, H);
+  check('strike card tells Sebastián 1 h', pg.AUTO_STRIKE_LINE.includes('1 h'), true);
   check('a reply never auto-sends', pg.autoSendDue(s({ kind: 'reply' }), now), false);
   check('a signal never auto-sends', pg.autoSendDue(s({ kind: 'signal', status: 'signal' }), now), false);
   check('an invalid strike never auto-sends', pg.autoSendDue(s({ problems: 'uses tú' }), now), false);
