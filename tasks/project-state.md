@@ -1372,3 +1372,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Why:** the dash added a fifth license, Prosp + KAI (`kai_prosp`, $140/mo, dash #583, strategy #148). The roster reads a fixed list of codes, so a client on it would not have shown.
 - **What:** `kai_prosp` joins `LICENSE_RUNG_CODES` and `KAI_INCLUDED` in `lib/licenseRoster.js`. Kai is paid on this plan, so a client with Kai off is flagged first with the warning, like the $200 license. No change to `index.js`, the query, the schedule or the post format.
 - **Not verified:** no client holds the plan yet. The first real line appears on the first roster after a sale (Mon and Thu 08:00 CR).
+
+## 2026-11-20: guardian strikes auto-send after 1 h (#532)
+
+- Untouched strike cards now go out on their own after 1 h (was 2 h). Ron's call after the data: since 11-17, 15 strikes sent, Sebastián edited 0 and stopped 0, and approved his within 1 to 7 min. Before auto sending, 26 expired unsent.
+- `CONFIG.autoStrikeAfterMs` in lib/pipelineGuardian.js; card line and thread note say 1 h. Actor id stays `auto_2h` (stored in approved_by, counts the 30/day cap).
+- Kill switch unchanged: `GUARDIAN_AUTO_STRIKES=off`.
