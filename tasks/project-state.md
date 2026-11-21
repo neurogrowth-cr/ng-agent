@@ -1387,3 +1387,10 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - The alert and the recovery are rows in `agent_activity` (`axon_inbox_watch`, `metadata.beat_key`), read back on the first poll after a boot so a redeploy in the middle of an outage does not repeat it.
 - Kill switch `AXON_INBOX_WATCH_CHECK=off`. By hand: `node scripts/axon-inbox-watch-dry.js --plus-min 120` prints what Max would post against the real row and posts nothing.
 - Verified: deploy success 21:15 UTC, boot line "AXON heartbeat watch + inbox watch liveness"; AXON's first stamped run 21:12:51 UTC reads `ok`; the dry run with the clock moved 120 minutes printed the alert, 03:00 printed nothing. Not verified: the alert posted for real in production.
+
+## 2026-11-21: guardian digest reports Max's own sends and the second read (#536)
+
+- The 18:00 guardian digest (Sebastián's DM) has two new sections with caps headers: `MAX ENVIÓ SOLO · últimos 7 días` (first replies and follow-ups apart: sent, lead answered, call booked) and `SEGUNDA REVISIÓN · hoy` (reviewed, rewritten, doubts). Existing section headers moved to caps.
+- Answered = any inbound GHL message after the send (thread read, up to 80 per digest; failed reads show as "sin leer"). Booked = a revops_appointments row booked after the send, via revops_prospects.ghl_contact_id. Second read = sum of today's guardian_run `reviewed`, `redrafts`, `doubts`.
+- Ron gets the two Max sections as a DM when there is something in them; nothing new, no DM.
+- First read-only run on prod: 5 follow-ups in 7 days, 1 answered, 0 booked; 11-20 had 7 reviewed, 1 rewritten, 0 doubts.
