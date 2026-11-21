@@ -219,7 +219,7 @@ const rows = [
 ];
 const digest = pg.formatDigest(rows, { now: NOW, stats: { leadsRead: 42, drafts: 6, signals: 2, sent: 4, expired: 1, medianMinutes: 12.4, approvalRate: 0.8 } });
 check('digest header counts only waiting rows', digest.split('\n')[0], '🛡️ *Guardián · cierre del día* · 4 tarjeta(s) esperando su ✅');
-check('digest groups by expiry', [digest.includes('*Vencen hoy* (1)'), digest.includes('*Vencen mañana* (1)'), digest.includes('*Sin ventana* (1)'), digest.includes('*Ventana cerrada* (1)')], [true, true, true, true]);
+check('digest groups by expiry', [digest.includes('*VENCEN HOY* (1)'), digest.includes('*VENCEN MAÑANA* (1)'), digest.includes('*SIN VENTANA* (1)'), digest.includes('*VENTANA CERRADA* (1)')], [true, true, true, true]);
 check('digest verdict line', digest.split('\n').pop(), '✅ ALL GREEN · guardián: 42 leads leídos, 6 borradores, 2 señales a Sebastián, 4 enviados, 1 vencidos, mediana 12 min, aprobación 80%');
 check('issues verdict line', pg.verdictLine({ issues: ['3 corridas fallaron', 'reintento automático ok', 'nada para Ron'] }), '⚠️ ISSUES · 3 corridas fallaron · reintento automático ok · nada para Ron');
 check('a quiet day with nothing waiting is no post', pg.formatDigest([], { now: NOW, stats: {} }), '');
@@ -315,6 +315,29 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('shadow card past deadline is skipped, never expired', pg.closeDecision(row({ mode: 'shadow', window_closes_at: '2026-11-13T17:00:00Z' }), now, null).status, 'skipped');
   check('shadow card answered is not credited', pg.closeDecision(row({ mode: 'shadow' }), now, ans), null);
   check('a sent card is never touched', pg.closeDecision(row({ status: 'sent' }), now, ans), null);
+}
+
+// What Max did on his own (Ron, 2026-11-21).
+{
+  const T = Date.parse('2026-11-20T15:00:00Z');
+  const msgs = [{ direction: 'outbound', dateAdded: '2026-11-20T15:00:00Z' }, { direction: 'inbound', dateAdded: '2026-11-20T16:00:00Z' }];
+  check('lead answered after Max', pg.leadAnsweredAfter(msgs, T), true);
+  check('an older lead message does not count', pg.leadAnsweredAfter(msgs, Date.parse('2026-11-20T17:00:00Z')), false);
+  const o = pg.autoOutcomes([
+    { kind: 'reply', answered: true, booked: true }, { kind: 'reply', answered: false, booked: false },
+    { kind: 'strike', answered: true, booked: false }, { kind: 'strike', answered: false, booked: false }, { kind: 'strike', answered: null, booked: null },
+  ]);
+  check('replies and follow-ups counted apart', [o.reply.sent, o.reply.answered, o.reply.booked, o.strike.sent, o.strike.judged, o.strike.answered], [2, 1, 1, 3, 2, 1]);
+  const lines = pg.formatMaxSections({ outcomes: o, review: { reviewed: 10, redrafts: 2, doubts: 1 } });
+  check('caps headers on both sections', [lines.includes('*MAX ENVIÓ SOLO · últimos 7 días*'), lines.includes('*SEGUNDA REVISIÓN · hoy*')], [true, true]);
+  check('first replies line', lines.includes('• Primeras respuestas: 2, el lead contestó 1 (50%), agendaron llamada 1'), true);
+  check('follow-ups line says what was not read', lines.includes('• Seguimientos: 3, el lead contestó 1 (50%), agendaron llamada 0 (1 sin leer)'), true);
+  check('second read line', lines.includes('• Revisados 10, reescritos 2, con duda 1 (10%)'), true);
+  check('nothing on his own and nothing reviewed is no lines', pg.formatMaxSections({ outcomes: pg.autoOutcomes([]), review: { reviewed: 0 } }), []);
+  check('an unreadable week says so', pg.formatMaxSections({ outcomes: null })[1], 'No se pudo leer hoy');
+  const d = pg.formatDigest([{ status: 'drafted', contact_name: 'A', channel: 'whatsapp', step: 1, window_closes_at: null, created_at: '2026-11-20T15:00:00Z' }], { now: T, stats: { drafts: 1 }, maxStats: { outcomes: o, review: { reviewed: 3 } } });
+  check('digest carries the Max sections before the verdict', d.indexOf('*MAX ENVIÓ SOLO') > 0 && d.indexOf('*MAX ENVIÓ SOLO') < d.indexOf('ALL GREEN'), true);
+  check('no em dash in the Max sections', /—/.test(lines.join('\n')), false);
 }
 
 // Auto strikes, nudges, unanswered share (Ron, 2026-11-17).
