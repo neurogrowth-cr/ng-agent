@@ -23685,11 +23685,70 @@ async function runGuardianDigest(correlationId) {
   const stats = await guardianStats(now);
   const { data: runs } = await portalSupabase.from('agent_activity').select('output').eq('event_type', 'guardian').eq('action', 'guardian_run').gte('created_at', stats.dayStartIso);
   stats.leadsRead = (runs || []).reduce((n, r) => n + (Number(r.output && r.output.leadsRead) || 0), 0);
-  const text = guardian.formatDigest(waiting, { now, stats });
+  const sumRuns = (k) => (runs || []).reduce((n, r) => n + (Number(r.output && r.output[k]) || 0), 0);
+  const maxStats = {
+    outcomes: await guardianAutoOutcomes(now).catch((err) => { console.warn(`[guardian] auto outcomes read failed: ${err.message}`); return null; }),
+    review: { reviewed: sumRuns('reviewed'), redrafts: sumRuns('redrafts'), doubts: sumRuns('doubts') },
+  };
+  const text = guardian.formatDigest(waiting, { now, stats, maxStats });
   if (!text) return;
   if (mode === 'draft') await slack.client.chat.postMessage({ channel: GUARDIAN_SETTER_SLACK_ID, text });
   else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[SHADOW] ${text}` });
-  guardianLog('guardian_digest', 'ok', { waiting: (waiting || []).length, drafts: stats.drafts, signals: stats.signals, sent: stats.sent, expired: stats.expired, mode }, correlationId);
+  // Ron gets the Max sections on their own (Ron, 2026-11-21); nothing new, no DM.
+  const maxLines = guardian.formatMaxSections(maxStats);
+  if (mode === 'draft' && maxLines.length) {
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: [`🛡️ *Guardián · lo que hizo Max* · ${guardian.crDay(now)}`, '', ...maxLines].join('\n') }).catch((err) => console.warn(`[guardian] Ron max DM failed: ${err.message}`));
+  }
+  const o = maxStats.outcomes;
+  guardianLog('guardian_digest', 'ok', { waiting: (waiting || []).length, drafts: stats.drafts, signals: stats.signals, sent: stats.sent, expired: stats.expired, mode, auto: o ? { reply: o.reply, strike: o.strike } : null, review: maxStats.review }, correlationId);
+}
+
+// Messages Max sent on his own in the last 7 days, and for each whether the
+// lead wrote back afterwards (GHL thread) and booked a call (revops_appointments
+// via revops_prospects.ghl_contact_id). Failed reads leave the row unjudged.
+const GUARDIAN_OUTCOME_MAX_READS = 80;
+async function guardianAutoOutcomes(now) {
+  const { data: sent, error } = await supabase.from('guardian_actions')
+    .select('kind, contact_id, conversation_id, sent_at')
+    .in('approved_by', [...GUARDIAN_AUTO_ACTORS]).eq('status', 'sent')
+    .gte('sent_at', new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString()).limit(500);
+  if (error) throw new Error(`guardian_actions auto read: ${error.message}`);
+  const rows = sent || [];
+  if (!rows.length) return guardian.autoOutcomes([]);
+  const contactIds = [...new Set(rows.map((r) => r.contact_id).filter(Boolean))];
+  let bookedAt = null; // contact_id -> [booking times]
+  const { data: prospects, error: pErr } = await portalSupabase.from('revops_prospects').select('id, ghl_contact_id').in('ghl_contact_id', contactIds);
+  if (!pErr) {
+    const byProspect = new Map((prospects || []).map((p) => [p.id, p.ghl_contact_id]));
+    bookedAt = new Map();
+    if (byProspect.size) {
+      const { data: appts, error: aErr } = await portalSupabase.from('revops_appointments').select('prospect_id, booked_at, created_at').in('prospect_id', [...byProspect.keys()]);
+      if (aErr) bookedAt = null;
+      else for (const a of appts || []) {
+        const cid = byProspect.get(a.prospect_id);
+        if (!bookedAt.has(cid)) bookedAt.set(cid, []);
+        bookedAt.get(cid).push(Date.parse(a.booked_at || a.created_at));
+      }
+    }
+  }
+  const threads = new Map();
+  let reads = 0;
+  const judged = [];
+  for (const r of rows) {
+    const sentMs = Date.parse(r.sent_at);
+    let answered = null;
+    if (r.conversation_id) {
+      if (!threads.has(r.conversation_id) && reads < GUARDIAN_OUTCOME_MAX_READS) {
+        reads++;
+        threads.set(r.conversation_id, await ghlGetConversationMessages(r.conversation_id).catch(() => null));
+      }
+      const msgs = threads.get(r.conversation_id);
+      if (msgs) answered = guardian.leadAnsweredAfter(msgs, sentMs);
+    }
+    const booked = answered == null || !bookedAt ? null : (bookedAt.get(r.contact_id) || []).some((t) => t > sentMs);
+    judged.push({ kind: r.kind, answered, booked });
+  }
+  return guardian.autoOutcomes(judged);
 }
 
 // Hourly (4b). Red posts to #ng-pm-agent with <@Ron>, once per metric per CR
