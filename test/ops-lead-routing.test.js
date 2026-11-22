@@ -1,16 +1,15 @@
-// Rules test for the ops-lead handover (Josué leaves 2026-12-01; Gerald is ops
-// lead designate since 2026-11-03, Ron's decision).
+// Rules test for the ops-lead seat (Josué left 2026-11-12; Gerald is ops lead
+// designate since 2026-11-03, Ron's decision).
 //   Run:  node test/ops-lead-routing.test.js
 //
-// Max routes several outputs by role, not by name: the keep-or-close deciders,
-// the tech_ops persona and the proactive flags go to whoever holds `tech_ops`
-// (the 09:00 ops brief and the Monday WBR reminder post to OPS_BRIEF_CHANNEL
-// since #417, guarded by test/ops-brief-channel.test.js). During the handover
-// BOTH Josué and Gerald must hold the role (Gerald through the new `roles`
-// list, so his primary `campaigns` role, persona and permissions do not change).
-// On 2026-12-01: move Josué to DEPARTED_MEMBERS, make Gerald's primary role
-// `tech_ops` with `roles: ['campaigns']`, and update section 2 below. Section 4
-// must keep passing unchanged: Phase 1 and the closes stay with Valeria.
+// Max routes several outputs by role, not by name: the tech_ops persona and the
+// proactive flags go to whoever holds `tech_ops` (the 09:00 ops brief and the
+// Monday WBR reminder post to OPS_BRIEF_CHANNEL since #417, guarded by
+// test/ops-brief-channel.test.js). Gerald holds the role through the `roles`
+// list, so his primary `campaigns` role, persona and permissions do not change.
+// Making `tech_ops` his primary role (with `roles: ['campaigns']`) is a separate
+// decision of Ron's: it widens his permissions. Section 4 must keep passing
+// unchanged either way: Phase 1 and the closes stay with Valeria.
 const fs   = require('fs');
 const path = require('path');
 
@@ -32,20 +31,29 @@ function check(label, actual, expected) {
 const JOSUE = 'U08ABBFNGUW', GERALD = 'U0BAAC0KS82', VALERIA = 'U09Q3BXJ18B', TANIA = 'U07SMMDMSLQ';
 
 // ── 1. Secondary roles reach the role lists without changing the primary ────
-check('1a tech_ops outputs reach Josue and Gerald during the handover', slackIdsByRole('tech_ops').sort(), [JOSUE, GERALD].sort());
+check('1a tech_ops outputs reach Gerald alone since Josue left', slackIdsByRole('tech_ops'), [GERALD]);
 check('1b Gerald keeps campaigns as primary role', TEAM_MEMBERS[GERALD].role, 'campaigns');
 check('1c campaigns brief still reaches Gerald', slackIdsByRole('campaigns'), [GERALD]);
 check('1d a role nobody holds resolves to an empty list, not a throw', slackIdsByRole('client_success'), []);
 check('1e Valeria alone holds fulfillment (Kai escalations owner)', slackIdsByRole('fulfillment'), [VALERIA]);
 
 // ── 2. Copy that named Josue follows the seat ───────────────────────────────
-check('2a opsLeadLabel names both holders', opsLeadLabel(), 'Josue or Gerald');
+check('2a opsLeadLabel names the one holder', opsLeadLabel(), 'Gerald');
 check('2b no hardcoded "Let Josue know" left in the standup copy', /Let Josue know/.test(SRC), false);
 check('2c no hardcoded "so Josue can sequence" left', /so Josue can sequence/.test(SRC), false);
 check('2d WBR reminder is not pinned to one Slack id', /const WBR_REMINDER_TO = OPS_BRIEF_CHANNEL;/.test(SRC) && !/const WBR_REMINDER_TO = 'U/.test(SRC), true);
 
 // ── 3. Deactivated accounts are not DM targets ───────────────────────────────
 check('3a Tania (deactivated Slack user) no longer in TEAM_MEMBERS', new RegExp(`${TANIA}':\\s*\\{`).test(rosterBlock), false);
+
+// ── 3b. Josue left 2026-11-12: off the roster, on the departed list, no DM fallback
+const departedBlock = SRC.slice(SRC.indexOf('const DEPARTED_MEMBERS'), SRC.indexOf('const DEPARTED_BY_ID'));
+check('3b Josue no longer in TEAM_MEMBERS', new RegExp(`'${JOSUE}':\\s*\\{`).test(rosterBlock), false);
+check('3c Josue is a departed member, by email, Slack id and GHL user id',
+  /'josue\.duran@neurogrowth\.io': \{[\s\S]*?since: '2026-11-12'[\s\S]*?aliases: \['U08ABBFNGUW', 't28sdyo0eaunhjhl4jyu'\]/.test(departedBlock), true);
+check('3d no code path DMs his Slack id as a fallback', /\[\s*'U08ABBFNGUW'\s*\]/.test(SRC.replace(departedBlock, '')), false);
+check('3e the roster prompt tells Max never to tag him', /never tag, DM or assign anything to Josue/.test(SRC), true);
+check('3f the standup no longer tags him', /Tag Josue, Valeria, Gerald/.test(SRC), false);
 
 // ── 4. Phase ownership does not follow the ops-lead seat (Ron, 2026-11-03) ──
 // "phase one owner is Valeria. phase 2 owner is Gerald. QA is going to be done
