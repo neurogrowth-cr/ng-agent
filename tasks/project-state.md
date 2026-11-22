@@ -1394,3 +1394,13 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - Answered = any inbound GHL message after the send (thread read, up to 80 per digest; failed reads show as "sin leer"). Booked = a revops_appointments row booked after the send, via revops_prospects.ghl_contact_id. Second read = sum of today's guardian_run `reviewed`, `redrafts`, `doubts`.
 - Ron gets the two Max sections as a DM when there is something in them; nothing new, no DM.
 - First read-only run on prod: 5 follow-ups in 7 days, 1 answered, 0 booked; 11-20 had 7 reviewed, 1 rewritten, 0 doubts.
+
+## 2026-11-22: Josue off the roster and onto the departed list (#538)
+
+- Josue Duran left NeuroGrowth on 2026-11-12 (Ron; the 2026-11-03 plan said 2026-12-01). Until #538 Max still held him as `tech_ops` in `TEAM_MEMBERS`: day 7 and day 14 flags and unblock asks were DMed to him as well as to Gerald, his Slack account could still ask Max for client and sales data, and the roster prompt presented him as a teammate until December.
+- `TEAM_MEMBERS`: Josue removed. Gerald is the only holder of `tech_ops`, through `roles: ['tech_ops']`, unchanged since #419. `opsLeadLabel()` now reads "Gerald".
+- `DEPARTED_MEMBERS`: Josue added, keyed by `josue.duran@neurogrowth.io`, aliases his Slack id and his GHL user id.
+- The two "nobody holds tech_ops" fallbacks DM Ron instead of Josue's Slack id.
+- Roster prompt, standup instruction and persona copy updated; the prompt says never to tag, DM or assign to him.
+- Not done, Ron's call: making `tech_ops` Gerald's primary role. That changes his persona and widens his permissions (GHL, sales channels, saving knowledge). `SALES_TEAM_MAP` keeps "Josue D" and the standup snapshot key stays `josue`, both for history.
+- `test/ops-lead-routing.test.js` sections 1 and 2 follow the single holder; new section 3b guards the removal. `node --check` and all 106 test files passed; CI green.
