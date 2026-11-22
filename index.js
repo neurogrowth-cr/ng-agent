@@ -268,10 +268,9 @@ Pricing, scope and terms are Ron's call. If a prospect needs anything outside th
 THE TEAM
 
 Ron Duarte (U05HXGX18H3) — CEO and Founder. Final decision-maker on clients, pricing, offers, hiring. Since 2026-11-03 he also does the pre-launch campaign QA (the go/no-go) for every client.
-Josue Duran (U08ABBFNGUW): Technical Operations Manager (full-time fulfillment) until 2026-12-01, when he leaves NeuroGrowth (Ron, 2026-11-03). Activation calls, campaign ops, client launch sequencing. Through November he hands the seat to Gerald; never assign Josue ownership that runs past that date.
 David McKinney (U08ACUHUUP6) — Lead Technology & Automation. Portal, Make.com, Supabase infrastructure.
 Valeria Rosales (U09Q3BXJ18B): Fulfillment Operations. Owner of Phase 0 and Phase 1 since 2026-11-03 (Ron): onboarding, LinkedIn profile builds, Fase 1 documents, AXON factory approvals, and every stalled or blocked Phase 1 client; client licenses; owner of the Kai escalation queue.
-Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner and ops lead designate since 2026-11-03 (Ron). Campaign config, Prosp management, campaign launches (Ron does the pre-launch QA and gives the go/no-go), Fase 3 stabilization, the Monday 16:00 CR WBR on Campaign health, and the daily ops brief. Josue's successor from 2026-12-01.
+Gerald Arias (U0BAAC0KS82): Fulfillment Operations, Phase 2 owner and ops lead designate since 2026-11-03 (Ron); he carries the ops lead duties alone since 2026-11-12. Campaign config, Prosp management, campaign launches (Ron does the pre-launch QA and gives the go/no-go), Fase 3 stabilization, the Monday 16:00 CR WBR on Campaign health, and the daily ops brief. Josue Duran held the ops lead seat before him and left NeuroGrowth on 2026-11-12: never tag, DM or assign anything to Josue.
 Sebastian Serrano (U0BFA4SRVQC): Appointment Setter, the only setter since 2026-10-31. Books discovery calls; the pipeline guardian drafts for him.
 Jose Carranza (U0AMTEKDCPN) — High-Ticket Closer. Closes deals after setting. Ron also closes.
 Jonathan Madriz — FORMER closer, departed 2026-07-19. He is not on the team: never DM him, never list him in a standup, leaderboard, roster or "who is closing today", and never assign him work. His past results stay attributed to him in reports covering his tenure — name him for history, never as someone current. His open deals are Jose's now.
@@ -288,7 +287,7 @@ Task Execution: When Ron assigns a task, confirm you understood it, execute with
 Communication Drafting: Draft all routine outgoing messages. Ron reviews client-facing or sales-critical content before it goes out. Write in professional, confident, direct tone for external; efficient and direct for internal.
 
 Standup Accountability (Scheduled Jobs):
-- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Josue, Valeria, Gerald.
+- Daily standup (weekdays 9:00 AM Costa Rica): Post in team Slack channel. Ask what each person is working on and if there are blockers. Tag Valeria and Gerald.
 - EOD check (weekdays 5:00 PM Costa Rica): Cross-reference open items against reported completions. Flag anything unresolved.
 - Weekly summary (Fridays 4:00 PM Costa Rica): Digest for Ron covering sales closures, delivery status, blockers, Monday priorities.
 - Sales call prep (evening before any sales call on calendar): Alert Ron to review prospect brief. If no brief exists, alert Ron directly.
@@ -624,7 +623,7 @@ async function loadOfferCatalog() {
 const AGENT_CHANNEL         = process.env.AGENT_CHANNEL         || '#ng-pm-agent';
 const OPS_CHANNEL           = process.env.OPS_CHANNEL           || '#ng-fullfillment-ops';
 // Ron, 2026-11-03: the 09:00 ops brief and the Monday WBR reminder that used to DM
-// Josué (tech_ops, leaves 2026-12-01) post to #ng-marktech-internal for now. A Slack
+// Josué (tech_ops until he left on 2026-11-12) post to #ng-marktech-internal. A Slack
 // user ID here turns them back into DMs.
 const OPS_BRIEF_CHANNEL     = process.env.OPS_BRIEF_CHANNEL     || 'C0B48H7NT41';
 const NEW_CLIENT_CHANNEL    = process.env.NEW_CLIENT_CHANNEL    || '#ng-new-client-alerts';
@@ -759,14 +758,16 @@ const RON_ONLY_DEFAULT_REASON = 'Gmail and Calendar use Ron\'s personal OAuth.';
 // ─── TEAM MEMBER REGISTRY ─────────────────────────────────────────────────────
 const TEAM_MEMBERS = {
   'U05HXGX18H3': { name: 'Ron',      role: 'ceo',            displayName: 'Ron Duarte NG' },
-  'U08ABBFNGUW': { name: 'Josue',    role: 'tech_ops',       displayName: 'Josue Duran NG' }, // leaves 2026-12-01 (Ron, 2026-11-03): that day move him to DEPARTED_MEMBERS and make Gerald's role 'tech_ops' with roles: ['campaigns']
   'U08ACUHUUP6': { name: 'David',    role: 'tech_lead',      displayName: 'David McKinney NG' },
   'U09Q3BXJ18B': { name: 'Valeria',  role: 'fulfillment',    displayName: 'Valeria Rosales NG' },
   'U0BFA4SRVQC': { name: 'Sebastian', role: 'setter',        displayName: 'Sebastian Neurogrowth' },
-  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG', roles: ['tech_ops'] }, // Phase 2 owner since Felipe left 2026-09-16. Ops lead designate since 2026-11-03 (Ron): co-holds tech_ops (persona, day 7/14 flags, unblock asks) while Josue hands over. Phase 1 stays Valeria's and the pre-launch QA is Ron's (Ron, 2026-11-03), so neither follows the seat.
+  'U0BAAC0KS82': { name: 'Gerald',   role: 'campaigns',      displayName: 'Gerald Arias NG', roles: ['tech_ops'] }, // Phase 2 owner since Felipe left 2026-09-16. Ops lead designate since 2026-11-03 (Ron) and the only holder of tech_ops since Josue left 2026-11-12: every tech_ops output (day 7/14 flags, unblock asks, keep-or-close fallback) reaches him through `roles`. His primary role, persona and permissions stay campaigns until Ron says to make tech_ops primary (that flip also widens his permissions: GHL, sales channels, saving knowledge).
   // Tania (U07SMMDMSLQ) removed 2026-11-03: Slack account deactivated, yet her
   // 'fulfillment' role made her a target of the daily delivery brief DM.
   'U0AMTEKDCPN': { name: 'Jose',     role: 'closer',         displayName: 'Jose Carranza NG' },
+  // Josue Duran (U08ABBFNGUW) removed 2026-11-21, departed 2026-11-12 (Ron; the
+  // plan said 2026-12-01). Off the roster he cannot ask Max for anything and no
+  // role list reaches him. See DEPARTED_MEMBERS.
   // Felipe Herrera (U09TNMVML3F) removed 2026-10-11, departed 2026-09-16. Gerald
   // took the campaigns role (Phase 2: campaign config, Prosp). See DEPARTED_MEMBERS.
   // Oscar M (U0B1S1UMH9P) removed 2026-11-11, departed 2026-10-31: Sebastian is
@@ -848,8 +849,8 @@ function slackIdsByRole(role) {
     .map(([id]) => id);
 }
 
-// "Josue or Gerald": whoever holds the ops-lead (tech_ops) seat today, for
-// copy that used to hardcode Josue.
+// Whoever holds the ops-lead (tech_ops) seat today ("Gerald" since 2026-11-12),
+// for copy that used to hardcode Josue.
 function opsLeadLabel() {
   const names = slackIdsByRole('tech_ops').map((id) => TEAM_MEMBERS[id] && TEAM_MEMBERS[id].name).filter(Boolean);
   return names.length ? names.join(' or ') : 'the ops lead';
@@ -876,7 +877,7 @@ Key KPIs: 100% client retention, >80 health score average, <2hr response time, 9
 
 When they ask about a client, give them full health context: engagement level, last interaction, open action items, any risk signals. Help them draft client comms, check-in messages, expansion proposals, escalation summaries, and case study outreach. They cannot access Ron's Gmail, calendar, or GHL.`,
 
-    tech_ops: `You are speaking with ${member.name}, who holds the ops lead seat (Technical Operations Manager) at NeuroGrowth. They report to Ron (CEO) and are the single point of accountability for technical campaign excellence across all clients. Handover note: Josue Duran leaves on 2026-12-01 and Gerald Arias is the ops lead from then on; through November both hold the seat. Ownership since 2026-11-03 (Ron): Phase 0 and Phase 1 belong to Valeria, Phase 2 to Gerald, and the pre-launch QA (go/no-go) to Ron; the ops lead sequences and unblocks the launch cycle and does not take those over.
+    tech_ops: `You are speaking with ${member.name}, who holds the ops lead seat (Technical Operations Manager) at NeuroGrowth. They report to Ron (CEO) and are the single point of accountability for technical campaign excellence across all clients. Josue Duran left NeuroGrowth on 2026-11-12; Gerald Arias, ops lead designate, carries the seat's duties. Ownership since 2026-11-03 (Ron): Phase 0 and Phase 1 belong to Valeria, Phase 2 to Gerald, and the pre-launch QA (go/no-go) to Ron; the ops lead sequences and unblocks the launch cycle and does not take those over.
 
 CROSS-ROLE CONTEXT: Sales context matters to the ops lead. When a new client lands in delivery, the close-call promises, price tier, and setter-to-closer notes shape how they scope the 14-day build. When a client is blocked or at-risk, sales needs to know before the next renewal or case-study ask. Surface both sides freely.
 
@@ -970,7 +971,7 @@ CROSS-ROLE CONTEXT: Operations management sits above day-to-day fulfillment and 
 PORTAL FOCUS: Lead with portfolio health — phase transitions, launch risk, SLA compliance, gap detection alerts, fulfillment throughput. They can ask about sales, fulfillment, campaigns, or any client — answer freely and surface cross-team risks (e.g. a stalled fulfillment client whose renewal is near, a sales promise that delivery can't meet).
 
 Their role:
-- Oversight of the 14-day launch cycle and the ROLEX/PATEK tier portfolio (works alongside Josue on technical campaign excellence)
+- Oversight of the 14-day launch cycle and the ROLEX/PATEK tier portfolio (works alongside the ops lead, Gerald, on technical campaign excellence)
 - Owns operational gap detection and escalation: when something is slipping, they're the one who notices and routes it
 - Coordinates between fulfillment (Valeria), campaigns (Gerald), client success, and tech lead (David)
 - Surfaces operational issues to Ron with recommended actions, not raw status
@@ -6585,7 +6586,7 @@ async function runProactiveDMs(_correlationId) {
     if (hitting14Tomorrow.length > 0) {
       const names = hitting14Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `Heads up — ${hitting14Tomorrow.length === 1 ? 'this client is' : 'these clients are'} at or past the 14-day launch deadline: ${names}. If campaigns are not live, we have missed the SLA. What needs to happen right now to get them launched?`;
-      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
+      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : [RON_SLACK_ID])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to tech_ops role: ${hitting14Tomorrow.length} client(s) hitting Day 14 today`);
@@ -6595,7 +6596,7 @@ async function runProactiveDMs(_correlationId) {
     if (hitting7Tomorrow.length > 0) {
       const names = hitting7Tomorrow.map(d => `${d.client_name} (Day ${dayNFor(d)})`).join(', ');
       const msg = `Quick flag — ${hitting7Tomorrow.length === 1 ? 'this client has' : 'these clients have'} passed Day 7, the at-risk threshold: ${names}. Worth checking their progress now so we're not scrambling later.`;
-      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : ['U08ABBFNGUW'])) {
+      for (const id of (slackIdsByRole('tech_ops').length ? slackIdsByRole('tech_ops') : [RON_SLACK_ID])) {
         await slack.client.chat.postMessage({ channel: id, text: msg });
       }
       console.log(`Proactive DM sent to tech_ops role: ${hitting7Tomorrow.length} client(s) past Day 7`);
@@ -10021,6 +10022,13 @@ const DEPARTED_MEMBERS = {
     role: 'setter',
     aliases: ['n8mvtuhbbby7qppqnmr7', 'U0B16P6DQ2F'],
     coverage: null,                            // setter: never a closer_id, so no open deals to inherit
+  },
+  'josue.duran@neurogrowth.io': {
+    name: 'Josue Duran',
+    since: '2026-11-12',                       // Ron, 2026-11-12 (the 2026-11-03 plan said 2026-12-01)
+    role: 'tech_ops',
+    aliases: ['U08ABBFNGUW', 't28sdyo0eaunhjhl4jyu'], // Slack id + his setter-shaped GHL user ("Josue D")
+    coverage: null,                            // ops lead, never a closer_id: Gerald holds the seat, nothing to inherit per deal
   },
   // Keyed by Slack id: no email of his is on record anywhere Max reads.
   'U09TNMVML3F': {
