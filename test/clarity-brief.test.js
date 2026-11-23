@@ -105,7 +105,7 @@ const date = new Date('2026-11-10T12:50:00Z'); // Tue Nov 10 CR
 const items = sup.kept.map(k => ({ ...k, whyRon: 'Only you hold the card.', action: 'Open the invoice and pay or dispute.' }));
 const counts = { slack: { scanned: 31 }, max: { scanned: 4 }, gmail_ron: { scanned: 48 }, gmail_contact: { scanned: 0, failed: 'auth' }, calendar: { scanned: 3 }, github: { scanned: 6 }, wiki: { scanned: 37 } };
 const scanned = cb.scannedLine(counts, { dropped: 94, expired: 2, muted: 1 });
-check('7a scanned line', scanned, 'Scanned: slack 31 · max 4 · gmail_ron 48 · ⚠️ gmail_contact unavailable · calendar 3 · github 6 · wiki 37 · dropped 94 · expired 2 · muted 1');
+check('7a scanned line', scanned, 'Scanned: slack 31 · max 4 · gmail_ron 48 · ⚠️ gmail_contact unavailable · calendar 3 · github 6 · wiki 37 · agents 0 · dropped 94 · expired 2 · muted 1');
 const projects = cb.projectsInFlight({ now, accepted: [{ id: 9, title: 'Fix the intake leak', url: 'https://x.example/p', tier: 2, accepted_at: '2026-11-01T00:00:00Z', shown_at: '2026-11-01T00:00:00Z' }], prs: [{ title: 'feat: clarity brief', url: 'https://github.example/pr', updatedAt: '2026-11-09T00:00:00Z', tier: 3 }] });
 check('7b projects ranked by tier, stale flagged after 7 days', [projects[0].title, projects[0].stale, projects[1].quietDays], ['Fix the intake leak', true, 1]);
 const parent = cb.formatParent({ date, items, projects: projects.map((p, i) => ({ ...p, why: i ? 'Ships the brief.' : 'Leads keep leaking.' })), scanned, today: [{ hm: '10:00', label: 'Sales call: Acme' }] });

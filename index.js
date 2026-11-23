@@ -25934,6 +25934,22 @@ async function collectClarityMax(window, now, shownItems) {
   return { candidates, scanned };
 }
 
+// Agent event bus phase 2: needs_human events from REVI, AXON and Kai that Max
+// routed to the brief and nobody acknowledged (last 7 days), one item per
+// agent. Plain code, no classifier. Off when AGENT_EVENTS_MODE=off.
+async function collectClarityAgents(now) {
+  if (agentEvents.eventsMode() === 'off') return { candidates: [], scanned: 0 };
+  const since = new Date(now.getTime() - agentEvents.BRIEF_LOOKBACK_DAYS * 86400e3).toISOString();
+  const { data, error } = await supabase.from('agent_events')
+    .select('id, created_at, source, kind, subject_key, summary, acked_at')
+    .eq('route', 'clarity').is('acked_at', null).gte('created_at', since).order('created_at', { ascending: false }).limit(200);
+  if (error) throw new Error(`agent_events read: ${error.message}`);
+  const channelUrl = (source) => source === 'axon'
+    ? `https://slack.com/app_redirect?channel=${AXON_OPS_CHANNEL}`
+    : 'https://supabase.com/dashboard/project/zbuqpdwjpxgsetduhjeo/editor';
+  return { candidates: agentEvents.briefCandidates(data || [], { channelUrl, now }), scanned: (data || []).length };
+}
+
 // Second Google account (contact@) uses the same OAuth client with its own
 // refresh token, consented once by Ron. Missing token = source unavailable.
 // contact@ lives in another Google Workspace (neurogrowthconsulting.com) and Max's
@@ -26133,6 +26149,7 @@ async function runClarityBrief(correlationId, { now = new Date(), force = false 
       calendar: () => collectClarityCalendar(),
       github: () => collectClarityGitHub(),
       wiki: () => collectClarityWiki(shownItems, now),
+      agents: () => collectClarityAgents(now),
     };
     const enabled = clarityBrief.SOURCES;
     const results = await Promise.all(enabled.map(async (src) => {
@@ -26247,6 +26264,15 @@ async function handleClarityReaction(event, baseEmoji) {
   // Atomic: only a row still in the status we read moves.
   const { data: moved } = await supabase.from('clarity_items').update(decision.set).eq('id', row.id).eq('status', row.status).select('id');
   if (!moved || !moved.length) return true;
+  // Agent event items: ✅ or ❌ acknowledges every event of that agent up to
+  // the newest one the item covered, so they never come back.
+  const evKey = row.source === 'agents' ? agentEvents.parseBriefKey(row.dedupe_key) : null;
+  if (evKey && agentEvents.acksEvents(decision.status)) {
+    const { error: ackErr } = await supabase.from('agent_events')
+      .update({ acked_at: new Date().toISOString(), acked_by: event.user })
+      .eq('source', evKey.source).eq('route', 'clarity').is('acked_at', null).lte('id', evKey.maxId);
+    if (ackErr) console.error(`[clarity] agent_events ack failed: ${ackErr.message}`);
+  }
   if (decision.dismissal) {
     const nowIso = new Date().toISOString();
     const sig = decision.dismissal.signature;
