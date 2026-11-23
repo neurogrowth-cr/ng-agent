@@ -19395,48 +19395,70 @@ async function checkAxonHealth() {
 // read back on the first poll after a boot so a redeploy does not repeat an
 // alert. Recipe: automations/ops/recipes/inbox-watch.md ("Watched by").
 // Kill switch: AXON_INBOX_WATCH_CHECK=off.
-let axonInboxWatchState = null; // restored on the first poll
+//
+// Prosp reader liveness (same poll, same shape). AXON's reader cron stamps
+// id 'cron:prosp_web_reader' at the end of every run, every 10 minutes around
+// the clock, in shadow and in live (on Railway since 2026-11-23). No run for
+// 40 minutes at any hour posts once; a newer run posts the recovery. Its rows
+// in agent_activity are axon_prosp_reader_watch.
+// Kill switch: AXON_PROSP_READER_CHECK=off.
+const axonCronWatchState = {}; // by event type, restored on the first poll
 
-async function restoreAxonInboxWatchState() {
+async function restoreAxonCronWatchState(w) {
   try {
     const { data, error } = await portalSupabase.from('agent_activity')
       .select('action, metadata, created_at')
-      .eq('event_type', 'axon_inbox_watch')
+      .eq('event_type', w.eventType)
       .order('created_at', { ascending: false })
       .limit(1);
     if (error) throw new Error(error.message);
     return axonHealthLib.restoreInboxWatchState(data);
   } catch (err) {
     // Fail toward telling: with no memory, an outage in progress is said again.
-    console.warn(`[axon-inbox-watch] could not read the last alert, starting clean: ${axonHealthLib.errorOneLine(err)}`);
+    console.warn(`[${w.tag}] could not read the last alert, starting clean: ${axonHealthLib.errorOneLine(err)}`);
     return axonHealthLib.newInboxWatchState();
   }
 }
 
-async function checkAxonInboxWatch() {
-  if (String(process.env.AXON_INBOX_WATCH_CHECK || '') === 'off') return;
-  if (!axonInboxWatchState) axonInboxWatchState = await restoreAxonInboxWatchState();
+// One cron row of AXON's, one poll: read it, classify, step, record, post.
+async function checkAxonCronWatch(w) {
+  if (String(process.env[w.killSwitch] || '') === 'off') return;
+  if (!axonCronWatchState[w.eventType]) axonCronWatchState[w.eventType] = await restoreAxonCronWatchState(w);
 
   let result;
   try {
     const { data, error } = await axonSupabase
-      .from('engine_heartbeat').select('beat_at').eq('id', axonHealthLib.INBOX_WATCH_BEAT_ID).limit(1);
-    result = axonHealthLib.classifyInboxWatch({ data, error });
+      .from('engine_heartbeat').select('beat_at').eq('id', w.beatId).limit(1);
+    result = w.classify({ data, error });
   } catch (err) {
-    result = axonHealthLib.classifyInboxWatch({ thrown: err });
+    result = w.classify({ thrown: err });
   }
-  if (result.kind === 'blind') { console.warn(`[axon-inbox-watch] ${result.reason}`); return; }
+  if (result.kind === 'blind') { console.warn(`[${w.tag}] ${result.reason}`); return; }
 
-  const { state, posts, event } = axonHealthLib.stepInboxWatch(axonInboxWatchState, result);
-  axonInboxWatchState = state;
+  const { state, posts, event } = w.step(axonCronWatchState[w.eventType], result);
+  axonCronWatchState[w.eventType] = state;
   if (event) {
-    console.warn(`[axon-inbox-watch] ${event.action}: last completed run ${event.beat_key}`);
-    logActivity({ event_type: 'axon_inbox_watch', event_source: 'cron', action: event.action, status: 'ok', metadata: { beat_key: event.beat_key } });
+    console.warn(`[${w.tag}] ${event.action}: last completed run ${event.beat_key}`);
+    logActivity({ event_type: w.eventType, event_source: 'cron', action: event.action, status: 'ok', metadata: { beat_key: event.beat_key } });
   }
   for (const text of posts) {
-    await slack.client.chat.postMessage({ channel: AXON_OPS_CHANNEL, text }).catch((e) => console.error('[axon-inbox-watch] channel post failed:', e.message));
-    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text }).catch((e) => console.error('[axon-inbox-watch] Ron DM failed:', e.message));
+    await slack.client.chat.postMessage({ channel: AXON_OPS_CHANNEL, text }).catch((e) => console.error(`[${w.tag}] channel post failed:`, e.message));
+    await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text }).catch((e) => console.error(`[${w.tag}] Ron DM failed:`, e.message));
   }
+}
+
+function checkAxonInboxWatch() {
+  return checkAxonCronWatch({
+    tag: 'axon-inbox-watch', eventType: 'axon_inbox_watch', killSwitch: 'AXON_INBOX_WATCH_CHECK',
+    beatId: axonHealthLib.INBOX_WATCH_BEAT_ID, classify: axonHealthLib.classifyInboxWatch, step: axonHealthLib.stepInboxWatch,
+  });
+}
+
+function checkAxonProspReader() {
+  return checkAxonCronWatch({
+    tag: 'axon-prosp-reader', eventType: 'axon_prosp_reader_watch', killSwitch: 'AXON_PROSP_READER_CHECK',
+    beatId: axonHealthLib.PROSP_READER_BEAT_ID, classify: axonHealthLib.classifyProspReader, step: axonHealthLib.stepProspReaderWatch,
+  });
 }
 
 async function checkMakeScenarioHealth(correlationId) {
@@ -19622,12 +19644,14 @@ if (MAKE_API_TOKEN) {
 // AXON's heartbeat lives in Supabase, not Make, so this watch must not depend on
 // MAKE_API_TOKEN. It used to sit inside the block above and would have stopped
 // silently if that token were ever unset.
-// The same poll also checks that AXON's inbox watch cron still runs. Each
-// check runs even when the other one throws.
+// The same poll also checks that AXON's inbox watch cron and its Prosp reader
+// cron still run. Each check runs even when another one throws.
 cron.schedule('*/10 * * * *', wrapCronJob('checkAxonHealth', async () => {
-  try { await checkAxonHealth(); } finally { await checkAxonInboxWatch(); }
+  try { await checkAxonHealth(); } finally {
+    try { await checkAxonInboxWatch(); } finally { await checkAxonProspReader(); }
+  }
 }), { timezone: 'America/Costa_Rica' });
-console.log('Registered static cron: AXON heartbeat watch + inbox watch liveness (*/10 * * * *)');
+console.log('Registered static cron: AXON heartbeat watch + inbox watch and Prosp reader liveness (*/10 * * * *)');
 
 // ─── KAI HEALTH WATCH ────────────────────────────────────────────────────────
 // Kai (ng-automation, the LinkedIn reply agent) had no watcher at all until
