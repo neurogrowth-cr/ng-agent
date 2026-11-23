@@ -1404,3 +1404,10 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - Roster prompt, standup instruction and persona copy updated; the prompt says never to tag, DM or assign to him.
 - Not done, Ron's call: making `tech_ops` Gerald's primary role. That changes his persona and widens his permissions (GHL, sales channels, saving knowledge). `SALES_TEAM_MAP` keeps "Josue D" and the standup snapshot key stays `josue`, both for history.
 - `test/ops-lead-routing.test.js` sections 1 and 2 follow the single holder; new section 3b guards the removal. `node --check` and all 106 test files passed; CI green.
+
+## 2026-11-22: Agent events in the Clarity Brief, bus live ([PR #540](https://github.com/neurogrowth-cr/ng-agent/pull/540))
+- **Why:** phase 2 of the agent event bus (spec `tasks/specs/agent-event-bus.md`). AXON's launch QA fails sat only in AXON's channel; Ron wants anything that needs a human in the 06:50 brief he already reads (Ron, 2026-11-22).
+- **What:** new brief source `agents` (`collectClarityAgents`, `lib/agentEvents.js` `briefCandidates`). Reads `agent_events` with route `clarity`, not acknowledged, last 7 days. One item per agent ("AXON: 4 things need a human"), up to 3 summaries plus a count, tier 2, no classifier call. Dedupe key `agents:<source>:<newest id>`, so the item returns only when the agent reports something new. ✅ (take or done) or ❌ sets `acked_at`/`acked_by` on every event of that agent up to that id; ⏭ does not.
+- **Mode:** `AGENT_EVENTS_MODE=live` on ng-pm-MAX since 2026-11-22 (Ron). Red events DM Ron, warn errors post to `#ng-pm-agent` (one per subject per 6 h), the 18:00 shadow digest stops.
+- **State at flip:** 2 unacknowledged launch QA events will show in the next brief. AXON also emits `campaign_identity_block` as red needs_human (7 in the week to 2026-11-22, built in ng-axon by another session); in live each new one DMs Ron at once.
+- **Tests:** 15 new checks in `test/agent-events.test.js`; `test/clarity-brief.test.js` expects `agents 0` in the Scanned line; full suite green.
