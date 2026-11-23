@@ -23852,13 +23852,14 @@ console.log(`Registered static cron: pipeline guardian (*/15 8-20, digest 0 18 M
 
 // ─── BACKLOG REACTIVATION (WhatsApp templates) ───────────────────────────────
 // Plan-of-record UPDATE 2026-10-29; Ron 2026-11-05: Initial Contact to Strike 3
-// cards silent 14+ days, WhatsApp only, 100 new contacts a weekday. Max tags the
+// cards silent 14+ days, WhatsApp only, 150 new contacts a weekday (100 until
+// 2026-11-23, raised by Ron so Max carries the follow-ups). Max tags the
 // contact; the GHL workflow sends the three templates (strike mover #433 moves the
 // card on each). Before tagging, Max checks that yesterday's contacts got strike 1
 // and pauses itself on a red health check. Spec:
 // ~/automations/ops/recipes/backlog-reactivation-whatsapp.md
 //   BACKLOG_REACT_MODE  off (default) | dry_run (counts, tags nobody) | live
-//   BACKLOG_REACT_DAILY contacts tagged per run (default 100)
+//   BACKLOG_REACT_DAILY contacts tagged per run (default 150)
 // Pause: agent_knowledge `backlog-react:paused` (set by a red check, cleared by hand).
 const backlogReact = require('./lib/backlogReactivation');
 backlogReact.inCampaign = (tags) => {
@@ -23968,7 +23969,7 @@ async function runBacklogReactivation(correlationId) {
   if (!paused) {
     const clientEmails = await loadActiveClientEmails();
     if (!clientEmails) throw new Error('client list unavailable (portal client_dashboards)');
-    const limit = Math.max(0, Number(process.env.BACKLOG_REACT_DAILY || 100));
+    const limit = Math.max(0, Number(process.env.BACKLOG_REACT_DAILY || 150));
     ({ picked, eligible, skips } = backlogReact.selectBacklog(cards, { now, limit, clientEmails, personalTag: PERSONAL_CONTACT_TAG }));
   }
   // Read each thread and pick the situation; write it before the tag, because
