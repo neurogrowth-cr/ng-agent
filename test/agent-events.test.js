@@ -76,5 +76,30 @@ check('5c  severities match', enumIn('severity'), ev.SEVERITIES);
 check('5d  audiences match', enumIn('audience'), ev.AUDIENCES);
 check('5e  payload cap matches', sql.includes(`<= ${ev.PAYLOAD_MAX_BYTES}`), true);
 
+// ── 6. Clarity Brief items (phase 2)
+const ev6 = (id, over = {}) => ({ id, created_at: new Date(NOW.getTime() - id * 3600e3).toISOString(), source: 'axon', kind: 'needs_human',
+  subject_key: `campaign:${id}`, summary: `Launch QA failed for Client ${id}`, acked_at: null, ...over });
+const url = (s) => `https://slack.com/app_redirect?channel=${s}`;
+const one = ev.briefCandidates([ev6(5)], { channelUrl: url, now: NOW });
+check('6a  one event, one item', one.length, 1);
+check('6b  item shape', [one[0].source, one[0].actor, one[0].tier, one[0].dedupeKey, one[0].url], ['agents', 'axon', 2, 'agents:axon:5', 'https://slack.com/app_redirect?channel=axon']);
+check('6c  single title names it', one[0].title, 'AXON: Launch QA failed for Client 5');
+check('6d  never sent to the classifier', one[0].needsClassification, undefined);
+const grouped = ev.briefCandidates([ev6(1), ev6(2), ev6(3), ev6(4), ev6(9, { subject_key: 'campaign:1' })], { channelUrl: url, now: NOW });
+check('6e  many events, still one item per agent', grouped.length, 1);
+check('6f  repeat subject counted once', grouped[0].title, 'AXON: 4 things need a human');
+check('6g  newest id in the key', grouped[0].dedupeKey, 'agents:axon:9');
+check('6h  snippet caps at 3 and counts the rest', /and 1 more$/.test(grouped[0].snippet), true);
+const mixed = ev.briefCandidates([ev6(1), ev6(2, { source: 'revi' })], { channelUrl: url, now: NOW });
+check('6i  one item per agent', mixed.map(m => m.actor).sort(), ['axon', 'revi']);
+check('6j  acked, errors and old events skipped', ev.briefCandidates([ev6(1, { acked_at: NOW.toISOString() }), ev6(2, { kind: 'error' }), ev6(200)], { now: NOW }).length, 0);
+check('6k  parse key', ev.parseBriefKey('agents:axon:42'), { source: 'axon', maxId: 42 });
+check('6l  foreign key ignored', [ev.parseBriefKey('max:dm:1'), ev.parseBriefKey('agents:hubspot:1')], [null, null]);
+check('6m  ✅, done and ❌ acknowledge, ⏭ does not', ['accepted', 'done', 'dismissed', 'snoozed'].map(ev.acksEvents), [true, true, true, false]);
+const cb = require('../lib/clarityBrief');
+check('6n  brief lists agents as a source', cb.SOURCES.includes('agents'), true);
+const reply = cb.formatItemReply({ ...grouped[0], whyRon: grouped[0].whyRon, action: grouped[0].action }, 1);
+check('6o  brief reply passes the contract', cb.validateClarityBrief({ parent: cb.formatParent({ date: NOW, items: [grouped[0]], scanned: cb.scannedLine({}) }), replies: [reply] }).ok, true);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nagent-events: all checks passed');
