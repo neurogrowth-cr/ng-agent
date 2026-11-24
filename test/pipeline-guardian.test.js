@@ -330,7 +330,7 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('replies and follow-ups counted apart', [o.reply.sent, o.reply.answered, o.reply.booked, o.strike.sent, o.strike.judged, o.strike.answered], [2, 1, 1, 3, 2, 1]);
   const lines = pg.formatMaxSections({ outcomes: o, review: { reviewed: 10, redrafts: 2, doubts: 1 } });
   check('caps headers on both sections', [lines.includes('*MAX ENVIÓ SOLO · últimos 7 días*'), lines.includes('*SEGUNDA REVISIÓN · hoy*')], [true, true]);
-  check('first replies line', lines.includes('• Primeras respuestas: 2, el lead contestó 1 (50%), agendaron llamada 1'), true);
+  check('replies line', lines.includes('• Respuestas: 2, el lead contestó 1 (50%), agendaron llamada 1'), true);
   check('follow-ups line says what was not read', lines.includes('• Seguimientos: 3, el lead contestó 1 (50%), agendaron llamada 0 (1 sin leer)'), true);
   check('second read line', lines.includes('• Revisados 10, reescritos 2, con duda 1 (10%)'), true);
   check('nothing on his own and nothing reviewed is no lines', pg.formatMaxSections({ outcomes: pg.autoOutcomes([]), review: { reviewed: 0 } }), []);
@@ -346,6 +346,7 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   const s = (o) => ({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'revisado', created_at: new Date(now - 1 * H - M).toISOString(), window_closes_at: null, ...o });
   check('untouched strike after 1 h is due', pg.autoSendDue(s(), now), true);
   check('strike under 1 h is not due', pg.autoSendDue(s({ created_at: new Date(now - 50 * M).toISOString() }), now), false);
+  check('strike on the run 1 h after the card (59.5 min) is due', pg.autoSendDue(s({ created_at: new Date(now - 59.5 * M).toISOString() }), now), true);
   check('auto strike wait is 1 h (Ron, 2026-11-20)', pg.CONFIG.autoStrikeAfterMs, H);
   check('strike card tells Sebastián 1 h', pg.AUTO_STRIKE_LINE.includes('1 h'), true);
   check('a reply never auto-sends', pg.autoSendDue(s({ kind: 'reply' }), now), false);
@@ -359,6 +360,10 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('no nudge at 10 min', pg.nudgeDue(r(10), now), null);
   check('no second nudge at 31 min', pg.nudgeDue(r(31), now), null);
   check('nudge at 1 h', pg.nudgeDue(r(62), now), 60);
+  check('nudge on the run 15 min after the card (14.5 min)', pg.nudgeDue(r(14.5), now), 15);
+  check('no repeat on the run after (29.5 min)', pg.nudgeDue(r(29.5), now), null);
+  check('nudge on the run 1 h after the card (59.5 min)', pg.nudgeDue(r(59.5), now), 60);
+  check('no repeat on the run after (74.5 min)', pg.nudgeDue(r(74.5), now), null);
   check('signal cards are nudged too', pg.nudgeDue(r(16, { kind: 'signal', status: 'signal' }), now), 15);
   check('strikes are not nudged', pg.nudgeDue(r(16, { kind: 'strike' }), now), null);
   check('nudge text', pg.nudgeText({ contact_name: 'Ana' }, 60), '⏰ Ana sigue esperando respuesta (1 h desde la tarjeta). Contéstele desde su teléfono o GHL.');
@@ -448,7 +453,21 @@ check('slack markup is unwrapped', pg.unSlack(`<${pg.APPROVED_URLS.booking}|agen
   check('an invalid draft is never auto', pg.autoReplyDue(r({ problems: 'uses tú' }), now), false);
   check('a signal is never auto', pg.autoReplyDue(r({ kind: 'signal', status: 'signal' }), now), false);
   // Second read and first reply only (Ron, 2026-11-19).
-  check('mid-conversation reply (revisado, not primera) is never auto', pg.autoReplyDue(r({ last_error: 'revisado' }), now), false);
+  // Running chats (Ron, 2026-11-24): 1 h instead of 15 min, same gates.
+  check('running chat at 16 min is not due yet', pg.autoReplyDue(r({ last_error: 'revisado' }), now), false);
+  check('running chat after 1 h is due', pg.autoReplyDue(r({ last_error: 'revisado', created_at: new Date(now - 61 * M).toISOString() }), now), true);
+  check('running chat on the run 1 h after the card (59.5 min) is due', pg.autoReplyDue(r({ last_error: 'revisado', created_at: new Date(now - 59.5 * M).toISOString() }), now), true);
+  check('running chat with the running switch off is never auto', pg.autoReplyDue(r({ last_error: 'revisado', created_at: new Date(now - 3 * H).toISOString() }), now, { running: false }), false);
+  check('running chat Max doubts is never auto', pg.autoReplyDue(r({ last_error: 'duda: no sigue', created_at: new Date(now - 3 * H).toISOString() }), now), false);
+  check('running chat, hot intent, is never auto', pg.autoReplyDue(r({ last_error: 'revisado', intent: 'positive_not_ready', created_at: new Date(now - 3 * H).toISOString() }), now), false);
+  check('running chat, window closing in 5 min: no auto', pg.autoReplyDue(r({ last_error: 'revisado', created_at: new Date(now - 3 * H).toISOString(), window_closes_at: new Date(now + 5 * M).toISOString() }), now), false);
+  check('wait is 15 min for a first reply, 1 h for a running chat', [pg.autoReplyWaitMs(r()), pg.autoReplyWaitMs(r({ last_error: 'revisado' }))], [15 * M, 60 * M]);
+  // Timers fire on the run they are due, not the one after (card written ~30 s into a run).
+  check('first reply on the run 15 min after the card (14.5 min) is due', pg.autoReplyDue(r({ created_at: new Date(now - 14.5 * M).toISOString() }), now), true);
+  const runningNudge = pg.nudgeText({ kind: 'reply', contact_name: 'Ana', draft: 'Hola', intent: 'wants_info', status: 'drafted', mode: 'draft', last_error: 'revisado' }, 15, { autoReplies: true });
+  check('15 min reminder says Max answers at the hour', runningNudge.includes('Si nadie contesta, Max la envía a la 1 h.'), true);
+  check('no such line when auto replies are off', pg.nudgeText({ kind: 'reply', contact_name: 'Ana', draft: 'Hola', intent: 'wants_info', status: 'drafted', mode: 'draft', last_error: 'revisado' }, 15).includes('Si nadie'), false);
+  check('no such line at the 1 h reminder', pg.nudgeText({ kind: 'reply', contact_name: 'Ana', draft: 'Hola', intent: 'wants_info', status: 'drafted', mode: 'draft', last_error: 'revisado' }, 60, { autoReplies: true }).includes('Si nadie'), false);
   check('a reply Max doubts is never auto', pg.autoReplyDue(r({ last_error: 'duda: pregunta algo que ya contestó' }), now), false);
   check('a reply drafted before the second read is never auto', pg.autoReplyDue(r({ last_error: null }), now), false);
   check('a strike Max doubts never auto-sends', pg.autoSendDue({ kind: 'strike', status: 'drafted', mode: 'draft', problems: null, last_error: 'duda: no sigue', created_at: new Date(now - 3 * H).toISOString() }, now), false);

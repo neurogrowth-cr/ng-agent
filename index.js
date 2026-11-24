@@ -23232,9 +23232,14 @@ const GUARDIAN_AUTO_STRIKES = String(process.env.GUARDIAN_AUTO_STRIKES || 'on').
 // Actor id kept as 'auto_2h' after the wait went to 1 h (2026-11-20): it is
 // stored in approved_by and counts the daily cap, so renaming it splits history.
 const GUARDIAN_AUTO_ACTOR = 'auto_2h';
-// Simple replies (asked for info, unclear) Max sends himself after 15 min.
-// OFF until Ron approves the blind test: GUARDIAN_AUTO_REPLIES=on.
+// Simple replies (asked for info, unclear) Max sends himself: a first reply
+// after 15 min. Off unless GUARDIAN_AUTO_REPLIES=on (on in prod since 2026-11-19).
+// Actor id stays 'auto_15m' for both waits: it counts the daily cap and history.
 const GUARDIAN_AUTO_REPLIES = String(process.env.GUARDIAN_AUTO_REPLIES || 'off').toLowerCase() === 'on';
+// Ron, 2026-11-24: also in chats Sebastián already carries, after 1 h with no
+// answer. Kill switch for that part only: GUARDIAN_AUTO_REPLIES_RUNNING=off.
+const GUARDIAN_AUTO_REPLIES_RUNNING = String(process.env.GUARDIAN_AUTO_REPLIES_RUNNING || 'on').toLowerCase() !== 'off';
+const GUARDIAN_AUTO_REPLY_OPTS = { running: GUARDIAN_AUTO_REPLIES_RUNNING };
 const GUARDIAN_AUTO_REPLY_ACTOR = 'auto_15m';
 const GUARDIAN_AUTO_ACTORS = new Set([GUARDIAN_AUTO_ACTOR, GUARDIAN_AUTO_REPLY_ACTOR]);
 async function guardianCloseOpenCards(now, stats) {
@@ -23270,9 +23275,10 @@ async function guardianCloseOpenCards(now, stats) {
     const d = guardian.closeDecision(r, now, answeredAt);
     if (!d) {
       if (answeredAt || !r.slack_channel_id || !r.slack_message_ts) continue;
-      // Simple reply Sebastián did not take in 15 min (Ron, 2026-11-18; off by
-      // default). Same ✅ path: claim, Meta window, live-thread check.
-      if (GUARDIAN_AUTO_REPLIES && guardian.autoReplyDue(r, now) && stats.autoReplies < guardian.CONFIG.autoStrikesPerRun) {
+      // Simple reply nobody answered: 15 min for a first reply (Ron, 2026-11-18),
+      // 1 h in a running chat (Ron, 2026-11-24). Same ✅ path: claim, Meta
+      // window, live-thread check.
+      if (GUARDIAN_AUTO_REPLIES && guardian.autoReplyDue(r, now, GUARDIAN_AUTO_REPLY_OPTS) && stats.autoReplies < guardian.CONFIG.autoStrikesPerRun) {
         if (autoRepliesToday === null) {
           const { count, error: cErr } = await supabase.from('guardian_actions').select('id', { count: 'exact', head: true })
             .eq('approved_by', GUARDIAN_AUTO_REPLY_ACTOR).eq('day', guardian.crDay(now));
@@ -23285,7 +23291,8 @@ async function guardianCloseOpenCards(now, stats) {
           if (appr && appr.length) {
             autoRepliesToday++;
             stats.autoReplies++;
-            await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, '15 min sin respuesta: Max contestó con la sugerencia del hilo.').catch(() => {});
+            const waitedLabel = guardian.autoReplyWaitMs(r, GUARDIAN_AUTO_REPLY_OPTS) >= 60 * 60 * 1000 ? '1 h' : '15 min';
+            await guardianThreadReply(r.slack_channel_id, r.slack_message_ts, `${waitedLabel} sin respuesta: Max contestó con la sugerencia del hilo.`).catch(() => {});
             await guardianSendApproved(r.id, { channel: r.slack_channel_id, ts: r.slack_message_ts, actor: GUARDIAN_AUTO_REPLY_ACTOR });
             continue;
           }
@@ -23312,7 +23319,7 @@ async function guardianCloseOpenCards(now, stats) {
       }
       const mark = guardian.nudgeDue(r, now);
       if (mark) {
-        await slack.client.chat.postMessage({ channel: r.slack_channel_id, thread_ts: r.slack_message_ts, reply_broadcast: true, text: guardian.nudgeText(r, mark) })
+        await slack.client.chat.postMessage({ channel: r.slack_channel_id, thread_ts: r.slack_message_ts, reply_broadcast: true, text: guardian.nudgeText(r, mark, { autoReplies: GUARDIAN_AUTO_REPLIES, ...GUARDIAN_AUTO_REPLY_OPTS }) })
           .then(() => { stats.nudges++; }).catch((e) => console.warn(`guardian nudge failed ${r.id}: ${e.message}`));
       }
       continue;
