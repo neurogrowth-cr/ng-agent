@@ -1431,3 +1431,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - To restart: Ron fixes the account side in GHL, then clear `backlog-react:paused` (Ron's go). The 11-20 cohort (47% failed strike 1) stays inside the 4-day health window through the 11-24 run, so a flag cleared before 2026-11-24 09:30 CR is set again by that run; cleared after it, the first batch of 150 goes out 2026-11-25.
 - Open: the 358 lost strikes are not resent (the workflow moves on after a failed send, and the 11-13 cohort gets `reactivacion-cerrada` and the Lost stage about 11-27 with strike 3 missing); pool was 978 eligible on 11-20, about 7 weekdays at 150.
 - Verified: CI green on #544 (`node --check` and the test files), merged `e6b7820`. Not verified: a live run at 150 (campaign paused), the GHL account side itself, the number's quality rating (Meta connector cannot read the phone number object).
+
+## 2026-11-24: backlog reactivation pause cleared, no resend of the lost strikes
+- Ron fixed the account side in GHL in the afternoon; `backlog-react:paused` was deleted from `agent_knowledge` at 15:40 CR at his go. `BACKLOG_REACT_MODE=live`, default 150 (#544) deployed. The 11-24 09:30 run had still paused itself on the 11-20 cohort (47% failed strike 1); that cohort is outside the 4-day health window from the 11-25 run on, so the first batch of 150 is due 2026-11-25 09:30 CR.
+- Ron's ruling the same day: the 358 lost strikes are NOT resent. The 317 contacts that lost one (65 a strike 3, 213 a strike 2, 39 strikes 1 and 2) stay in the main workflow, which sends their next step on 2026-11-27.
+- Watch: the 11-25 run (150 tagged, strike 1 statuses), and 11-27, the busiest day (new contacts plus the next strike of about 250 contacts already in the sequence).
+- Not verified: a template send after the fix (none was due on 11-24 afternoon).
