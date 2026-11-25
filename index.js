@@ -15148,6 +15148,11 @@ cron.schedule('30 8 * * 1', wrapCronJob('runProvisioningLagCheck', async (c) => 
 // revi.llm_usage, axon.factory_usage), never estimated; cache writes are billed
 // at the 1h rate (2x) even where 5-min was used, so savings are UNDERstated,
 // never overstated.
+// Daily usage, cost, cache and health per agent live in the dash admin since
+// 2026-11-24 (Ron: "log it in the dashboard, not Slack every day"). The weekly
+// report and the budget alert link there; the daily AI SPEND post is off
+// (DAILY_SPEND_POST=off). Prices there mirror ICM_MODEL_RATES: change both.
+const AGENTS_USAGE_URL = 'https://dash.neurogrowth.io/admin/agents';
 const ICM_MODEL_RATES = [
   // USD per 1M tokens; prefix-matched so dated ids resolve (longest prefix wins)
   { prefix: 'claude-sonnet-4-6', in: 3, out: 15, write: 6, read: 0.3 },
@@ -15402,6 +15407,7 @@ async function runIcmCostReport(correlationId) {
   lines.push('');
   lines.push(`FLEET: ${fmtUsd(fleet.actual)} actual vs ${fmtUsd(fleet.uncached)} uncached → ICM saved ${fmtUsd(fleet.uncached - fleet.actual)} this week`);
   lines.push('_Cache writes billed at the 1h rate everywhere, so savings are understated. Excludes this report (zero LLM calls) and any spend outside the usage tables._');
+  lines.push(`Daily trends per agent: ${AGENTS_USAGE_URL}`);
   if (problems.length) {
     lines.push('');
     lines.push(`⚠️ Sources unreachable this run: ${problems.join(' | ')}`);
@@ -15458,6 +15464,7 @@ async function runApiBudgetCheck(correlationId) {
       : '• Check the Console limit has headroom, or pause the factory/experiments until the 1st.',
   ];
   if (problems.length) lines.push(`• Sources unreachable: ${problems.join(' | ')}`);
+  lines.push(`• Trends per agent: ${AGENTS_USAGE_URL}`);
   const text = lines.join('\n');
   await slack.client.chat.postMessage({ channel: AGENT_CHANNEL, text });
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text });
