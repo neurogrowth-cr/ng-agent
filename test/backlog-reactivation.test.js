@@ -160,7 +160,7 @@ check('all four stages are in scope', [S.INITIAL_CONTACT, S.STRIKE_1, S.STRIKE_2
 {
   const r = br.selectBacklog([card({ contactId: 'mailed' }, { tags: ['reactivacion-email'] }), card({ contactId: 'free' })], { now: NOW, limit: 5 });
   check('email tag counts as already enrolled', [r.picked.map((o) => o.contactId), r.skips.already_enrolled], [['free'], 1]);
-  check('email track ships off until the workflow id is set', br.CONFIG.emailWorkflowId, null);
+  check('email track points at the published GHL email workflow', br.CONFIG.emailWorkflowId, '7cd53bce-2f61-42c7-801d-6e068af703a6');
 }
 {
   const base = { mode: 'live', picked: 150, eligible: 900, health: { level: 'green', checked: 0 }, paused: null };
