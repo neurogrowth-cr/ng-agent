@@ -19840,7 +19840,19 @@ async function loadAgentEventsContext(now) {
     }
     if (r.consumed_at >= crMidnight) usedToday.set(r.source, (usedToday.get(r.source) || 0) + 1);
   }
-  return { recentErrorPosts, usedToday };
+  // Red events DM Ron once per subject a week; only live DMs count (a shadow
+  // row was never sent).
+  const weekAgo = new Date(now.getTime() - agentEvents.RED_DM_ONCE_MS).toISOString();
+  const { data: reds, error: redErr } = await supabase.from('agent_events')
+    .select('source, kind, subject_key, consumed_at')
+    .eq('route', 'dm_ron').eq('route_mode', 'live').gte('consumed_at', weekAgo).limit(1000);
+  if (redErr) throw new Error(`agent_events red DM read: ${redErr.message}`);
+  const recentRedDms = new Map();
+  for (const r of reds || []) {
+    const k = agentEvents.collapseKey(r);
+    recentRedDms.set(k, Math.max(recentRedDms.get(k) || 0, new Date(r.consumed_at).getTime()));
+  }
+  return { recentErrorPosts, usedToday, recentRedDms };
 }
 
 async function pollAgentEvents() {
