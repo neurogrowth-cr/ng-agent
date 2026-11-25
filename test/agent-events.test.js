@@ -101,5 +101,16 @@ check('6n  brief lists agents as a source', cb.SOURCES.includes('agents'), true)
 const reply = cb.formatItemReply({ ...grouped[0], whyRon: grouped[0].whyRon, action: grouped[0].action }, 1);
 check('6o  brief reply passes the contract', cb.validateClarityBrief({ parent: cb.formatParent({ date: NOW, items: [grouped[0]], scanned: cb.scannedLine({}) }), replies: [reply] }).ok, true);
 
+// ── 7. Red events DM Ron once per subject a week (Ron, 2026-11-25)
+const red = (id, over = {}) => mk(id, { kind: 'needs_human', severity: 'red', subject_key: 'campaign:9', ...over });
+const day = 24 * 3600 * 1000;
+check('7a  first red DMs Ron', r({ kind: 'needs_human', severity: 'red', subject_key: 'campaign:9' }), 'dm_ron');
+check('7b  repeat red within a week goes to the brief', ev.routeEvent(red(1), { now: NOW, recentRedDms: new Map([['axon|campaign:9', NOW.getTime() - 2 * day]]) }).route, 'clarity');
+check('7c  after a week it DMs again', ev.routeEvent(red(1), { now: NOW, recentRedDms: new Map([['axon|campaign:9', NOW.getTime() - 8 * day]]) }).route, 'dm_ron');
+check('7d  another campaign still DMs', ev.routeEvent(red(1, { subject_key: 'campaign:10' }), { now: NOW, recentRedDms: new Map([['axon|campaign:9', NOW.getTime()]]) }).route, 'dm_ron');
+check('7e  repeat red error collapses', ev.routeEvent(red(1, { kind: 'error' }), { now: NOW, recentRedDms: new Map([['axon|campaign:9', NOW.getTime()]]) }).route, 'collapsed');
+const day3 = ev.planBatch([red(1), red(2), red(3, { subject_key: 'campaign:10' }), red(4, { subject_key: 'campaign:10' })], { now: NOW });
+check('7f  same batch: one DM per campaign, rest to the brief', day3.map(d => d.route), ['dm_ron', 'clarity', 'dm_ron', 'clarity']);
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nagent-events: all checks passed');
