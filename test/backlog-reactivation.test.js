@@ -112,5 +112,68 @@ check('all four stages are in scope', [S.INITIAL_CONTACT, S.STRIKE_1, S.STRIKE_2
   check('health reads started_at, falls back a run timeout before the log', /r\.output\?\.started_at \? Date\.parse\(r\.output\.started_at\) : Date\.parse\(r\.created_at\) - BACKLOG_REACT_RUN_TIMEOUT_MS/.test(SRC), true);
 }
 
+// Email track (Ron, 2026-11-24): never-replied leads with an email get the
+// strikes by email; stop rule on spam complaints and bounces over 2%.
+{
+  const on = { emailEnabled: true };
+  check('email: never replied with an address goes to email', br.pickChannel({ ...on, situation: 'sin_respuesta', email: 'a@example.test' }), 'email');
+  check('email: off track stays on WhatsApp', br.pickChannel({ situation: 'sin_respuesta', email: 'a@example.test' }), 'whatsapp');
+  check('email: other situations stay on WhatsApp', ['respondio_poco', 'conto_negocio', 'pregunto_precio'].map((s) => br.pickChannel({ ...on, situation: s, email: 'a@example.test' })), ['whatsapp', 'whatsapp', 'whatsapp']);
+  check('email: no address stays on WhatsApp', br.pickChannel({ ...on, situation: 'sin_respuesta', email: '  ' }), 'whatsapp');
+  check('email: address on DND stays on WhatsApp', br.pickChannel({ ...on, situation: 'sin_respuesta', email: 'a@example.test', emailDndActive: true }), 'whatsapp');
+  check('email: paused track holds the lead', br.pickChannel({ ...on, situation: 'sin_respuesta', email: 'a@example.test', emailPaused: true }), 'hold');
+  check('email: paused track does not hold other situations', br.pickChannel({ ...on, situation: 'pregunto_precio', email: 'a@example.test', emailPaused: true }), 'whatsapp');
+}
+{
+  check('dnd: unsubscribe link', br.classifyEmailDnd({ status: 'active', message: 'User clicked on the unsubscribe link', code: 105 }), 'unsubscribe');
+  check('dnd: no longer want', br.classifyEmailDnd({ status: 'active', message: 'I no longer want to receive these emails', code: 105 }), 'unsubscribe');
+  check('dnd: inactive merge is nothing', br.classifyEmailDnd({ status: 'inactive', message: 'Updated by contact merge', code: 103 }), null);
+  check('dnd: missing is nothing', br.classifyEmailDnd(undefined), null);
+  check('dnd: spam complaint', br.classifyEmailDnd({ status: 'active', message: 'Marked as spam by recipient' }), 'complaint');
+  check('dnd: hard bounce', br.classifyEmailDnd({ status: 'active', message: 'Hard bounced' }), 'bounce');
+  check('dnd: unknown active reason', br.classifyEmailDnd({ status: 'active', message: 'Set by user' }), 'other');
+}
+{
+  const old = NOW - 2 * DAY;
+  const rows = (sent, bounced = 0, extra = {}) => Array.from({ length: sent }, (_, i) => ({ contactId: `e${i}`, at: old, sent: true, dndKind: i < bounced ? 'bounce' : null, ...extra }));
+  check('email health: clean run is green', br.evaluateEmailHealth(rows(30), NOW).level, 'green');
+  check('email health: 1 bounce of 30 is green', br.evaluateEmailHealth(rows(30, 1), NOW).level, 'green');
+  const two = br.evaluateEmailHealth(rows(30, 2), NOW);
+  check('email health: 2 bounces of 30 is red', [two.level, two.reasons], ['red', ['2 rebotes de 30 correos']]);
+  check('email health: 2 bounces of 120 is green', br.evaluateEmailHealth(rows(120, 2), NOW).level, 'green');
+  check('email health: 3 bounces of 120 is red', br.evaluateEmailHealth(rows(120, 3), NOW).level, 'red');
+  const spam = rows(30); spam[5].dndKind = 'complaint';
+  const s = br.evaluateEmailHealth(spam, NOW);
+  check('email health: one spam complaint is red', [s.level, s.complaints, s.reasons], ['red', 1, ['1 quejas de spam']]);
+  const unsub = rows(30); for (let i = 0; i < 10; i++) unsub[i].dndKind = 'unsubscribe';
+  const u = br.evaluateEmailHealth(unsub, NOW);
+  check('email health: unsubscribes are reported, never red', [u.level, u.unsubscribed], ['green', 10]);
+  const unsent = rows(30); unsent[0].dndKind = 'bounce'; unsent[0].sent = false; unsent[1].dndKind = 'bounce'; unsent[1].sent = false;
+  check('email health: a bounce without a send does not count', br.evaluateEmailHealth(unsent, NOW).bounced, 0);
+  const missing = [...rows(28), ...Array.from({ length: 2 }, (_, i) => ({ contactId: `m${i}`, at: old, sent: false, dndKind: null }))];
+  check('email health: missing over 5% at warmup is red', br.evaluateEmailHealth(missing, NOW).level, 'red');
+  const fresh = Array.from({ length: 30 }, (_, i) => ({ contactId: `f${i}`, at: NOW - 2 * 3600e3, sent: false, dndKind: null }));
+  check('email health: unsent inside the grace period is not missing', br.evaluateEmailHealth(fresh, NOW).level, 'green');
+  const few = Array.from({ length: 5 }, (_, i) => ({ contactId: `w${i}`, at: old, sent: false, dndKind: null }));
+  check('email health: all missing below warmup is red', br.evaluateEmailHealth(few, NOW).reasons, ['ninguno de 5 contactos recibió el correo 1']);
+}
+{
+  const r = br.selectBacklog([card({ contactId: 'mailed' }, { tags: ['reactivacion-email'] }), card({ contactId: 'free' })], { now: NOW, limit: 5 });
+  check('email tag counts as already enrolled', [r.picked.map((o) => o.contactId), r.skips.already_enrolled], [['free'], 1]);
+  check('email track points at the published GHL email workflow', br.CONFIG.emailWorkflowId, '7cd53bce-2f61-42c7-801d-6e068af703a6');
+}
+{
+  const base = { mode: 'live', picked: 150, eligible: 900, health: { level: 'green', checked: 0 }, paused: null };
+  check('verdict without email is unchanged', br.verdictLine(base), '✅ ALL GREEN · Reactivación backlog (live): 150 etiquetados hoy, 750 pendientes.');
+  check('verdict with email adds the email part', br.verdictLine({ ...base, email: { tagged: 38, health: { sent: 76, bounced: 1, complaints: 0, unsubscribed: 2, missing: 0 }, paused: null } }),
+    '✅ ALL GREEN · Reactivación backlog (live): 150 etiquetados hoy, 750 pendientes. Correo (sin respuesta): 38 etiquetados hoy. Correos: 76 enviados, 1 rebotes, 0 quejas, 2 bajas.');
+  check('verdict says when the email track is paused', /Correo en pausa: 1 quejas de spam\.$/.test(br.verdictLine({ ...base, email: { tagged: 0, health: null, paused: '1 quejas de spam' } })), true);
+  const SRC = require('fs').readFileSync(require('path').join(__dirname, '..', 'index.js'), 'utf8');
+  check('index: email leads get the email tag, not the WhatsApp one', /channel === 'email'\) \{\s*await ghlAddContactTag\(o\.contactId, backlogReact\.CONFIG\.emailTag\)/.test(SRC), true);
+  check('index: tagged stays WhatsApp-only, email leads logged apart', /tagged_email: taggedEmail/.test(SRC), true);
+  check('index: inCampaign covers the email tag', /t\.includes\(backlogReact\.CONFIG\.emailTag\)/.test(SRC), true);
+  check('index: a red email check only writes in live mode', /if \(!emailPaused && emailHealth\.level === 'red'\) \{\s*emailPaused = [^\n]+\n\s*if \(mode === 'live'\)/.test(SRC), true);
+}
+
 if (failures > 0) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log('\nall checks passed');

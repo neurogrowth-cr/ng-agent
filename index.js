@@ -17556,6 +17556,8 @@ const STRIKE_TEMPLATE_MARKERS = [
   'pasaba a darle un seguimiento y preguntarle',       // 2nd_follow_up
   'pasaba a darle un ultimo seguimiento',              // last_follow_up_attempt
   // Backlog situation pool (Ron, 2026-11-10/11), approved by Meta 2026-11-11.
+  // The backlog email track (2026-11-24) sends these same texts by email, so the
+  // markers also match its emails (HTML body, each strike inside one <p>).
   'me gustaría entender si usted sigue estando interesado', // react_s1_sin_respuesta
   'quedamos a medias la última vez',                   // react_s1_respondio_poco
   'me quedé pensando en lo que me contó de su negocio', // react_s1_conto_negocio
@@ -23878,9 +23880,34 @@ console.log(`Registered static cron: pipeline guardian (*/15 8-20, digest 0 18 M
 const backlogReact = require('./lib/backlogReactivation');
 backlogReact.inCampaign = (tags) => {
   const t = (Array.isArray(tags) ? tags : []).map((x) => String(x || '').toLowerCase());
-  return t.includes(backlogReact.CONFIG.enrolTag) || t.includes(backlogReact.CONFIG.closedTag);
+  return t.includes(backlogReact.CONFIG.enrolTag) || t.includes(backlogReact.CONFIG.closedTag)
+    || t.includes(backlogReact.CONFIG.emailTag);
 };
 const BACKLOG_REACT_PAUSE_KEY = 'backlog-react:paused';
+// Email track (Ron, 2026-11-24; strategy repo #161): never-replied backlog leads
+// with an email get the strikes from the GHL email workflow. Off while
+// CONFIG.emailWorkflowId is null; kill switch BACKLOG_REACT_EMAIL=off. A red
+// email check sets this flag (cleared by hand) and pulls the leads in flight out
+// of the email workflow; the WhatsApp track keeps running.
+const BACKLOG_REACT_EMAIL_PAUSE_KEY = 'backlog-react:email-paused';
+function backlogReactEmailEnabled() {
+  return !!backlogReact.CONFIG.emailWorkflowId
+    && String(process.env.BACKLOG_REACT_EMAIL || 'on').trim().toLowerCase() !== 'off';
+}
+
+// The first strike-1 email from the workflow after the tag, or null. GHL email
+// bodies are HTML; tags are stripped before matching the strike-1 markers.
+async function backlogReactFirstEmail(contactId, sinceMs) {
+  const convoId = await ghlFindConversationId(contactId);
+  if (!convoId) return null;
+  for (const m of await ghlGetConversationMessages(convoId)) {
+    if (m.direction !== 'outbound' || m.messageType !== 'TYPE_EMAIL' || String(m.source || '') !== 'workflow') continue;
+    const at = Date.parse(m.dateAdded || m.createdAt || 0) || 0;
+    const body = strikeNormalizeText(String(m.body || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' '));
+    if (at >= sinceMs - 60 * 1000 && BACKLOG_STRIKE1_MARKERS.some((mk) => body.includes(mk))) return { at, status: m.status || null };
+  }
+  return null;
+}
 function backlogReactMode() {
   const m = String(process.env.BACKLOG_REACT_MODE || 'off').trim().toLowerCase();
   return ['off', 'dry_run', 'live'].includes(m) ? m : 'off';
@@ -23923,7 +23950,9 @@ async function ghlSetContactField(contactId, fieldId, value) {
   if (!res.ok) throw new Error(`contact field PUT ${contactId} → ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
-const BACKLOG_REACT_RUN_TIMEOUT_MS = 15 * 60 * 1000;
+// 25 minutes since the email track (2026-11-24): the run also reads up to 14 days
+// of email leads. Rows older than started_at back off this value; none are left.
+const BACKLOG_REACT_RUN_TIMEOUT_MS = 25 * 60 * 1000;
 async function runBacklogReactivation(correlationId) {
   const mode = backlogReactMode();
   if (mode === 'off') return;
@@ -23961,6 +23990,55 @@ async function runBacklogReactivation(correlationId) {
     await upsertKnowledge('process', BACKLOG_REACT_PAUSE_KEY, JSON.stringify({ reason: paused, at: now }), 'backlog_react');
   }
 
+  // Email track health (stop rule, Ron 2026-11-24): email leads tagged in the last
+  // emailWindowDays. Strike 1 must show up a day after the tag; a spam complaint,
+  // or bounces over 2% of the emails sent, pause the email track.
+  const emailEnabled = backlogReactEmailEnabled();
+  let emailHealth = null, emailPaused = null, emailRemoved = 0;
+  if (emailEnabled) {
+    const { data: eRuns, error: eErr } = await portalSupabase.from('agent_activity')
+      .select('output, created_at').eq('event_type', 'backlog_react').eq('action', 'backlog_react_run')
+      .gte('created_at', new Date(now - backlogReact.CONFIG.emailWindowDays * 24 * 3600 * 1000).toISOString()).limit(40);
+    if (eErr) throw new Error(`backlog email runs read: ${eErr.message}`);
+    const emailRows = [];
+    for (const r of eRuns || []) {
+      if (r.output?.mode !== 'live') continue;
+      const at = r.output?.started_at ? Date.parse(r.output.started_at) : Date.parse(r.created_at) - BACKLOG_REACT_RUN_TIMEOUT_MS;
+      for (const id of r.output?.tagged_email || []) emailRows.push({ contactId: id, at, sent: false, dndKind: null });
+    }
+    for (const row of emailRows) {
+      try { row.sent = !!(await backlogReactFirstEmail(row.contactId, row.at)); } catch (err) { /* read as not sent */ }
+      try {
+        const ct = (await ghlFetchJson(`https://services.leadconnectorhq.com/contacts/${row.contactId}`)).contact || {};
+        row.dndKind = backlogReact.classifyEmailDnd(ct.dndSettings?.Email);
+        row.closed = (ct.tags || []).map((x) => String(x).toLowerCase()).includes(backlogReact.CONFIG.closedTag);
+      } catch (err) { console.error(`backlog-react: email contact read failed ${row.contactId}:`, err.message); }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    emailHealth = backlogReact.evaluateEmailHealth(emailRows, now);
+    const ePausedRaw = (await hotReadKnowledge([BACKLOG_REACT_EMAIL_PAUSE_KEY])).get(BACKLOG_REACT_EMAIL_PAUSE_KEY);
+    emailPaused = ePausedRaw ? (hotParse(ePausedRaw)?.reason || 'pausa manual') : null;
+    if (!emailPaused && emailHealth.level === 'red') {
+      emailPaused = emailHealth.reasons.join('; ');
+      if (mode === 'live') {
+        await upsertKnowledge('process', BACKLOG_REACT_EMAIL_PAUSE_KEY, JSON.stringify({ reason: emailPaused, at: now }), 'backlog_react');
+        // Pull the leads still in the sequence out of the email workflow.
+        for (const row of emailRows) {
+          if (row.closed || now - row.at > 15 * 24 * 3600 * 1000) continue;
+          try {
+            const res = await ghlFetch(`https://services.leadconnectorhq.com/contacts/${row.contactId}/workflow/${backlogReact.CONFIG.emailWorkflowId}`, {
+              method: 'DELETE',
+              headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Version': '2021-07-28' },
+            }, { label: `DELETE /contacts/${row.contactId}/workflow (email pause)` });
+            if (res.ok) emailRemoved++;
+            else console.error(`backlog-react: email workflow removal ${row.contactId} → ${res.status}`);
+          } catch (err) { console.error(`backlog-react: email workflow removal failed ${row.contactId}:`, err.message); }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+    }
+  }
+
   const cards = [];
   for (const stageId of Object.values(backlogReact.CONFIG.stages)) cards.push(...await ghlSearchOppsByStage(stageId));
 
@@ -23990,22 +24068,45 @@ async function runBacklogReactivation(correlationId) {
   // the tag starts the workflow and the workflow branches on the field.
   const situations = {};
   const tagged = [], tagFailed = [];
+  // Email track: tagged_email (live), would_email / would_whatsapp (dry run),
+  // email_held = never-replied leads skipped while the email track is paused.
+  const taggedEmail = [];
+  let emailHeld = 0, wouldEmail = 0, wouldWhatsapp = 0;
   for (const o of picked) {
     let situation = null;
     try { situation = await backlogReactSituation(o.contactId, correlationId); }
     catch (err) { console.error(`backlog-react: situation failed ${o.contactId}:`, err.message); }
     situations[situation || 'sin_clasificar'] = (situations[situation || 'sin_clasificar'] || 0) + 1;
-    if (mode !== 'live' || !situation) continue;
+    if (!situation) continue;
+    let channel = 'whatsapp';
+    if (emailEnabled && situation === backlogReact.CONFIG.emailSituation) {
+      try {
+        const ct = (await ghlFetchJson(`https://services.leadconnectorhq.com/contacts/${o.contactId}`)).contact || {};
+        channel = backlogReact.pickChannel({
+          situation, email: ct.email, emailEnabled, emailPaused: !!emailPaused,
+          emailDndActive: String(ct.dndSettings?.Email?.status || '').toLowerCase() === 'active' || !!ct.dnd,
+        });
+      } catch (err) { console.error(`backlog-react: email channel read failed ${o.contactId}:`, err.message); }
+    }
+    if (channel === 'hold') { emailHeld++; continue; }
+    if (mode !== 'live') { if (channel === 'email') wouldEmail++; else wouldWhatsapp++; continue; }
     try {
       await ghlSetContactField(o.contactId, backlogReact.CONFIG.situationFieldId, situation);
-      await ghlAddContactTag(o.contactId, backlogReact.CONFIG.enrolTag);
-      tagged.push(o.contactId);
+      if (channel === 'email') {
+        await ghlAddContactTag(o.contactId, backlogReact.CONFIG.emailTag);
+        taggedEmail.push(o.contactId);
+      } else {
+        await ghlAddContactTag(o.contactId, backlogReact.CONFIG.enrolTag);
+        tagged.push(o.contactId);
+      }
     } catch (err) { tagFailed.push(o.contactId); console.error(`backlog-react: enrol failed ${o.contactId}:`, err.message); }
     await new Promise((r) => setTimeout(r, 150));
   }
-  const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length : picked.length, eligible, health, paused, situations, closed: mode === 'live' ? closed : struckOut.length });
-  log('backlog_react_run', paused || health.level === 'red' || tagFailed.length ? 'warning' : 'ok',
-    { mode, started_at: new Date(now).toISOString(), tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, situations, struck_out: struckOut.length, moved_to_lost: closed, health: { ...health }, paused });
+  const email = emailEnabled ? { tagged: mode === 'live' ? taggedEmail.length : wouldEmail, health: emailHealth, paused: emailPaused } : null;
+  const line = backlogReact.verdictLine({ mode, picked: mode === 'live' ? tagged.length + taggedEmail.length : picked.length, eligible, health, paused, situations, closed: mode === 'live' ? closed : struckOut.length, email });
+  log('backlog_react_run', paused || health.level === 'red' || tagFailed.length || (emailHealth && emailHealth.level === 'red') ? 'warning' : 'ok',
+    { mode, started_at: new Date(now).toISOString(), tagged, tag_failed: tagFailed.length, would_tag: mode === 'dry_run' ? picked.length : 0, eligible, skips, situations, struck_out: struckOut.length, moved_to_lost: closed, health: { ...health }, paused,
+      tagged_email: taggedEmail, email_enabled: emailEnabled, email_health: emailHealth, email_paused: emailPaused, email_held: emailHeld, email_removed: emailRemoved, would_email: wouldEmail, would_whatsapp: wouldWhatsapp });
   await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: mode === 'dry_run' ? `[DRY RUN] ${line}` : line })
     .catch((e) => console.error('backlog-react: DM failed:', e.message));
 }
