@@ -1464,3 +1464,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Why:** AXON's red `campaign_identity_block` events DMed Ron about three times a day for the same campaigns (Ron, 2026-11-25: one notice per campaign, then the brief).
 - **Change:** `routeEvent` takes `recentRedDms` (source + subject_key -> last live DM). The first red event for a subject DMs Ron; repeats within 7 days (`RED_DM_ONCE_MS`) go to the Clarity Brief (needs_human) or route `collapsed` (error). Only `route_mode='live'` DMs count. `loadAgentEventsContext` reads them.
 - **Tests:** 6 new checks in `test/agent-events.test.js`; full suite green. Deployed 2026-11-25 18:53 UTC.
+
+## 2026-11-25: Three reports move from Ron's DM to team channels ([PR #555](https://github.com/neurogrowth-cr/ng-agent/pull/555))
+- **Why:** Ron, 2026-11-25: more signal in the channels, fewer DMs.
+- **Moved:** open-deal zombie digest (Mon 08:45) to #ng-sales-goats (`OPEN_DEAL_DIGEST_CHANNEL`); cron liveness audit findings (07:30, only when something is wrong) to #ng-pm-agent (`CRON_AUDIT_CHANNEL`); license roster (Mon and Thu 08:00) from #ng-fullfillment-ops to #ng-marktech-internal (code default `OPS_BRIEF_CHANNEL`, and `LICENSE_ROSTER_REPORT_TO=C0B48H7NT41` set on ng-pm-MAX the same day).
+- **Not moved:** the nightly learning's confidential block (finance and billing from Gmail) stays in Ron's DM; its team summary already posts to #ng-pm-agent. Failure DMs still go to Ron.
+- **Tests:** full suite green. Deployed 2026-11-26 00:36 UTC.
