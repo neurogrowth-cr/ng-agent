@@ -13191,8 +13191,11 @@ async function runOpenDealZombieDigest(correlationId) {
     console.log(`Open-deal digest: healthy — ${deals.length} open deal(s), 0 zombies, 0 drift, 0 historical.`);
     return;
   }
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: message });
-  console.log(`Open-deal digest: DMed Ron — ${buckets.zombies.length} zombie(s), ${buckets.historical.length} historical, ${buckets.drift.length} drift.`);
+  // Ron, 2026-11-25: posts to #ng-sales-goats (was his DM) so the closers see
+  // the deals nobody is closing. Override with OPEN_DEAL_DIGEST_CHANNEL.
+  const digestChannel = process.env.OPEN_DEAL_DIGEST_CHANNEL || SALES_CHANNEL;
+  await postToSlack(digestChannel, message);
+  console.log(`Open-deal digest: posted to ${digestChannel}: ${buckets.zombies.length} zombie(s), ${buckets.historical.length} historical, ${buckets.drift.length} drift.`);
 }
 
 // ─── UNLOGGED OUTCOME REMINDERS (GHL) ────────────────────────────────────────
@@ -19972,7 +19975,8 @@ cron.schedule('30 8 * * 1', wrapCronJob('runKaiEscalationsDigest', async (c) => 
 const licenseRoster = require('./lib/licenseRoster');
 async function runLicenseRosterReport(correlationId) {
   if (String(process.env.LICENSE_ROSTER_REPORT || '') === 'off') return;
-  const target = String(process.env.LICENSE_ROSTER_REPORT_TO || '').trim() || OPS_CHANNEL;
+  // Ron, 2026-11-25: #ng-marktech-internal (OPS_BRIEF_CHANNEL), was #ng-fullfillment-ops.
+  const target = String(process.env.LICENSE_ROSTER_REPORT_TO || '').trim() || OPS_BRIEF_CHANNEL;
   if (!portalPg) throw new Error('PORTAL_READONLY_DATABASE_URL is not set; license roster skipped');
   const summary = licenseRoster.summarizeLicenseRoster(await licenseRoster.readLicenseRoster(portalPg, new Date()));
   const text = licenseRoster.formatLicenseRoster(summary);
@@ -24872,6 +24876,9 @@ const VANISHED_LOOKBACK_MS = 48 * 60 * 60 * 1000;
 // A run in flight right now is not a vanished run.
 const VANISHED_GRACE_MS = 20 * 60 * 1000;
 
+// Ron, 2026-11-25: findings post to #ng-pm-agent (was his DM). Channel names go
+// through postMessage as-is; Slack resolves them for a bot that is a member.
+const CRON_AUDIT_CHANNEL = (process.env.CRON_AUDIT_CHANNEL || AGENT_CHANNEL).replace(/^#/, '');
 async function runCronLivenessAudit(correlationId) {
   const now = Date.now();
 
@@ -24906,7 +24913,7 @@ async function runCronLivenessAudit(correlationId) {
   // FAIL CLOSED. Unreadable history means "unknown", never "healthy".
   if (runsErr) {
     await slack.client.chat.postMessage({
-      channel: RON_SLACK_ID,
+      channel: CRON_AUDIT_CHANNEL,
       text: `⚠️ *Cron liveness audit could not run* — agent_activity unreadable: ${runsErr.message}\nThis is not an all-clear. Nothing was checked.`,
     });
     logActivity({ event_type: 'alert', event_source: 'cron', action: 'cron_liveness_audit', status: 'degraded', correlation_id: correlationId });
@@ -24978,7 +24985,7 @@ async function runCronLivenessAudit(correlationId) {
   // precisely because it could make that decision on its own.
   lines.push(`\n_Audit alive · next run ${formatCronFire(nextCronFire(STATIC_CRON_SCHEDULES[SELF_ACTION], now))}. This job has no expiry and cannot disable itself._`);
 
-  await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: lines.join('\n') });
+  await slack.client.chat.postMessage({ channel: CRON_AUDIT_CHANNEL, text: lines.join('\n') });
 }
 
 // 07:30 CR daily — after the 05:30 nightly learning and before the 09:00
