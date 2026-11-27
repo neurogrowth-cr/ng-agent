@@ -73,5 +73,56 @@ check('3c  id is forgotten after the ttl', seen.has('help:1'), false);
 seen.add('help:2'); seen.delete('help:2');
 check('3d  a failed post can be retried', seen.has('help:2'), false);
 
+// ── 4. Updates: taken or closed (dash "Take it" and "Close Feedback")
+const LIVE_CHANNEL = 'C0B48H7NT41';
+const CLAIM = {
+  id: 'help:42',
+  event: 'claimed',
+  by: 'Valeria',
+  clientName: 'Mind Lift',
+  channel: LIVE_CHANNEL,
+  ts: '1764170400.123456',
+  mode: 'live',
+};
+const CLOSE = { ...CLAIM, event: 'closed', by: 'Gerald', answer: 'We changed the second message.\nIt is live.' };
+
+check('4a  claim is accepted', pr.checkUpdate(CLAIM).ok, true);
+check('4b  close is accepted', pr.checkUpdate(CLOSE).ok, true);
+check('4c  unknown event is refused', pr.checkUpdate({ ...CLAIM, event: 'reopened' }).ok, false);
+check('4d  missing by is refused', pr.checkUpdate({ ...CLAIM, by: ' ' }).ok, false);
+check('4e  missing client is refused', pr.checkUpdate({ ...CLAIM, clientName: '' }).ok, false);
+check('4f  not an object is refused', pr.checkUpdate('x').ok, false);
+check('4g  missing mode is a dry run', pr.checkUpdate({ ...CLAIM, mode: undefined }).update.mode, 'dry_run');
+check('4h  a claim never carries an answer', pr.checkUpdate({ ...CLAIM, answer: 'hi' }).update.answer, '');
+check('4i  a long answer is clipped', pr.checkUpdate({ ...CLOSE, answer: 'y'.repeat(900) }).update.answer.length, pr.MAX_ANSWER);
+check('4j  a malformed ts drops the thread', pr.checkUpdate({ ...CLAIM, ts: 'abc' }).update.ts, null);
+check('4k  a malformed channel drops the thread', pr.checkUpdate({ ...CLAIM, channel: '#general' }).update.channel, null);
+
+const claim = pr.checkUpdate(CLAIM).update;
+check('4l  live update threads under the alert in the request channel',
+  pr.threadTarget(claim, { liveChannel: LIVE_CHANNEL }), { channel: LIVE_CHANNEL, ts: CLAIM.ts });
+check('4m  live update never threads in another channel',
+  pr.threadTarget({ ...claim, channel: 'C0OTHER999' }, { liveChannel: LIVE_CHANNEL }), null);
+check('4n  dry run threads only in a DM',
+  pr.threadTarget({ ...claim, mode: 'dry_run', channel: 'D0RONDM123' }, { liveChannel: LIVE_CHANNEL }), { channel: 'D0RONDM123', ts: CLAIM.ts });
+check('4o  dry run never threads in the request channel',
+  pr.threadTarget({ ...claim, mode: 'dry_run' }, { liveChannel: LIVE_CHANNEL }), null);
+check('4p  no stored alert means no thread',
+  pr.threadTarget(pr.checkUpdate({ ...CLAIM, channel: undefined, ts: undefined }).update, { liveChannel: LIVE_CHANNEL }), null);
+
+const close = pr.checkUpdate(CLOSE).update;
+check('4q  claim text in the thread', pr.formatUpdate(claim, { threaded: true }), '👀 *Valeria* took it.');
+check('4r  claim text standalone names the client', pr.formatUpdate(claim, { threaded: false }), '👀 *Valeria* took the help request from *Mind Lift*.');
+check('4s  close text in the thread quotes the answer on one line', pr.formatUpdate(close, { threaded: true }),
+  '✅ Closed by *Gerald*. Answer sent to the client:\n> We changed the second message. It is live.');
+check('4t  close with no answer says so', pr.formatUpdate({ ...close, answer: '' }, { threaded: true }),
+  '✅ Closed by *Gerald*. Closed with no answer: the client only sees Resolved.');
+check('4u  close text standalone escapes the client name',
+  pr.formatUpdate({ ...close, clientName: 'Acme <Corp>' }, { threaded: false }).split('.')[0], '✅ *Gerald* closed the help request from *Acme &lt;Corp&gt;*');
+check('4v  no em dash in update texts',
+  [pr.formatUpdate(claim, { threaded: false }), pr.formatUpdate(close, { threaded: false })].some((s) => /—/.test(s)), false);
+check('4w  reactions: eyes while taken', pr.updateReactions('claimed'), { add: ['eyes'], remove: [] });
+check('4x  reactions: check mark once closed', pr.updateReactions('closed'), { add: ['white_check_mark'], remove: ['eyes'] });
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall portal request checks passed');

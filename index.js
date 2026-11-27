@@ -18675,13 +18675,16 @@ async function handleAgentConsult(req, res) {
 // CLIENT_ATTENTION_FEED_SECRET (the same one Max sends to read the attention
 // feed), so nothing new is configured. mode "live" posts to the channel and
 // tags @fulfillment; anything else goes to Ron's DM as a dry run. Each request
-// id posts once (24 h memory). Rules and text: lib/portalRequest.js.
+// id posts once (24 h memory) and the response carries the post's channel and
+// ts, which the dash stores so later updates thread under it (see
+// handlePortalRequestUpdate). Rules and text: lib/portalRequest.js.
 const portalRequestLib = require('./lib/portalRequest');
 const PORTAL_REQUEST_CHANNEL = process.env.PORTAL_REQUEST_CHANNEL || OPS_BRIEF_CHANNEL;
 const PORTAL_REQUEST_USERGROUP = String(process.env.FULFILLMENT_USERGROUP_ID || '').trim() || 'S0BH988QW1K';
 const portalRequestSeen = portalRequestLib.createSeen(24 * 60 * 60 * 1000);
 
-function handlePortalRequest(req, res) {
+/** Shared secret check and JSON body for the dash's portal webhooks. */
+function readPortalWebhook(req, res, onPayload) {
   const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   const secret = String(process.env.CLIENT_ATTENTION_FEED_SECRET || '').trim();
   if (!secret) return json(503, { ok: false, error: 'portal requests disabled' });
@@ -18701,6 +18704,12 @@ function handlePortalRequest(req, res) {
     if (tooLarge) return;
     let payload;
     try { payload = JSON.parse(body); } catch { return json(400, { ok: false, error: 'invalid JSON' }); }
+    await onPayload(payload, json);
+  });
+}
+
+function handlePortalRequest(req, res) {
+  readPortalWebhook(req, res, async (payload, json) => {
     const checked = portalRequestLib.checkRequest(payload);
     if (!checked.ok) {
       console.warn(`[portal-request] refused: ${checked.problem}`);
@@ -18712,11 +18721,12 @@ function handlePortalRequest(req, res) {
     const live = request.mode === 'live';
     const text = portalRequestLib.formatRequest(request, { mention: live ? `<!subteam^${PORTAL_REQUEST_USERGROUP}|@fulfillment>` : '' });
     try {
-      if (live) await slack.client.chat.postMessage({ channel: PORTAL_REQUEST_CHANNEL, text, unfurl_links: false });
-      else await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${PORTAL_REQUEST_CHANNEL}, tags @fulfillment]\n${text}`, unfurl_links: false });
+      const posted = live
+        ? await slack.client.chat.postMessage({ channel: PORTAL_REQUEST_CHANNEL, text, unfurl_links: false })
+        : await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${PORTAL_REQUEST_CHANNEL}, tags @fulfillment]\n${text}`, unfurl_links: false });
       console.log(`[portal-request] posted ${request.id} (${request.mode})`);
       logActivity({ event_type: 'alert', event_source: 'webhook', action: `portalRequest:${request.kind}`, status: 'success' });
-      return json(200, { ok: true, posted: true, mode: request.mode });
+      return json(200, { ok: true, posted: true, mode: request.mode, channel: posted?.channel || null, ts: posted?.ts || null });
     } catch (err) {
       portalRequestSeen.delete(request.id);
       console.error(`[portal-request] post failed for ${request.id}: ${err.message}`);
@@ -18726,6 +18736,46 @@ function handlePortalRequest(req, res) {
       } catch (dmErr) {
         console.error('[portal-request] failure DM failed:', dmErr.message);
       }
+      return json(502, { ok: false, error: 'slack post failed' });
+    }
+  });
+}
+
+// ─── PORTAL REQUEST UPDATES (dash "Take it" / "Close Feedback" → the thread) ─
+// The dash calls this when a team member takes a help request or closes it.
+// Max answers in the thread of its own alert (channel + ts the dash stored
+// from handlePortalRequest) and marks the alert 👀 while taken, ✅ once closed,
+// so #ng-marktech-internal shows what is still waiting. Requests alerted
+// before the dash stored the ts get a standalone line. No @fulfillment tag.
+// Same auth and modes as portal requests. Rules and text: lib/portalRequest.js.
+function handlePortalRequestUpdate(req, res) {
+  readPortalWebhook(req, res, async (payload, json) => {
+    const checked = portalRequestLib.checkUpdate(payload);
+    if (!checked.ok) {
+      console.warn(`[portal-request-update] refused: ${checked.problem}`);
+      return json(400, { ok: false, error: checked.problem });
+    }
+    const update = checked.update;
+    const live = update.mode === 'live';
+    const thread = portalRequestLib.threadTarget(update, { liveChannel: PORTAL_REQUEST_CHANNEL });
+    const text = portalRequestLib.formatUpdate(update, { threaded: Boolean(thread) });
+    try {
+      if (thread) {
+        await slack.client.chat.postMessage({ channel: thread.channel, thread_ts: thread.ts, text, unfurl_links: false });
+        const { add, remove } = portalRequestLib.updateReactions(update.event);
+        for (const name of remove) await slack.client.reactions.remove({ channel: thread.channel, timestamp: thread.ts, name }).catch(() => {});
+        for (const name of add) await slack.client.reactions.add({ channel: thread.channel, timestamp: thread.ts, name }).catch(() => {});
+      } else if (live) {
+        await slack.client.chat.postMessage({ channel: PORTAL_REQUEST_CHANNEL, text, unfurl_links: false });
+      } else {
+        await slack.client.chat.postMessage({ channel: RON_SLACK_ID, text: `[DRY RUN → ${PORTAL_REQUEST_CHANNEL}]\n${text}`, unfurl_links: false });
+      }
+      console.log(`[portal-request-update] ${update.event} ${update.id} (${update.mode}, ${thread ? 'thread' : 'standalone'})`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: `portalRequestUpdate:${update.event}`, status: 'success' });
+      return json(200, { ok: true, posted: true, threaded: Boolean(thread) });
+    } catch (err) {
+      console.error(`[portal-request-update] post failed for ${update.id}: ${err.message}`);
+      logActivity({ event_type: 'alert', event_source: 'webhook', action: `portalRequestUpdate:${update.event}`, status: 'error', error_message: err.message });
       return json(502, { ok: false, error: 'slack post failed' });
     }
   });
@@ -18804,6 +18854,8 @@ const healthServer = http.createServer((req, res) => {
     handleAgentConsult(req, res);
   } else if (req.url === '/webhook/portal-request' && req.method === 'POST') {
     handlePortalRequest(req, res);
+  } else if (req.url === '/webhook/portal-request-update' && req.method === 'POST') {
+    handlePortalRequestUpdate(req, res);
   } else if (req.url === '/webhook/agency-move-overdue' && req.method === 'POST') {
     handleAgencyMoveOverdue(req, res);
   } else {
