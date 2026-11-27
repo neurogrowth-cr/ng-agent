@@ -1470,3 +1470,9 @@ fields behaves as before. tw12 to tw17 in `test/kai-health-watch.test.js`.
 - **Moved:** open-deal zombie digest (Mon 08:45) to #ng-sales-goats (`OPEN_DEAL_DIGEST_CHANNEL`); cron liveness audit findings (07:30, only when something is wrong) to #ng-pm-agent (`CRON_AUDIT_CHANNEL`); license roster (Mon and Thu 08:00) from #ng-fullfillment-ops to #ng-marktech-internal (code default `OPS_BRIEF_CHANNEL`, and `LICENSE_ROSTER_REPORT_TO=C0B48H7NT41` set on ng-pm-MAX the same day).
 - **Not moved:** the nightly learning's confidential block (finance and billing from Gmail) stays in Ron's DM; its team summary already posts to #ng-pm-agent. Failure DMs still go to Ron.
 - **Tests:** full suite green. Deployed 2026-11-26 00:36 UTC.
+
+## 2026-11-26: Max reads the contact@ inbox, nightly learning sees the last 24 h ([PR #557](https://github.com/neurogrowth-cr/ng-agent/pull/557))
+- **Why:** Ron, 2026-11-25 ("100% for all email context"): most tech stack billing, receipts and vendor mail land in contact@, which only the Clarity Brief read.
+- **Change:** `getRecentEmails({ max, query, bodyChars })` returns both inboxes, labelled (Ron's, and contact@ through `clarityContactGoogleAuth`); an unreadable inbox reads "Unavailable right now" without hiding the other. Nightly learning asks for the last 24 h of both inboxes except promotions and social, up to 25 each, 600-character bodies; digest cap 30k to 45k. Ron-only scheduled tasks and the Ron-only `get_recent_emails` tool also see both inboxes. The guard that dropped the whole email block when any email contained "error" is gone.
+- **Unchanged:** financial lines still go to the `confidential` category, Ron's DM only; no team-visible surface reads email.
+- **Verified:** contact@ token works (Clarity Brief 2026-11-26 scanned 17 contact@ emails). The first nightly run on both inboxes is 2026-11-27 05:30 CR.
