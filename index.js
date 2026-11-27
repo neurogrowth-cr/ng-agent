@@ -1930,9 +1930,7 @@ function registerDynamicCron(task) {
         }
         if (deliversToRonOnly) {
           const emails = await getRecentEmails();
-          if (emails && !emails.includes('error')) {
-            liveContext += `\n\nRECENT EMAILS (unread):\n${emails}`;
-          }
+          if (emails) liveContext += `\n\nRECENT EMAILS (unread, Ron's inbox + contact@):\n${emails}`;
         }
       } catch (e) { console.error('Live context fetch error for scheduled task:', e.message); }
 
@@ -2568,13 +2566,39 @@ function getGoogleAuth() {
 }
 
 // ─── GMAIL ────────────────────────────────────────────────────────────────────
-async function getRecentEmails() {
-  const auth  = getGoogleAuth();
+// Two inboxes since 2026-11-25 (Ron: "100% for all email context"): Ron's own
+// and contact@ (the team inbox where most tech stack billing, receipts and
+// vendor mail land; read through its own OAuth client, see
+// clarityContactGoogleAuth). Every caller is Ron-only: the nightly learning
+// (financial lines go to the confidential block in Ron's DM), scheduled tasks
+// gated by deliversToRonOnly, and the Ron-only get_recent_emails tool.
+// A mailbox that cannot be read says "unavailable" (never the word that callers
+// treat as a failed fetch) so the other mailbox still gets through.
+const EMAIL_INBOXES = [
+  { account: 'ron', label: "Ron's inbox" },
+  { account: 'contact', label: 'contact@ (team inbox: tech stack billing, receipts, vendors)' },
+];
+async function getRecentEmails({ max = 5, query = 'is:unread', bodyChars = 1000 } = {}) {
+  const sections = [];
+  for (const box of EMAIL_INBOXES) {
+    try {
+      const items = await fetchInboxEmails(box.account, { max, query, bodyChars });
+      sections.push(`### ${box.label}\n${items.length ? items.join('\n\n---\n\n') : 'No matching emails.'}`);
+    } catch (e) {
+      console.warn(`[email] ${box.account} inbox unreadable: ${e.message}`);
+      sections.push(`### ${box.label}\nUnavailable right now.`);
+    }
+  }
+  return sections.join('\n\n');
+}
+
+async function fetchInboxEmails(account, { max, query, bodyChars }) {
+  const auth  = account === 'contact' ? clarityContactGoogleAuth() : getGoogleAuth();
   const gmail = google.gmail({ version: 'v1', auth });
-  const res   = await gmail.users.messages.list({ userId: 'me', maxResults: 5, q: 'is:unread' });
+  const res   = await gmail.users.messages.list({ userId: 'me', maxResults: max, q: query });
   const messages = res.data.messages || [];
-  if (!messages.length) return 'No unread emails.';
-  const details = await Promise.all(messages.map(async (m) => {
+  if (!messages.length) return [];
+  return Promise.all(messages.map(async (m) => {
     const msg     = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
     const headers = msg.data.payload.headers;
     const subject = headers.find(h => h.name === 'Subject')?.value || 'No subject';
@@ -2584,14 +2608,13 @@ async function getRecentEmails() {
     const payload = msg.data.payload;
     if (payload.parts) {
       const textPart = payload.parts.find(p => p.mimeType === 'text/plain');
-      if (textPart?.body?.data) body = clipText(Buffer.from(textPart.body.data, 'base64').toString('utf8'), 1000);
+      if (textPart?.body?.data) body = clipText(Buffer.from(textPart.body.data, 'base64').toString('utf8'), bodyChars);
     } else if (payload.body?.data) {
-      body = clipText(Buffer.from(payload.body.data, 'base64').toString('utf8'), 1000);
+      body = clipText(Buffer.from(payload.body.data, 'base64').toString('utf8'), bodyChars);
     }
     if (!body) body = clipText(msg.data.snippet, 500);
     return `From: ${from}\nDate: ${date}\nSubject: ${subject}\nBody:\n${body}`;
   }));
-  return details.join('\n\n---\n\n');
 }
 
 // ─── RON GMAIL SIGNATURE (cached) ─────────────────────────────────────────────
@@ -6294,13 +6317,15 @@ async function runNightlyLearning(correlationId) {
       const messages = await readSlackChannel(ch, 20);
       if (!messages.includes('not found')) digest += `\n\n=== ${ch} ===\n${messages}`;
     }
-    // Pull recent emails into nightly digest
+    // Both inboxes (Ron + contact@), everything of the last 24 h except
+    // promotions and social, read or not (was: Ron's 5 newest unread). Financial
+    // lines become the confidential category, which only reaches Ron's DM.
+    // No includes('error') guard: an email about a "payment error" is exactly
+    // what this should see, and an unreadable inbox already says "Unavailable".
     try {
-      const emails = await getRecentEmails();
-      if (emails && !emails.includes('error')) {
-        digest += `\n\n=== GMAIL (recent unread) ===\n${emails}`;
-      }
-    } catch (e) { console.error('Nightly learning — email fetch error:', e.message); }
+      const emails = await getRecentEmails({ max: 25, query: 'newer_than:1d -category:promotions -category:social', bodyChars: 600 });
+      if (emails) digest += `\n\n=== GMAIL (last 24 h, Ron's inbox + contact@) ===\n${emails}`;
+    } catch (e) { console.error('Nightly learning: email fetch failed:', e.message); }
 
     // Pull tomorrow's calendar events into nightly digest
     try {
@@ -6355,7 +6380,7 @@ async function runNightlyLearning(correlationId) {
 
     if (!digest) return;
     const todayStr = new Date().toLocaleDateString('en-US', { timeZone: 'America/Costa_Rica', weekday:'long', month:'long', day:'numeric' });
-    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${capText(digest, 30000)}`;
+    const learningPrompt = `You are the NeuroGrowth PM agent. Today is ${todayStr}. The current year is 2026.\n\nBelow is today's activity from key Slack channels and the portal. Extract and summarize operational intelligence.\n\nFormat EVERY insight as exactly: CATEGORY | KEY | VALUE\n\nRules:\n- CATEGORY must be exactly one of these words with no other characters: client, team, process, decision, alert, intel, confidential\n- Any company financial, banking, or billing information — bank balances, failed or successful payments, invoices, subscription/billing status, cash or revenue figures from emails — MUST use CATEGORY confidential. Confidential entries are delivered privately to Ron and are never shown to the team.\n- Do NOT use markdown in CATEGORY. No asterisks, no backticks, no bold, no formatting. Just the plain word.\n- KEY should be a short descriptive identifier (client name, issue name, topic)\n- VALUE should be a single clear sentence or short paragraph, max 150 words\n- Only extract meaningful operational intelligence — skip small talk, greetings, and noise\n\nWhat to capture:\n1. Client status changes — who moved forward, who is blocked, who launched, who needs attention\n2. Wins and completions — what the team shipped or finished today\n3. Open action items that were raised but not resolved\n4. Team decisions made today\n5. Recurring patterns or blockers appearing across multiple clients\n6. Anything that should be flagged as an alert for tomorrow\n7. Email threads — any client or prospect communication that signals urgency, dissatisfaction, or opportunity\n8. Calendar events tomorrow — any sales calls, client check-ins, or deadlines Max should be aware of for morning briefing\n9. REVI section — sales-call quality patterns worth remembering: recurring objections across prospects, per-closer score trends, notable won/lost outcomes (save as team or intel). Leadership initiative movements: anything marked done/dropped is a decision; anything rediscussed_no_action repeatedly is an alert (initiative stalling)\n10. AUTO STRIKE MOVER section — only capture anomalies: zero sweeps ran (alert — cron may be dead), or unusually high move volume (intel). Do NOT judge failure levels yourself: the section states its own verdict. If it says "⚠️ FAILURE SPIKE", raise an alert quoting that line verbatim. If it says failures are within normal limits, or that it is warming up, say NOTHING about failures. A routine day (sweeps ran, few or no moves, failures within limits) needs NO entry\n\n${capText(digest, 45000)}`;
     const tNightly = Date.now();
     const response = await anthropic.messages.create({ model: MODEL_AGENT, thinking: THINKING_OFF, max_tokens: 1024, messages: [{ role: 'user', content: learningPrompt }] });
     logLlmFromAnthropicResponse(response, Date.now() - tNightly, correlationId, 'nightly_learning');
@@ -6419,7 +6444,7 @@ async function runNightlyLearning(correlationId) {
     }
 
     console.log(`Nightly learning complete. ${saved} knowledge entries saved, ${ronOnlyEntries.length} confidential (Ron-only).`);
-    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail + Calendar + REVI + strike mover | Knowledge entries saved: ${saved}${strikeSlackLine}${learnedBlock}`);
+    await postToSlack(AGENT_CHANNEL, `🧠 *Nightly learning complete* — ${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric', timeZone:'America/Costa_Rica'})}\nSources scanned: 5 Slack channels + Gmail (Ron + contact@) + Calendar + REVI + strike mover | Knowledge entries saved: ${saved}${strikeSlackLine}${learnedBlock}`);
 
     // Confidential (financial/billing) findings go to Ron's DM only.
     if (ronOnlyEntries.length) {
@@ -8473,7 +8498,7 @@ async function transcribeAudio(fileBuffer, filename) {
 const ALL_TOOLS = [
           { name: 'search_notion',       description: 'Search NeuroGrowth Notion workspace for pages, tasks, client info, and SOPs',           input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
           { name: 'get_notion_page',      description: 'Get the content of a specific Notion page by its ID',                                   input_schema: { type: 'object', properties: { page_id: { type: 'string' } }, required: ['page_id'] } },
-          { name: 'get_recent_emails',    description: "Get recent unread emails from Ron's Gmail inbox including full email body content",      input_schema: { type: 'object', properties: {} } },
+          { name: 'get_recent_emails',    description: "Get recent unread emails from Ron's Gmail inbox and the contact@ team inbox (tech stack billing, receipts, vendors), including body content",      input_schema: { type: 'object', properties: {} } },
           { name: 'send_email',           description: "Send an email on Ron's behalf. Always confirm before sending.",                          input_schema: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to','subject','body'] } },
           { name: 'get_calendar_events',  description: 'Get calendar events. daysFromNow: 0=today, 1=tomorrow, -1=yesterday. daysRange: 1=day, 7=week, 14=two weeks.', input_schema: { type: 'object', properties: { daysFromNow: { type: 'number' }, daysRange: { type: 'number' } } } },
           { name: 'search_drive',         description: "Search Ron's Google Drive for files and documents",                                      input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
