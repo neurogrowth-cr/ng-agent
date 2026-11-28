@@ -18741,13 +18741,16 @@ function handlePortalRequest(req, res) {
   });
 }
 
-// ─── PORTAL REQUEST UPDATES (dash "Take it" / "Close Feedback" → the thread) ─
-// The dash calls this when a team member takes a help request or closes it.
+// ─── PORTAL REQUEST UPDATES (dash Take it / Send update / overdue / Close) ───
+// The dash calls this when a team member takes a help request, sends the
+// client an update or closes it, and once when a request passes its response
+// time (24, 48 or 72 h by priority, until the first update; Ron 2026-11-27).
 // Max answers in the thread of its own alert (channel + ts the dash stored
-// from handlePortalRequest) and marks the alert 👀 while taken, ✅ once closed,
-// so #ng-marktech-internal shows what is still waiting. Requests alerted
-// before the dash stored the ts get a standalone line. No @fulfillment tag.
-// Same auth and modes as portal requests. Rules and text: lib/portalRequest.js.
+// from handlePortalRequest) and marks the alert 👀 while taken, ⏰ while
+// overdue, ✅ once closed, so #ng-marktech-internal shows what is still
+// waiting. Requests alerted before the dash stored the ts get a standalone
+// line. Only overdue tags @fulfillment. Same auth and modes as portal
+// requests. Rules and text: lib/portalRequest.js.
 function handlePortalRequestUpdate(req, res) {
   readPortalWebhook(req, res, async (payload, json) => {
     const checked = portalRequestLib.checkUpdate(payload);
@@ -18758,7 +18761,9 @@ function handlePortalRequestUpdate(req, res) {
     const update = checked.update;
     const live = update.mode === 'live';
     const thread = portalRequestLib.threadTarget(update, { liveChannel: PORTAL_REQUEST_CHANNEL });
-    const text = portalRequestLib.formatUpdate(update, { threaded: Boolean(thread) });
+    // Only an overdue request tags @fulfillment, and only live (dry runs go to Ron).
+    const mention = live && update.event === 'overdue' ? `<!subteam^${PORTAL_REQUEST_USERGROUP}|@fulfillment>` : '';
+    const text = portalRequestLib.formatUpdate(update, { threaded: Boolean(thread), mention });
     try {
       if (thread) {
         await slack.client.chat.postMessage({ channel: thread.channel, thread_ts: thread.ts, text, unfurl_links: false });

@@ -122,7 +122,33 @@ check('4u  close text standalone escapes the client name',
 check('4v  no em dash in update texts',
   [pr.formatUpdate(claim, { threaded: false }), pr.formatUpdate(close, { threaded: false })].some((s) => /—/.test(s)), false);
 check('4w  reactions: eyes while taken', pr.updateReactions('claimed'), { add: ['eyes'], remove: [] });
-check('4x  reactions: check mark once closed', pr.updateReactions('closed'), { add: ['white_check_mark'], remove: ['eyes'] });
+check('4x  reactions: check mark once closed, eyes and clock gone', pr.updateReactions('closed'), { add: ['white_check_mark'], remove: ['eyes', 'alarm_clock'] });
+
+// ── 5. Send update and overdue (Ron, 2026-11-27: 24, 48, 72 h until the first update or the close)
+const UPDATE = { ...CLAIM, event: 'updated', by: 'Valeria', answer: 'We are adjusting message 2.\nNew version tomorrow.' };
+const OVERDUE = { id: 'help:42', event: 'overdue', hours: 24, claimedBy: 'Valeria', clientName: 'Mind Lift', channel: LIVE_CHANNEL, ts: CLAIM.ts, mode: 'live' };
+
+check('5a  update is accepted', pr.checkUpdate(UPDATE).ok, true);
+check('5b  update without text is refused', pr.checkUpdate({ ...UPDATE, answer: '  ' }).ok, false);
+check('5c  overdue needs no "by"', pr.checkUpdate(OVERDUE).ok, true);
+check('5d  overdue needs a response time of 24, 48 or 72', pr.checkUpdate({ ...OVERDUE, hours: 12 }).ok, false);
+check('5e  overdue never carries an answer', pr.checkUpdate({ ...OVERDUE, answer: 'x' }).update.answer, '');
+check('5f  a claim still needs "by"', pr.checkUpdate({ ...CLAIM, by: '' }).ok, false);
+
+const upd = pr.checkUpdate(UPDATE).update;
+const late = pr.checkUpdate(OVERDUE).update;
+check('5g  update text in the thread', pr.formatUpdate(upd, { threaded: true }),
+  '💬 *Valeria* sent the client an update:\n> We are adjusting message 2. New version tomorrow.');
+check('5h  update text standalone names the client', pr.formatUpdate(upd, { threaded: false }).split('\n')[0],
+  '💬 *Valeria* sent *Mind Lift* an update on their help request:');
+check('5i  overdue in the thread tags the team and names who has it', pr.formatUpdate(late, { threaded: true, mention: MENTION }),
+  `${MENTION} ⏰ Past its 24 h response time with no update to the client. Taken by *Valeria*.`);
+check('5j  overdue nobody took, dry run, standalone', pr.formatUpdate({ ...late, claimedBy: '' }, { threaded: false }),
+  '⏰ The help request from *Mind Lift* is past its 24 h response time with no update to the client. Nobody has taken it.');
+check('5k  reactions: update keeps eyes and clears the clock', pr.updateReactions('updated'), { add: ['eyes'], remove: ['alarm_clock'] });
+check('5l  reactions: overdue adds the clock', pr.updateReactions('overdue'), { add: ['alarm_clock'], remove: [] });
+check('5m  no em dash in the new texts',
+  [pr.formatUpdate(upd, { threaded: false }), pr.formatUpdate(late, { threaded: false })].some((x) => /\u2014/.test(x)), false);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('\nall portal request checks passed');
