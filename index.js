@@ -19482,7 +19482,7 @@ async function checkAxonHealth() {
 
 // Inbox watch liveness (same 10-min poll). AXON's `inbox_watch` cron stamps
 // axon.engine_heartbeat (id 'cron:inbox_watch') after each run that read the
-// inbox (ng-axon #373). No completed run for 75 minutes inside 06:00 to 20:59
+// inbox (ng-axon #373). No completed run for 35 minutes inside 06:00 to 20:59
 // Costa Rica posts once, in Spanish, to AXON's channel and to Ron; a newer run
 // posts the recovery. Rule, text and state live in lib/axonHealth.js. The
 // alert and the recovery are also rows in agent_activity (axon_inbox_watch),

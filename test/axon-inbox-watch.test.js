@@ -1,9 +1,10 @@
 // Rules test for the inbox watch liveness check.  Run:  node test/axon-inbox-watch.test.js
 //
-// AXON's inbox_watch cron (12,42 6-20 * * * Costa Rica) stamps
+// AXON's inbox_watch cron (2,12,22,32,42,52 6-20 * * * Costa Rica, every 10
+// minutes since ng-axon #453) stamps
 // axon.engine_heartbeat id 'cron:inbox_watch' after each run that read the
 // inbox. lib/axonHealth.js decides, from that one timestamp, when the cron has
-// stopped: 75 minutes with no completed run inside 06:00 to 20:59 Costa Rica.
+// stopped: 35 minutes with no completed run inside 06:00 to 20:59 Costa Rica.
 // One alert per outage, a recovery when a newer run appears, quiet at night.
 const ax = require('../lib/axonHealth');
 
@@ -22,13 +23,14 @@ const at = (now, beatMs) => ax.classifyInboxWatch({ data: beatMs == null ? [] : 
 
 // ── 1. the id is a contract with ng-axon lib/pure.js cronBeatRow
 check('1a  beat id', ax.INBOX_WATCH_BEAT_ID, 'cron:inbox_watch');
-check('1b  threshold is 75 minutes', ax.INBOX_WATCH_STALE_MS, 75 * MIN);
+check('1b  threshold is 35 minutes', ax.INBOX_WATCH_STALE_MS, 35 * MIN);
 
 // ── 2. classify inside the cron's hours
 check('2a  run 17 min ago is ok', at(cr(20, '10:30'), cr(20, '10:13')).kind, 'ok');
-check('2b  one missed run (47 min) is ok', at(cr(20, '11:00'), cr(20, '10:13')).kind, 'ok');
-check('2c  74 min is ok', at(cr(20, '11:27'), cr(20, '10:13')).kind, 'ok');
-check('2d  75 min is stale', at(cr(20, '11:28'), cr(20, '10:13')).kind, 'stale');
+check('2b  two missed runs (30 min) is ok', at(cr(20, '10:43'), cr(20, '10:13')).kind, 'ok');
+check('2c  34 min is ok', at(cr(20, '10:47'), cr(20, '10:13')).kind, 'ok');
+check('2d  35 min is stale', at(cr(20, '10:48'), cr(20, '10:13')).kind, 'stale');
+check('2d2 36 min is stale', at(cr(20, '10:49'), cr(20, '10:13')).kind, 'stale');
 check('2e  no row at midday is stale', at(cr(20, '12:00'), null).kind, 'stale');
 check('2f  read error is blind', ax.classifyInboxWatch({ error: { message: 'upstream request timeout' }, now: cr(20, '12:00') }).kind, 'blind');
 check('2g  throw is blind', ax.classifyInboxWatch({ thrown: new Error('fetch failed'), now: cr(20, '12:00') }).kind, 'blind');
@@ -40,12 +42,12 @@ check('3a  21:00, last run 20:43: quiet', at(cr(19, '21:00'), lastNight).kind, '
 check('3b  03:00 with a 6 hour old run: quiet', at(cr(20, '03:00'), lastNight).kind, 'quiet');
 check('3c  05:59: quiet', at(cr(20, '05:59'), lastNight).kind, 'quiet');
 check('3d  06:00: the day starts, ok', at(cr(20, '06:00'), lastNight).kind, 'ok');
-check('3e  07:10, no run yet today: still ok (70 min)', at(cr(20, '07:10'), lastNight).kind, 'ok');
-check('3f  07:20, no run yet today: stale', at(cr(20, '07:20'), lastNight).kind, 'stale');
-check('3g  07:20 with the 06:13 run: ok', at(cr(20, '07:20'), cr(20, '06:13')).kind, 'ok');
+check('3e  06:34, no run yet today: still ok (34 min)', at(cr(20, '06:34'), lastNight).kind, 'ok');
+check('3f  06:35, no run yet today: stale', at(cr(20, '06:35'), lastNight).kind, 'stale');
+check('3g  06:35 with the 06:13 run: ok', at(cr(20, '06:35'), cr(20, '06:13')).kind, 'ok');
 check('3h  20:59 is still inside the hours', at(cr(20, '20:59'), cr(20, '19:13')).kind, 'stale');
-check('3i  cron dead at 19:50: 20:50 poll not yet stale, then the night is quiet',
-  [at(cr(20, '20:50'), cr(20, '19:43')).kind, at(cr(20, '21:00'), cr(20, '19:43')).kind], ['ok', 'quiet']);
+check('3i  cron dead at 20:30: 20:50 poll not yet stale, then the night is quiet',
+  [at(cr(20, '20:50'), cr(20, '20:23')).kind, at(cr(20, '21:00'), cr(20, '20:23')).kind], ['ok', 'quiet']);
 check('3j  a dead night with no row at all: quiet', at(cr(20, '02:00'), null).kind, 'quiet');
 
 // ── 4. one alert per outage, recovery clears it
@@ -63,9 +65,9 @@ function run(polls, start = ax.newInboxWatchState()) {
 }
 const B = cr(20, '10:13');
 const outage = run([
-  [cr(20, '10:20'), B], [cr(20, '11:20'), B],             // fine, one missed run
-  [cr(20, '11:30'), B],                                   // 77 min: alert
-  [cr(20, '11:40'), B], [cr(20, '14:00'), B], [cr(20, '20:50'), B], // same outage: silent
+  [cr(20, '10:20'), B], [cr(20, '10:40'), B],             // fine, two missed runs
+  [cr(20, '10:50'), B],                                   // 37 min: alert
+  [cr(20, '11:00'), B], [cr(20, '14:00'), B], [cr(20, '20:50'), B], // same outage: silent
   [cr(20, '23:00'), B],                                   // night: silent
   [cr(21, '07:30'), B], [cr(21, '12:00'), B],             // next day, same outage: silent
   [cr(21, '12:20'), cr(21, '12:13')],                     // a run completed: recovery
@@ -108,11 +110,11 @@ check('8f  a row with no metadata: clean', ax.restoreInboxWatchState([{ action: 
 // ── 9. the text the team reads (Spanish, usted, exact)
 const alertText = outage.out[2][0];
 check('9a  alert first line', alertText.split('\n')[0],
-  '🔴 *La vigilancia del inbox de AXON dejó de correr*: no completa una lectura desde las 10:13, hora de Costa Rica (hace 77 min). Debe correr cada 30 minutos entre las 06:00 y las 20:59.');
+  '🔴 *La vigilancia del inbox de AXON dejó de correr*: no completa una lectura desde las 10:13, hora de Costa Rica (hace 37 min). Debe correr cada 10 minutos entre las 06:00 y las 20:59.');
 check('9b  alert says what to check', [/node scripts\/prosp-web-session\.js/.test(alertText), /ng-fulfillment-AXON en Railway/.test(alertText), /PROSP_INBOX_WATCH/.test(alertText)], [true, true, true]);
 check('9c  alert says it is sent once', /una sola vez por caída/.test(alertText), true);
 check('9d  morning alert names yesterday\'s run', run([[cr(20, '07:20'), lastNight]]).out[0][0].split('\n')[0],
-  '🔴 *La vigilancia del inbox de AXON dejó de correr*: hoy no ha completado ninguna lectura (la última fue el 19 nov a las 20:43, hora de Costa Rica). Debe correr cada 30 minutos entre las 06:00 y las 20:59.');
+  '🔴 *La vigilancia del inbox de AXON dejó de correr*: hoy no ha completado ninguna lectura (la última fue el 19 nov a las 20:43, hora de Costa Rica). Debe correr cada 10 minutos entre las 06:00 y las 20:59.');
 check('9e  recovery text', outage.out[9][0],
   '✅ *La vigilancia del inbox de AXON volvió a correr*: completó una lectura a las 12:13, hora de Costa Rica, después de 26 h sin correr.');
 const everything = [alertText, never.out[0][0], outage.out[9][0], never.out[2][0], run([[cr(20, '07:20'), lastNight]]).out[0][0]];
